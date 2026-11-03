@@ -25,8 +25,8 @@
 
 use scp_event_log::payload::{MembershipChangePayload, encode_payload};
 use scp_event_log::{EventPayload, EventType};
-use scp_runtime::context::builder::ContextEventLogProvider;
-use scp_runtime::context::providers::MerkleEventLogProvider;
+use scp_runtime_core::context::builder::ContextEventLogProvider;
+use scp_runtime_core::context::providers::MerkleEventLogProvider;
 
 const CTX: [u8; 32] = [0x5cu8; 32];
 const ALICE: &str = "did:dht:z6MkAliceConverge";
@@ -72,7 +72,7 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     // converge.
     let _ = local_clock_offset;
     log.append_context_event(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::ContextCreated,
         ALICE,
@@ -81,7 +81,7 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         ALICE,
@@ -91,7 +91,7 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         BOB,
@@ -101,7 +101,7 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::GovernanceAction,
         ALICE,
@@ -123,7 +123,7 @@ async fn append_stream_with_local_timestamps(
     local_clock_offset: u64,
 ) {
     log.append_context_event(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::ContextCreated,
         ALICE,
@@ -132,7 +132,7 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         ALICE,
@@ -142,7 +142,7 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         BOB,
@@ -152,7 +152,7 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
+        scp_runtime_core::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::GovernanceAction,
         ALICE,
@@ -220,7 +220,7 @@ async fn negative_control_per_author_appends_break_convergence() {
     for _ in 0..3 {
         log_a
             .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
+                scp_runtime_core::context::builder::AppendMode::FailClosed,
                 &CTX,
                 EventType::MessageSent,
                 ALICE,
@@ -236,7 +236,7 @@ async fn negative_control_per_author_appends_break_convergence() {
     for _ in 0..5 {
         log_b
             .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
+                scp_runtime_core::context::builder::AppendMode::FailClosed,
                 &CTX,
                 EventType::MessageSent,
                 BOB,
@@ -302,7 +302,7 @@ async fn negative_control_per_payee_payment_appends_break_convergence() {
     for _ in 0..2 {
         log_a
             .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
+                scp_runtime_core::context::builder::AppendMode::FailClosed,
                 &CTX,
                 EventType::PaymentReceived,
                 ALICE,
@@ -318,7 +318,7 @@ async fn negative_control_per_payee_payment_appends_break_convergence() {
     for _ in 0..4 {
         log_b
             .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
+                scp_runtime_core::context::builder::AppendMode::FailClosed,
                 &CTX,
                 EventType::PaymentReceived,
                 BOB,
@@ -393,7 +393,7 @@ async fn negative_control_per_committer_commit_broadcast_appends_break_convergen
     // Committer-only divergence: re-introduce the durable broadcast records.
     log_a
         .append_context_event(
-            scp_runtime::context::builder::AppendMode::FailClosed,
+            scp_runtime_core::context::builder::AppendMode::FailClosed,
             &CTX,
             EventType::CommitBroadcasted,
             ALICE,
@@ -403,7 +403,7 @@ async fn negative_control_per_committer_commit_broadcast_appends_break_convergen
         .unwrap();
     log_a
         .append_context_event(
-            scp_runtime::context::builder::AppendMode::FailClosed,
+            scp_runtime_core::context::builder::AppendMode::FailClosed,
             &CTX,
             EventType::CommitBroadcastFailed,
             ALICE,

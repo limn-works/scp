@@ -15,8 +15,8 @@
 //!
 //! See spec section 19.2.2 and ADR-033 in `.docs/adrs/phase-3.md`.
 
-use crate::context::shared::economy::EnforceEconomyRequest;
-use crate::context::shared::economy::validate_spending_ucan_or_error;
+use scp_runtime_core::context::shared::economy::EnforceEconomyRequest;
+use scp_runtime_core::context::shared::economy::validate_spending_ucan_or_error;
 
 use scp_protocol::context::ContextError;
 use scp_protocol::economy::policy::ObservableMetrics;

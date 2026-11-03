@@ -1,0 +1,854 @@
+//! Caller-side actor handle. See plan §"Mailbox parameters".
+//!
+//! # Clippy allows
+//!
+//! `doc_markdown` / `too_long_first_doc_paragraph` — doc prose cites
+//! plan section titles (`§"Mailbox parameters"`, etc.); wrapping each
+//! reference in backticks is churn for no reader benefit.
+#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+//!
+//! `ContextActorHandle` wraps a `tokio::sync::mpsc::Sender<ContextCommand>`
+//! and enforces the two caller-side protocol contracts:
+//!
+//! 1. **Per-send timeout.** Every `send_*` method wraps the mailbox send in
+//!    `tokio::time::timeout(Duration::from_secs(30), ...)`. If the mailbox
+//!    is full for 30 s the caller receives
+//!    [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy).
+//!    This closes the "hung caller pile-up" failure mode documented in
+//!    plan §"Mailbox parameters".
+//! 2. **Cheap clone.** `mpsc::Sender` is already `Clone` — the handle
+//!    follows its semantics. Each caller can clone the handle without
+//!    coordinating with the actor; the shared refcount is `Sender`'s
+//!    internal atomic counter.
+//!
+//! Cancellation semantics (plan §"Cancel-safety check"): dropping the
+//! handle does NOT cancel in-flight commands. A command already in the
+//! mailbox is processed to completion; the caller's oneshot receiver is
+//! the only cancellation vector (drop the receiver → outcome is discarded
+//! on `actor.dispatch`'s `reply.send` branch).
+
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot};
+
+use scp_protocol::context::ContextError;
+
+use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Per-send mailbox timeout. Plan §"Mailbox parameters" fixes this at 30 s
+/// — matching the actor-internal transport-timeout and the saga-phase
+/// default so the end-to-end caller deadline is predictable. If this
+/// value changes, audit the three sibling timers together.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-caller reply-await timeout bounding how long the handle waits on the
+/// actor's oneshot reply AFTER the command was enqueued.
+///
+/// Distinct budget from [`SEND_TIMEOUT`], which bounds only mailbox ADMISSION
+/// (waiting for a free slot on a full mailbox). Once the command is enqueued,
+/// this bounds actor-side PROCESSING — a wedged/deadlocked actor (stuck in an
+/// infinite loop or a never-completing future inside a handler) never
+/// terminates, so the Phase-2B watchdog never fires and the reply sender is
+/// never dropped; without this bound `rx.await` would pin the caller forever.
+///
+/// This is a defense-in-depth BACKSTOP, not a budget any healthy path is
+/// expected to approach: every healthy reply path is already cut off first by
+/// the 30 s send / handler / PHASE budgets, so this only ever fires on a
+/// genuine wedge. On elapse the handle fail-closes with a retryable
+/// [`ContextError::ActorBusy`] (the actor keeps running — we only drop our own
+/// receiver; any committed Class-S state stays committed) rather than awaiting
+/// unbounded.
+///
+/// Set to 2 min — ≥ the key-package actor's 1 min
+/// ([`KP_REPLY_TIMEOUT`](crate::context::supervisor::key_package_actor::KP_REPLY_TIMEOUT),
+/// internal follow-up #129) because context actors have a deeper mailbox
+/// ([`ACTOR_MAILBOX_CAPACITY`](crate::context::supervisor::ACTOR_MAILBOX_CAPACITY)
+/// = 256 vs 32) plus heavier MLS handlers, so a legitimately deep-queued (but
+/// healthy) actor can trail further behind. The exact value is not
+/// load-bearing — it only has to be safely larger than the healthy-path
+/// budgets it backstops.
+pub const REPLY_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Per-call transport budget inside an actor handler (plan §"Transport
+/// timeouts inside actor handlers"): 30 seconds. Every domain handler bounds
+/// its relay and event-log I/O with this one constant.
+pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Bounded reply-await mechanics
+// ---------------------------------------------------------------------------
+
+/// Classifies why a bounded reply-await did not yield a handler reply.
+///
+/// The two variants let a caller that wants to distinguish the failure modes
+/// do so (e.g. log "wedged actor" vs "dropped reply channel"); callers that
+/// treat any non-reply uniformly match both with `Err(_)` and never inspect
+/// the value. See [`bounded_reply_await`].
+///
+/// Visibility is `pub(crate)` (not `pub(in crate::context)`) because the
+/// `?Send` recovery reply-await in `crate::identity::recovery` — a sibling of
+/// `crate::context`, not nested within it — routes through the same helper.
+#[derive(Debug)]
+pub enum BoundedReplyError {
+    /// The actor dropped the reply sender before answering (the underlying
+    /// [`oneshot`] channel closed) — typically a terminated/replaced actor.
+    Dropped,
+    /// The actor did not reply within [`REPLY_TIMEOUT`] — a wedged/deadlocked
+    /// actor whose reply sender is still alive (so the channel never closed).
+    Elapsed,
+}
+
+/// Bounds a reply-oneshot await by [`REPLY_TIMEOUT`] and classifies the
+/// outcome, so a wedged/deadlocked actor (whose reply sender is never dropped)
+/// cannot pin the caller forever.
+///
+/// This is **mechanics only**: it centralizes the
+/// `tokio::time::timeout(REPLY_TIMEOUT, rx).await` + outcome-classification
+/// step shared by every `Supervisor::dispatch_*` reply-await, but it does
+/// **not** unify the callers' dispositions. Each caller keeps its own handling
+/// of the [`BoundedReplyError`] inline — return a typed error, soft-default,
+/// discard, warn-and-continue — exactly as it did with a raw `rx.await`.
+///
+/// `T` is generic — it is the oneshot payload type, which the helper never
+/// inspects (the payload is typically the handler's own
+/// `Result<_, ContextError>`, riding through untouched on the `Ok` arm). The
+/// helper imposes no `Send` bound of its own, so it also works in the `?Send`
+/// recovery path (`identity::recovery`, ADR-049 Decision 7). Visibility is
+/// `pub(crate)` because that recovery path is a sibling of `crate::context`.
+///
+/// # Errors
+///
+/// [`BoundedReplyError::Elapsed`] when no reply arrives within `REPLY_TIMEOUT`, and
+/// [`BoundedReplyError::Dropped`] when the actor drops the reply sender.
+pub async fn bounded_reply_await<T>(rx: oneshot::Receiver<T>) -> Result<T, BoundedReplyError> {
+    match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_dropped)) => Err(BoundedReplyError::Dropped),
+        Err(_elapsed) => Err(BoundedReplyError::Elapsed),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deliberate exit
+// ---------------------------------------------------------------------------
+
+/// Why an actor's `run()` loop ended on purpose. The actor records it before
+/// its inbox drops, so a caller whose command went unanswered can tell an
+/// actor that stopped on purpose from one that crashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliberateExit {
+    /// The actor dispatched `LifecycleControlCommand::Shutdown`.
+    Shutdown,
+    /// The actor dispatched a `LifecycleControlCommand::PrepareForReplace`
+    /// that claimed its slot for an imported context.
+    Replaced,
+    /// The actor's TTL expiry landed the context in a terminal state, which
+    /// the expiry persisted before the actor despawned itself.
+    Expired,
+}
+
+/// The cell an actor records its [`DeliberateExit`] in, shared with every
+/// [`ContextActorHandle`] clone for that actor. Empty while the actor runs,
+/// and empty forever after an exit that was not deliberate: a panic
+/// unwinds past every recording site.
+#[derive(Debug, Clone, Default)]
+pub struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
+
+impl ExitRecord {
+    /// Records `exit`. The first record wins; an actor exits once.
+    pub fn record(&self, exit: DeliberateExit) {
+        if self.0.set(exit).is_err() {
+            tracing::error!(?exit, "an actor recorded a second deliberate exit");
+        }
+    }
+
+    /// The deliberate exit the actor recorded, if any.
+    pub(in crate::context) fn get(&self) -> Option<DeliberateExit> {
+        self.0.get().copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContextActorHandle
+// ---------------------------------------------------------------------------
+
+/// Caller-side handle for a `ContextActor`. Cheap to clone; the actor
+/// observes the sender refcount reaching zero as "all callers dropped"
+/// and, together with `LifecycleControlCommand::Shutdown`, decides when
+/// to exit `run()`.
+///
+/// The handle holds only the mpsc sender — no back-reference to the
+/// actor task, no shared state, no locks. This keeps the hot path
+/// (supervisor DashMap::get → clone handle → send) lock-free in the
+/// common case.
+#[derive(Clone)]
+pub struct ContextActorHandle {
+    /// Command inbox sender. `Sender::send` applies the bounded mailbox
+    /// backpressure; `tokio::time::timeout` bounds the wait.
+    inbox: mpsc::Sender<ContextCommand>,
+    /// Where the actor records a deliberate exit; see
+    /// [`Self::exited_deliberately`].
+    exit: ExitRecord,
+}
+
+impl ContextActorHandle {
+    /// Wraps a raw mpsc sender. Visible only within the actor-supervisor
+    /// module pair — the sender half is paired with an actor's `inbox:
+    /// Receiver` by the `Supervisor::spawn_actor` constructor. External
+    /// code obtains a handle via `Supervisor::lookup(context_id)`, not
+    /// by constructing one directly.
+    ///
+    /// `dead_code` allow: the only production caller is
+    /// `Supervisor::spawn_actor`, which is itself only exercised in
+    /// `#[cfg(test)]` until the lifecycle handler migrates in commit 9.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn from_sender(inbox: mpsc::Sender<ContextCommand>) -> Self {
+        Self {
+            inbox,
+            exit: ExitRecord::default(),
+        }
+    }
+
+    /// The cell the actor behind this handle records its deliberate exit
+    /// in. The spawn hands it to [`super::ContextActor::new`], so the
+    /// handle reads what that actor records.
+    #[must_use]
+    pub fn exit_record(&self) -> ExitRecord {
+        self.exit.clone()
+    }
+
+    /// The exit the actor recorded when its `run()` loop ended on purpose,
+    /// or `None` while it runs and after any other exit, a panic included.
+    #[must_use]
+    pub fn exited_deliberately(&self) -> Option<DeliberateExit> {
+        self.exit.get()
+    }
+
+    /// Submits a command to the actor's mailbox, waits for the actor's
+    /// oneshot reply, and returns the typed result.
+    ///
+    /// The `cmd_factory` closure constructs the command from the
+    /// `oneshot::Sender<Result<T, ContextError>>` the handle creates for
+    /// the reply. This keeps the oneshot lifetimes tied to this method
+    /// call — callers cannot accidentally reuse a oneshot across
+    /// commands.
+    ///
+    /// # Timeouts
+    ///
+    /// - **Send timeout.** Mailbox-send is bounded by [`SEND_TIMEOUT`]
+    ///   (30 s). On timeout, returns
+    ///   [`ContextError::ActorBusy`].
+    /// - **Reply wait.** After the command enters the mailbox the reply
+    ///   future is bounded by [`REPLY_TIMEOUT`] (2 min). On the healthy path
+    ///   the actor's per-handler transport and storage timeouts (30 s each
+    ///   per plan §"Transport timeouts inside actor handlers") bound the
+    ///   end-to-end wait long before this fires; [`REPLY_TIMEOUT`] is the
+    ///   defense-in-depth backstop for a wedged/deadlocked actor that never
+    ///   terminates (so the watchdog never drops the reply sender) — on
+    ///   elapse the caller gets a retryable [`ContextError::ActorBusy`]
+    ///   instead of hanging forever.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] — the mailbox was full for the full
+    ///   [`SEND_TIMEOUT`]; the command was never delivered.
+    /// - Actor-channel-closed errors surface as
+    ///   [`ContextError::ActorBusy`] with a descriptive message — the
+    ///   actor has terminated and the handle is stale; callers typically
+    ///   respond by fetching a fresh handle from the supervisor.
+    /// - The handler's typed `ContextError` — whatever the handler
+    ///   returned on the oneshot reply channel.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future returned by this method mid-flight is safe:
+    /// the actor continues processing the command and attempts to
+    /// `reply.send(..)`. Since the receiver is dropped, that send is a
+    /// no-op — the committed state stays committed. See plan
+    /// §"Cancel-safety check".
+    pub async fn send<T, F>(&self, cmd_factory: F) -> Result<T, ContextError>
+    where
+        F: FnOnce(oneshot::Sender<Result<T, ContextError>>) -> ContextCommand,
+    {
+        let (tx, rx) = oneshot::channel::<Result<T, ContextError>>();
+        let cmd = cmd_factory(tx);
+
+        // Bounded-wait mailbox send. Plan §"Mailbox parameters".
+        match tokio::time::timeout(SEND_TIMEOUT, self.inbox.send(cmd)).await {
+            // Enqueued: bound the reply-await too. A wedged/deadlocked actor
+            // (stuck in an infinite loop or never-completing handler future)
+            // never terminates, so the watchdog never fires and the reply
+            // sender is never dropped — without this bound the caller would
+            // hang forever. On elapse, fail-closed with a retryable
+            // `ActorBusy` (defense-in-depth backstop; every healthy path is
+            // cut off first by the 30 s send/handler/PHASE budgets).
+            Ok(Ok(())) => match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_dropped)) => Err(ContextError::ActorBusy(
+                    "actor dropped reply channel before replying".to_owned(),
+                )),
+                Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                    "context actor did not reply within {} seconds",
+                    REPLY_TIMEOUT.as_secs()
+                ))),
+            },
+            Ok(Err(_closed)) => Err(ContextError::ActorBusy(
+                "actor inbox is closed — actor has terminated".to_owned(),
+            )),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "mailbox full for {} seconds",
+                SEND_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Like [`Self::send`], but RECOVERS the un-delivered command when the
+    /// mailbox send itself fails, so a caller that moved an unbalanced,
+    /// must-consume payload (e.g. a `OutletEconomyTicket`-bearing reservation)
+    /// into the command can reclaim and balance it instead of dropping it.
+    ///
+    /// [`Self::send`] builds the command, then on a full/closed mailbox drops
+    /// the built command INSIDE the send — the caller never gets it back. For a
+    /// command carrying a `#[must_use]` ticket whose `Drop` debug-asserts on an
+    /// unbalanced drop, that is a panic under `--features testing` (and an
+    /// escrow leak in release). This variant instead returns the built command
+    /// back on a send failure so the caller can extract and reverse the ticket.
+    ///
+    /// Returns:
+    /// - `Ok(T)` — the command was delivered and the handler replied `Ok`.
+    /// - `Err((error, Some(cmd)))` — the mailbox send FAILED (full for the full
+    ///   [`SEND_TIMEOUT`], or the inbox is closed); `cmd` is the un-delivered
+    ///   command (boxed — `ContextCommand` is large), returned for ticket
+    ///   recovery. The command NEVER reached the actor, so no handler-side
+    ///   effect occurred.
+    /// - `Err((error, None))` — the command WAS delivered but the handler
+    ///   replied with a typed error, dropped the reply channel, or did not
+    ///   reply within [`REPLY_TIMEOUT`] (a wedged actor). There is no command
+    ///   to recover (the actor owns its outcome, including any `#[must_use]`
+    ///   ticket the command carried); the handler-side effect, if any, is the
+    ///   handler's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Same error classes as [`Self::send`] — including the post-enqueue reply
+    /// bounded by [`REPLY_TIMEOUT`]; the `Option<Box<ContextCommand>>` half
+    /// distinguishes a never-delivered send (recoverable) from a delivered
+    /// handler error / reply timeout (not recoverable).
+    pub async fn send_recover_on_failure<T, F>(
+        &self,
+        cmd_factory: F,
+    ) -> Result<T, (ContextError, Option<Box<ContextCommand>>)>
+    where
+        F: FnOnce(oneshot::Sender<Result<T, ContextError>>) -> ContextCommand,
+    {
+        // Reserve a mailbox slot BEFORE building the command, so the command is
+        // never moved into a cancellable send future. `reserve()` is cancel-safe
+        // and yields a `Permit` (or a closed error) WITHOUT consuming any value;
+        // the timeout therefore cannot strand a built command. Only once a slot
+        // is secured do we build the reply-bearing command and `permit.send` it
+        // (a synchronous, infallible enqueue). On reserve timeout / closed inbox
+        // we build the command anyway and hand it BACK for ticket recovery —
+        // the actor never saw it, so no handler-side effect occurred.
+        let permit = match tokio::time::timeout(SEND_TIMEOUT, self.inbox.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => {
+                let (tx, _rx) = oneshot::channel::<Result<T, ContextError>>();
+                return Err((
+                    ContextError::ActorBusy(
+                        "actor inbox is closed — actor has terminated".to_owned(),
+                    ),
+                    Some(Box::new(cmd_factory(tx))),
+                ));
+            }
+            Err(_elapsed) => {
+                let (tx, _rx) = oneshot::channel::<Result<T, ContextError>>();
+                return Err((
+                    ContextError::ActorBusy(format!(
+                        "mailbox full for {} seconds",
+                        SEND_TIMEOUT.as_secs()
+                    )),
+                    Some(Box::new(cmd_factory(tx))),
+                ));
+            }
+        };
+
+        let (tx, rx) = oneshot::channel::<Result<T, ContextError>>();
+        permit.send(cmd_factory(tx));
+
+        // Delivered: the command reached the actor. A reply error, a dropped
+        // reply channel, or a reply-timeout (wedged/deadlocked actor) is NOT
+        // recoverable — the command was enqueued, so the actor owns the
+        // outcome, including any `#[must_use]` ticket the command carried.
+        // The un-delivered slot is therefore `None` (returning `Some` here
+        // would risk a double-balance of the escrow). The reply-await is
+        // bounded by `REPLY_TIMEOUT` so a wedged actor cannot pin the caller
+        // forever — same defense-in-depth backstop as `send`.
+        match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => reply.map_err(|e| (e, None)),
+            Ok(Err(_dropped)) => Err((
+                ContextError::ActorBusy("actor dropped reply channel before replying".to_owned()),
+                None,
+            )),
+            Err(_elapsed) => Err((
+                ContextError::ActorBusy(format!(
+                    "context actor did not reply within {} seconds",
+                    REPLY_TIMEOUT.as_secs()
+                )),
+                None,
+            )),
+        }
+    }
+
+    /// Submits a pre-built command to the actor's mailbox with a
+    /// caller-supplied send-side timeout. **Does NOT wait for the
+    /// reply.** Reply consumption is the caller's responsibility — the
+    /// caller embedded a `oneshot::Sender` inside `cmd` and holds the
+    /// matching `Receiver`.
+    ///
+    /// This is the spec-shape entry point per ADR-049 §"Mailbox
+    /// parameters" / master plan §"Mailbox parameters". Used by the
+    /// `Supervisor::dispatch_*_command` mailbox-routing path that
+    /// constructs each command's reply-bearing oneshot, sends through
+    /// the mailbox, then awaits the receiver itself.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] — mailbox full for the full
+    ///   `timeout` window; the command was never delivered. The text
+    ///   describes which condition (full vs. closed) the caller hit so
+    ///   higher-level logging / metrics can disambiguate.
+    /// - [`ContextError::ActorBusy`] (text contains "closed") — the
+    ///   inbox receiver was already dropped (actor has terminated).
+    ///   Callers typically respond by fetching a fresh handle.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future mid-flight aborts the in-flight mailbox
+    /// send. If the send had not yet reached the actor, the command is
+    /// discarded. Once enqueued, the actor processes the command to
+    /// completion regardless of caller cancellation — the embedded
+    /// reply oneshot's receiver-drop is the only cancellation vector
+    /// for the actor-side outcome (plan §"Cancel-safety check").
+    pub async fn send_with_timeout(
+        &self,
+        cmd: ContextCommand,
+        timeout: std::time::Duration,
+    ) -> Result<(), ContextError> {
+        match tokio::time::timeout(timeout, self.inbox.send(cmd)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_closed)) => Err(ContextError::ActorBusy(
+                "actor inbox is closed — actor has terminated".to_owned(),
+            )),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "mailbox full for {} seconds",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    /// Submits `LifecycleControlCommand::Pause` to the actor and awaits
+    /// the ack. See [`Self::send`] for error semantics.
+    ///
+    /// Called by the `BridgeInstanceCore::suspend` default body in
+    /// `scp_ffi_common::bridge_instance::BridgeInstanceCore`. The handler
+    /// that processes the `Pause` variant is implemented in
+    /// [`crate::context::actor::handlers::lifecycle_control`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::send`].
+    pub async fn send_pause(&self) -> Result<(), ContextError> {
+        self.send(|reply| {
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply })
+        })
+        .await
+    }
+
+    /// Submits `LifecycleControlCommand::PersistSync` to the actor and
+    /// awaits the ack. See [`Self::send`] for error semantics.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::send`].
+    pub async fn send_persist_sync(&self) -> Result<(), ContextError> {
+        self.send(|reply| {
+            ContextCommand::LifecycleControl(LifecycleControlCommand::PersistSync { reply })
+        })
+        .await
+    }
+
+    /// Submits `LifecycleControlCommand::Shutdown` to the actor and
+    /// awaits the ack. The actor exits its dispatch loop after
+    /// processing this command. See [`Self::send`] for error semantics.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::send`].
+    pub async fn send_shutdown(&self) -> Result<(), ContextError> {
+        self.send(|reply| {
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply })
+        })
+        .await
+    }
+
+    /// Stops the actor and waits until its `run()` has returned, so no write
+    /// the actor makes can land after this resolves.
+    ///
+    /// The `Shutdown` ack does not give that order: the handler replies during
+    /// dispatch, and the run loop's post-loop drain persists any dirty state
+    /// after the reply. The inbox receiver drops only when `run()` returns,
+    /// after that drain, and `Sender::closed` resolves at that drop. An actor
+    /// that has already exited resolves it at once.
+    ///
+    /// # Errors
+    ///
+    /// The `Shutdown` send's error, or [`ContextError::ActorBusy`] when the
+    /// send succeeded, if the actor has not exited within [`REPLY_TIMEOUT`].
+    /// The actor may still write after an error.
+    pub async fn shutdown_and_await_exit(&self) -> Result<(), ContextError> {
+        // A closed inbox (the actor already exited) fails the send and
+        // resolves `closed` at once, so the exit wait alone decides success.
+        let shutdown = self.send_shutdown().await;
+        match tokio::time::timeout(REPLY_TIMEOUT, self.inbox.closed()).await {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => Err(shutdown.err().unwrap_or_else(|| {
+                ContextError::ActorBusy(format!(
+                    "context actor did not exit within {} seconds of its shutdown ack",
+                    REPLY_TIMEOUT.as_secs()
+                ))
+            })),
+        }
+    }
+
+    /// How many commands wait in the actor's mailbox, not counting the one
+    /// the actor is processing (`testing` only).
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::context) fn queued_commands(&self) -> usize {
+        self.inbox.max_capacity() - self.inbox.capacity()
+    }
+
+    /// Whether the actor's inbox receiver has dropped, which happens when its
+    /// `run()` returns or its task unwinds from a panic.
+    pub(in crate::context) fn is_closed(&self) -> bool {
+        self.inbox.is_closed()
+    }
+
+    /// [`Self::shutdown_and_await_exit`] with no time bound, for a caller that
+    /// must not proceed until the actor has exited however long it takes.
+    ///
+    /// The `Shutdown` send waits for mailbox capacity instead of timing out,
+    /// so a full mailbox delays the stop rather than skipping it. A send that
+    /// fails means the inbox receiver has dropped, which happens only when
+    /// `run()` returns, so the actor has already exited.
+    pub async fn stop_and_await_exit_unbounded(&self) {
+        let (reply, _ack) = oneshot::channel();
+        let shutdown =
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply });
+        if self.inbox.send(shutdown).await.is_err() {
+            return;
+        }
+        self.inbox.closed().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::context::actor::commands::QueriesCommand;
+
+    /// Build the read-only smoke-test command used across these plumbing
+    /// tests: a `MemberCount` query is side-effect-free and carries a
+    /// unit-shaped `Result<Option<usize>, _>` reply, so it exercises the
+    /// mailbox/handle machinery without invoking any real handler here
+    /// (these tests use hand-rolled pseudo-actors, not the dispatch loop).
+    fn smoke_query(reply: oneshot::Sender<Result<Option<usize>, ContextError>>) -> ContextCommand {
+        ContextCommand::Queries(QueriesCommand::MemberCount {
+            context_id: "smoke".to_owned(),
+            reply,
+        })
+    }
+
+    #[test]
+    fn send_timeout_is_30_seconds() {
+        assert_eq!(SEND_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reply_timeout_is_2_minutes() {
+        // Pins the post-enqueue reply-await backstop. Distinct budget from
+        // SEND_TIMEOUT (mailbox admission); ≥ the key-package actor's 1 min
+        // because context actors have a deeper mailbox + heavier MLS handlers.
+        assert_eq!(REPLY_TIMEOUT, Duration::from_mins(2));
+    }
+
+    /// A command that enqueues successfully but is NEVER replied to (no actor
+    /// drains the mailbox / no oneshot ack) must NOT hang the caller forever:
+    /// `send`'s post-enqueue reply-await is bounded by [`REPLY_TIMEOUT`],
+    /// returning a retryable [`ContextError::ActorBusy`] on elapse. Uses
+    /// `start_paused` so tokio auto-advances virtual time to fire the timer —
+    /// the test is deterministic and completes instantly instead of waiting
+    /// the real 2 min.
+    #[tokio::test(start_paused = true)]
+    async fn send_reply_await_is_bounded_when_actor_never_replies() {
+        use crate::context::supervisor::ACTOR_MAILBOX_CAPACITY;
+
+        // Buffered mailbox (capacity > 0) with the receiver held alive but
+        // NEVER drained: `inbox.send` succeeds and buffers the command, so we
+        // exercise the post-enqueue reply-await — the exact wedge — rather
+        // than the enqueue-timeout or closed-inbox branches. `_rx` stays bound
+        // to keep the inbox (and thus the buffered oneshot sender) alive;
+        // dropping it would close the channel and take a different arm.
+        let (tx, _rx) = mpsc::channel::<ContextCommand>(ACTOR_MAILBOX_CAPACITY);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let start = tokio::time::Instant::now();
+        let result: Result<Option<usize>, ContextError> = handle.send(smoke_query).await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(ContextError::ActorBusy(msg)) => assert!(
+                msg.contains("did not reply"),
+                "expected the reply-timeout ActorBusy variant, got {msg:?}"
+            ),
+            other => panic!("expected ActorBusy reply-timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "reply-await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// Same wedge as [`send_reply_await_is_bounded_when_actor_never_replies`],
+    /// but for [`ContextActorHandle::send_recover_on_failure`]: a command that
+    /// was DELIVERED (enqueued) then never answered must fail closed with a
+    /// bounded reply-timeout `ActorBusy`, and the recovery slot must be `None`
+    /// (the actor owns the enqueued command + any ticket it carried — returning
+    /// `Some` would risk a double-balance of the escrow).
+    #[tokio::test(start_paused = true)]
+    async fn send_recover_on_failure_reply_await_is_bounded() {
+        use crate::context::supervisor::ACTOR_MAILBOX_CAPACITY;
+
+        let (tx, _rx) = mpsc::channel::<ContextCommand>(ACTOR_MAILBOX_CAPACITY);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let start = tokio::time::Instant::now();
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
+        let elapsed = start.elapsed();
+
+        let (err, recovered) = result.expect_err("a never-answered command must error");
+        match err {
+            ContextError::ActorBusy(msg) => assert!(
+                msg.contains("did not reply"),
+                "expected the reply-timeout ActorBusy variant, got {msg:?}"
+            ),
+            other => panic!("expected ActorBusy reply-timeout, got {other:?}"),
+        }
+        assert!(
+            recovered.is_none(),
+            "a DELIVERED-then-wedged command is NOT recoverable — the actor owns \
+             it (and any ticket); the recovery slot must be None to avoid a \
+             double-balance"
+        );
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "reply-await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// [`bounded_reply_await`] must fail closed on a wedged actor: a reply
+    /// sender held alive but NEVER answered elapses to
+    /// [`BoundedReplyError::Elapsed`] after the full [`REPLY_TIMEOUT`] budget
+    /// (not before), rather than pinning the caller forever. `start_paused`
+    /// auto-advances virtual time so the test is deterministic and instant.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_elapses_when_actor_never_replies() {
+        // `_tx` stays bound so the sender is never dropped — the receiver
+        // therefore never sees a closed channel and can only elapse.
+        let (_tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+
+        let start = tokio::time::Instant::now();
+        let result = bounded_reply_await(rx).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(BoundedReplyError::Elapsed)),
+            "a never-answered reply must classify as Elapsed, got {result:?}"
+        );
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "the await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// A dropped reply sender (terminated/replaced actor) classifies as
+    /// [`BoundedReplyError::Dropped`] — distinct from the timeout path — and
+    /// returns promptly (no need to wait out [`REPLY_TIMEOUT`]).
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_reports_dropped_when_sender_dropped() {
+        let (tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+        drop(tx);
+
+        let result = bounded_reply_await(rx).await;
+
+        assert!(
+            matches!(result, Err(BoundedReplyError::Dropped)),
+            "a dropped reply sender must classify as Dropped, got {result:?}"
+        );
+    }
+
+    /// A prompt handler reply passes through untouched on the `Ok` arm — the
+    /// helper is mechanics only and never inspects the payload.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_passes_prompt_reply_through() {
+        let (tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+        tx.send(Ok(Some(7))).expect("receiver is alive");
+
+        let result = bounded_reply_await(rx).await;
+
+        assert!(
+            matches!(result, Ok(Ok(Some(7)))),
+            "a prompt reply must pass through untouched, got {result:?}"
+        );
+    }
+
+    // The sibling supervisor-handle reply-awaits
+    // (`SupervisorHandle::dispatch_prepare_for_replace`,
+    // `dispatch_start_ttl_timer`, and `dispatch_recovery_send_notification`)
+    // wrap their `reply_rx.await` in the identical
+    // `tokio::time::timeout(REPLY_TIMEOUT, ..)` pattern over the SAME
+    // [`REPLY_TIMEOUT`] constant pinned above. Constructing a live
+    // `SupervisorHandle` in isolation requires a fully-wired `Supervisor`
+    // (providers, journal, registry), so those seams are covered by this
+    // shared-constant pin plus the two wedge tests here rather than a
+    // standalone supervisor-handle unit test.
+
+    #[tokio::test]
+    async fn send_to_closed_actor_returns_actor_busy() {
+        // Build a mailbox, drop the receiver to simulate an actor that
+        // has terminated, then try to send. The handle should map the
+        // closed-channel error to `ActorBusy`.
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        let handle = ContextActorHandle::from_sender(tx);
+        let err = handle
+            .send(smoke_query)
+            .await
+            .expect_err("closed mailbox must error");
+        match err {
+            ContextError::ActorBusy(msg) => assert!(
+                msg.contains("closed"),
+                "expected 'closed' in ActorBusy message, got {msg:?}"
+            ),
+            other => panic!("expected ActorBusy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_recover_on_failure_returns_command_on_closed_mailbox() {
+        // FIX 1 core: a send to a closed mailbox RETURNS the un-delivered
+        // command instead of dropping it, so a caller that moved a must-use
+        // payload (a OutletEconomyTicket-bearing reservation) into the command can
+        // reclaim and balance it rather than tripping the ticket's drop guard.
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        let handle = ContextActorHandle::from_sender(tx);
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
+        let (err, recovered) = result.expect_err("closed mailbox must error");
+        match err {
+            ContextError::ActorBusy(msg) => {
+                assert!(msg.contains("closed"), "expected 'closed', got {msg:?}");
+            }
+            other => panic!("expected ActorBusy, got {other:?}"),
+        }
+        let cmd = recovered.expect("the un-delivered command must be returned for recovery");
+        assert!(
+            matches!(
+                *cmd,
+                ContextCommand::Queries(QueriesCommand::MemberCount { .. })
+            ),
+            "the recovered command must be the SAME command we attempted to send"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_recover_on_failure_delivers_and_returns_ok() {
+        // The happy path: a live actor receives the command and replies Ok.
+        let (tx, mut rx) = mpsc::channel::<ContextCommand>(1);
+        let handle = ContextActorHandle::from_sender(tx);
+        let actor = tokio::spawn(async move {
+            if let Some(ContextCommand::Queries(QueriesCommand::MemberCount { reply, .. })) =
+                rx.recv().await
+            {
+                let _ = reply.send(Ok(None));
+            }
+        });
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
+        assert!(result.is_ok(), "delivered command must return Ok");
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_and_receive_roundtrip() {
+        // Run a tiny pseudo-actor: receive one command, reply Ok.
+        let (tx, mut rx) = mpsc::channel::<ContextCommand>(1);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let actor_task = tokio::spawn(async move {
+            let cmd = rx.recv().await.expect("actor received a command");
+            if let ContextCommand::Queries(QueriesCommand::MemberCount { reply, .. }) = cmd {
+                let _ = reply.send(Ok(None));
+            } else {
+                panic!("unexpected command variant");
+            }
+        });
+
+        let result: Result<Option<usize>, ContextError> = handle.send(smoke_query).await;
+        assert!(result.is_ok(), "roundtrip must succeed, got {result:?}");
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_is_cheap_to_clone() {
+        let (tx, _rx) = mpsc::channel::<ContextCommand>(1);
+        let h1 = ContextActorHandle::from_sender(tx);
+        let h2 = h1.clone();
+        let h3 = h2.clone();
+        drop(h1);
+        drop(h2);
+        drop(h3);
+    }
+
+    #[tokio::test]
+    async fn send_pause_sends_lifecycle_control_pause() {
+        let (tx, mut rx) = mpsc::channel::<ContextCommand>(1);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let actor_task = tokio::spawn(async move {
+            let cmd = rx.recv().await.expect("actor received a command");
+            assert!(matches!(
+                cmd,
+                ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { .. })
+            ));
+            if let ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply }) = cmd
+            {
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        handle.send_pause().await.unwrap();
+        actor_task.await.unwrap();
+    }
+}

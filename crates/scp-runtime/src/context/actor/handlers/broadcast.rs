@@ -30,27 +30,27 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use tokio::sync::oneshot;
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::commands::{
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::{
     BlockBroadcastSubscriberReply, BroadcastAdmissionReply, BroadcastBlockPayload,
     BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
     SubscribeBroadcastPayload, SubscribeBroadcastReply, UnsubscribeBroadcastPayload,
     UnsubscribeBroadcastReply,
 };
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 
-use crate::context::shared::economy::ContextRevocationChecker;
-use crate::context::shared::economy::KeyResolverDidResolver;
+use scp_runtime_core::context::shared::economy::ContextRevocationChecker;
+use scp_runtime_core::context::shared::economy::KeyResolverDidResolver;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`BroadcastCommand`] against actor-owned cell and deps.
 ///
 /// The publish variants sign through the payload's `CommandSigner` inside
 /// this turn (ADR-049 Decision 7a); see the module docs.
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: BroadcastCommand,
@@ -386,7 +386,7 @@ async fn handle_handle_broadcast_key_request(
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
-        crate::context::shared::broadcast::handle_broadcast_key_request(
+        scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
             cell,
             deps,
             author_did,
@@ -641,25 +641,25 @@ fn handle_seed_broadcast_author(
 // let the subscribe succeed; an absent, wrong-signer, or wrong-audience token
 // must be rejected.
 // ---------------------------------------------------------------------------
-/// The broadcast domain's [`BroadcastDomain`](crate::context::domains::BroadcastDomain)
+/// The broadcast domain's [`BroadcastDomain`](scp_runtime_core::context::domains::BroadcastDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Broadcast;
 
 #[async_trait::async_trait]
-impl crate::context::domains::BroadcastDomain for Broadcast {
+impl scp_runtime_core::context::domains::BroadcastDomain for Broadcast {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::BroadcastCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::BroadcastCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn block_broadcast_subscriber(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         author_did: &scp_did::DID,
         subscriber_did: &scp_did::DID,
@@ -677,8 +677,8 @@ impl crate::context::domains::BroadcastDomain for Broadcast {
 
     async fn unblock_broadcast_subscriber(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         author_did: &scp_did::DID,
         subscriber_did: &scp_did::DID,
@@ -712,9 +712,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::context::ContextState;
-    use crate::context::actor::commands::SubscribeBroadcastPayload;
-    use crate::context::actor::state::PerContextState;
+    use scp_protocol::context::ContextState;
+    use scp_runtime_core::context::actor::commands::SubscribeBroadcastPayload;
+    use scp_runtime_core::context::actor::state::PerContextState;
 
     const CREATOR_DID: &str = "did:example:broadcast-creator";
     const SUBSCRIBER_DID: &str = "did:example:broadcast-subscriber";
@@ -752,7 +752,7 @@ mod tests {
         recorded: RecordedLeaves,
     }
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for TestEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -792,11 +792,11 @@ mod tests {
 
     struct TestPersistence;
     #[async_trait::async_trait]
-    impl crate::context::persistence::ContextPersistence for TestPersistence {
+    impl scp_runtime_core::context::persistence::ContextPersistence for TestPersistence {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -804,7 +804,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -843,13 +843,13 @@ mod tests {
     /// [`build_deps_recording`] plus the supervisor the deps reach, for a test
     /// that registers a second context on it.
     async fn build_supervisor_and_deps() -> (
-        Arc<crate::context::supervisor::supervisor::Supervisor>,
+        Arc<scp_runtime_core::context::supervisor::supervisor::Supervisor>,
         ActorDeps,
         Arc<AtomicUsize>,
         RecordedLeaves,
     ) {
-        use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
+        use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
         let creator_vk = creator_key().verifying_key();
         let key_resolver: scp_protocol::context::governance::KeyResolver =
@@ -861,15 +861,17 @@ mod tests {
                 }
             });
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:example:broadcast-actor".to_owned(),
-            Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:example:broadcast-actor".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
         let appended = Arc::new(AtomicUsize::new(0));
         let recorded: RecordedLeaves = Arc::new(std::sync::RwLock::new(Vec::new()));
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog {
                 appended: Arc::clone(&appended),
                 recorded: Arc::clone(&recorded),
@@ -894,7 +896,7 @@ mod tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         let deps = supervisor
             .build_actor_deps_loaded(&DID("did:example:broadcast-actor".to_owned()))
             .await
@@ -1217,8 +1219,10 @@ mod tests {
         scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON
     }
 
-    fn commit_meta(pid_byte: u8) -> crate::context::shared::governance::CommitMeta<'static> {
-        crate::context::shared::governance::CommitMeta {
+    fn commit_meta(
+        pid_byte: u8,
+    ) -> scp_runtime_core::context::shared::governance::CommitMeta<'static> {
+        scp_runtime_core::context::shared::governance::CommitMeta {
             pid: [pid_byte; 32],
             actor_did: CREATOR_DID,
             timestamp_secs: 1_700_000_000,
@@ -1693,7 +1697,7 @@ mod tests {
         let (pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         assert!(
             matches!(
-                crate::context::shared::broadcast::handle_broadcast_key_request(
+                scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
                     &mut cell, &deps, &creator, &creator, &pubkey,
                 )
                 .expect("serve decision"),
@@ -1740,7 +1744,7 @@ mod tests {
         );
 
         // Serve path: the banned author requests a broadcast key → DENIED.
-        let decision = crate::context::shared::broadcast::handle_broadcast_key_request(
+        let decision = scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
             &mut cell, &deps, &creator, &creator, &pubkey,
         )
         .expect("serve decision");
@@ -1827,7 +1831,7 @@ mod tests {
         fail_type: scp_event_log::EventType,
     }
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for KeaFailingEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for KeaFailingEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -3074,7 +3078,7 @@ mod tests {
             &ctx_hex,
             &DID(CREATOR_DID.to_owned()),
             action,
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3113,7 +3117,7 @@ mod tests {
     proposal_refuses!(
         child_refuses_an_empty_ceiling,
         ProposedArm::Child,
-        crate::context::params_validation::failing::empty_ceiling,
+        scp_runtime_core::context::params_validation::failing::empty_ceiling,
         |e| matches!(
             e,
             ContextError::CeilingRequired(scp_protocol::context::CeilingDeclaration::Empty)
@@ -3122,103 +3126,103 @@ mod tests {
     proposal_refuses!(
         migration_refuses_a_malformed_ceiling_entry,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::malformed_ceiling_entry,
+        scp_runtime_core::context::params_validation::failing::malformed_ceiling_entry,
         |e| names("ceiling entry invalid")(e)
     );
     proposal_refuses!(
         child_refuses_a_malformed_ceiling_entry,
         ProposedArm::Child,
-        crate::context::params_validation::failing::malformed_ceiling_entry,
+        scp_runtime_core::context::params_validation::failing::malformed_ceiling_entry,
         |e| names("ceiling entry invalid")(e)
     );
     proposal_refuses!(
         migration_refuses_an_unsupported_version,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::unsupported_version,
+        scp_runtime_core::context::params_validation::failing::unsupported_version,
         |e| matches!(e, ContextError::VersionIncompatible { .. })
     );
     proposal_refuses!(
         child_refuses_an_unsupported_version,
         ProposedArm::Child,
-        crate::context::params_validation::failing::unsupported_version,
+        scp_runtime_core::context::params_validation::failing::unsupported_version,
         |e| matches!(e, ContextError::VersionIncompatible { .. })
     );
     proposal_refuses!(
         migration_refuses_voterless_governance,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::voterless_governance,
+        scp_runtime_core::context::params_validation::failing::voterless_governance,
         |e| names("governance invalid")(e)
     );
     proposal_refuses!(
         child_refuses_voterless_governance,
         ProposedArm::Child,
-        crate::context::params_validation::failing::voterless_governance,
+        scp_runtime_core::context::params_validation::failing::voterless_governance,
         |e| names("governance invalid")(e)
     );
     proposal_refuses!(
         migration_refuses_an_invalid_consequence_rule,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::empty_suspension_rule,
+        scp_runtime_core::context::params_validation::failing::empty_suspension_rule,
         |e| names("consequence_rules[0]")(e)
     );
     proposal_refuses!(
         child_refuses_an_invalid_consequence_rule,
         ProposedArm::Child,
-        crate::context::params_validation::failing::empty_suspension_rule,
+        scp_runtime_core::context::params_validation::failing::empty_suspension_rule,
         |e| names("consequence_rules[0]")(e)
     );
     proposal_refuses!(
         migration_refuses_an_unavailable_pricing_metric,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::unavailable_pricing_metric,
+        scp_runtime_core::context::params_validation::failing::unavailable_pricing_metric,
         |e| names("economic_policy")(e)
     );
     proposal_refuses!(
         child_refuses_an_unavailable_pricing_metric,
         ProposedArm::Child,
-        crate::context::params_validation::failing::unavailable_pricing_metric,
+        scp_runtime_core::context::params_validation::failing::unavailable_pricing_metric,
         |e| names("economic_policy")(e)
     );
     proposal_refuses!(
         migration_refuses_a_triggerless_rotation,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::triggerless_rotation,
+        scp_runtime_core::context::params_validation::failing::triggerless_rotation,
         |e| names("pseudonym_rotation")(e)
     );
     proposal_refuses!(
         child_refuses_a_triggerless_rotation,
         ProposedArm::Child,
-        crate::context::params_validation::failing::triggerless_rotation,
+        scp_runtime_core::context::params_validation::failing::triggerless_rotation,
         |e| names("pseudonym_rotation")(e)
     );
     proposal_refuses!(
         migration_refuses_a_property_free_genesis_outlet,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::property_free_outlet,
+        scp_runtime_core::context::params_validation::failing::property_free_outlet,
         |e| names("outlets invalid")(e)
     );
     proposal_refuses!(
         child_refuses_a_property_free_genesis_outlet,
         ProposedArm::Child,
-        crate::context::params_validation::failing::property_free_outlet,
+        scp_runtime_core::context::params_validation::failing::property_free_outlet,
         |e| names("outlets invalid")(e)
     );
     proposal_refuses!(
         migration_refuses_an_ephemeral_broadcast,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::ephemeral_broadcast,
+        scp_runtime_core::context::params_validation::failing::ephemeral_broadcast,
         |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
     );
     proposal_refuses!(
         child_refuses_an_ephemeral_broadcast,
         ProposedArm::Child,
-        crate::context::params_validation::failing::ephemeral_broadcast,
+        scp_runtime_core::context::params_validation::failing::ephemeral_broadcast,
         |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
     );
     proposal_refuses!(
         migration_refuses_a_template_mismatch,
         ProposedArm::Migration,
-        crate::context::params_validation::failing::template_mismatch,
+        scp_runtime_core::context::params_validation::failing::template_mismatch,
         |e| matches!(
             e,
             ContextError::TemplateMismatch(
@@ -3229,7 +3233,7 @@ mod tests {
     proposal_refuses!(
         child_refuses_a_template_mismatch,
         ProposedArm::Child,
-        crate::context::params_validation::failing::template_mismatch,
+        scp_runtime_core::context::params_validation::failing::template_mismatch,
         |e| matches!(
             e,
             ContextError::TemplateMismatch(
@@ -3307,7 +3311,9 @@ mod tests {
                 &ctx_hex,
                 &proposer,
                 action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
-                &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    creator_key().clone(),
+                ),
                 false,
                 None,
             )
@@ -3335,7 +3341,9 @@ mod tests {
                 &ctx_hex,
                 &proposer,
                 action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS),
-                &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    creator_key().clone(),
+                ),
                 false,
                 None,
             )
@@ -3385,7 +3393,7 @@ mod tests {
             &ctx_hex,
             &DID(LURKER_DID.to_owned()),
             migrate(Vec::new()),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             true,
             None,
         )
@@ -3402,7 +3410,7 @@ mod tests {
             &ctx_hex,
             &proposer,
             migrate(Vec::new()),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3427,7 +3435,7 @@ mod tests {
             &ctx_hex,
             &proposer,
             migrate(vec![Capability::MessagesRead]),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3493,7 +3501,7 @@ mod tests {
                 grace_period_secs: 60,
                 auto_invite: false,
             },
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3543,7 +3551,7 @@ mod tests {
             &ctx_hex,
             &DID(LURKER_DID.to_owned()),
             empty_migration(),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3562,7 +3570,7 @@ mod tests {
             &ctx_hex,
             &DID(CREATOR_DID.to_owned()),
             empty_migration(),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -3606,12 +3614,12 @@ mod tests {
             "fixture",
             60,
             false,
-            crate::context::shared::governance::CommitMeta {
+            scp_runtime_core::context::shared::governance::CommitMeta {
                 pid: [0x77; 32],
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            crate::context::shared::governance::MigrationBootstrap::reserve(
+            scp_runtime_core::context::shared::governance::MigrationBootstrap::reserve(
                 &deps,
                 &ctx_hex,
                 &[0x77; 32],
@@ -3672,7 +3680,7 @@ mod tests {
             DID("did:example:broadcast-actor".to_owned()),
         );
         let _running_handle = supervisor
-            .spawn_actor_with_state(running, deps.clone_for_spawn(), None)
+            .spawn_actor_with_state_for_test(running, deps.clone_for_spawn(), None)
             .await
             .expect("spawn the destination's actor");
         let contacts = supervisor.relay_contact_store();
@@ -3689,13 +3697,15 @@ mod tests {
             "fixture",
             60,
             false,
-            crate::context::shared::governance::CommitMeta {
+            scp_runtime_core::context::shared::governance::CommitMeta {
                 pid,
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            crate::context::shared::governance::MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
-                .expect("reserve the migration's bootstrap"),
+            scp_runtime_core::context::shared::governance::MigrationBootstrap::reserve(
+                &deps, &ctx_hex, &pid,
+            )
+            .expect("reserve the migration's bootstrap"),
         )
         .await;
 
@@ -3729,13 +3739,13 @@ mod tests {
     /// cannot run without the lock.
     #[tokio::test]
     async fn a_busy_migration_bootstrap_fails_at_once_and_holds_nothing() {
-        use crate::context::shared::governance::MigrationBootstrap;
+        use scp_runtime_core::context::shared::governance::MigrationBootstrap;
 
         let (supervisor, deps, _appends, _recorded) = build_supervisor_and_deps().await;
         let ctx_hex = "ab".repeat(32);
         let pid = [0x79; 32];
         let destination =
-            crate::context::shared::governance::migration_destination_id(&ctx_hex, &pid);
+            scp_runtime_core::context::shared::governance::migration_destination_id(&ctx_hex, &pid);
         // Whether some operation holds the first-state claim of `destination`.
         let claimed = |deps: &ActorDeps| {
             let free = deps.supervisor.claim_first_state(&destination).is_ok();
@@ -3744,7 +3754,7 @@ mod tests {
             }
             !free
         };
-        let held = supervisor.bootstrap_spawn_lock.lock().await;
+        let held = supervisor.lock_bootstrap_spawn_for_test().await;
         let busy = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid).map(|_| ());
         assert!(
             matches!(&busy, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
@@ -3773,7 +3783,7 @@ mod tests {
             "{unsettled:?}"
         );
         assert!(
-            supervisor.bootstrap_spawn_lock.try_lock().is_ok(),
+            supervisor.bootstrap_spawn_lock_is_free_for_test(),
             "a refused claim releases the lock it took"
         );
         deps.supervisor.release_first_state(&destination);
@@ -3802,7 +3812,7 @@ mod tests {
         let mut cell = ClassSCell::new(state);
         appends.store(0, Ordering::SeqCst);
         let creator = DID(CREATOR_DID.to_owned());
-        let signer = crate::context::actor::CommandSigner::local_ed25519(creator_key());
+        let signer = scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key());
         let migrate = || GovernanceAction::ProposeContextMigration {
             new_context_params: Box::new(destination_params()),
             reason: "fixture".to_owned(),
@@ -3810,7 +3820,7 @@ mod tests {
             auto_invite: false,
         };
 
-        let held = supervisor.bootstrap_spawn_lock.lock().await;
+        let held = supervisor.lock_bootstrap_spawn_for_test().await;
         let busy = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             crate::context::governance_helpers::propose_governance_action_inner(
@@ -4202,7 +4212,7 @@ mod tests {
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
         // A TTL, so `extend_ttl_deadline_and_record` derives a convergent
         // deadline and appends the leaf.
-        state.handle = crate::context::ContextHandle::new(
+        state.handle = scp_runtime_core::context::ContextHandle::new(
             ctx_hex.clone(),
             scp_protocol::context::ContextParams {
                 ttl: Some(std::time::Duration::from_secs(3_600)),
@@ -4270,7 +4280,7 @@ mod tests {
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
         // Give the context a TTL so the combinator derives a convergent
         // deadline (`creation + ttl` over an empty log) and appends the leaf.
-        state.handle = crate::context::ContextHandle::new(
+        state.handle = scp_runtime_core::context::ContextHandle::new(
             ctx_hex.clone(),
             scp_protocol::context::ContextParams {
                 ttl: Some(std::time::Duration::from_secs(3_600)),
@@ -4324,9 +4334,9 @@ mod tests {
 
     mod publish_in_turn {
         use super::*;
-        use crate::context::actor::commands::PublishBroadcastPayload;
-        use crate::context::actor::signer::SIGN_TIMEOUT;
         use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use scp_runtime_core::context::actor::commands::PublishBroadcastPayload;
+        use scp_runtime_core::context::actor::signer::SIGN_TIMEOUT;
 
         /// A signer that answers every sign with a fixed outcome: a custody
         /// refusal of `refusal`, or never when `refusal` is `None`.
@@ -4376,7 +4386,7 @@ mod tests {
         /// completes.
         async fn publishing_deps() -> ActorDeps {
             let (mut deps, _appends) = build_deps().await;
-            deps.transport = Arc::new(crate::context::builder::LocalTransportProvider);
+            deps.transport = Arc::new(scp_runtime_core::context::builder::LocalTransportProvider);
             deps
         }
 

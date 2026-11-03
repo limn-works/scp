@@ -1,5 +1,5 @@
 //! Lifecycle-control handlers — see
-//! [`LifecycleControlCommand`](crate::context::actor::commands::LifecycleControlCommand)
+//! [`LifecycleControlCommand`](scp_runtime_core::context::actor::commands::LifecycleControlCommand)
 //! and plan §"BridgeInstance actor integration".
 //!
 //! # Clippy allows
@@ -23,11 +23,11 @@
 
 use scp_protocol::context::{ContextError, ContextState};
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::commands::LifecycleControlCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::ContextLifecycleState;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::LifecycleControlCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::state::ContextLifecycleState;
 
 /// Dispatch a [`LifecycleControlCommand`] against actor state.
 ///
@@ -35,7 +35,7 @@ use crate::context::actor::state::ContextLifecycleState;
 /// reply so the bridge's `suspend()` default body can complete. The
 /// state mutations (e.g. flipping `lifecycle_state` to `Closing`) are
 /// minimal and locally-owned — no persistence, no transport.
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleControlCommand,
@@ -97,7 +97,7 @@ pub(crate) async fn dispatch(
 fn handle_prepare_for_replace(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
-    floors: &crate::context::restored_crypto::VerifiedFloors,
+    floors: &scp_runtime_core::context::restored_crypto::VerifiedFloors,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let ctx_id_bytes = cell.context_id;
@@ -147,12 +147,14 @@ fn handle_prepare_for_replace(
     // reject-before-terminal barrier. `import_context` SEEDS the owned crypto
     // onto the fresh replacement actor after this actor is despawned; the floor
     // merge is idempotent, so running it here (gate) and there (seed) is safe.
-    if let Err(e) = crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
-        deps,
-        &ctx_id_bytes,
-        floors,
-        false,
-    ) {
+    if let Err(e) =
+        scp_runtime_core::context::restored_crypto::restore_crypto_state_with_floor_guard(
+            deps,
+            &ctx_id_bytes,
+            floors,
+            false,
+        )
+    {
         let _ = reply.send(Err(e));
         return Outcome::ok(());
     }
@@ -166,18 +168,18 @@ fn handle_prepare_for_replace(
     Outcome::ok_mutated(())
 }
 
-/// The lifecycle-control domain's [`LifecycleControlDomain`](crate::context::domains::LifecycleControlDomain)
+/// The lifecycle-control domain's [`LifecycleControlDomain`](scp_runtime_core::context::domains::LifecycleControlDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct LifecycleControl;
 
 #[async_trait::async_trait]
-impl crate::context::domains::LifecycleControlDomain for LifecycleControl {
+impl scp_runtime_core::context::domains::LifecycleControlDomain for LifecycleControl {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::LifecycleControlCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::LifecycleControlCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 }

@@ -35,8 +35,8 @@ use scp_protocol::economy::types::Amount;
 use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_protocol::trust::caveats::InvocationCaveats;
 
-use scp_runtime::context::outlets::dispatch::StreamSessionHandle;
-use scp_runtime::context::outlets::invoke::{
+use scp_runtime_core::context::outlets::dispatch::StreamSessionHandle;
+use scp_runtime_core::context::outlets::invoke::{
     MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
 };
 

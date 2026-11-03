@@ -5,7 +5,7 @@
 //!
 //! This module hosts the standing-domain helpers that the actor handler
 //! in [`crate::context::actor::handlers::standing`] calls to implement
-//! [`StandingCommand`](crate::context::actor::commands::StandingCommand).
+//! [`StandingCommand`](scp_runtime_core::context::actor::commands::StandingCommand).
 //!
 //! # Phase 2A.2 migration
 //!
@@ -14,13 +14,13 @@
 //! [`ActorDeps`] without `PerContextState` — they do not read or mutate
 //! per-context state and route supervisor-scoped work through the
 //! capability-reduced
-//! [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle)
+//! [`SupervisorHandle`](scp_runtime_core::context::supervisor::SupervisorHandle)
 //! embedded in `deps`.
 //!
 //! Get-or-create (`standing_context`) and `reconnect_all_standing` are
 //! NOT exposed here: both are actor-native methods on the supervisor
-//! ([`Supervisor::standing_context`](crate::context::supervisor::supervisor::Supervisor::standing_context),
-//! [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing))
+//! ([`Supervisor::standing_context`](scp_runtime_core::context::supervisor::supervisor::Supervisor::standing_context),
+//! [`Supervisor::reconnect_all_standing`](scp_runtime_core::context::supervisor::supervisor::Supervisor::reconnect_all_standing))
 //! that resolve per-context lifecycle and params through the actor
 //! registry and mailbox. Get-or-create may CREATE the target actor, so
 //! routing it through a per-context actor handler would risk a
@@ -30,7 +30,7 @@
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 
-use crate::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::deps::ActorDeps;
 
 // ---------------------------------------------------------------------------
 // generate_standing_context_id (pure helper)
@@ -42,14 +42,14 @@ use crate::context::actor::deps::ActorDeps;
 //
 // There is intentionally no actor-shape `standing_context(deps, ..)`
 // helper here. Get-or-create is supervisor-scoped: the actor-native body
-// ([`Supervisor::standing_context`](crate::context::supervisor::supervisor::Supervisor::standing_context))
+// ([`Supervisor::standing_context`](scp_runtime_core::context::supervisor::supervisor::Supervisor::standing_context))
 // may CREATE the target per-context actor (build deps + spawn an
 // owned-state actor via `lifecycle_helpers::create_context`). Wrapping
 // that behind an `&ActorDeps` helper invoked from the per-context actor
 // handler would make the actor's own `run()` loop recursively spawn
 // another actor — a non-`Send` call graph the runtime cannot spawn. The
 // two production entry points
-// ([`SupervisorHandle::standing_context`](crate::context::supervisor::handle::SupervisorHandle)
+// ([`SupervisorHandle::standing_context`](scp_runtime_core::context::supervisor::handle::SupervisorHandle)
 // and `Supervisor::dispatch_standing_direct`'s `StandingContext` arm)
 // therefore call `Supervisor::standing_context` directly.
 

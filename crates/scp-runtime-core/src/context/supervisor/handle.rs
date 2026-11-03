@@ -1,0 +1,1317 @@
+//! `SupervisorHandle` — capability-reduced supervisor surface held by
+//! actors via [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//!
+//! # Clippy allows
+//!
+//! `doc_markdown` / `too_long_first_doc_paragraph` — doc prose cites
+//! plan section titles in quoted form.
+#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+//!
+//! Per ADR-049 §5 and plan §"ActorDeps and SupervisorHandle" the handle
+//! must **not** expose any method that returns a
+//! [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle).
+//! Actors cannot reach sibling actors; cross-context work goes through
+//! [`SupervisorHandle::start_saga`]. This is the capability-reduction mechanism:
+//! the inner reference is private and no accessor exposes it.
+//!
+//! # `Weak<Supervisor>` back-reference
+//!
+//! The handle wraps a `Weak<Supervisor>` (ADR-049 Decision 16, supervisor
+//! task drain): every method upgrades it for one operation and drops the
+//! upgraded `Arc` when the operation ends, so the Supervisor → actor
+//! hierarchy holds no reference cycle (Decision 2). A failed upgrade means every owner dropped the
+//! Supervisor.
+//!
+//! # `&OwnedIdentityDid` parameters
+//!
+//! Methods that touch per-identity state take `&OwnedIdentityDid`, not
+//! `&DID`. `OwnedIdentityDid`
+//! is `pub(in crate::context)` — the SAME name-visibility as these
+//! methods — so naming the type is not what gates these calls. The mint
+//! guarantee rides on two narrower mechanisms: the `pub(super)`
+//! constructor `issue_for_actor` (only supervisor-module code can mint a
+//! token from a raw `DID`) and the private `did` field (no struct-literal
+//! construction outside `identity_capability`). Handlers in
+//! `actor/handlers/` receive `&OwnedIdentityDid` references through
+//! [`ActorDeps`](crate::context::actor::deps::ActorDeps) and can call
+//! these methods, but they cannot CONSTRUCT a token — so they cannot
+//! fabricate one for an identity they do not own. See ADR-049 §5
+//! (`OwnedIdentityDid`: unforgeable by constructor visibility + private
+//! field).
+
+use std::collections::HashSet;
+use std::sync::{Arc, Weak};
+
+use scp_did::DID;
+use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::ReceiveFloor;
+use scp_protocol::crypto::sender_keys::MergePolicy;
+
+use crate::context::actor::{BoundedReplyError, bounded_reply_await};
+use crate::context::supervisor::identity_capability::OwnedIdentityDid;
+use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
+use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
+
+// ---------------------------------------------------------------------------
+// Handle
+// ---------------------------------------------------------------------------
+
+/// Capability-reduced view of `Supervisor` held by actors. Cloned into
+/// each actor's `ActorDeps` and never exposed outside `crate::context::`.
+///
+/// **No `ContextActorHandle` accessor.** This is the mechanical contract
+/// that makes "actors cannot reach sibling actors" a type-system
+/// property. The inner `Weak<Supervisor>` field is private; no public
+/// method returns it or its upgrade. Cross-context work MUST go through
+/// [`Self::start_saga`].
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    supervisor: Weak<Supervisor>,
+}
+
+impl SupervisorHandle {
+    // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
+    // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
+    // bare `&DID` — an actor reaches only the identity that owns it, even for
+    // PUBLIC reads (`my_wrapping_key` exposes public data too, yet is
+    // token-gated, because the discriminator is caller-isolation, not
+    // data-sensitivity). A per-identity op callable by the FFI/bridge
+    // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
+    // `Supervisor` instead (see `Supervisor::create_context`). The
+    // non-per-identity methods below (registry fan-out, saga dispatch,
+    // lifecycle bootstrap) are unaffected by this rule.
+
+    /// Wrap a `Weak` reference to the Supervisor (ADR-049 Decision 16).
+    /// Visible only to supervisor-module code; the supervisor constructs one
+    /// in
+    /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
+    /// at actor-spawn time, and handlers receive the handle via
+    /// `ActorDeps` at dispatch time.
+    #[must_use]
+    pub fn wrap(supervisor: &Arc<Supervisor>) -> Self {
+        Self {
+            supervisor: Arc::downgrade(supervisor),
+        }
+    }
+
+    /// Upgrades the back-reference for one operation.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when every owner has dropped the
+    /// Supervisor.
+    fn upgrade(&self) -> Result<Arc<Supervisor>, ContextError> {
+        self.supervisor.upgrade().ok_or_else(|| {
+            ContextError::SupervisorShutDown(
+                "the actor's supervisor has dropped; no supervisor operation can run".to_owned(),
+            )
+        })
+    }
+
+    /// Spawns `future` onto the Supervisor's task tracker (ADR-049 Decision
+    /// 16). An actor uses this for any detached task that can write through
+    /// the store, so `shutdown_all_contexts` waits for it. A future that holds
+    /// the handle or the actor's dependencies is an indicator of such a task.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+    /// or shutdown has begun; the future is dropped without running.
+    pub fn spawn_tracked<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.upgrade()?.spawn_tracked(operation, future)
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 (read-authority switch) — supervisor-owned floor registry fan-out.
+    //
+    // These accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
+    // `&OwnedIdentityDid` and NOT `&DID`): they are registry fan-out, which the
+    // AXIS comment above explicitly exempts from the per-identity token rule.
+    // They forward to the same-named `Supervisor` primitives on
+    // `Supervisor.floors`. NONE returns (or exposes) a `ContextActorHandle`, so
+    // Invariant 3 (actors cannot reach sibling actors) is preserved.
+    //
+    // Single-writer / security separation (inquisitor-sharpened, verbatim — it
+    // SEPARATES structural security from liveness): SECURITY — "never accept a
+    // key below the floor" — is STRUCTURAL and caller-topology-independent: the
+    // single-`entry()`-guard body (atomic read → reject-`<=` → reject-overshoot
+    // → write, all under one guard) plus the fail-safe gate-then-key-insert
+    // ordering make key-below-floor impossible no matter who calls. The
+    // per-context single-writer actor (`ContextActor::run()` serializes
+    // gate-then-insert) preserves only LIVENESS (avoids spurious rejects). If
+    // `check_and_advance` were ever called for a LIVE context from OUTSIDE its
+    // owning actor, the gate→insert window would open but stays FAIL-SAFE — it
+    // degrades liveness (a spurious reject / retry), NEVER fail-open. Do NOT
+    // read this as "security depends on single-writer"; security is the
+    // structural gate, single-writer is a liveness convention. PR-6 made the
+    // call: NO separate structural guard is warranted — the single-`entry()`
+    // gate + fail-safe ordering is sufficient now that the gate RESULT is
+    // security-enforced (fail-closed at the seams); co-locating the gate with the
+    // key insert is deferred to PR-7's key-move, which co-serializes it for free.
+
+    /// Advance a per-sender epoch floor in the authoritative registry, FAIL-CLOSED.
+    /// See [`Supervisor::check_and_advance_sender_epoch`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting epoch; the live receive seams surface
+    /// it via `?` and abort the operation (it is NEVER log-and-dropped).
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn check_and_advance_sender_epoch(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        epoch: u64,
+        max_advance: u64,
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
+            .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
+            .map_err(ContextError::from)
+    }
+
+    /// Read a per-sender epoch floor from the authoritative registry without
+    /// advancing it (absent reads as `0`). See [`Supervisor::sender_epoch_floor`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn sender_epoch_floor(&self, ctx: &[u8; 32], did: &str) -> Result<u64, ContextError> {
+        Ok(self.upgrade()?.sender_epoch_floor(ctx, did))
+    }
+
+    /// Advance a per-sender receive-sequence floor in the authoritative registry,
+    /// FAIL-CLOSED. See [`Supervisor::check_and_advance_recv_sequence`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting `(epoch, sequence)`; the recv seam
+    /// surfaces it via `?` (never dropped). [`ContextError::SupervisorShutDown`]
+    /// when the Supervisor has dropped.
+    pub fn check_and_advance_recv_sequence(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        next: ReceiveFloor,
+        max_advance: u64,
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
+            .check_and_advance_recv_sequence(ctx, did, next, max_advance)
+            .map_err(ContextError::from)
+    }
+
+    /// Read the registry's per-sender epoch floors for `ctx`. See
+    /// [`Supervisor::export_sender_key_epochs`].
+    ///
+    /// ADR-049 PR-6: with [`Self::export_recv_sequence_floors`], the
+    /// authoritative durable-blob export source.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped. A
+    /// caller MUST NOT persist a crypto blob without these floors: an empty
+    /// floor set written durably regresses them.
+    pub fn export_sender_key_epochs(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Result<Vec<(String, u64)>, ContextError> {
+        Ok(self.upgrade()?.export_sender_key_epochs(ctx))
+    }
+
+    /// Read the registry's receive-sequence floors for `ctx`. See
+    /// [`Supervisor::export_recv_sequence_floors`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped,
+    /// with the same no-persist rule as [`Self::export_sender_key_epochs`].
+    pub fn export_recv_sequence_floors(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Result<Vec<(String, ReceiveFloor)>, ContextError> {
+        Ok(self.upgrade()?.export_recv_sequence_floors(ctx))
+    }
+
+    /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
+    /// floors into the registry under one guard (the restore/import sink). See
+    /// [`Supervisor::validate_and_merge_all_floors`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on an Inv-3 regression ([`MergePolicy::RejectRegression`]) or an overshoot
+    /// (RejectRegression only). [`ContextError::SupervisorShutDown`] when the
+    /// Supervisor has dropped.
+    pub fn validate_and_merge_all_floors(
+        &self,
+        ctx: &[u8; 32],
+        epochs: Vec<(String, u64)>,
+        recv: Vec<(String, ReceiveFloor)>,
+        max_advance: u64,
+        policy: MergePolicy,
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
+            .validate_and_merge_all_floors(ctx, epochs, recv, max_advance, policy)
+            .map_err(ContextError::from)
+    }
+
+    /// Create-seed the floor registry for `ctx` (insert-if-absent). See
+    /// [`Supervisor::seed_context_floors`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn seed_context_floors(&self, ctx: &[u8; 32]) -> Result<(), ContextError> {
+        self.upgrade()?.seed_context_floors(ctx);
+        Ok(())
+    }
+
+    /// Permanent-teardown prune of the floor registry entry for `ctx`. See
+    /// [`Supervisor::remove_context_floors`] — including the permanent-vs-
+    /// transient safety argument. Callers (the terminal close / TTL-expiry /
+    /// shutdown paths) invoke this only when the context is permanently gone.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
+    pub fn remove_context_floors(&self, ctx: &[u8; 32]) {
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.remove_context_floors(ctx),
+            Err(e) => {
+                tracing::debug!(error = %e, "remove_context_floors: supervisor dropped, registry already gone");
+            }
+        }
+    }
+
+    /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
+    /// [`Supervisor::remove_member_floors`] — the member-granular twin of
+    /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
+    /// departed member's floors under one guard). ADR-049 PR-6: called from every
+    /// member-removal seam.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
+    pub fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.remove_member_floors(ctx, did),
+            Err(e) => {
+                tracing::debug!(error = %e, "remove_member_floors: supervisor dropped, registry already gone");
+            }
+        }
+    }
+
+    /// Wakes every [`Supervisor::push_routes_changed`] receiver, because this
+    /// actor's push routes changed (`10-infrastructure-and-self-hosting.md`
+    /// §10.7.1 **Re-registration**). A dropped Supervisor has no receiver to
+    /// wake; that case logs at debug and returns.
+    pub(in crate::context) fn note_push_routes_changed(&self) {
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.note_push_routes_changed(),
+            Err(e) => {
+                tracing::debug!(error = %e, "note_push_routes_changed: supervisor dropped, no receiver to wake");
+            }
+        }
+    }
+
+    /// Permanent-teardown drop of the per-context outlet-stream admission
+    /// registry entry for `context_id` (spec §5.4.5) — the streaming twin of
+    /// [`Self::remove_context_floors`]. See
+    /// [`Supervisor::reap_stream_admission`] for the live-Arc safety
+    /// argument. Callers (the terminal close / TTL-expiry paths) invoke this
+    /// only when the context is permanently gone.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
+    pub fn reap_stream_admission(&self, context_id: &str) {
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.reap_stream_admission(context_id),
+            Err(e) => {
+                tracing::debug!(error = %e, "reap_stream_admission: supervisor dropped, registry already gone");
+            }
+        }
+    }
+
+    /// Start a cross-context saga. The ONLY way for an actor to affect
+    /// state in another context.
+    ///
+    /// # Errors
+    ///
+    /// Errors propagate from `Supervisor::start_saga` — the saga
+    /// terminal/abort mapping.
+    pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
+        self.upgrade()?.start_saga(input).await
+    }
+
+    /// Snapshot the local-DIDs set. Returned as an `Arc` so callers read
+    /// without copying; the snapshot is stable for its lifetime even if
+    /// the supervisor rotates the underlying `ArcSwap` mid-read.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn local_dids(&self) -> Result<Arc<HashSet<DID>>, ContextError> {
+        Ok(self.upgrade()?.local_dids.load_full())
+    }
+
+    /// Find the first context where both `member_a` and `member_b` are
+    /// members. Returns `None` if no such context exists.
+    ///
+    /// Cross-context read used by trust-recovery's `notify_contact`
+    /// path (spec §9.12 step 5): the recovering DID's actor must
+    /// dispatch a recovery notification through any context shared
+    /// with the contact DID. The supervisor performs this enumeration
+    /// because no individual actor sees its peers' membership state —
+    /// it is the only legal cross-context membership read in the
+    /// post-actor-model dispatch.
+    ///
+    /// # Implementation
+    ///
+    /// Fan-out over the actor registry: `Supervisor::actor_ids` yields
+    /// a lock-free snapshot of every registered context id, and for each
+    /// id the membership predicate is read through the per-context actor
+    /// mailbox via [`Supervisor::is_member`]. The first context where
+    /// BOTH members are present wins; `None` if none qualifies. No
+    /// `per-context-state Mutex` lock and no `contexts` DashMap access —
+    /// the actor that owns each context is the sole authority for its
+    /// membership.
+    ///
+    /// # Ordering
+    ///
+    /// `actor_ids()` rebuilds its snapshot per call, so the iteration
+    /// order is the registry's shard order — unspecified but stable for
+    /// the duration of a single call. The legacy DashMap iteration was
+    /// likewise order-unspecified, so "first shared context" carries the
+    /// same (non-deterministic across registry mutations) semantics it
+    /// always did.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub async fn find_shared_context(
+        &self,
+        member_a: &str,
+        member_b: &str,
+    ) -> Result<Option<String>, ContextError> {
+        let supervisor = self.upgrade()?;
+        for context_id in supervisor.actor_ids() {
+            if supervisor.is_member(&context_id, member_a).await
+                && supervisor.is_member(&context_id, member_b).await
+            {
+                return Ok(Some(context_id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Dispatch a `TrustRecoveryCommand::RecoverySendNotification`
+    /// through the supervisor's mailbox routing — used by
+    /// trust-recovery's cross-context `notify_contact` path after the
+    /// shared context has been found via [`Self::find_shared_context`].
+    ///
+    /// Routes through `Supervisor::dispatch_recovery_send_notification_in_turn`,
+    /// which dispatches via the per-context actor mailbox when one is
+    /// registered and otherwise respawns the target actor only if it can
+    /// take `bootstrap_spawn_lock` without waiting. The reply is awaited inline — bounded by
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT) — so the
+    /// caller observes the full per-actor outcome without a wedged actor
+    /// pinning it forever.
+    ///
+    /// # Errors
+    ///
+    /// - Any [`ContextError`] surfaced through the mailbox dispatch (e.g.
+    ///   [`ContextError::NotInitialized`] if no providers attached).
+    /// - Any [`ContextError`] surfaced via the per-actor reply on the
+    ///   embedded oneshot channel.
+    /// - [`ContextError::TransportFailed`] if the reply channel is
+    ///   closed before a response arrives (actor panicked or shut down
+    ///   between dispatch and reply).
+    /// - [`ContextError::ActorBusy`] (retryable) if the actor does not
+    ///   reply within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT)
+    ///   — a wedged/deadlocked actor never terminates, so the watchdog never
+    ///   drops the reply sender; this backstop fail-closes instead of
+    ///   hanging the caller.
+    /// - [`ContextError::ActorBusy`] (retryable) when the target context has
+    ///   no registered actor and another bootstrap holds
+    ///   `bootstrap_spawn_lock`: an actor turn never waits for that lock, so
+    ///   the respawn is not attempted and nothing is sent.
+    pub async fn dispatch_recovery_send_notification(
+        &self,
+        payload: crate::context::actor::commands::RecoverySendNotificationPayload,
+    ) -> Result<(), ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        // The in-turn dispatch: a respawn of an unregistered target
+        // try-locks `bootstrap_spawn_lock` and returns a retryable
+        // `ActorBusy` on the reply while another bootstrap holds it.
+        self.upgrade()?
+            .dispatch_recovery_send_notification_in_turn(Box::new(payload), reply_tx)
+            .await?;
+        // Bounded by REPLY_TIMEOUT: the result is load-bearing (propagated
+        // via `?` into trust-recovery `recovery_notify_contact`, §9.12) and a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender) — without the bound a wedged actor would
+        // pin the caller forever. On elapse, fail-closed with the retryable
+        // `ActorBusy` class; the existing dropped-channel `TransportFailed`
+        // behavior is preserved exactly.
+        match bounded_reply_await(reply_rx).await {
+            // Handler verdict rides through untouched.
+            Ok(reply) => reply,
+            Err(BoundedReplyError::Dropped) => Err(ContextError::TransportFailed(
+                "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
+            )),
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Look up the registered standing-context peer DID for `peer_did`.
+    /// Returns `None` if the peer has no registered standing context.
+    ///
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior
+    /// signature took `ctx_id: &str` but the underlying
+    /// `standing_contexts: ArcSwap<HashMap<String, DID>>` is keyed by
+    /// the peer DID's `to_string()` form (see `standing_helpers.rs`
+    /// lines 161/230/291). Querying by context ID always returned
+    /// `None`. The renamed parameter matches the actual key shape; the
+    /// lookup is now correct.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn standing_peer(&self, peer_did: &DID) -> Result<Option<DID>, ContextError> {
+        Ok(self
+            .upgrade()?
+            .standing_contexts
+            .load()
+            .get(peer_did.as_ref())
+            .cloned())
+    }
+
+    /// Read-only lifecycle-state probe for `context_id`. Close does not
+    /// despawn the actor, so `Some(state)` reflects the live lifecycle
+    /// state — `Active` / `Creating` vs a terminal state such as `Closed` —
+    /// and a context the crash watchdog poisoned reads `Some(Poisoned)`
+    /// (ADR-049 §10). A TTL expiry does despawn the actor once its cleanup
+    /// completes and the `Expired` state is durable, so a context whose
+    /// expiry completed reads `None`. While an incomplete expiry is retrying,
+    /// the actor stays registered and reads `Some(Expired)`.
+    ///
+    /// `None` does not mean the context is absent. It covers an id no actor
+    /// serves and also an actor this call could not reach: a busy or
+    /// timed-out actor, and a context mid-respawn or past a failed respawn.
+    /// Read `None` only as "no live `Active` context". A caller whose
+    /// decision turns on absence calls
+    /// [`Supervisor::read_context_state_checked`](crate::context::supervisor::supervisor::Supervisor::read_context_state_checked),
+    /// which reports the unreachable cases as `ActorBusy` and `ActorCrashed`.
+    ///
+    /// Capability-reduced surface over
+    /// [`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor::read_context_state):
+    /// handler / standing-domain code can probe lifecycle state without
+    /// receiving `&Supervisor` directly.
+    // First in-tree caller is the actor-native standing get-or-create
+    // rewrite in the immediately-following commit; `Supervisor::read_context_state`
+    // (the body this wraps) is already exercised by the supervisor's
+    // `pub` surface and the bridge passthroughs.
+    #[allow(dead_code)]
+    pub(crate) async fn read_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_protocol::context::ContextState>, ContextError> {
+        Ok(self.upgrade()?.read_context_state(context_id).await)
+    }
+
+    // No `SupervisorHandle::standing_context` get-or-create wrapper: that
+    // operation is supervisor-scoped (it may CREATE the target per-context
+    // actor) and is dispatched supervisor-direct through
+    // [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
+    // → `Supervisor::standing_context`. Exposing it on the
+    // capability-reduced handle (reachable from the per-context actor's
+    // `run()` loop) would invite the non-`Send` actor-spawns-actor
+    // recursion the routing in `Supervisor::standing_command_context_id`
+    // explicitly avoids.
+
+    /// Number of supervisor-tracked standing peers.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
+    pub fn standing_context_count(&self) -> Result<usize, ContextError> {
+        Ok(self.upgrade()?.standing_contexts.load().len())
+    }
+
+    /// Whether `peer_did` is registered as a standing peer.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
+    pub fn has_standing_context(&self, peer_did: &DID) -> Result<bool, ContextError> {
+        Ok(self
+            .upgrade()?
+            .standing_contexts
+            .load()
+            .contains_key(peer_did.as_ref()))
+    }
+
+    /// Register `peer_did` in the supervisor standing-context index.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
+    pub async fn register_standing_context(&self, peer_did: DID) -> Result<(), ContextError> {
+        let supervisor = self.upgrade()?;
+        let _guard = supervisor.write_lock.lock().await;
+        let snapshot = supervisor.standing_contexts.load_full();
+        let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+        updated.insert(peer_did.to_string(), peer_did);
+        supervisor
+            .standing_contexts
+            .store(std::sync::Arc::new(updated));
+        Ok(())
+    }
+
+    /// Reconnect all standing contexts.
+    ///
+    /// Capability-reduced surface over the actor-native
+    /// [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing),
+    /// which resolves per-context lifecycle + params through the actor
+    /// registry + mailbox (no `contexts` DashMap, no
+    /// `per-context-state Mutex`).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped. Otherwise the errors of
+    /// [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing).
+    pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
+        self.upgrade()?.reconnect_all_standing().await
+    }
+
+    /// This identity's DHKEM(P-256) wrapping key (spec 09 §9.16.1): the
+    /// public point every context of the identity publishes in `0xFF01`, and
+    /// the custody handle that opens what is sealed to it.
+    ///
+    /// The supervisor loads the key at every entry point that builds an actor
+    /// for the identity, before the actor exists, so every actor's owner has
+    /// one. The returned `Arc` is shared with the supervisor.
+    ///
+    /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold the
+    /// capability proof that it is an actor of this identity. The token is
+    /// minted only in `supervisor/` code and its `did` field is private.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] if no key is loaded because
+    /// shutdown has begun and cleared every key, and
+    /// [`ContextError::InvalidState`] if no key is loaded otherwise. Either
+    /// fails the operation closed rather than publishing or opening with
+    /// another key.
+    pub(in crate::context) fn my_wrapping_key(
+        &self,
+        identity: &OwnedIdentityDid,
+    ) -> Result<Arc<crate::crypto::wrapping::IdentityWrappingKey>, ContextError> {
+        let supervisor = self.upgrade()?;
+        let key = supervisor
+            .wrapping_keys
+            .get(identity.as_did())
+            .map(|entry| Arc::clone(entry.value()));
+        if key.is_none() {
+            supervisor.refuse_if_shut_down("wrapping key lookup")?;
+        }
+        key.ok_or_else(|| {
+            ContextError::InvalidState("wrapping key not loaded for the actor owner".to_owned())
+        })
+    }
+
+    /// Look up this identity's `KeyPackageStoreActor` handle. Returns
+    /// `None` if no KeyPackage actor has been spawned for the identity.
+    ///
+    /// Same capability discipline as [`Self::my_wrapping_key`]:
+    /// `&OwnedIdentityDid` proves ownership, the token cannot be minted
+    /// outside `supervisor/`, and the method shares the type's
+    /// `pub(in crate::context)` visibility — so no `private_interfaces`
+    /// asymmetry exists to allow.
+    pub(in crate::context) fn my_key_package_store(
+        &self,
+        identity: &OwnedIdentityDid,
+    ) -> Result<Option<KeyPackageStoreHandle>, ContextError> {
+        let did = identity.as_did();
+        Ok(self
+            .upgrade()?
+            .key_package_stores
+            .get(did)
+            .map(|r| r.value().clone()))
+    }
+
+    // -----------------------------------------------------------------
+    // Lifecycle bootstrap surface (Phase 2A.9 / ADR-049 finalization).
+    //
+    // These methods wrap the supervisor's registry operations through a
+    // capability-reduced interface so the actor-shape bootstrap entry
+    // points in [`crate::context::lifecycle_helpers`] can register fresh
+    // `PerContextState` without holding `&Supervisor` directly. All three
+    // bootstrap paths (`create` / `restore` / `import`) register through
+    // [`Self::spawn_actor_with_state`] (owned-state spawn). Import's
+    // replaceability gate runs inside the existing actor via
+    // [`Self::dispatch_prepare_for_replace`].
+    // -----------------------------------------------------------------
+
+    /// Initialize a `BroadcastContext` (SCP-227) and persist its
+    /// initial state if persistence is configured. Capability-reduced
+    /// wrapper around
+    /// [`crate::context::manager_methods::init_broadcast_context`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
+    /// if the broadcast context construction or initial author
+    /// registration fails, and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// carrying [`ContextError::SupervisorShutDown`] when the Supervisor has
+    /// dropped.
+    pub fn init_broadcast_context(
+        &self,
+        context_id: &str,
+        params: &scp_protocol::context::ContextParams,
+        creator_did: &DID,
+    ) -> Result<
+        Option<scp_protocol::context::broadcast::BroadcastContext>,
+        scp_protocol::context::builder::ContextCreationError,
+    > {
+        let supervisor = self.upgrade().map_err(|e| {
+            scp_protocol::context::builder::ContextCreationError::StateTransition(e)
+        })?;
+        crate::context::manager_methods::init_broadcast_context(
+            &supervisor,
+            context_id,
+            params,
+            creator_did,
+        )
+    }
+
+    /// Starts a refresh of the operational gauges (active contexts, buffer
+    /// occupancy) as a tracked task and returns without waiting for it.
+    /// Best-effort: skipped if no metrics recorder is installed.
+    ///
+    /// The sweep mailboxes each per-context actor for its receive-buffer
+    /// length (ADR-049 Phase 2A finalization — DashMap removal), so no caller
+    /// waits on it: a caller inside an actor's turn, or one holding
+    /// `bootstrap_spawn_lock` while an actor's turn waits for that lock, would
+    /// wait on itself until a timeout fired. The task spawns on the
+    /// Supervisor's tracker (ADR-049 Decision 16), so shutdown waits for it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped or
+    /// shutdown has begun.
+    pub fn update_context_gauges(&self) -> Result<(), ContextError> {
+        let handle = self.clone();
+        let sweep = async move {
+            match handle.upgrade() {
+                Ok(supervisor) => {
+                    crate::context::manager_methods::update_context_gauges(&supervisor).await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "context gauge refresh skipped: supervisor gone");
+                }
+            }
+        };
+        self.spawn_tracked("refresh context gauges", sweep)
+            .map(drop)
+    }
+
+    /// The supervisor's store of each context's last successful relay
+    /// contact. See [`Supervisor::relay_contact_store`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn relay_contact_store(
+        &self,
+    ) -> Result<Arc<dyn crate::store::sync::RelayContactStore>, ContextError> {
+        Ok(self.upgrade()?.relay_contact_store())
+    }
+
+    /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
+    /// task that owns the supplied
+    /// [`PerContextState`](crate::context::actor::state::PerContextState) +
+    /// [`ActorDeps`](crate::context::actor::deps::ActorDeps) bundle and
+    /// register the resulting handle in the supervisor's actor registry.
+    ///
+    /// Capability-reduced wrapper around
+    /// [`Supervisor::spawn_actor_with_state`](crate::context::supervisor::Supervisor::spawn_actor_with_state).
+    /// Phase 2A finalization keystone: lifecycle bootstrap entry points
+    /// in [`crate::context::lifecycle_helpers`] (`create_context`,
+    /// `restore_context`, `import_context`) call this after building the
+    /// actor-shape state so production paths populate
+    /// `Supervisor::actors`, the sole context registry; there is no
+    /// legacy contexts-map.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — only lifecycle bootstrap callers
+    /// (`crate::context::lifecycle_helpers`) reach this. The
+    /// `private_interfaces` allow mirrors the discipline used by the other
+    /// owned-state `pub(in crate::context)` registry methods on this handle:
+    /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
+    /// method itself is reachable from inside the `context` module
+    /// tree.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError::CreationFailed`] when an actor is
+    /// already registered for this context id (first-writer-wins).
+    #[allow(private_interfaces)]
+    pub async fn spawn_actor_with_state(
+        &self,
+        state: crate::context::actor::state::PerContextState,
+        deps: crate::context::actor::deps::ActorDeps,
+        mailbox_capacity: Option<usize>,
+    ) -> Result<crate::context::actor::handle::ContextActorHandle, ContextError> {
+        self.upgrade()?
+            .spawn_actor_with_state(state, deps, mailbox_capacity)
+            .await
+    }
+
+    // NOTE (ADR-049 Phase 2J): the spawn-from-Welcome joiner seam is NOT a
+    // `SupervisorHandle` method. `Supervisor::reserve_key_package` and
+    // `Supervisor::spawn_actor_from_welcome` are bridge-initiated node-level
+    // bootstraps (the app receives a Welcome, or pre-publishes KeyPackages), so
+    // they live as genuinely-`pub` `Supervisor` entrypoints taking a bare `DID`
+    // — the same shape as `Supervisor::create_context`, with local-identity
+    // custody enforced at the FFI bridge layer. They are deliberately NOT gated
+    // on `&OwnedIdentityDid`: that token is the actor-internal per-identity-
+    // secret axis (ADR-049 Decision 5), and neither op returns identity-private
+    // crypto — `reserve_key_package` yields only a `ReservationId` + PUBLIC
+    // KeyPackage bytes, and `spawn_actor_from_welcome` yields a `ContextHandle`
+    // (context state), so §5's "no `&DID` method returning identity state" rule
+    // is not triggered.
+
+    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`](crate::context::actor::commands::LifecycleControlCommand::PrepareForReplace) to the
+    /// actor currently registered for `context_id`, awaiting its verdict.
+    ///
+    /// This is the actor-native replacement gate for
+    /// [`crate::context::lifecycle_helpers::import_context`]: the existing
+    /// actor, running on its own owned state, checks replaceability and
+    /// performs the crypto teardown + epoch-floor validate/merge, then
+    /// claims itself terminal and exits. Capability-reduced wrapper —
+    /// import never holds the raw `ContextActorHandle`.
+    ///
+    /// # Errors
+    ///
+    /// - `Err(MembershipFailed)` if the context is live (not replaceable)
+    ///   or already claimed by a concurrent replace.
+    /// - `Err(CryptoFailed)` from the floor merge.
+    /// - `Err(ContextNotRegistered)` if no actor is registered, or the
+    ///   mailbox send / reply failed (a stale handle whose actor already
+    ///   exited) — the caller re-checks `lookup` and falls back to the
+    ///   fresh-import path.
+    pub async fn dispatch_prepare_for_replace(
+        &self,
+        context_id: &str,
+        floors: crate::context::restored_crypto::VerifiedFloors,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
+
+        let Some(actor) = self.upgrade()?.lookup(context_id) else {
+            return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
+            floors,
+            reply: reply_tx,
+        });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            // Stale handle: the actor exited (e.g. a prior replace) before
+            // we could send. Signal the caller to re-`lookup`.
+            return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+        }
+        // The actor dropped the reply sender mid-flight (it exited
+        // without answering) → treat as a stale handle; otherwise return
+        // the handler's verdict. The reply-await is bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), so without the bound this replace path
+        // would hang the caller forever. On elapse, fail-closed with a
+        // retryable `ActorBusy` — the actor keeps running; we only drop our
+        // own receiver.
+        match bounded_reply_await(reply_rx).await {
+            // Handler verdict rides through untouched.
+            Ok(reply) => reply,
+            // Dropped reply sender → stale handle: signal the caller to re-`lookup`.
+            Err(BoundedReplyError::Dropped) => {
+                Err(ContextError::ContextNotRegistered(context_id.to_owned()))
+            }
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Despawn the actor registered for `context_id`, removing the
+    /// entry from `Supervisor::actors` under the supervisor's
+    /// `write_lock` so concurrent registrations cannot race.
+    ///
+    /// Two callers:
+    /// - `import_context` — import overwrites an existing context, so the
+    ///   prior actor's mailbox is shut down before the fresh actor is
+    ///   spawned.
+    /// - `ContextActor::run()` on a terminal TTL self-expiry — the actor
+    ///   despawns its OWN registry handle (`&self.context_id`) before
+    ///   breaking the run loop, so the dead-but-registered handle does not
+    ///   linger (the watchdog deliberately leaves clean `Ok(())` exits
+    ///   registered to avoid racing PrepareForReplace; ADR-049 finding A3).
+    ///
+    /// Removing the entry drops the registered
+    /// [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle),
+    /// whose `Drop` closes the `mpsc::Sender`, so the actor task's `run()`
+    /// loop exits on the next inbox-empty poll (a no-op when the caller is
+    /// the exiting actor itself).
+    ///
+    /// Returns `true` if a handle was registered and removed,
+    /// `false` if no entry existed for `context_id`.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — reachable by lifecycle bootstrap and by
+    /// the actor's own run loop, not by handler bodies under
+    /// `actor/handlers/`.
+    pub(in crate::context) async fn despawn_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.despawn_actor(context_id).await)
+    }
+
+    /// Despawn the actor an import is replacing, and mark the gap until the
+    /// replacement registers (ADR-049 §10). See
+    /// [`Supervisor::despawn_for_replace`](crate::context::supervisor::Supervisor::despawn_for_replace).
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — reachable by the lifecycle import path only.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
+    pub async fn despawn_for_replace(&self, context_id: &str) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.despawn_for_replace(context_id).await)
+    }
+
+    /// Whether the context is poisoned (ADR-049 §10) — its actor exceeded
+    /// the respawn budget and is no longer being respawned. Lock-free read.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn is_context_poisoned(&self, context_id: &str) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.is_context_poisoned(context_id))
+    }
+
+    /// Operator recovery action (ADR-049 §10) for a poisoned per-identity
+    /// `KeyPackageStoreActor`: clear its `kp::{did}` crash window and
+    /// re-resolve the actor, which reconciles its pool from the durable
+    /// `mls_storage` journal on spawn.
+    ///
+    /// This is the KeyPackage-actor twin of `Supervisor::clear_poison`. It is a
+    /// SEPARATE surface because a KP actor has no context-snapshot to
+    /// rehydrate — routing it through the per-context snapshot respawn would
+    /// fail and re-dirty the crash window. Surfaced on the operator-facing
+    /// `SupervisorHandle` so ordinary callers cannot un-poison a KP actor.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from the re-resolve (e.g.
+    /// [`ContextError::NotInitialized`]
+    /// when providers are absent).
+    pub async fn clear_kp_poison(&self, identity: &DID) -> Result<(), ContextError> {
+        self.upgrade()?.clear_kp_poison(identity).await
+    }
+
+    // -----------------------------------------------------------------
+    // Actor-resolution surface.
+    //
+    // `lookup` resolves a `context_id` to the owning `ContextActorHandle`
+    // through the lock-free `actors` registry. It is used by the
+    // supervisor-side dispatch routing (`dispatch_*_command`) and the
+    // bootstrap TTL-arm dispatch (`dispatch_start_ttl_timer`). It is NOT a
+    // timer surface: TTL + governance timers are ACTOR-OWNED arms
+    // reconciled inside `ContextActor::run()` (ADR-049 Decision-1 /
+    // finding A3), so no detached timer task resolves actors this way.
+    //
+    // `lookup` is the ONE place a `SupervisorHandle` yields a
+    // `ContextActorHandle`. It does NOT breach the "actors cannot reach
+    // sibling actors" contract: the callers are supervisor-side dispatch
+    // and bootstrap helpers, not a handler running inside another actor's
+    // dispatch turn. Visibility is `pub(in crate::context)` so only
+    // `crate::context` infra can reach it — handler bodies under
+    // `actor/handlers/` are `pub`-only consumers of the handle and cannot
+    // name this method.
+    // -----------------------------------------------------------------
+
+    /// Resolve the actor handle for `context_id` through the lock-free
+    /// `Supervisor::actors` registry. Returns `None` if no actor is
+    /// registered (context gone / not yet spawned).
+    ///
+    /// See the actor-resolution surface comment above for why this is the
+    /// single sanctioned `ContextActorHandle` yield.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
+    pub fn lookup(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<crate::context::actor::handle::ContextActorHandle>, ContextError> {
+        Ok(self.upgrade()?.lookup(context_id))
+    }
+
+    /// Try-locks the Supervisor's `bootstrap_spawn_lock` for a bootstrap that
+    /// runs in an actor turn, the migration create.
+    ///
+    /// An actor turn never waits for this lock: its holders wait on actor
+    /// mailboxes (a create's post-spawn wiring, a discard's teardown), so a
+    /// turn that waited could deadlock with them. Work that must wait for
+    /// the lock goes through [`Self::spawn_under_bootstrap_spawn_lock`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock;
+    ///   the caller retries.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn try_lock_bootstrap_spawn(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
+        Arc::clone(&self.upgrade()?.bootstrap_spawn_lock)
+            .try_lock_owned()
+            .map_err(|_| {
+                ContextError::ActorBusy(
+                    "another create, import, restore, join or rollback holds the bootstrap \
+                     lock; retry"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// Runs `before_lock`, then `under_lock` while holding
+    /// `bootstrap_spawn_lock`, on a tracked task, so the caller, which may be
+    /// an actor turn, never waits for the lock. `under_lock` is skipped when
+    /// `before_lock` returns `false`. The task holds the Supervisor only to
+    /// clone the lock, never across the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+    /// or shutdown has begun; neither future runs.
+    pub(in crate::context) fn spawn_under_bootstrap_spawn_lock<B, F, U>(
+        &self,
+        operation: &'static str,
+        before_lock: B,
+        under_lock: F,
+    ) -> Result<(), ContextError>
+    where
+        B: std::future::Future<Output = bool> + Send + 'static,
+        F: FnOnce() -> U + Send + 'static,
+        U: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let supervisor = self.supervisor.clone();
+        self.spawn_tracked(operation, async move {
+            if !before_lock.await {
+                return;
+            }
+            let Some(lock) = supervisor
+                .upgrade()
+                .map(|supervisor| Arc::clone(&supervisor.bootstrap_spawn_lock))
+            else {
+                tracing::error!(
+                    operation,
+                    "the supervisor dropped before the task took the bootstrap lock; its \
+                     work did not run"
+                );
+                return;
+            };
+            let _bootstrap_guard = lock.lock_owned().await;
+            under_lock().await;
+        })
+        .map(|_detached| ())
+    }
+
+    /// Claims `context_id` for one operation's first-state writes
+    /// (`Supervisor::pending_first_state`) until
+    /// [`Self::release_first_state`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] while another operation's first state of
+    ///   the id is unsettled; it is retryable.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn claim_first_state(&self, context_id: &str) -> Result<(), ContextError> {
+        if self
+            .upgrade()?
+            .pending_first_state
+            .insert(context_id.to_owned())
+        {
+            return Ok(());
+        }
+        Err(ContextError::ActorBusy(format!(
+            "{context_id}: another create, import or join of this context has not committed or \
+             rolled back its first state; retry"
+        )))
+    }
+
+    /// Releases a claim [`Self::claim_first_state`] made. A dropped Supervisor
+    /// holds no claim.
+    pub fn release_first_state(&self, context_id: &str) {
+        if let Some(supervisor) = self.supervisor.upgrade() {
+            supervisor.pending_first_state.remove(context_id);
+            supervisor.first_state_settled.notify_waiters();
+        }
+    }
+
+    /// The token cancelled when Supervisor shutdown begins
+    /// (`Supervisor::shutdown_signal`).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn shutdown_signal(
+        &self,
+    ) -> Result<tokio_util::sync::CancellationToken, ContextError> {
+        Ok(self.upgrade()?.shutdown_signal())
+    }
+
+    /// Install the per-context TTL timer for `context_id` by mailboxing
+    /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
+    /// to the owning actor. The actor handler runs the actor-shape
+    /// `start_ttl_timer` on its owned `&mut state`, so the timer task and
+    /// its `state.ttl.timer` bookkeeping are installed by the actor that
+    /// owns the state — no `&Supervisor` / DashMap reach.
+    ///
+    /// Used by the lifecycle bootstrap paths (`SpawnedContext::finalize`
+    /// for create, import and the Welcome join, and `restore_context`) which run AFTER actor spawn
+    /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
+    /// installation to the actor through this mailbox dispatch.
+    ///
+    /// A `lookup → None` (actor not yet registered) or a mailbox-send
+    /// failure is logged and skipped. (The actor's own `reconcile_timers`
+    /// arms the one-shot TTL sleep from the recorded `deadline_unix_secs`;
+    /// ADR-049 finding A3.)
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub async fn dispatch_start_ttl_timer(
+        &self,
+        context_id: &str,
+        params: scp_protocol::context::params::ContextParams,
+        // The ABSOLUTE convergent expiry deadline to record, as a
+        // [`ConvergentDeadline`](ConvergentDeadline)
+        // — the arming-seam newtype that can only be minted from the single
+        // authoritative source (B1). `None` (initial-create / spawn-from-Welcome)
+        // lets the actor handler derive the convergent create base
+        // `creation_timestamp_secs + params.ttl`. The restore/import paths pass
+        // `Some` — the deadline `convergent_ttl_deadline` derived from the event
+        // log — so a prior extension survives and a `None`-remaining Active
+        // snapshot still re-arms (D1/D2). See `TtlTimerPayload::deadline_override`.
+        deadline_override: Option<ConvergentDeadline>,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
+
+        let Some(actor) = self.upgrade()?.lookup(context_id) else {
+            tracing::warn!(
+                context_id,
+                "dispatch_start_ttl_timer: no actor registered — TTL timer not installed"
+            );
+            return Ok(());
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::TtlClose(TtlCloseCommand::StartTtlTimer {
+            payload: Box::new(TtlTimerPayload {
+                context_id: context_id.to_owned(),
+                params,
+                // Vestigial for `StartTtlTimer` — only `ResetTtlTimer` reads
+                // `duration` (as the extension amount). The absolute deadline is
+                // carried by `deadline_override`.
+                duration: std::time::Duration::ZERO,
+                deadline_override,
+            }),
+            reply: reply_tx,
+        });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                context_id,
+                "dispatch_start_ttl_timer: mailbox send failed — TTL timer not installed"
+            );
+            return Ok(());
+        }
+        // Await the install reply so the timer is registered before the
+        // bootstrap path returns control to the caller. Bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), and arming the TTL deadline is a
+        // best-effort background facility — it must never pin the bootstrap
+        // caller forever. On elapse (as on an install failure) we log and
+        // move on; the actor's own `reconcile_timers` re-arms from the
+        // recorded deadline regardless.
+        match bounded_reply_await(reply_rx).await {
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "dispatch_start_ttl_timer: actor reported TTL timer install failure"
+                );
+            }
+            // Handler confirmed install (Ok), or the actor dropped the reply
+            // channel: nothing to do (matches the prior best-effort behavior).
+            Ok(Ok(())) | Err(BoundedReplyError::Dropped) => {}
+            Err(BoundedReplyError::Elapsed) => {
+                tracing::warn!(
+                    context_id,
+                    "dispatch_start_ttl_timer: actor did not confirm TTL timer install \
+                     within the reply budget — timer install unconfirmed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
+    /// freshly-respawned actor, delegating to
+    /// [`Supervisor::reconcile_stream_reservations_via_actor`](crate::context::supervisor::Supervisor::reconcile_stream_reservations_via_actor).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dispatch / reply-channel [`ContextError`] from the inner
+    /// supervisor (callers on the restore path treat it best-effort).
+    pub async fn reconcile_stream_reservations_via_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<usize, scp_protocol::context::ContextError> {
+        self.upgrade()?
+            .reconcile_stream_reservations_via_actor(context_id)
+            .await
+    }
+}
+
+// Explicit non-exposure check: ensure no public method returns
+// `ContextActorHandle`, `Arc<Supervisor>`, or the inner `Weak<Supervisor>`. This is enforced by the
+// methods above (none do), but the file-level contract is documented
+// here so future edits see the rule.
+//
+// Any method added to this impl that returns `ContextActorHandle`,
+// `Arc<Supervisor>`, `&Supervisor`, or `&mut Supervisor` breaks the
+// capability-reduction contract. The contract is maintained by this
+// documented rule plus review — there is no CI grep-ban for it.
+
+// ---------------------------------------------------------------------------
+// Forbidden trait impls — compile-time checklist
+// ---------------------------------------------------------------------------
+
+// Do NOT impl:
+// - `Deref<Target = Supervisor>` — would leak `&Supervisor` via auto-deref.
+// - `AsRef<Supervisor>` — would leak `&Supervisor`.
+// - `From<SupervisorHandle> for Arc<Supervisor>` — would smuggle the
+//   Arc out past the capability boundary.
+//
+// These are documentation, not static assertions — Rust has no
+// "forbid impl of trait X" attribute. The rule is upheld by review,
+// not a CI grep-ban.
+
+// Compile-time witness that `SupervisorHandle` is `Send + Sync` — the
+// handle rides inside `ActorDeps`, which is moved into a spawned task.
+const fn _assert_send_sync() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SupervisorHandle>();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// A convergent TTL expiry deadline (absolute Unix seconds), resolved from the
+/// single authoritative source and safe to arm a timer with.
+///
+/// # Why a newtype (ADR-049 §9 — the single-source TTL-deadline invariant)
+///
+/// The deadline is *the* security-critical quantity of the TTL subsystem: it is
+/// the instant at which key material is destroyed. Passing it as a bare `u64`
+/// lets any scalar — a stale persisted cache, an attacker-supplied snapshot
+/// field, a local `now()+ttl` — masquerade as "the convergent deadline" (the
+/// M3 scalar-trust hole). `ConvergentDeadline` closes that at the type level:
+/// its field is PRIVATE and it has a CLOSED constructor set, so a value can only
+/// come from a sanctioned derivation:
+///
+/// 1. [`convergent_ttl_deadline`] — the prune-immune snapshot create base raised
+///    to the highest fail-safe `TtlExtended` leaf in the (Merkle-validated) log
+///    (the partitioned single-source derivation).
+/// 2. [`convergent_ttl_deadline_secs`] — the prune-immune create base
+///    (`creation_timestamp_secs + params.ttl`) from the persisted snapshot, used
+///    both at create-arm time and as the base inside `convergent_ttl_deadline`.
+/// 3. [`ConvergentDeadline::extend`] — raises an already-convergent deadline by
+///    an agreed additional duration (the TTL-extension primitive).
+///
+/// There is deliberately **no** `from_raw` / `Deserialize` (B1/B2): admitting a
+/// `ConvergentDeadline` from arbitrary bytes would reconstruct a "trusted"
+/// deadline from an untrusted scalar and re-open the M3 hole. The arming seam
+/// [`start_ttl_timer`] / [`dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer) accept ONLY this type, so
+/// every armed deadline is convergent by construction. The type is TRANSIENT —
+/// it lives only on the arming path and is never persisted; the durable
+/// [`TtlTimer::deadline_unix_secs`](crate::context::ttl::TtlTimer) cache stays a
+/// plain `Option<u64>` (an untrusted cache re-derived from the log on every
+/// restore/import).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvergentDeadline(pub u64);
+
+impl ConvergentDeadline {
+    /// The absolute deadline as Unix seconds. Unwrapped ONLY at the persistence
+    /// cache write ([`start_ttl_timer`]) and when recording a leaf's
+    /// `old`/`new` deadline fields — never to reconstruct a new
+    /// `ConvergentDeadline` from the result.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    /// Raises this convergent deadline by `additional_secs` (saturating), the
+    /// TTL-extension primitive. The result is convergent because both inputs
+    /// are — every member extends the SAME recorded convergent deadline by the
+    /// SAME agreed duration (§7.3.1).
+    #[must_use]
+    pub const fn extend(self, additional_secs: u64) -> Self {
+        Self(self.0.saturating_add(additional_secs))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_is_clone_send_sync() {
+        const fn assert_send_sync<T: Send + Sync + Clone>() {}
+        assert_send_sync::<SupervisorHandle>();
+    }
+}

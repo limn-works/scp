@@ -14,8 +14,8 @@ pub use scp_protocol::serde_util;
 pub use scp_protocol::uri;
 
 // --- Modules that exist ONLY in scp-runtime (no conflict) ---
-pub use scp_runtime::push;
-pub use scp_runtime::store;
+pub use scp_runtime_core::push;
+pub use scp_runtime_core::store;
 pub use scp_runtime_types::metrics;
 pub use scp_runtime_types::well_known;
 
@@ -38,7 +38,7 @@ pub mod crypto {
             group, key_package, ratchet, wire, wrapping_extension,
         };
         // Node-only async MLS backend (scp-runtime-types) and provider (scp-runtime).
-        pub use scp_runtime::crypto::mls::{NodeMlsFactory, provider};
+        pub use scp_runtime_core::crypto::mls::{NodeMlsFactory, provider};
         pub use scp_runtime_types::crypto::mls::{backend, production_backend, storage_adapter};
     }
     pub mod sender_keys {
@@ -64,12 +64,12 @@ pub mod context {
     // All pure types from scp-protocol::context (includes params, roles, etc.)
     pub use scp_protocol::context::*;
     // Async modules from scp-runtime
-    pub use scp_runtime::context::app_sandbox;
-    pub use scp_runtime::context::builder;
-    pub use scp_runtime::context::export_import;
-    pub use scp_runtime::context::providers;
-    pub use scp_runtime::context::ttl;
-    pub use scp_runtime::context::ttl::{
+    pub use scp_runtime_core::context::app_sandbox;
+    pub use scp_runtime_core::context::builder;
+    pub use scp_runtime_core::context::export_import;
+    pub use scp_runtime_core::context::providers;
+    pub use scp_runtime_core::context::ttl;
+    pub use scp_runtime_core::context::ttl::{
         ExtensionConsentMode, TtlExtensionProposal, consent_mode_for_member_count,
     };
     pub use scp_runtime_types::context::invitation_helpers;
@@ -79,39 +79,39 @@ pub mod context {
         AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
         MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
-    pub use scp_runtime::context::ContextHandle;
+    /// The 13 domain handlers every `Supervisor` constructor takes last
+    /// (ADR-070 §3).
+    pub use scp_runtime::domain_handlers;
+    /// Test-only helper: builds a fresh [`supervisor::Supervisor`] with
+    /// caller-supplied providers and no-op persistence (ADR-049
+    /// commit 12, replacing the legacy `attach_test_supervisor`).
+    #[cfg(any(test, feature = "testing"))]
+    pub use scp_runtime::test_supervisor;
+    pub use scp_runtime_core::context::ContextHandle;
     /// ADR-029 §2 push-wake pull mode: one Active context's relay URLs and
     /// routing IDs, which the FFI wake handler pulls.
-    pub use scp_runtime::context::ContextWakeTarget;
+    pub use scp_runtime_core::context::ContextWakeTarget;
     /// Actor module — re-exported from `scp-runtime` so the FFI bridges
     /// can name the [`QueriesCommand`](actor::commands::QueriesCommand)
     /// variants they dispatch through
     /// [`supervisor::Supervisor::dispatch_query`]. Part of the same
     /// commits-7-to-11 shim surface; deleted in commit 12.
-    pub use scp_runtime::context::actor;
-    pub use scp_runtime::context::builder::{
+    pub use scp_runtime_core::context::actor;
+    pub use scp_runtime_core::context::builder::{
         ContextEventLogProvider, ContextTransportProvider, LocalTransportProvider,
         NotConfiguredTransportProvider,
     };
-    /// Test-only helper: builds a fresh [`supervisor::Supervisor`] with
-    /// caller-supplied providers and no-op persistence (ADR-049
-    /// commit 12, replacing the legacy `attach_test_supervisor`).
-    #[cfg(any(test, feature = "testing"))]
-    pub use scp_runtime::context::test_supervisor;
-    /// The 13 domain handlers every `Supervisor` constructor takes last
-    /// (ADR-070 §3).
-    pub use scp_runtime::domain_handlers;
     // ContextManager type deleted in ADR-049 commit 12; consumers
     // build a `Supervisor` directly via `Supervisor::with_providers`
     // (re-exported through `scp_core::context::supervisor`).
-    pub use scp_runtime::context::persistence;
-    pub use scp_runtime::context::persistence::ContextPersistence;
-    pub use scp_runtime::context::state;
+    pub use scp_runtime_core::context::persistence;
+    pub use scp_runtime_core::context::persistence::ContextPersistence;
+    pub use scp_runtime_core::context::state;
     /// Supervisor module — re-exported from `scp-runtime` so the FFI
     /// bridges (which depend on `scp-core`, not `scp-runtime` directly)
     /// can construct the commits-7-to-11 query shim. Shrinks back to an
     /// internal module in commit 12 when the shim is deleted.
-    pub use scp_runtime::context::supervisor;
+    pub use scp_runtime_core::context::supervisor;
     /// The saga journal types (`SagaId` and the rest) the FFI bridges name
     /// when they drive a streaming saga (ADR-070: they live in
     /// `scp-runtime-types`).
@@ -131,16 +131,16 @@ pub mod context {
         pub use scp_protocol::context::outlets::*;
         // §7.3.8 caveat/CID coupling minted by the FFI bridges (see
         // `Supervisor::invoke_outlet_with_economy`).
-        pub use scp_runtime::context::InvocationCaveatBinding;
-        pub use scp_runtime::context::outlets::invoke;
-        pub use scp_runtime::context::outlets::invoke::{
+        pub use scp_runtime_core::context::InvocationCaveatBinding;
+        pub use scp_runtime_core::context::outlets::invoke;
+        pub use scp_runtime_core::context::outlets::invoke::{
             InvocationError, has_outlet_call_capability, has_outlet_invocation_capability,
             has_outlet_query_capability, invoke_outlet, invoke_outlet_aggregating,
             invoke_outlet_with_cancellation_aggregating, one_shot_to_stream,
             validate_outlet_invocation_ucan,
         };
-        pub use scp_runtime::context::outlets::session;
-        pub use scp_runtime::context::outlets::session::{
+        pub use scp_runtime_core::context::outlets::session;
+        pub use scp_runtime_core::context::outlets::session::{
             DEFAULT_SESSION_CAP_PER_CALLER, OutletSession, SessionStore, cleanup_expired,
             create_session, invoke_session,
         };
@@ -151,11 +151,11 @@ pub mod context {
         // open-rejection taxonomy, the control-plane identities/errors,
         // the operator chunk signer trait, and the executor trait are
         // surfaced here.
-        pub use scp_runtime::context::outlets::dispatch::{
+        pub use scp_runtime_core::context::outlets::dispatch::{
             CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamCloseSummary,
             StreamSessionHandle, TerminateError,
         };
-        pub use scp_runtime::context::outlets::invoke::{
+        pub use scp_runtime_core::context::outlets::invoke::{
             MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
         };
         pub use scp_runtime_types::context::outlets::signer::{
@@ -170,7 +170,7 @@ pub mod context {
 
 pub mod trust {
     pub use scp_protocol::trust::*;
-    pub use scp_runtime::trust::ProtocolRepositoryTrustBridge;
+    pub use scp_runtime_core::trust::ProtocolRepositoryTrustBridge;
     // Re-export all submodule types at this level for backward compatibility.
     pub use scp_protocol::trust::admission::{
         AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
@@ -221,7 +221,7 @@ pub mod trust {
 
 pub mod identity {
     pub use scp_protocol::identity::*;
-    pub use scp_runtime::identity::recovery;
+    pub use scp_runtime_core::identity::recovery;
     pub use scp_runtime_types::identity::blocking;
     pub use scp_runtime_types::identity::custody_migration;
     pub use scp_runtime_types::identity::scpid;
@@ -273,19 +273,19 @@ pub mod envelope {
     pub use scp_runtime_types::envelope::pseudonym::derive_pseudonym;
     pub mod inner {
         pub use scp_protocol::envelope::inner::*;
-        pub use scp_runtime::envelope::inner::sign;
-        pub use scp_runtime::envelope::inner::sign::create_inner_envelope;
+        pub use scp_runtime_core::envelope::inner::sign;
+        pub use scp_runtime_core::envelope::inner::sign::create_inner_envelope;
     }
     pub mod outer {
         pub use scp_protocol::envelope::outer::*;
     }
-    pub use scp_runtime::envelope::inner::sign::create_inner_envelope;
+    pub use scp_runtime_core::envelope::inner::sign::create_inner_envelope;
 }
 
 pub mod sync {
     pub use scp_protocol::sync::*;
-    pub use scp_runtime::sync::days_offline;
-    pub use scp_runtime::sync::hours_offline;
+    pub use scp_runtime_core::sync::days_offline;
+    pub use scp_runtime_core::sync::hours_offline;
     pub use scp_runtime_types::sync::weeks_offline;
 }
 

@@ -33,18 +33,18 @@
 use std::sync::Arc;
 
 use scp_platform::in_memory::InMemoryStorage;
-use scp_runtime::context::supervisor::{RestoredContexts, Supervisor, SupervisorConfig};
+use scp_runtime_core::context::supervisor::{RestoredContexts, Supervisor, SupervisorConfig};
 use scp_runtime_types::context::supervisor::saga_journal::{
     JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
 };
 
 struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
+impl scp_runtime_core::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
-        _: &scp_runtime::context::state::ContextSnapshot,
+        _: &scp_runtime_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -52,7 +52,7 @@ impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
         &self,
         _: &str,
     ) -> Result<
-        Option<scp_runtime::context::state::ContextSnapshot>,
+        Option<scp_runtime_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -90,7 +90,7 @@ async fn inject(
 }
 
 fn build_supervisor(storage: &Arc<InMemoryStorage>) -> Supervisor {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(storage)));
@@ -248,7 +248,7 @@ async fn restore_on_startup_fails_closed_when_restore_leg_errors() {
     // Second "process": a fresh supervisor over the SAME durable storage with no
     // helper-side persistence provider, so the restore leg returns
     // `PersistenceFailed`.
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));

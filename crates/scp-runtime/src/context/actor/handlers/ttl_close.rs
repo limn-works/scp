@@ -1,5 +1,5 @@
 //! TTL-close handlers — see
-//! [`TtlCloseCommand`](crate::context::actor::commands::TtlCloseCommand)
+//! [`TtlCloseCommand`](scp_runtime_core::context::actor::commands::TtlCloseCommand)
 //! and spec §5.8.
 //!
 //! # Phase 2A — actor-shape dispatch
@@ -10,7 +10,7 @@
 //! actor-shape TTL-domain helpers). Phase 2A finalization deleted the
 //! supervisor-receiver shim — every command's target actor must be
 //! spawned before
-//! [`Supervisor::dispatch_ttl_close_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
+//! [`Supervisor::dispatch_ttl_close_command`](scp_runtime_core::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
 //! routes it here.
 //!
 //! # Timer ownership (ADR-049 Decision-1 / finding A3)
@@ -38,12 +38,12 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::commands::TtlCloseCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::TtlCloseCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`TtlCloseCommand`] against actor-owned state and deps.
 ///
@@ -52,7 +52,7 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 /// (`handlers::ttl_close::dispatch(&mut state, &deps, cmd).await`).
 /// Each variant routes through [`crate::context::ttl_close_helpers`]
 /// (the actor-shape TTL-domain helpers).
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: TtlCloseCommand,
@@ -97,11 +97,11 @@ pub(crate) async fn dispatch(
 fn handle_start_ttl_timer(
     cell: &mut ClassSCell,
     params: &scp_protocol::context::params::ContextParams,
-    deadline_override: Option<crate::context::supervisor::handle::ConvergentDeadline>,
+    deadline_override: Option<scp_runtime_core::context::supervisor::handle::ConvergentDeadline>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Resolve the ABSOLUTE convergent expiry deadline to record, as a
-    // [`ConvergentDeadline`](crate::context::supervisor::handle::ConvergentDeadline)
+    // [`ConvergentDeadline`](scp_runtime_core::context::supervisor::handle::ConvergentDeadline)
     // (the arming-seam newtype). `Some` is the explicit deadline supplied by the
     // restore/import paths — derived from the SINGLE authoritative source (the
     // log) via `convergent_ttl_deadline`, so a prior extension survives and a
@@ -113,7 +113,7 @@ fn handle_start_ttl_timer(
     // §9.9.3). `creation_timestamp_secs` is the authentic creator-assigned value
     // on every path (verbatim from the creator-signed snapshot on import).
     let deadline = deadline_override.or_else(|| {
-        crate::context::shared::ttl_close::convergent_ttl_deadline_secs(
+        scp_runtime_core::context::shared::ttl_close::convergent_ttl_deadline_secs(
             cell.creation_timestamp_secs,
             params.ttl.map(|ttl| ttl.as_secs()),
         )
@@ -226,7 +226,7 @@ async fn handle_reset_ttl_timer(
 /// version drives the actor's real `cell.handle` (a clone shares the same
 /// `Arc<ArcSwap<ContextState>>`), so the FFI path transitions and FAIL-CLOSED
 /// persists the actor's own terminal `Expired` state — the same SEC-1 treatment
-/// as [`on_ttl_tick`](crate::context::actor). No `transition_to(Active)`: the
+/// as [`on_ttl_tick`](scp_runtime_core::context::actor). No `transition_to(Active)`: the
 /// live actor is already `Active`, and `apply_ttl_terminal_transition` moves
 /// `Active`/`Expired` → `Expired`.
 ///
@@ -299,8 +299,8 @@ async fn handle_execute_ttl_close(
 ///
 /// No forced `transition_to(Closing)` on a detached handle: per the documented
 /// FFI contract the context must ALREADY be in `Closing` (a prior
-/// `close_context`), and [`crate::context::shared::ttl_close::finalize_close`](crate::context::shared::ttl_close::finalize_close) —
-/// via [`ttl::finalize_close`](crate::context::ttl::finalize_close) — performs
+/// `close_context`), and [`scp_runtime_core::context::shared::ttl_close::finalize_close`](scp_runtime_core::context::shared::ttl_close::finalize_close) —
+/// via [`ttl::finalize_close`](scp_runtime_core::context::ttl::finalize_close) — performs
 /// the `Closing → Closed` transition itself, returning `InvalidTransition` if
 /// the context is not in `Closing`, exactly the FFI error contract.
 /// `ttl::finalize_close` validates that transition BEFORE destroying any key
@@ -316,7 +316,8 @@ async fn handle_finalize_close(
     // so the `Closing → Closed` transition lands on the live context.
     let handle = cell.handle.clone();
 
-    let finalize_fut = crate::context::shared::ttl_close::finalize_close(cell, deps, &handle);
+    let finalize_fut =
+        scp_runtime_core::context::shared::ttl_close::finalize_close(cell, deps, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(attestation)) => {
@@ -377,29 +378,29 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
     }
 }
 
-/// The ttl-close domain's [`TtlCloseDomain`](crate::context::domains::TtlCloseDomain)
+/// The ttl-close domain's [`TtlCloseDomain`](scp_runtime_core::context::domains::TtlCloseDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct TtlClose;
 
 #[async_trait::async_trait]
-impl crate::context::domains::TtlCloseDomain for TtlClose {
+impl scp_runtime_core::context::domains::TtlCloseDomain for TtlClose {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::TtlCloseCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::TtlCloseCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn extend_ttl_deadline_and_record(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
         context_id_bytes: &[u8; 32],
         actor_did: &str,
         additional_secs: u64,
-        leaf: crate::context::shared::ttl_close::ExtensionLeaf,
+        leaf: scp_runtime_core::context::shared::ttl_close::ExtensionLeaf,
     ) -> Result<(), scp_protocol::context::ContextError> {
         crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
             cell,
@@ -414,19 +415,19 @@ impl crate::context::domains::TtlCloseDomain for TtlClose {
 
     async fn handle_ttl_expiry(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        handle: &crate::context::ContextHandle,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        handle: &scp_runtime_core::context::ContextHandle,
         prior_completed: u8,
-    ) -> crate::context::shared::ttl_close::TtlExpiryOutcome {
+    ) -> scp_runtime_core::context::shared::ttl_close::TtlExpiryOutcome {
         crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, handle, prior_completed)
             .await
     }
 
     async fn reset_ttl_timer(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         new_duration: std::time::Duration,
     ) -> Result<(), scp_protocol::context::ContextError> {
@@ -443,11 +444,11 @@ mod tests {
     use scp_did::DID;
     use tokio::sync::oneshot;
 
-    use crate::context::actor::class_s::ClassSCell;
-    use crate::context::actor::deps::ActorDeps;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::builder::ContextEventLogProvider;
-    use crate::context::providers::MerkleEventLogProvider;
+    use scp_runtime_core::context::actor::class_s::ClassSCell;
+    use scp_runtime_core::context::actor::deps::ActorDeps;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::builder::ContextEventLogProvider;
+    use scp_runtime_core::context::providers::MerkleEventLogProvider;
 
     const ADMIN: &str = "did:dht:z6MkTtlFinalizeAdmin";
     const CTX_BYTE: u8 = 0xfc;
@@ -455,15 +456,17 @@ mod tests {
     /// Builds a minimal `ActorDeps` with an in-memory Merkle event log so the
     /// real-handle `finalize_close` path can append its `ContextClosed` leaf.
     async fn build_deps() -> ActorDeps {
-        use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
+        use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            ADMIN.to_owned(),
-            Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                ADMIN.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<
@@ -486,7 +489,7 @@ mod tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
             .await
@@ -521,11 +524,11 @@ mod tests {
         // (a prior `close_context` drove `Active → Closing`).
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
         state
             .handle
-            .transition_to(&crate::context::ContextState::Closing)
+            .transition_to(&scp_protocol::context::ContextState::Closing)
             .unwrap();
 
         // The real-handle path appends a `ContextClosed` leaf; init the log so
@@ -547,7 +550,7 @@ mod tests {
         );
         assert_eq!(
             cell.handle.state(),
-            crate::context::ContextState::Closed,
+            scp_protocol::context::ContextState::Closed,
             "FinalizeClose MUST transition the actor's REAL handle to Closed \
              (pre-fix it mutated a detached throwaway and left the live handle \
              in Closing)"
@@ -590,11 +593,11 @@ mod tests {
         );
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
         state
             .handle
-            .transition_to(&crate::context::ContextState::Closing)
+            .transition_to(&scp_protocol::context::ContextState::Closing)
             .unwrap();
 
         deps.event_log
@@ -606,7 +609,7 @@ mod tests {
         let handle = cell.handle.clone();
 
         let attestation =
-            crate::context::shared::ttl_close::finalize_close(&mut cell, &deps, &handle)
+            scp_runtime_core::context::shared::ttl_close::finalize_close(&mut cell, &deps, &handle)
                 .await
                 .expect("finalize_close on a Closing Ephemeral context succeeds")
                 .expect("Ephemeral close with present crypto returns Some(attestation)");

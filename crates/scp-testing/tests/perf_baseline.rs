@@ -100,12 +100,12 @@ use scp_protocol::context::governance::GovernanceAction;
 use scp_protocol::context::params::{
     Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
 };
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::actor::CommandSigner;
-use scp_runtime::context::actor::commands::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::CommandSigner;
+use scp_runtime_core::context::actor::commands::{
     BroadcastCommand, PublishBroadcastPayload, SubscribeBroadcastPayload,
 };
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime_core::context::supervisor::Supervisor;
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 // ---------------------------------------------------------------------------
@@ -467,7 +467,7 @@ async fn deliver_instance(i: usize) -> Arc<DeliverInst> {
         .deliver_commit_blob(
             &ctx_id,
             probe,
-            scp_runtime::context::actor::commands::DeliveryMode::Live,
+            scp_runtime_core::context::actor::commands::DeliveryMode::Live,
         )
         .await
         .expect("probe deliver_commit_blob");
@@ -491,7 +491,7 @@ async fn op_deliver(inst: Arc<DeliverInst>, round: usize) -> Duration {
         .deliver_commit_blob(
             &inst.ctx_id,
             envelope,
-            scp_runtime::context::actor::commands::DeliveryMode::Live,
+            scp_runtime_core::context::actor::commands::DeliveryMode::Live,
         )
         .await
         .expect("deliver_commit_blob");

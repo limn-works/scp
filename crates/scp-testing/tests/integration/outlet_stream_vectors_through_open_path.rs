@@ -50,8 +50,8 @@ use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
-use scp_runtime::context::InvocationCaveatBinding;
-use scp_runtime::context::outlets::dispatch::{CancelIdentity, OpenStreamParams};
+use scp_runtime_core::context::InvocationCaveatBinding;
+use scp_runtime_core::context::outlets::dispatch::{CancelIdentity, OpenStreamParams};
 use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
 use scp_runtime_types::context::outlets::stream::{AdmissionCaps, StreamIdentity};
 
@@ -191,7 +191,7 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
     .expect("register conformance outlet");
 
     let (emit, terminal) = build_script(vec);
-    let executor: Arc<dyn scp_runtime::context::outlets::invoke::OutletExecutor> =
+    let executor: Arc<dyn scp_runtime_core::context::outlets::invoke::OutletExecutor> =
         Arc::new(ScriptedExecutor { emit, terminal });
 
     let params = OpenStreamParams {

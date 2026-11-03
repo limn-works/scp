@@ -1,5 +1,5 @@
 //! Outlets handlers — see
-//! [`OutletsCommand`](crate::context::actor::commands::OutletsCommand)
+//! [`OutletsCommand`](scp_runtime_core::context::actor::commands::OutletsCommand)
 //! and spec §19 (economic governance) / §19.7 (anti-spam cost
 //! escalation); hard rate limits §6.2.0.2.
 //!
@@ -14,16 +14,16 @@
 //! pipeline's non-`Send` executor runs supervisor-side between the
 //! [`OutletsCommand::ReserveOutletEconomy`] and [`OutletsCommand::SettleOutletEconomy`]
 //! mailbox round-trips (see
-//! [`crate::context::shared::outlets::invoke_outlet_with_economy`]).
+//! [`scp_runtime_core::context::shared::outlets::invoke_outlet_with_economy`]).
 //!
 //! The cross-context outlet invocation saga (§6.2.4) is produced directly by
-//! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga) — it does not
+//! [`Supervisor::start_cross_context_outlet_invocation_saga`](scp_runtime_core::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga) — it does not
 //! cross the actor mailbox: the FSM drives each phase supervisor-side and
 //! sends each phase to its own context's actor, carrying the
-//! [`SagaSigners`](crate::context::supervisor::SagaSigners) a phase signs
+//! [`SagaSigners`](scp_runtime_core::context::supervisor::SagaSigners) a phase signs
 //! with. A distinct constraint keeps the
 //! outlet-economy executor off the mailbox:
-//! [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
+//! [`Supervisor::invoke_outlet_with_economy`](scp_runtime_core::context::supervisor::Supervisor::invoke_outlet_with_economy)
 //! takes a generic non-`Send` executor closure that cannot cross the
 //! actor mailbox, so its economy bookkeeping is split into the
 //! [`OutletsCommand::ReserveOutletEconomy`] / [`OutletsCommand::SettleOutletEconomy`]
@@ -33,11 +33,11 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::actor::commands::OutletsCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
+use scp_runtime_core::context::actor::commands::OutletsCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`OutletsCommand`] against actor-owned state and
 /// capability-reduced dependencies.
@@ -46,8 +46,8 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
     reason = "a flat command-dispatch match — one arm per OutletsCommand variant; \
               splitting it would obscure the 1:1 variant→handler routing"
 )]
-pub(crate) async fn dispatch(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn dispatch(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: OutletsCommand,
 ) -> Outcome<()> {
@@ -236,7 +236,7 @@ pub(crate) async fn dispatch(
 /// refund attempt on a timed-out consume is unsafe. Surfacing the
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     did: &scp_did::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
@@ -282,7 +282,7 @@ async fn handle_try_consume_hard_rate_limit(
 /// [`outlets_helpers::refund_hard_rate_limit`](crate::context::outlets_helpers::refund_hard_rate_limit)
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     did: &scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -311,7 +311,7 @@ async fn handle_refund_hard_rate_limit(
 ///
 /// The actor-mailbox port of the reference
 /// `ContextManager::outlet_stream_reverse_spend`: the
-/// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+/// [`StreamEscrowTicket`](scp_runtime_core::context::outlets::dispatch::StreamEscrowTicket)
 /// Drop-guard runs supervisor-side (it cannot take `&mut` to actor-owned
 /// state), so its refund of a debited-but-never-settled hold routes here.
 /// Runs
@@ -319,12 +319,12 @@ async fn handle_refund_hard_rate_limit(
 /// — infallible / SATURATING at `0`, so a double-refund (a Drop after an
 /// explicit settlement already returned the hold) is a safe no-op — against the
 /// owned budget tracker under a fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep),
 /// so the returned budget survives a coalesce-window crash the same way the
 /// original debit does. Reverse never rejects; the reply carries only the
 /// persist / transport infrastructure outcome.
 async fn handle_reverse_stream_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &scp_did::DID,
@@ -386,17 +386,17 @@ async fn handle_reverse_stream_escrow(
 /// (possibly `None`) receipt. The helper never returns `Err` (a persist failure
 /// is KEEP'd + logged, service-rendered capture runs regardless).
 async fn handle_settle_outlet_stream(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+    settlement: Box<scp_runtime_core::context::outlets::invoke::StreamSettlement>,
     generation: u64,
     witness_saga_id: Option<scp_runtime_types::context::supervisor::saga_journal::SagaId>,
     reply: oneshot::Sender<
-        Result<crate::context::actor::commands::StreamSettleApplication, ContextError>,
+        Result<scp_runtime_core::context::actor::commands::StreamSettleApplication, ContextError>,
     >,
 ) -> Outcome<()> {
-    use crate::context::actor::commands::StreamSettleApplication;
     use crate::context::outlets_helpers::StreamSettleOutcome;
+    use scp_runtime_core::context::actor::commands::StreamSettleApplication;
     match crate::context::outlets_helpers::settle_outlet_stream(
         cell,
         deps,
@@ -448,16 +448,19 @@ async fn handle_settle_outlet_stream(
 /// `Send` reservation the supervisor carries across the executor.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_outlet_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_did::DID,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-    caveat_binding: Option<&crate::context::outlets::invoke::InvocationCaveatBinding>,
+    caveat_binding: Option<&scp_runtime_core::context::outlets::invoke::InvocationCaveatBinding>,
     input: &serde_json::Value,
     now_secs: u64,
     reply: oneshot::Sender<
-        Result<Box<crate::context::shared::outlets::OutletEconomyReservation>, ContextError>,
+        Result<
+            Box<scp_runtime_core::context::shared::outlets::OutletEconomyReservation>,
+            ContextError,
+        >,
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::outlets_helpers::reserve_outlet_economy(
@@ -498,11 +501,11 @@ async fn handle_reserve_outlet_economy(
 /// open-time economy reserve. Delegates to
 /// [`outlets_helpers::reserve_outlet_stream_economy`](crate::context::outlets_helpers::reserve_outlet_stream_economy)
 /// on owned state under a 30s timeout. On success replies with the `Send`
-/// [`StreamEconomyReservation`](crate::context::shared::outlets::StreamEconomyReservation)
+/// [`StreamEconomyReservation`](scp_runtime_core::context::shared::outlets::StreamEconomyReservation)
 /// the supervisor carries across the off-mailbox pump.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_outlet_stream_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_did::DID,
@@ -511,7 +514,10 @@ async fn handle_reserve_outlet_stream_economy(
     max_per_action: Option<scp_protocol::economy::types::Amount>,
     now_secs: u64,
     reply: oneshot::Sender<
-        Result<Box<crate::context::shared::outlets::StreamEconomyReservation>, ContextError>,
+        Result<
+            Box<scp_runtime_core::context::shared::outlets::StreamEconomyReservation>,
+            ContextError,
+        >,
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::outlets_helpers::reserve_outlet_stream_economy(
@@ -555,7 +561,7 @@ async fn handle_reserve_outlet_stream_economy(
 /// hold `Amount` the FFI bridge threads into `apply_credit_grant`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_stream_grant_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &scp_did::DID,
@@ -603,7 +609,7 @@ async fn handle_reserve_stream_grant_escrow(
 /// [`outlets_helpers::reverse_stream_grant_escrow`](crate::context::outlets_helpers::reverse_stream_grant_escrow)
 /// (CREDIT budget + un-bump the durable record atomically) under a 30s timeout.
 async fn handle_reverse_stream_grant_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &scp_did::DID,
@@ -642,21 +648,21 @@ async fn handle_reverse_stream_grant_escrow(
 /// Mirrors the unary `consume_caveat_counters` gate for ONE counter kind, but
 /// split across the mailbox: the supervisor-side stream pump cannot take `&mut`
 /// to actor-owned Class-S state, so its per-kind
-/// [`CaveatCounters::try_consume`](crate::trust::CaveatCounters::try_consume)
+/// [`CaveatCounters::try_consume`](scp_runtime_core::trust::CaveatCounters::try_consume)
 /// runs here on the owned record keyed by `ucan_cid`.
 ///
 /// The admission check runs on a CLONE first, so a rejection mutates nothing
 /// and performs NO persist (mirroring the unary "reject before persist"
 /// semantics — and avoiding a spurious durable write on a rate-limited open).
 /// Only an ADMITTED consume writes the mutated record back under a fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep)
 /// (durable via the ADR-049 §9 snapshot). The structured
-/// [`CounterExhausted`](crate::trust::CounterExhausted) is threaded through the
+/// [`CounterExhausted`](scp_runtime_core::trust::CounterExhausted) is threaded through the
 /// reply's inner `Result` so the pump can map the precise §7.3.8 slug; the
 /// outer `Result` carries only persist / transport infrastructure failures.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_stream_caveat_counter(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     ucan_cid: &str,
@@ -665,7 +671,9 @@ async fn handle_reserve_stream_caveat_counter(
     cap: u64,
     window_secs: u32,
     now_secs: u64,
-    reply: oneshot::Sender<Result<Result<(), crate::trust::CounterExhausted>, ContextError>>,
+    reply: oneshot::Sender<
+        Result<Result<(), scp_runtime_core::trust::CounterExhausted>, ContextError>,
+    >,
 ) -> Outcome<()> {
     // Phase 1 — pure admission on a clone. `try_consume` leaves the record
     // unchanged on exhaustion; consuming a clone means a rejection touches no
@@ -724,15 +732,15 @@ async fn handle_reserve_stream_caveat_counter(
 ///
 /// Returns the unspent portion of a stream's open-time reservation (SCP R4
 /// HIGH-1), or rolls back an earlier-kind increment when a later kind rejects
-/// the open. Runs [`CaveatCounters::release`](crate::trust::CaveatCounters::release)
+/// the open. Runs [`CaveatCounters::release`](scp_runtime_core::trust::CaveatCounters::release)
 /// — infallible / saturating at `0` — on the owned record keyed by `ucan_cid`
 /// under a fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep),
 /// so the returned capacity survives a coalesce-window crash the same way the
 /// original consume does. Release itself never rejects; the reply carries only
 /// the persist / transport infrastructure outcome.
 async fn handle_release_stream_caveat_counter(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     ucan_cid: &str,
@@ -774,20 +782,20 @@ async fn handle_release_stream_caveat_counter(
 /// crash-recovery record insert at pump open.
 ///
 /// Inserts the
-/// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+/// [`StreamReservationRecord`](scp_runtime_core::context::outlets::invoke::StreamReservationRecord)
 /// (keyed by the hex `request_id`) into the owned `ClassSState.stream_reservations`
 /// under a fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep)
 /// (durable via the ADR-049 §9 snapshot), stamping the record's `generation`
 /// with the live cell generation — the authoritative reservation generation,
 /// since this persist runs on the same instance the reserve did (absent a crash
 /// in between). The reply carries only the persist / transport infra outcome.
 async fn handle_persist_stream_reservation(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     request_id: scp_protocol::context::outlets::stream::RequestId,
-    record: Box<crate::context::outlets::invoke::StreamReservationRecord>,
+    record: Box<scp_runtime_core::context::outlets::invoke::StreamReservationRecord>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let key = hex::encode(request_id);
@@ -828,7 +836,7 @@ async fn handle_persist_stream_reservation(
 /// crash-recovery sweep.
 ///
 /// Drains `ClassSState.stream_reservations` under ONE fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep).
 /// For each unresolved record it REFUNDS the full `reserved_escrow` to the
 /// invoker's `MemberBudgetTracker` (`reverse_spend`, saturating) and RELEASES the
 /// full `amount_cumulative_reserved` back to the §7.3.8 `AmountCumulative` counter
@@ -843,7 +851,7 @@ async fn handle_persist_stream_reservation(
 /// idempotent across restarts: a persist failure re-runs from the restored
 /// record; a success removes it.
 async fn handle_reconcile_stream_reservations(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<usize, ContextError>>,
@@ -890,13 +898,13 @@ async fn handle_reconcile_stream_reservations(
 /// [`outlets_helpers::settle_outlet_economy`](crate::context::outlets_helpers::settle_outlet_economy)
 /// on owned state under a 30s timeout.
 async fn handle_settle_outlet_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_did::DID,
-    request: crate::context::shared::outlets::OutletSettleRequest,
+    request: scp_runtime_core::context::shared::outlets::OutletSettleRequest,
     reply: oneshot::Sender<
-        Result<crate::context::shared::outlets::OutletSettleOutcome, ContextError>,
+        Result<scp_runtime_core::context::shared::outlets::OutletSettleOutcome, ContextError>,
     >,
 ) -> Outcome<()> {
     let settle_fut = crate::context::outlets_helpers::settle_outlet_economy(
@@ -926,28 +934,28 @@ async fn handle_settle_outlet_economy(
     outcome
 }
 
-/// The outlets domain's [`OutletsDomain`](crate::context::domains::OutletsDomain)
+/// The outlets domain's [`OutletsDomain`](scp_runtime_core::context::domains::OutletsDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Outlets;
 
 #[async_trait::async_trait]
-impl crate::context::domains::OutletsDomain for Outlets {
+impl scp_runtime_core::context::domains::OutletsDomain for Outlets {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::OutletsCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::OutletsCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn reserve_outlet_economy(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        reserve: crate::context::domains::ReserveOutletEconomyRequest<'_>,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        reserve: scp_runtime_core::context::domains::ReserveOutletEconomyRequest<'_>,
     ) -> Result<
-        crate::context::shared::outlets::OutletEconomyReservation,
+        scp_runtime_core::context::shared::outlets::OutletEconomyReservation,
         scp_protocol::context::ContextError,
     > {
         crate::context::outlets_helpers::reserve_outlet_economy(
@@ -965,22 +973,22 @@ impl crate::context::domains::OutletsDomain for Outlets {
 
     async fn reverse_caller_reservation_record(
         &self,
-        view: crate::context::actor::class_s::ClassCMut<'_>,
-        deps: &crate::context::actor::deps::ActorDeps,
-        record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+        view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        record: &scp_runtime_core::context::supervisor::saga_prepared_state::CallerReservationRecord,
     ) -> bool {
         crate::context::outlets_helpers::reverse_caller_reservation_record(view, deps, record).await
     }
 
     async fn settle_outlet_economy(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         invoker_did: &scp_did::DID,
-        request: crate::context::shared::outlets::OutletSettleRequest,
+        request: scp_runtime_core::context::shared::outlets::OutletSettleRequest,
     ) -> Result<
-        crate::context::shared::outlets::OutletSettleOutcome,
+        scp_runtime_core::context::shared::outlets::OutletSettleOutcome,
         scp_protocol::context::ContextError,
     > {
         crate::context::outlets_helpers::settle_outlet_economy(

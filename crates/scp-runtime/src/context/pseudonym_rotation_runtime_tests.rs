@@ -32,13 +32,13 @@ use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextError, context_routing_id};
 use tokio::sync::broadcast;
 
-use crate::context::ContextHandle;
-use crate::context::actor::pseudonym_rotation::{LocalRoutingIds, RotationWake};
-use crate::context::actor::signer::CommandSigner;
-use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::persistence::ContextPersistence;
-use crate::context::state::ContextSnapshot;
-use crate::context::supervisor::supervisor::Supervisor;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::pseudonym_rotation::{LocalRoutingIds, RotationWake};
+use scp_runtime_core::context::actor::signer::CommandSigner;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::persistence::ContextPersistence;
+use scp_runtime_core::context::state::ContextSnapshot;
+use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
 type PersistErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -69,7 +69,7 @@ fn bob() -> DID {
 /// A canonical context ID: production IDs are 64 lowercase hex characters,
 /// which the actor keys its own writes by, so the fixture uses the same form.
 fn cid(name: &str) -> String {
-    hex::encode(crate::context::state::context_id_to_bytes(name))
+    hex::encode(scp_runtime_core::context::state::context_id_to_bytes(name))
 }
 
 fn interval_policy() -> PseudonymRotationPolicy {
@@ -260,10 +260,12 @@ fn mls_storage() -> Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::Ope
 }
 
 fn node_on(store: Arc<Store>, clock: Arc<TestClock>) -> Node {
-    let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-        LOCAL.to_owned(),
-        Arc::new(scp_clock::SystemClock),
-    ));
+    let crypto = Arc::new(
+        scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+            LOCAL.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ),
+    );
     let keys: HashMap<String, ed25519_dalek::VerifyingKey> = [
         (LOCAL.to_owned(), local_key().verifying_key()),
         (BOB.to_owned(), bob_key().verifying_key()),
@@ -557,16 +559,16 @@ async fn push_routing_ids_follow_a_rotation() {
 /// Records every push message the registrar publishes and accepts it.
 struct PushRecorder(tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>);
 
-impl crate::push::PushRelayPublisher for PushRecorder {
+impl scp_runtime_core::push::PushRelayPublisher for PushRecorder {
     fn publish<'a>(
         &'a self,
         relay_url: &'a str,
         _routing_id: [u8; 32],
         blob: Vec<u8>,
-    ) -> futures::future::BoxFuture<'a, Result<(), crate::push::PushPublishError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), scp_runtime_core::push::PushPublishError>> {
         let sent = self.0.send((relay_url.to_owned(), blob));
         Box::pin(async move {
-            sent.map_err(|_| crate::push::PushPublishError::Unreachable {
+            sent.map_err(|_| scp_runtime_core::push::PushPublishError::Unreachable {
                 reason: "test receiver closed".to_owned(),
             })
         })
@@ -602,18 +604,18 @@ async fn a_rotation_after_start_reregisters_once_with_the_new_routing_id() {
     )
     .await
     .expect("P-256 key");
-    let signing_key = crate::push::PushSigningKey::for_testing(local(), custody, handle)
+    let signing_key = scp_runtime_core::push::PushSigningKey::for_testing(local(), custody, handle)
         .await
         .expect("signing key");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let registrar = crate::push::PushRegistrar::new(crate::push::PushRegistrarConfig {
+    let registrar = scp_runtime_core::push::PushRegistrar::new(scp_runtime_core::push::PushRegistrarConfig {
         signing_key,
         publisher: Arc::new(PushRecorder(tx)),
         clock: Arc::clone(&n.clock) as Arc<dyn scp_clock::Clock>,
         monotonic_clock: Arc::new(scp_clock::SystemMonotonicClock::new()),
         platform: PushPlatform::Apns,
         token: scp_platform::PushToken::new(b"rotation-device-token".to_vec()),
-        storage: Arc::new(crate::store::ProtocolRepository::new_for_testing(
+        storage: Arc::new(scp_runtime_core::store::ProtocolRepository::new_for_testing(
             InMemoryStorage::new(),
         )),
     })
@@ -938,14 +940,18 @@ async fn a_failed_announcement_stays_pending_and_the_republish_clears_it() {
 
 /// Dispatches `SendPseudonymAnnouncement`, the bridge's re-publish path.
 async fn republish(supervisor: &Supervisor, handle: &ContextHandle) -> Result<(), ContextError> {
-    use crate::context::actor::commands::{MessagingCommand, SendPseudonymAnnouncementPayload};
+    use scp_runtime_core::context::actor::commands::{
+        MessagingCommand, SendPseudonymAnnouncementPayload,
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = MessagingCommand::SendPseudonymAnnouncement {
         payload: Box::new(SendPseudonymAnnouncementPayload {
             context_id: handle.context_id().to_owned(),
             params: handle.params().clone(),
             sender_did: local(),
-            signer: crate::context::actor::signer::CommandSigner::local_ed25519(local_key()),
+            signer: scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                local_key(),
+            ),
         }),
         reply: tx,
     };
@@ -1169,7 +1175,9 @@ async fn leave_close_and_expiry_discard_the_rotation_state() {
                     .await;
             }
             _ => {
-                use crate::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
+                use scp_runtime_core::context::actor::commands::{
+                    TtlCloseCommand, TtlContextPayload,
+                };
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 n.supervisor
                     .dispatch_ttl_close_command(TtlCloseCommand::ExecuteTtlClose {
@@ -1206,7 +1214,7 @@ async fn restart(from: &Node) -> Node {
     let restarted = node_on(from.store.copy(), Arc::clone(&from.clock));
     let ids = restarted
         .supervisor
-        .restore_all_contexts()
+        .restore_all_contexts_for_test()
         .await
         .expect("restore_all_contexts")
         .into_ids();

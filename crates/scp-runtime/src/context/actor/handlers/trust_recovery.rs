@@ -1,5 +1,5 @@
 //! Trust-recovery handlers — see
-//! [`TrustRecoveryCommand`](crate::context::actor::commands::TrustRecoveryCommand)
+//! [`TrustRecoveryCommand`](scp_runtime_core::context::actor::commands::TrustRecoveryCommand)
 //! and spec §9.12 / §23.17.
 //!
 //! # Phase 2A.1 — actor-shape dispatch
@@ -11,7 +11,7 @@
 //! `RecoveryNotifyContact` variant drives a shared-context scan and
 //! fan-out through the actor's `ActorDeps` bundle
 //! (see [`handle_recovery_notify_contact`]); the supervisor's
-//! [`dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
+//! [`dispatch_trust_recovery_command`](scp_runtime_core::context::supervisor::Supervisor::dispatch_trust_recovery_command)
 //! intercepts it and routes it through the supervisor-side
 //! `Supervisor::dispatch_trust_recovery_direct` before the
 //! per-context mailbox lookup, so the actor arm is the direct-path
@@ -27,16 +27,16 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::commands::{
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::{
     CreateGovernanceCheckpointPayload, RecoveryNotifyContactPayload,
     RecoverySendNotificationPayload, TrustRecoveryCommand,
 };
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`TrustRecoveryCommand`] against actor-owned state.
 ///
@@ -44,13 +44,13 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 ///
 /// `RecoveryNotifyContact` requires cross-context fan-out. The
 /// supervisor's
-/// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
+/// [`Supervisor::dispatch_trust_recovery_command`](scp_runtime_core::context::supervisor::Supervisor::dispatch_trust_recovery_command)
 /// intercepts it and routes it through the cross-context direct path
 /// before any per-context actor lookup; the arm here is the actor-shape
 /// twin that performs the same shared-context scan and fan-out via
 /// [`handle_recovery_notify_contact`] when a command does reach the
 /// mailbox.
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: TrustRecoveryCommand,
@@ -112,7 +112,7 @@ async fn handle_create_governance_checkpoint(
     // `async {}` so the 30s timeout still applies (event log pruning
     // could in principle do disk I/O via the provider).
     let create_fut = async {
-        crate::context::shared::trust_recovery::create_governance_checkpoint(
+        scp_runtime_core::context::shared::trust_recovery::create_governance_checkpoint(
             cell,
             deps,
             &p.context_id,
@@ -280,7 +280,7 @@ async fn handle_recovery_send_notification(
 
 /// Handle [`TrustRecoveryCommand::RecoveryNotifyContact`] — actor-
 /// shape entry. Cross-context fan-out: looks up the shared context
-/// via [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context)
+/// via [`SupervisorHandle::find_shared_context`](scp_runtime_core::context::supervisor::handle::SupervisorHandle::find_shared_context)
 /// and dispatches a `RecoverySendNotification` through the
 /// supervisor's mailbox-routing path. The actor that handles this
 /// command does not need to be a member of the shared context — any
@@ -349,18 +349,18 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
     }
 }
 
-/// The trust-recovery domain's [`TrustRecoveryDomain`](crate::context::domains::TrustRecoveryDomain)
+/// The trust-recovery domain's [`TrustRecoveryDomain`](scp_runtime_core::context::domains::TrustRecoveryDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct TrustRecovery;
 
 #[async_trait::async_trait]
-impl crate::context::domains::TrustRecoveryDomain for TrustRecovery {
+impl scp_runtime_core::context::domains::TrustRecoveryDomain for TrustRecovery {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::TrustRecoveryCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::TrustRecoveryCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 }

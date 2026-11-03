@@ -52,17 +52,17 @@ use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextError, ContextState};
 use scp_protocol::envelope::outer::BlobTtl;
 
-use crate::context::ContextHandle;
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::{DistributionFault, PerContextState};
-use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::lifecycle_helpers::drain_and_deliver_sender_keys;
-use crate::context::persistence::ContextPersistence;
-use crate::context::shared::lifecycle::DistributionScope;
-use crate::context::state::ContextSnapshot;
-use crate::context::supervisor::supervisor::Supervisor;
-use crate::crypto::mls::provider::{NodeMlsFactory, PendingDistribution};
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::{DistributionFault, PerContextState};
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::persistence::ContextPersistence;
+use scp_runtime_core::context::shared::lifecycle::DistributionScope;
+use scp_runtime_core::context::state::ContextSnapshot;
+use scp_runtime_core::context::supervisor::supervisor::Supervisor;
+use scp_runtime_core::crypto::mls::provider::{NodeMlsFactory, PendingDistribution};
 
 const ALICE: &str = "did:dht:z6MkAliceSenderKeyRequeueAliceSenderKeyRe1";
 const BOB: &str = "did:dht:z6MkBobSenderKeyRequeueBobSenderKeyRequeu1";
@@ -312,7 +312,7 @@ async fn alice_deps(
         crypto,
         Box::new(RelayTransport(Arc::clone(relay))),
         Box::new(OkEventLog),
-        crate::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
         Some(Box::new(SharedStore(Arc::clone(store)))),
         None,
         Some(event_tx),
@@ -353,11 +353,16 @@ fn activate(state: &mut PerContextState) {
 /// Alice, active, with one distribution of her sender key to Bob queued by the
 /// production `distribute_sender_key`, and the relay down.
 async fn alice_with_queued_distribution(ctx: &str) -> Alice {
-    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+    let scp_runtime_core::crypto::mls::two_party_test_support::TwoPartyPair {
         alice_provider,
         mut alice_state,
         ..
-    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    } = scp_runtime_core::crypto::mls::two_party_test_support::stand_up_two_party(
+        ctx,
+        ALICE,
+        BOB,
+        crate::domain_handlers(),
+    );
     let relay = Arc::new(Relay::default());
     relay.down.store(true, Ordering::SeqCst);
     let store = Arc::new(Store::default());
@@ -399,7 +404,7 @@ fn enqueue(
 ) {
     let mut view = cell.class_c_view();
     let crypto = view.mode_mut().crypto_mut().expect("encrypted");
-    crate::context::actor::state::ContextCryptoState::enqueue_distribution(
+    scp_runtime_core::context::actor::state::ContextCryptoState::enqueue_distribution(
         &mut crypto.pending_distributions,
         target.to_owned(),
         recipient_key.to_vec(),
@@ -444,12 +449,12 @@ const fn is_distribution_event(e: &ContextEvent) -> bool {
 async fn send_queued(
     alice: &mut Alice,
     ctx: &str,
-) -> Result<crate::context::actor::state::DistributionReport, ContextError> {
+) -> Result<scp_runtime_core::context::actor::state::DistributionReport, ContextError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _outcome = crate::context::actor::handlers::messaging::dispatch(
         &mut alice.cell,
         &alice.deps,
-        crate::context::actor::commands::MessagingCommand::SendQueuedSenderKeys {
+        scp_runtime_core::context::actor::commands::MessagingCommand::SendQueuedSenderKeys {
             context_id: ctx.to_owned(),
             reply: tx,
         },
@@ -490,9 +495,12 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     );
 
     // Persist exactly as the run loop does, then restore into a fresh actor.
-    let snapshot =
-        crate::context::snapshot::build_snapshot_for_persist(&alice.cell, &alice.deps, ctx)
-            .expect("snapshot");
+    let snapshot = scp_runtime_core::context::snapshot::build_snapshot_for_persist(
+        &alice.cell,
+        &alice.deps,
+        ctx,
+    )
+    .expect("snapshot");
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx);
     let (owned, _floors) =
         NodeMlsFactory::build_restored_owned(&ctx_bytes, &snapshot.mls_crypto_state.0)
@@ -707,8 +715,8 @@ async fn a_distribution_supersedes_the_one_queued_to_the_same_target_and_key() {
 }
 
 /// Builds and signs an inner envelope from Alice in `ctx` at `epoch`.
-fn alice_inner(ctx: &str, epoch: u64) -> crate::envelope::inner::InnerEnvelope {
-    let params = crate::envelope::inner::InnerEnvelopeParams {
+fn alice_inner(ctx: &str, epoch: u64) -> scp_runtime_core::envelope::inner::InnerEnvelope {
+    let params = scp_runtime_core::envelope::inner::InnerEnvelopeParams {
         version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
         context_id: ctx,
         sender_did: ALICE,
@@ -716,14 +724,14 @@ fn alice_inner(ctx: &str, epoch: u64) -> crate::envelope::inner::InnerEnvelope {
         generation: 0,
         sequence: 0,
         timestamp: T0,
-        message_type: crate::envelope::inner::MessageType::Content,
+        message_type: scp_runtime_core::envelope::inner::MessageType::Content,
         payload: b"hello",
         provenance: None,
         signing_key_id: scp_did::SigningKeyId::Active,
     };
-    crate::envelope::inner::sign::create_inner_envelope_raw(
+    scp_runtime_core::envelope::inner::sign::create_inner_envelope_raw(
         &params,
-        &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        &scp_runtime_core::crypto::mls::two_party_test_support::alice_signing_key(),
     )
     .expect("alice signs the inner envelope")
 }
@@ -830,7 +838,7 @@ fn bob_key_request(nonce: [u8; 16]) -> Vec<u8> {
         },
     )
     .expect("hash the request");
-    let signature = crate::crypto::mls::two_party_test_support::bob_signing_key()
+    let signature = scp_runtime_core::crypto::mls::two_party_test_support::bob_signing_key()
         .sign(&hash)
         .to_bytes();
     SenderKeyDistributionMessage::KeyRequest(SenderKeyRequest {
@@ -852,12 +860,17 @@ fn bob_key_request(nonce: [u8; 16]) -> Vec<u8> {
 #[tokio::test]
 async fn a_read_revoked_requester_gets_no_answer() {
     let ctx = "sender-key-requeue-read-revoked-request";
-    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+    let scp_runtime_core::crypto::mls::two_party_test_support::TwoPartyPair {
         alice_provider,
         mut alice_state,
         mut bob_state,
         ..
-    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    } = scp_runtime_core::crypto::mls::two_party_test_support::stand_up_two_party(
+        ctx,
+        ALICE,
+        BOB,
+        crate::domain_handlers(),
+    );
     let relay = Arc::new(Relay::default());
     let store = Arc::new(Store::default());
     let clock = Arc::new(TestClock::new(T0));
@@ -890,7 +903,7 @@ async fn a_read_revoked_requester_gets_no_answer() {
     .expect("the request is consumed");
     assert!(matches!(
         outcome,
-        crate::context::actor::commands::DeliverOutcome::Handled
+        scp_runtime_core::context::actor::commands::DeliverOutcome::Handled
     ));
     assert_eq!(
         answers_to_bob(&cell),
@@ -922,12 +935,17 @@ async fn a_read_revoked_requester_gets_no_answer() {
 #[tokio::test]
 async fn a_request_flood_keeps_one_answer_per_target_and_epoch() {
     let ctx = "sender-key-requeue-request-flood";
-    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+    let scp_runtime_core::crypto::mls::two_party_test_support::TwoPartyPair {
         alice_provider,
         mut alice_state,
         mut bob_state,
         ..
-    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    } = scp_runtime_core::crypto::mls::two_party_test_support::stand_up_two_party(
+        ctx,
+        ALICE,
+        BOB,
+        crate::domain_handlers(),
+    );
     let relay = Arc::new(Relay::default());
     let store = Arc::new(Store::default());
     let clock = Arc::new(TestClock::new(T0));
@@ -966,8 +984,8 @@ async fn a_request_flood_keeps_one_answer_per_target_and_epoch() {
 /// (spec 09 §9.16.9).
 #[test]
 fn a_push_supersedes_the_targets_answer_of_an_earlier_epoch() {
-    use crate::context::actor::state::ContextCryptoState;
-    use crate::crypto::mls::provider::DistributionKind;
+    use scp_runtime_core::context::actor::state::ContextCryptoState;
+    use scp_runtime_core::crypto::mls::provider::DistributionKind;
     let mut q = Vec::new();
     ContextCryptoState::enqueue_answer(&mut q, BOB.to_owned(), vec![1], 1, vec![0]);
     ContextCryptoState::enqueue_answer(&mut q, "did:dht:zCarol".to_owned(), vec![2], 1, vec![0]);
@@ -995,12 +1013,12 @@ mod operations {
     use scp_protocol::context::roles::Capability;
     use scp_protocol::context::{ContextMode, ContextParams};
 
-    use crate::context::ContextHandle;
-    use crate::context::actor::CommandSigner;
-    use crate::context::builder::NotConfiguredTransportProvider;
-    use crate::context::providers::event_log::MerkleEventLogProvider;
-    use crate::context::supervisor::supervisor::Supervisor;
-    use crate::crypto::mls::provider::NodeMlsFactory;
+    use scp_runtime_core::context::ContextHandle;
+    use scp_runtime_core::context::actor::CommandSigner;
+    use scp_runtime_core::context::builder::NotConfiguredTransportProvider;
+    use scp_runtime_core::context::providers::event_log::MerkleEventLogProvider;
+    use scp_runtime_core::context::supervisor::supervisor::Supervisor;
+    use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
     const ALICE: &str = "did:dht:z6MkAliceSenderKeyOpsAliceSenderKeyOpsAli1";
     const BOB: &str = "did:dht:z6MkBobSenderKeyOpsBobSenderKeyOpsBobSend1";
@@ -1260,9 +1278,9 @@ mod operations {
         let (tx, rx) = tokio::sync::oneshot::channel();
         node.sup
             .dispatch_governance_command(
-                crate::context::actor::commands::GovernanceCommand::ProposeGovernanceActionChecked {
+                scp_runtime_core::context::actor::commands::GovernanceCommand::ProposeGovernanceActionChecked {
                     payload: Box::new(
-                        crate::context::actor::commands::ProposeGovernanceActionPayload {
+                        scp_runtime_core::context::actor::commands::ProposeGovernanceActionPayload {
                             context_id: node.ctx.clone(),
                             proposer_did: DID::from(ALICE),
                             action: GovernanceAction::ResetMember {
@@ -1357,7 +1375,7 @@ mod operations {
                 &node.handle,
                 &DID::from(ALICE),
                 b"after the change",
-                crate::context::supervisor::MessageSigner::Active(&s),
+                scp_runtime_core::context::supervisor::MessageSigner::Active(&s),
                 None,
                 None,
             )

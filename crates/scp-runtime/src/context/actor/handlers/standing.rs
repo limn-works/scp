@@ -1,5 +1,5 @@
 //! Standing-pair handlers — see
-//! [`StandingCommand`](crate::context::actor::commands::StandingCommand)
+//! [`StandingCommand`](scp_runtime_core::context::actor::commands::StandingCommand)
 //! and spec §5.12.6 (contact graph) / §5.15.8 (standing-pair creation).
 //!
 //! # Phase 2A.2 — actor-shape dispatch
@@ -11,7 +11,7 @@
 //! (`dispatch_from_shim`); supervisor-scoped variants (count / has /
 //! register / reconnect-all) now route directly through
 //! `Supervisor::dispatch_standing_direct` in
-//! [`crate::context::supervisor::supervisor`].
+//! [`scp_runtime_core::context::supervisor::supervisor`].
 //!
 //! The `StandingContext` get-or-create variant is likewise
 //! supervisor-scoped: it always dispatches supervisor-direct through
@@ -23,11 +23,11 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::actor::commands::StandingCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::commands::StandingCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`StandingCommand`] against actor-owned state and
 /// capability-reduced dependencies.
@@ -203,17 +203,17 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
     }
 }
 
-/// The standing domain's [`StandingDomain`](crate::context::domains::StandingDomain)
+/// The standing domain's [`StandingDomain`](scp_runtime_core::context::domains::StandingDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Standing;
 
 #[async_trait::async_trait]
-impl crate::context::domains::StandingDomain for Standing {
+impl scp_runtime_core::context::domains::StandingDomain for Standing {
     async fn dispatch(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::StandingCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::StandingCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(deps, cmd).await
     }
 }

@@ -1,11 +1,11 @@
 //! Query handlers — pure-read surface over per-context state.
 //!
-//! See [`QueriesCommand`](crate::context::actor::commands::QueriesCommand)
+//! See [`QueriesCommand`](scp_runtime_core::context::actor::commands::QueriesCommand)
 //! for the full variant set. Every handler takes a borrowed actor-owned
-//! [`PerContextState`](crate::context::actor::state::PerContextState)
-//! plus the capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps),
+//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState)
+//! plus the capability-reduced [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps),
 //! and returns `Outcome { mutated: false }` by construction — the
-//! dispatch function uses [`Outcome::ok(())`](crate::context::actor::outcome::Outcome::ok)
+//! dispatch function uses [`Outcome::ok(())`](scp_runtime_core::context::actor::outcome::Outcome::ok)
 //! on every arm.
 //!
 //! # Single dispatch entry point
@@ -14,24 +14,24 @@
 //!   cmd)` and routes to the actor-shape helpers in
 //!   [`crate::context::queries_helpers`] which operate on
 //!   actor-owned `PerContextState` directly. The actor's
-//!   [`dispatch_state`](crate::context::actor::ContextActor::dispatch_state)
+//!   [`dispatch_state`](scp_runtime_core::context::actor::ContextActor::dispatch_state)
 //!   loop is the only production caller.
 //!
 //! The prior `dispatch_from_shim` entry point (locked legacy state +
 //! shared event-log provider) was deleted in the Phase 2A finalization
 //! queries+lifecycle session. Unknown-context routing now lands on
-//! [`Supervisor::dispatch_queries_direct`](crate::context::supervisor::supervisor::Supervisor)
+//! [`Supervisor::dispatch_queries_direct`](scp_runtime_core::context::supervisor::supervisor::Supervisor)
 //! which surfaces the variant's legacy default (or
 //! `ContextError::ContextNotRegistered` for the hard-error variants)
 //! directly on the reply oneshot.
 
 use scp_protocol::context::ContextError;
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::commands::QueriesCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
 use crate::context::queries_helpers;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::QueriesCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
 
 /// Actor-shape dispatch — routes a [`QueriesCommand`] against the
 /// actor's owned `&PerContextState` and `&ActorDeps`.
@@ -58,11 +58,7 @@ use crate::context::queries_helpers;
 /// lifecycle-state read is the lock-free `handle.state()` atomic load,
 /// which takes `&self`, so a shared borrow suffices.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_ref_mut)]
-pub(crate) async fn dispatch(
-    cell: &mut ClassSCell,
-    deps: &ActorDeps,
-    cmd: QueriesCommand,
-) -> Outcome<()> {
+pub async fn dispatch(cell: &mut ClassSCell, deps: &ActorDeps, cmd: QueriesCommand) -> Outcome<()> {
     let state = &**cell;
     match cmd {
         QueriesCommand::ReadContextState {
@@ -316,25 +312,25 @@ pub(crate) async fn dispatch(
     }
 }
 
-/// The queries domain's [`QueriesDomain`](crate::context::domains::QueriesDomain)
+/// The queries domain's [`QueriesDomain`](scp_runtime_core::context::domains::QueriesDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Queries;
 
 #[async_trait::async_trait]
-impl crate::context::domains::QueriesDomain for Queries {
+impl scp_runtime_core::context::domains::QueriesDomain for Queries {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::QueriesCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::QueriesCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     fn compare_remote_checkpoint(
         &self,
-        view: &mut crate::context::actor::class_s::ClassCMut<'_>,
-        deps: &crate::context::actor::deps::ActorDeps,
+        view: &mut scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     ) -> Result<scp_event_log::checkpoint::CheckpointComparison, scp_protocol::context::ContextError>

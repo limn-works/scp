@@ -72,7 +72,7 @@ use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::outlets::error_codes::{
     CODE_ECONOMIC_FAULT, SLUG_ECONOMIC_BUDGET_EXCEEDED,
 };
-use scp_runtime::context::actor::commands::QueriesCommand;
+use scp_runtime_core::context::actor::commands::QueriesCommand;
 
 // ---------------------------------------------------------------------------
 // Host construction — a real `Supervisor` over a concrete `NodeMlsFactory`.

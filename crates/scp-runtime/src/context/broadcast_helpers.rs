@@ -34,11 +34,11 @@ use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::signer::CommandSigner;
-use crate::context::actor::state::PerContextState;
-use crate::context::state::{context_id_to_bytes, require_active, strip_event_payload};
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::signer::CommandSigner;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::state::{context_id_to_bytes, require_active, strip_event_payload};
 
 // ---------------------------------------------------------------------------
 // subscribe_broadcast
@@ -158,7 +158,7 @@ where
     // copied by every member (§7.3.1, §9.9.3).
     deps.event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             subscriber_did.as_ref(),
@@ -244,7 +244,7 @@ pub async fn unsubscribe_broadcast(
     let unsub_ts = deps.clock.now_secs();
     deps.event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             subscriber_did.as_ref(),
@@ -287,7 +287,7 @@ pub async fn unsubscribe_broadcast(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
+                        scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         rotation.author_did.as_str(),
@@ -351,7 +351,7 @@ struct PendingBroadcastPublish {
 
 /// Publishes `payload` to the broadcast context in one actor turn: reserves
 /// the author's broadcast sequence, signs the broadcast signing payload
-/// through `signer` within [`SIGN_TIMEOUT`](crate::context::actor::signer::SIGN_TIMEOUT),
+/// through `signer` within [`SIGN_TIMEOUT`](scp_runtime_core::context::actor::signer::SIGN_TIMEOUT),
 /// seals, emits the local `MessageSent` event, and sends the envelope.
 ///
 /// Every error before the seal rolls the reserved sequence back, so a
@@ -707,7 +707,7 @@ pub async fn block_broadcast_subscriber(
     let block_ts = deps.clock.now_secs();
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberBlocked,
             author_did.as_ref(),
@@ -744,7 +744,7 @@ pub async fn block_broadcast_subscriber(
             if let Err(e) = deps
                 .event_log
                 .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
+                    scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                     &context_id_bytes,
                     scp_event_log::EventType::KeyEpochAdvance,
                     author_did.as_ref(),
@@ -832,7 +832,7 @@ pub async fn unblock_broadcast_subscriber(
 
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberUnblocked,
             author_did.as_ref(),
@@ -920,13 +920,16 @@ fn persist_state_best_effort<'d, 'c>(
     // Single source of truth: the canonical best-effort persist builds the
     // snapshot, exports the crypto state with the Supervisor's floors, and
     // persists nothing when the Supervisor has dropped.
-    crate::context::snapshot::persist_state_best_effort(state, deps, context_id)
+    scp_runtime_core::context::snapshot::persist_state_best_effort(state, deps, context_id)
 }
+
+#[cfg(test)]
+mod mailbox_tests;
 
 #[cfg(test)]
 mod broadcast_routing_tests {
     use super::broadcast_publish_routing_id;
-    use crate::context::state::context_id_to_bytes;
+    use scp_runtime_core::context::state::context_id_to_bytes;
 
     /// Regression guard (ADR-056 / spec §5.14.6): the broadcast publish path
     /// MUST address the relay under the broadcast ROUTING id

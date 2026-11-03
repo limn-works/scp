@@ -21,11 +21,6 @@
 //! timeouts are an ACTOR-OWNED interval arm — ADR-049 finding A3 — not a
 //! supervisor-spawned task.)
 
-use crate::context::actor::class_s::CommitBroadcastBorrows;
-use crate::context::shared::governance::conflicting_approved;
-use crate::context::shared::governance::{
-    BroadcastFailure, CommitMeta, MigrationBootstrap, check_commit_fault, migration_destination_id,
-};
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::broadcast::AuthorKeyRotation;
@@ -42,18 +37,23 @@ use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
+use scp_runtime_core::context::actor::class_s::CommitBroadcastBorrows;
+use scp_runtime_core::context::shared::governance::conflicting_approved;
+use scp_runtime_core::context::shared::governance::{
+    BroadcastFailure, CommitMeta, MigrationBootstrap, check_commit_fault, migration_destination_id,
+};
 use tracing::instrument;
 
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::signer::CommandSigner;
-use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
     enforce_triggered_consequences, event_log_entries_for_consequences,
     event_log_entries_for_consequences_after_side_effect,
 };
-use crate::context::shared::governance::EnforceConsequencesCtx;
-use crate::context::state::{
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::signer::CommandSigner;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::shared::governance::EnforceConsequencesCtx;
+use scp_runtime_core::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
@@ -204,7 +204,7 @@ pub fn migration_state(state: &PerContextState) -> Option<MigrationState> {
 ///   provider attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn tombstone_migrated_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
@@ -291,7 +291,7 @@ pub async fn tombstone_migrated_context(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextTombstoned,
             "system",
@@ -316,7 +316,7 @@ pub async fn tombstone_migrated_context(
 /// - [`ContextError::InvalidState`] if no fault marker is set.
 #[instrument(skip_all, fields(context_id))]
 pub fn acknowledge_commit_fault(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
 ) -> Result<CommitFaultMarker, ContextError> {
     // Clearing the commit-fault marker is a coalesced Class-C mutation (the
@@ -347,7 +347,7 @@ pub fn acknowledge_commit_fault(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn withdraw_governance_vote(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -376,7 +376,7 @@ pub async fn withdraw_governance_vote(
     for event in &events {
         deps.event_log
             .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
+                scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 governance_event_label(event),
                 voter_did.as_ref(),
@@ -413,7 +413,7 @@ pub async fn withdraw_governance_vote(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_ceiling_modification(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
@@ -462,7 +462,7 @@ pub async fn apply_pending_ceiling_modification(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::CeilingModified,
             "",
@@ -491,7 +491,7 @@ pub async fn apply_pending_ceiling_modification(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_economic_policy_change(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
@@ -519,7 +519,7 @@ pub async fn apply_pending_economic_policy_change(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyApplied,
             "",
@@ -541,7 +541,7 @@ pub async fn apply_pending_economic_policy_change(
 /// Detects and handles conflicts when a proposal becomes approved
 /// (ADR-031 §7).
 pub fn detect_and_handle_conflicts(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     new_proposal: &GovernanceProposal,
 ) -> Vec<GovernanceEvent> {
@@ -654,7 +654,10 @@ pub fn detect_and_handle_conflicts(
 
 /// Whether the standing governance freeze has passed its timeout at `now`
 /// (ADR-031 §7), so [`check_and_resolve_expired_freezes`] at `now` clears it.
-fn freeze_has_expired(cell: &crate::context::actor::class_s::ClassSCell, now: u64) -> bool {
+fn freeze_has_expired(
+    cell: &scp_runtime_core::context::actor::class_s::ClassSCell,
+    now: u64,
+) -> bool {
     cell.governance.freeze.is_some_and(|(_, _, freeze_start)| {
         now.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
     })
@@ -663,7 +666,7 @@ fn freeze_has_expired(cell: &crate::context::actor::class_s::ClassSCell, now: u6
 /// Checks for and resolves the governance freeze expired at `now` (ADR-031
 /// §7).
 pub fn check_and_resolve_expired_freezes(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     now: u64,
 ) -> Vec<GovernanceEvent> {
     if freeze_has_expired(cell, now)
@@ -732,7 +735,7 @@ fn fail_close_remove_member(
 
 /// Executes a `SuspendMember` governance action.
 pub async fn execute_suspend_member(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -786,7 +789,7 @@ pub async fn execute_suspend_member(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberSuspended,
             actor_did,
@@ -806,7 +809,7 @@ pub async fn execute_suspend_member(
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
 pub async fn execute_revoke(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -945,7 +948,7 @@ pub async fn execute_revoke(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AccessRevoked,
             actor_did,
@@ -999,7 +1002,7 @@ pub async fn execute_revoke(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
+                        scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         rotation.author_did.as_str(),
@@ -1051,7 +1054,7 @@ pub async fn execute_revoke(
 
 /// Executes a `RestoreAccess` governance action.
 pub async fn execute_restore_access(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1173,7 +1176,7 @@ pub async fn execute_restore_access(
 
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AccessRestored,
             actor_did,
@@ -1192,14 +1195,14 @@ pub async fn execute_restore_access(
 
 #[allow(clippy::too_many_lines)]
 pub async fn execute_add_member(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     role: &str,
     // The invitee's TLS-serialized MLS `KeyPackage`, carried on the actor
     // command envelope by the invitation-sealing caller
-    // ([`crate::context::supervisor::Supervisor::invite_member`]) and threaded
+    // ([`scp_runtime_core::context::supervisor::Supervisor::invite_member`]) and threaded
     // through the governance dispatch to here. `Some(..)` on the real
     // invitation path; `None` on the generic FFI `AddMember` arm, which never
     // carried a real add, where production `add_member` errors and
@@ -1273,7 +1276,7 @@ pub async fn execute_add_member(
     // matching the prior provider disposition; the error propagates unchanged.
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            crate::context::shared::lifecycle::add_member_and_queue_distribution(
+            scp_runtime_core::context::shared::lifecycle::add_member_and_queue_distribution(
                 v.rest_mut(),
                 deps,
                 did.as_ref(),
@@ -1408,7 +1411,7 @@ pub async fn execute_add_member(
                 deps,
                 &mut cell.class_c_view(),
                 context_id,
-                crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+                scp_runtime_core::context::shared::lifecycle::DistributionScope::NeverAttempted,
             )
             .await;
     }
@@ -1419,7 +1422,7 @@ pub async fn execute_add_member(
     // (§7.3.2) attributes the join interval to this subject.
     deps.event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             actor_did,
@@ -1443,7 +1446,7 @@ pub async fn execute_add_member(
 
 #[allow(clippy::too_many_lines)]
 pub async fn execute_remove_member(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1527,7 +1530,7 @@ pub async fn execute_remove_member(
             // which the rotate above advanced) in the authoritative floor registry
             // (fail-closed anti-replay backstop). Read-authority follows
             // write-authority.
-            crate::context::shared::messaging::mirror_forward_local_sender_epoch(
+            scp_runtime_core::context::shared::messaging::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
                 state.local_sender_key_epoch(),
@@ -1538,7 +1541,7 @@ pub async fn execute_remove_member(
             // inside this fail-closed persist (ADR-049 §9).
             state.remove_member_state(context_id, did);
             // §9.10.4.1 membership trigger, persisted with the removal.
-            crate::context::actor::pseudonym_rotation::note_member_removed(
+            scp_runtime_core::context::actor::pseudonym_rotation::note_member_removed(
                 state,
                 deps.crypto.local_did(),
                 did.as_ref(),
@@ -1596,7 +1599,7 @@ pub async fn execute_remove_member(
                 deps,
                 &mut cell.class_c_view(),
                 context_id,
-                crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+                scp_runtime_core::context::shared::lifecycle::DistributionScope::NeverAttempted,
             )
             .await;
     }
@@ -1607,7 +1610,7 @@ pub async fn execute_remove_member(
     // attributes the leave interval to this subject.
     deps.event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             actor_did,
@@ -1627,7 +1630,7 @@ pub async fn execute_remove_member(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_change_role(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1673,7 +1676,7 @@ pub async fn execute_change_role(
     // subject.
     deps.event_log
         .append_role_assigned_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             actor_did,
             did.as_ref(),
@@ -1690,7 +1693,7 @@ pub async fn execute_change_role(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_register_outlet(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     registration: &OutletRegistration,
@@ -1787,7 +1790,7 @@ pub async fn execute_register_outlet(
     })?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletRegistered,
             actor_did,
@@ -1804,7 +1807,7 @@ pub async fn execute_register_outlet(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_remove_outlet(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     outlet_id: &str,
@@ -1852,7 +1855,7 @@ pub async fn execute_remove_outlet(
     })?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletRemoved,
             actor_did,
@@ -1869,7 +1872,7 @@ pub async fn execute_remove_outlet(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_ceiling(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_ceiling: &[Capability],
@@ -1971,7 +1974,7 @@ pub async fn execute_modify_ceiling(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::CeilingModificationPending,
             actor_did,
@@ -1992,7 +1995,7 @@ pub async fn execute_modify_ceiling(
 // ADR-049 Decision 7 (async-provider-trait conversion).
 #[allow(clippy::unused_async)]
 pub async fn execute_close_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _reason: Option<&str>,
@@ -2042,7 +2045,7 @@ pub async fn execute_close_context(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextClosing,
             actor_did,
@@ -2062,7 +2065,7 @@ pub async fn execute_close_context(
 /// override per ADR-031 §4d and spec §5.10.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_extend_ttl(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     additional_secs: u64,
@@ -2105,7 +2108,7 @@ pub async fn execute_extend_ttl(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
         deps.event_log
             .append_context_event_with_payload(
-                crate::context::builder::AppendMode::AfterSideEffect,
+                scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 scp_event_log::EventType::TtlExtensionRejected,
                 actor_did,
@@ -2167,7 +2170,7 @@ pub async fn execute_extend_ttl(
             &context_id_bytes,
             actor_did,
             additional_secs,
-            crate::context::shared::ttl_close::ExtensionLeaf::Governance {
+            scp_runtime_core::context::shared::ttl_close::ExtensionLeaf::Governance {
                 proposal_id,
                 committer_timestamp_secs: timestamp_secs,
                 consenting_members: consenting,
@@ -2175,7 +2178,7 @@ pub async fn execute_extend_ttl(
         )
         .await?;
 
-    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
+    scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
     Ok(())
 }
 
@@ -2184,7 +2187,7 @@ pub async fn execute_extend_ttl(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_transfer_admin(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_admin: &DID,
@@ -2239,7 +2242,7 @@ pub async fn execute_transfer_admin(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AdminTransferred,
             actor_did,
@@ -2255,7 +2258,7 @@ pub async fn execute_transfer_admin(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_create_child_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _params: &ContextParams,
@@ -2285,7 +2288,7 @@ pub async fn execute_create_child_context(
 
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ChildContextCreated,
             actor_did,
@@ -2301,7 +2304,7 @@ pub async fn execute_create_child_context(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_pruning_policy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_policy: &PruningPolicy,
@@ -2362,7 +2365,7 @@ pub async fn execute_modify_pruning_policy(
     .await;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::PruningPolicyModified,
             actor_did,
@@ -2378,7 +2381,7 @@ pub async fn execute_modify_pruning_policy(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_add_signer(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -2449,7 +2452,7 @@ pub async fn execute_add_signer(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SignerAdded,
             actor_did,
@@ -2465,7 +2468,7 @@ pub async fn execute_add_signer(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_remove_signer(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -2533,7 +2536,7 @@ pub async fn execute_remove_signer(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SignerRemoved,
             actor_did,
@@ -2549,7 +2552,7 @@ pub async fn execute_remove_signer(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_threshold(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_threshold: u32,
@@ -2583,7 +2586,7 @@ pub async fn execute_modify_threshold(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ThresholdModified,
             actor_did,
@@ -2599,7 +2602,7 @@ pub async fn execute_modify_threshold(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_establish_outlet_interface(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     interface: &OutletInterface,
@@ -2641,7 +2644,7 @@ pub async fn execute_establish_outlet_interface(
     .await;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletInterfaceEstablished,
             actor_did,
@@ -2661,7 +2664,7 @@ pub async fn execute_establish_outlet_interface(
     reason = "single-pipeline member-reset orchestration (one remove-and-add Commit, broadcast, rotate, drain)"
 )]
 pub async fn execute_reset_member(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -2781,7 +2784,7 @@ pub async fn execute_reset_member(
 
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberReset,
             actor_did,
@@ -2812,7 +2815,7 @@ pub async fn execute_reset_member(
 )]
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_resolve_conflict(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_a: &ProposalId,
@@ -2920,7 +2923,7 @@ pub async fn execute_resolve_conflict(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceConflictResolved,
             actor_did,
@@ -2936,7 +2939,7 @@ pub async fn execute_resolve_conflict(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_promote_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     approvals: &[scp_protocol::context::governance::SignedVote],
@@ -3010,7 +3013,7 @@ pub async fn execute_promote_context(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextPromoted,
             actor_did,
@@ -3027,7 +3030,7 @@ pub async fn execute_promote_context(
 
 #[allow(clippy::too_many_lines)]
 pub async fn execute_rotate_content_keys(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reason: Option<&str>,
@@ -3149,7 +3152,7 @@ pub async fn execute_rotate_content_keys(
 
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContentKeysRotated,
             actor_did,
@@ -3204,7 +3207,7 @@ pub async fn execute_rotate_content_keys(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
+                        scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         advance.author_did.as_str(),
@@ -3250,7 +3253,7 @@ pub async fn execute_rotate_content_keys(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_reconfigure_governance(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
@@ -3327,7 +3330,7 @@ pub async fn execute_reconfigure_governance(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceReconfigured,
             actor_did,
@@ -3367,7 +3370,7 @@ pub async fn execute_reconfigure_governance(
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceDeadlockRecovery,
             actor_did,
@@ -3384,7 +3387,7 @@ pub async fn execute_reconfigure_governance(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_set_economic_policy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     policy: &EconomicPolicy,
@@ -3470,7 +3473,7 @@ pub async fn execute_set_economic_policy(
     .await;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyChanged,
             actor_did,
@@ -3487,7 +3490,7 @@ pub async fn execute_set_economic_policy(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_approve_spend(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     spender: &DID,
@@ -3527,7 +3530,7 @@ pub async fn execute_approve_spend(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SpendApproved,
             actor_did,
@@ -3551,7 +3554,7 @@ pub async fn execute_approve_spend(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_lock_economic_policy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     meta: CommitMeta<'_>,
@@ -3593,7 +3596,7 @@ pub async fn execute_lock_economic_policy(
     .await;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyLocked,
             actor_did,
@@ -3609,7 +3612,7 @@ pub async fn execute_lock_economic_policy(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_hard_rate_limit(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
@@ -3659,7 +3662,7 @@ pub async fn execute_modify_hard_rate_limit(
     .await;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::HardRateLimitModified,
             actor_did,
@@ -3696,7 +3699,7 @@ pub async fn execute_modify_hard_rate_limit(
 /// [`ContextError::ContextNotActive`] for a context that is not `Active`, or
 /// [`ContextError::PersistenceFailed`] when the persist fails.
 pub async fn execute_modify_capability_requirements(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     requirements: &scp_protocol::trust::CapabilityRequirements,
@@ -3708,16 +3711,18 @@ pub async fn execute_modify_capability_requirements(
         timestamp_secs: _,
     } = meta;
     require_active(&cell.handle)?;
-    let replace = |mut view: crate::context::actor::class_s::ClassSMut| {
+    let replace = |mut view: scp_runtime_core::context::actor::class_s::ClassSMut| {
         view.governance_class_s_mut().capability_requirements =
-            crate::context::state::Replicated::Live(requirements.clone());
+            scp_runtime_core::context::state::Replicated::Live(requirements.clone());
         Ok::<(), ContextError>(())
     };
     // A joiner awaiting the live list has no old list to tighten, so its
     // first replacement commits restore-direction.
     let tightens = match &cell.governance.class_s.capability_requirements {
-        crate::context::state::Replicated::Live(old) => requirements.is_tightening_of(old),
-        crate::context::state::Replicated::AwaitingReplication => false,
+        scp_runtime_core::context::state::Replicated::Live(old) => {
+            requirements.is_tightening_of(old)
+        }
+        scp_runtime_core::context::state::Replicated::AwaitingReplication => false,
     };
     if tightens {
         cell.commit_class_s_keep(deps, context_id, replace).await
@@ -3741,7 +3746,7 @@ pub async fn execute_modify_capability_requirements(
 /// - The persist error of `commit_class_s_keep`, and the event-log append
 ///   error.
 pub async fn execute_modify_pseudonym_rotation_policy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_policy: Option<scp_protocol::context::params::PseudonymRotationPolicy>,
@@ -3786,7 +3791,7 @@ pub async fn execute_modify_pseudonym_rotation_policy(
     .await?;
     deps.event_log
         .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::PseudonymRotationPolicyModified,
             actor_did,
@@ -3816,7 +3821,7 @@ pub async fn execute_modify_pseudonym_rotation_policy(
 /// spawned actor's `.run()` future be provably `Send`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn execute_propose_context_migration<'a>(
-    cell: &'a mut crate::context::actor::class_s::ClassSCell,
+    cell: &'a mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &'a ActorDeps,
     context_id: &'a str,
     new_context_params: &'a scp_protocol::context::params::ContextParams,
@@ -3938,7 +3943,7 @@ pub fn execute_propose_context_migration<'a>(
         // `Supervisor::spawn_actor_with_state`.
         let create_fut = deps.domains.lifecycle.create_context(
             deps,
-            crate::context::domains::CreateContextRequest {
+            scp_runtime_core::context::domains::CreateContextRequest {
                 context_id: destination_context_id.clone(),
                 params: dest_params,
                 creator_did: creator,
@@ -3971,7 +3976,7 @@ pub fn execute_propose_context_migration<'a>(
                     .rollback_with_guard(bootstrap_guard)
                     .await
                     .map_err(|rollback| {
-                        crate::context::shared::lifecycle::fold_rollback_failure(
+                        scp_runtime_core::context::shared::lifecycle::fold_rollback_failure(
                             &format!("failed to create destination context: {e}"),
                             &rollback,
                         )
@@ -4019,10 +4024,11 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
+        scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, context_id)
+            .await;
         deps.event_log
             .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
+                scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 scp_event_log::EventType::ContextMigrationStarted,
                 actor_did,
@@ -4048,7 +4054,7 @@ pub fn execute_propose_context_migration<'a>(
 // ADR-049 Decision 7 (async-provider-trait conversion).
 #[allow(clippy::unused_async)]
 pub async fn execute_cancel_context_migration(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     meta: CommitMeta<'_>,
@@ -4096,7 +4102,7 @@ pub async fn execute_cancel_context_migration(
         original_proposal_id
     };
 
-    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
+    scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
     let cancel_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::ContextMigrationCancelledPayload {
             original_proposal_id,
@@ -4105,7 +4111,7 @@ pub async fn execute_cancel_context_migration(
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextMigrationCancelled,
             actor_did,
@@ -4136,7 +4142,7 @@ pub async fn execute_cancel_context_migration(
 /// submission (actor-owned state — no TOCTOU window).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn propose_governance_action_inner(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -4235,9 +4241,9 @@ pub async fn propose_governance_action_inner(
         _ => None,
     };
     if let Some(Err(rejection)) = proposed_params.map(|params| {
-        crate::context::params_validation::validate_params(
+        scp_runtime_core::context::params_validation::validate_params(
             params,
-            crate::context::params_validation::ParamsOrigin::Creation,
+            scp_runtime_core::context::params_validation::ParamsOrigin::Creation,
         )
     }) {
         cell.governance
@@ -4312,7 +4318,7 @@ pub async fn propose_governance_action_inner(
             if let GovernanceEvent::ConflictResolved { .. } = event {
                 deps.event_log
                     .append_context_event(
-                        crate::context::builder::AppendMode::AfterSideEffect,
+                        scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                         &cid_bytes,
                         scp_event_log::EventType::GovernanceFreezeExpired,
                         proposer_did.as_ref(),
@@ -4361,7 +4367,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log
                         .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
+                            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictDetected,
                             proposer_did.as_ref(),
@@ -4376,7 +4382,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log
                         .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
+                            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictResolved,
                             proposer_did.as_ref(),
@@ -4419,7 +4425,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
+    scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -4429,10 +4435,10 @@ pub async fn propose_governance_action_inner(
 /// bypass, participation-threshold gate, and earned-capacity rate limit.
 #[allow(clippy::too_many_lines)]
 fn actor_check_proposer_eligibility(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     proposer_did: &DID,
     now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
 ) -> Result<(), ContextError> {
     use scp_protocol::context::params::GovernanceModel;
     use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
@@ -4524,7 +4530,7 @@ fn actor_check_proposer_eligibility(
 
     // Earned capacity enforcement (§9.3).
     if let Some(sybil_policy) = cell.handle.params().sybil_policy.as_ref() {
-        let assessment = crate::context::shared::lifecycle::build_identity_assessment(
+        let assessment = scp_runtime_core::context::shared::lifecycle::build_identity_assessment(
             proposer_did,
             &cell.governance,
             now,
@@ -4581,7 +4587,7 @@ fn actor_check_proposer_eligibility(
 /// path as the proposal submission (no TOCTOU).
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action_checked(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -4622,7 +4628,7 @@ pub async fn propose_governance_action_checked(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal_inner(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -4769,7 +4775,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log
                         .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
+                            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictDetected,
                             voter_did.as_ref(),
@@ -4781,7 +4787,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log
                         .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
+                            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictResolved,
                             voter_did.as_ref(),
@@ -4833,7 +4839,7 @@ pub async fn vote_on_proposal_inner(
         drop(bootstrap);
     }
 
-    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
+    scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -4855,7 +4861,7 @@ pub async fn vote_on_proposal_inner(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn approve_governance_proposal(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -4885,7 +4891,7 @@ pub async fn approve_governance_proposal(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn reject_governance_proposal(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -4914,7 +4920,7 @@ pub async fn reject_governance_proposal(
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_content_governance_action(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -5127,7 +5133,7 @@ pub async fn dispatch_content_governance_action(
 /// methods, returning typed [`GovernanceActionResult`] variants.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_context_governance_action(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -5414,7 +5420,7 @@ pub async fn dispatch_context_governance_action(
 /// its executor unless its RFC 8785 bytes hashed to the proposal's id first.
 #[allow(clippy::too_many_lines)]
 async fn dispatch_governance_action(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     // The checked proposal and its committing member (quorum-crossing voter,
@@ -5505,7 +5511,7 @@ async fn dispatch_governance_action(
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log
                 .append_context_event(
-                    crate::context::builder::AppendMode::AfterSideEffect,
+                    scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                     &context_id_bytes,
                     scp_event_log::EventType::MemberSuspendedAll,
                     actor,
@@ -5846,7 +5852,7 @@ async fn finalize_governance_action(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             governance_event_label(&executed_event),
             executor_did.as_ref(),
@@ -5949,8 +5955,9 @@ async fn finalize_governance_action(
             // FAIL-CLOSED persist of the post-finalize state (keep-direction). So an
             // armed sink here is REDUNDANT — it is subsumed by the caller's
             // discharge (no second persist) below.
-            let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
-                None;
+            let mut downward_auth_sink: Option<
+                scp_runtime_core::context::actor::class_s::ClassSCommitToken,
+            > = None;
             let mut split = ConsequenceStateSplit::from_state(state);
             let _ = enforce_triggered_consequences(
                 &mut split,
@@ -6059,7 +6066,7 @@ async fn finalize_governance_action(
 #[allow(clippy::significant_drop_tightening)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn execute_governance_action(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     // Identifier of the proposal to execute. The authoritative proposal is
@@ -6309,7 +6316,7 @@ pub async fn execute_governance_action(
 /// A persist failure of the removal is returned in place of the refusal,
 /// because the caller must learn that the removal is not durable.
 async fn refuse_unexecutable_proposal(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
@@ -6373,8 +6380,8 @@ async fn refuse_unexecutable_proposal(
 /// dispatch error is the one returned; `persist_snapshot_fail_closed` logs the
 /// same failure at its own site.
 async fn discharge_and_order_governance_action(
-    token: crate::context::actor::class_s::ClassSCommitToken,
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    token: scp_runtime_core::context::actor::class_s::ClassSCommitToken,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     executed: ExecutedProposal<'_>,
@@ -6516,7 +6523,7 @@ const _: () = assert!(
 /// callers treat it as a failed attempt, so the Commit stays queued and the
 /// context fails closed once the retry budget runs out.
 pub(super) async fn publish_commit(
-    transport: &dyn crate::context::builder::ContextTransportProvider,
+    transport: &dyn scp_runtime_core::context::builder::ContextTransportProvider,
     routing_id: [u8; 32],
     commit: &[u8],
     ttl: scp_protocol::envelope::outer::BlobTtl,
@@ -6601,7 +6608,7 @@ pub fn apply_broadcast_failure(
 }
 
 /// Applies a failed MLS-Commit broadcast's retry-queue bookkeeping FAIL-CLOSED,
-/// inside a second [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// inside a second [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep)
 /// so it survives a crash before the actor's ≤50 ms coalesced persist tick.
 ///
 /// The single call the safety-gated commit-broadcast sites —
@@ -6631,7 +6638,7 @@ pub fn apply_broadcast_failure(
 /// the helper is not FFI-exported (reconciled via the cross-layer PR-body marker,
 /// like the sibling async transport helpers).
 pub async fn keep_broadcast_failure(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     failure: BroadcastFailure,
@@ -6649,7 +6656,7 @@ pub async fn keep_broadcast_failure(
 //
 // These are the non-legacy replacements for the `_legacy` sweep helpers
 // in `governance_helpers_legacy.rs`. Each iterates
-// [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+// [`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids)
 // (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
 // and dispatches one typed sweep command per actor via the per-actor
 // mailbox.
@@ -6671,7 +6678,7 @@ pub async fn keep_broadcast_failure(
 /// Relocates the legacy `evaluate_periodic_consequences_legacy` off
 /// the `Supervisor::contexts` `DashMap` (now deleted). Iterates the
 /// actor registry and dispatches one
-/// [`GovernanceCommand::EvaluatePeriodicConsequences`](crate::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences)
+/// [`GovernanceCommand::EvaluatePeriodicConsequences`](scp_runtime_core::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences)
 /// per actor.
 ///
 /// Best-effort: if an actor's mailbox is closed mid-sweep (actor has
@@ -6691,8 +6698,10 @@ pub async fn keep_broadcast_failure(
     reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
               the per-actor variant is wired through the timer task today"
 )]
-pub async fn evaluate_periodic_consequences(supervisor: &crate::context::supervisor::Supervisor) {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+pub async fn evaluate_periodic_consequences(
+    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
+) {
+    use scp_runtime_core::context::actor::commands::{ContextCommand, GovernanceCommand};
 
     for ctx_id in supervisor.actor_ids() {
         let Some(actor) = supervisor.lookup(&ctx_id) else {
@@ -6703,7 +6712,7 @@ pub async fn evaluate_periodic_consequences(supervisor: &crate::context::supervi
             reply: tx,
         });
         if actor
-            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
             .await
             .is_err()
         {
@@ -6722,7 +6731,7 @@ pub async fn evaluate_periodic_consequences(supervisor: &crate::context::supervi
 /// Relocates the legacy `process_pending_commits_legacy` off the
 /// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
 /// registry and dispatches one
-/// [`GovernanceCommand::ProcessPendingCommits`](crate::context::actor::commands::GovernanceCommand::ProcessPendingCommits)
+/// [`GovernanceCommand::ProcessPendingCommits`](scp_runtime_core::context::actor::commands::GovernanceCommand::ProcessPendingCommits)
 /// per actor.
 ///
 /// First bulk-iterator caller lands in Phase 2B per ADR-049 — see
@@ -6733,8 +6742,10 @@ pub async fn evaluate_periodic_consequences(supervisor: &crate::context::supervi
     reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
               the per-actor variant is wired through the timer task today"
 )]
-pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Supervisor) {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+pub async fn process_pending_commits(
+    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
+) {
+    use scp_runtime_core::context::actor::commands::{ContextCommand, GovernanceCommand};
 
     for ctx_id in supervisor.actor_ids() {
         let Some(actor) = supervisor.lookup(&ctx_id) else {
@@ -6744,7 +6755,7 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
         let cmd =
             ContextCommand::Governance(GovernanceCommand::ProcessPendingCommits { reply: tx });
         if actor
-            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
             .await
             .is_err()
         {
@@ -6833,6 +6844,9 @@ pub fn translate_timeout_events(
 }
 
 #[cfg(test)]
+mod class_s_tests;
+
+#[cfg(test)]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -6890,13 +6904,13 @@ mod commit_broadcast_retry_tests {
     use scp_protocol::context::{ContextError, ContextParams};
 
     use super::{apply_broadcast_failure, keep_broadcast_failure, try_broadcast_commit};
-    use crate::context::actor::class_s::ClassSCell;
-    use crate::context::actor::class_s::CommitBroadcastBorrows;
-    use crate::context::actor::deps::ActorDeps;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-    use crate::context::persistence::ContextPersistence;
-    use crate::context::state::{
+    use scp_runtime_core::context::actor::class_s::ClassSCell;
+    use scp_runtime_core::context::actor::class_s::CommitBroadcastBorrows;
+    use scp_runtime_core::context::actor::deps::ActorDeps;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use scp_runtime_core::context::persistence::ContextPersistence;
+    use scp_runtime_core::context::state::{
         CommitFaultMarker, CommitOperation, MAX_PENDING_COMMITS, PendingCommit,
     };
 
@@ -6986,14 +7000,14 @@ mod commit_broadcast_retry_tests {
     /// merely that a persist happened).
     struct CountingOkPersistence {
         persists: Arc<AtomicUsize>,
-        last_snapshot: Arc<Mutex<Option<crate::context::state::ContextSnapshot>>>,
+        last_snapshot: Arc<Mutex<Option<scp_runtime_core::context::state::ContextSnapshot>>>,
     }
     #[async_trait::async_trait]
     impl ContextPersistence for CountingOkPersistence {
         async fn persist_context(
             &self,
             _: &str,
-            snapshot: &crate::context::state::ContextSnapshot,
+            snapshot: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.persists.fetch_add(1, Ordering::SeqCst);
             *self.last_snapshot.lock().unwrap() = Some(snapshot.clone());
@@ -7003,7 +7017,7 @@ mod commit_broadcast_retry_tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -7028,7 +7042,7 @@ mod commit_broadcast_retry_tests {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
@@ -7036,7 +7050,7 @@ mod commit_broadcast_retry_tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -7078,13 +7092,15 @@ mod commit_broadcast_retry_tests {
         clock: Arc<scp_clock::TestClock>,
         key_resolver: scp_protocol::context::governance::KeyResolver,
     ) -> ActorDeps {
-        use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
+        use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            ADMIN.to_owned(),
-            Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                ADMIN.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(TestEventLog);
         let mls_storage: Arc<
             dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
@@ -7106,7 +7122,7 @@ mod commit_broadcast_retry_tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
             .await
@@ -7152,7 +7168,7 @@ mod commit_broadcast_retry_tests {
             &DID(TARGET.to_owned()),
             scp_protocol::economy::types::Amount::new(500),
             "test-purpose",
-            crate::context::shared::governance::CommitMeta {
+            scp_runtime_core::context::shared::governance::CommitMeta {
                 pid: [0x4e; 32],
                 actor_did: ADMIN,
                 timestamp_secs: 1_700_000_000,
@@ -7214,7 +7230,7 @@ mod commit_broadcast_retry_tests {
                 missed_windows: vec![(DID(TARGET.to_owned()), 3)],
                 detected_at: 1_700_000_000,
             },
-            crate::context::shared::governance::CommitMeta {
+            scp_runtime_core::context::shared::governance::CommitMeta {
                 pid: [0x4d; 32],
                 actor_did: ADMIN,
                 timestamp_secs: 1_700_000_000,
@@ -7251,7 +7267,7 @@ mod commit_broadcast_retry_tests {
     async fn make_failure(
         deps: &ActorDeps,
         op: &CommitOperation,
-    ) -> crate::context::shared::governance::BroadcastFailure {
+    ) -> scp_runtime_core::context::shared::governance::BroadcastFailure {
         try_broadcast_commit(deps, &ctx_hex(), b"commit-bytes".to_vec(), op)
             .await
             .expect("failing transport yields Some(BroadcastFailure)")
@@ -7740,7 +7756,7 @@ mod commit_broadcast_retry_tests {
         // Active, Promotable, finite ttl with an armed absolute deadline — the
         // exact shape whose promotion, if lost, would re-arm on restart.
         let mut state = fresh_state();
-        state.handle = crate::context::ContextHandle::new(
+        state.handle = scp_runtime_core::context::ContextHandle::new(
             ctx_hex(),
             ContextParams {
                 promotion_policy: PromotionPolicy::Promotable,
@@ -7755,7 +7771,7 @@ mod commit_broadcast_retry_tests {
         state.ttl.timer.deadline_unix_secs = Some(1_700_000_500);
         let mut cell = ClassSCell::new(state);
 
-        let meta = crate::context::shared::governance::CommitMeta {
+        let meta = scp_runtime_core::context::shared::governance::CommitMeta {
             pid: [0u8; 32],
             actor_did: ADMIN,
             timestamp_secs: 1_700_000_000,
@@ -7807,10 +7823,10 @@ mod commit_broadcast_retry_tests {
         use super::{
             CountingOkPersistence, RecordingTransport, build_deps_with, ctx_hex, fresh_state,
         };
-        use crate::context::ContextHandle;
-        use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::deps::ActorDeps;
-        use crate::context::actor::signer::CommandSigner;
+        use scp_runtime_core::context::ContextHandle;
+        use scp_runtime_core::context::actor::class_s::ClassSCell;
+        use scp_runtime_core::context::actor::deps::ActorDeps;
+        use scp_runtime_core::context::actor::signer::CommandSigner;
 
         const A: &str = "did:dht:z6MkSignerTurnA";
         const B: &str = "did:dht:z6MkSignerTurnB";
@@ -8052,12 +8068,12 @@ mod commit_broadcast_retry_tests {
         /// the log is then released and not loaded again.
         #[tokio::test]
         async fn proposer_eligibility_fails_closed_over_an_unreadable_log() {
-            use crate::context::builder::ContextEventLogProvider as _;
+            use scp_runtime_core::context::builder::ContextEventLogProvider as _;
 
             let clock = scp_clock::TestClock::new(1_700_000_000);
             let mut cell = majority_cell(&clock);
-            let log = crate::context::providers::MerkleEventLogProvider::new();
-            let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_hex());
+            let log = scp_runtime_core::context::providers::MerkleEventLogProvider::new();
+            let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_hex());
             log.init_event_log(&ctx_bytes).await.expect("init log");
             let now = 1_700_000_100;
 

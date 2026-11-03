@@ -77,11 +77,11 @@ use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{GovernanceAction, KeyResolver};
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::context::{ContextError, ContextState};
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::persistence::ContextPersistence;
-use scp_runtime::context::state::ContextSnapshot;
-use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::persistence::ContextPersistence;
+use scp_runtime_core::context::state::ContextSnapshot;
+use scp_runtime_core::context::supervisor::Supervisor;
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // RecordingPersistence — the fail-on-demand persistence fixture.
@@ -272,7 +272,7 @@ fn suspension_ceiling() -> Vec<Capability> {
 }
 
 /// Builds a `Supervisor` wired to `persistence`, mirroring
-/// `scp_runtime::context::test_supervisor` but injecting the caller's
+/// `scp_runtime::test_supervisor` but injecting the caller's
 /// persistence provider (which `test_supervisor` hardcodes to `None`).
 fn build_supervisor(persistence: RecordingPersistence) -> Arc<Supervisor> {
     let mls_storage: Arc<
@@ -336,7 +336,7 @@ async fn suspend_bob_governance_vote(
             ctx_id,
             &alice(),
             action,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk.clone()),
         )
         .await
         .map(|_| ())

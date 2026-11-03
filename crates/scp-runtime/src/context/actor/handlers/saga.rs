@@ -1,5 +1,5 @@
 //! Saga-phase handlers — see
-//! [`SagaPhaseMessage`](crate::context::actor::commands::SagaPhaseMessage)
+//! [`SagaPhaseMessage`](scp_runtime_core::context::actor::commands::SagaPhaseMessage)
 //! and spec §6.2.4 (cross-context outlet-invocation saga).
 //!
 //! # What runs here
@@ -8,7 +8,7 @@
 //! this module implements every phase handler, each running on a LOCAL actor.
 //! All phases are fully implemented AND supervisor-driven (the FSM in
 //! `supervisor/supervisor.rs` drives them end-to-end via
-//! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_outlet_invocation_saga)).
+//! [`Supervisor::start_cross_context_outlet_invocation_saga`](scp_runtime_core::context::supervisor::supervisor::Supervisor::start_cross_context_outlet_invocation_saga)).
 //!
 //! - **Prepare-A** ([`prepare_a`]) — on the caller-context actor. Validates the
 //!   caller holds `outlet:interface` and is in `OutboundPolicy.allowed_callers`,
@@ -66,25 +66,25 @@ use scp_protocol::context::outlets::cross_context_saga::{
 };
 use scp_protocol::context::outlets::stream::{OutletStreamChunk, StreamTerminalStatus};
 
-use crate::context::actor::commands::{
+use scp_runtime_core::context::actor::commands::{
     CommitBReserveOutcome, CommitBReserveReply, CommitBSettleOutcome, CommitBSettleReply,
     CommitBStreamSettleOutcome, CommitBStreamSettleReply, PrepareAOutcome, PrepareBOutcome,
     PrepareBStreamingFields, PreparedAFields, PreparedBFields, SagaPhaseMessage, SagaReject,
     saga_reject,
 };
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
-use crate::context::actor::signer::CommandSigner;
-use crate::context::actor::state::PerContextState;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
+use scp_runtime_core::context::actor::signer::CommandSigner;
+use scp_runtime_core::context::actor::state::PerContextState;
 
-use crate::context::shared::economy::ContextRevocationChecker;
-use crate::context::shared::economy::KeyResolverDidResolver;
+use scp_runtime_core::context::shared::economy::ContextRevocationChecker;
+use scp_runtime_core::context::shared::economy::KeyResolverDidResolver;
 
-use crate::context::shared::outlets::OutletSettleRequest;
-use crate::context::snapshot::build_snapshot_for_persist;
-use crate::context::snapshot::persist_snapshot_fail_closed;
-use crate::context::snapshot::persist_state_best_effort;
-use crate::context::supervisor::saga_prepared_state::{
+use scp_runtime_core::context::shared::outlets::OutletSettleRequest;
+use scp_runtime_core::context::snapshot::build_snapshot_for_persist;
+use scp_runtime_core::context::snapshot::persist_snapshot_fail_closed;
+use scp_runtime_core::context::snapshot::persist_state_best_effort;
+use scp_runtime_core::context::supervisor::saga_prepared_state::{
     CommittedOutletInvocation, CommittedStreamingOutletInvocation,
     CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
     SagaPreparedState,
@@ -125,7 +125,7 @@ use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 /// victim's `caller_did`; a caller replaying its own invocation re-spends its
 /// own non-refundable budget). This per-interface ceiling is defense-in-depth
 /// under that channel-auth argument, not a standalone aggregate guarantee.
-pub(crate) const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
+pub const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 
 /// Lowercase-hex encode a raw 32-byte context-id digest (the wire / role-state
 /// id-form, never the `"standing-"`-prefixed display string — spec §6.2.4
@@ -172,8 +172,8 @@ impl scp_protocol::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
 }
 
 /// Dispatch a [`SagaPhaseMessage`] against actor state.
-pub(crate) async fn dispatch(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn dispatch(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
@@ -205,7 +205,7 @@ pub(crate) async fn dispatch(
 /// and `StreamSettleCheckWitness` is the read-only recovery witness check.
 #[allow(clippy::too_many_lines)]
 async fn dispatch_stream_phase(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
@@ -320,7 +320,7 @@ async fn dispatch_stream_phase(
 /// Dispatch the Prepare-A / Prepare-B saga phases (slice 3b). Split out of
 /// [`dispatch`] so each router stays within the per-function line budget.
 async fn dispatch_prepare_phase(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
@@ -409,7 +409,7 @@ async fn dispatch_prepare_phase(
 /// saga phases (slice 4). Split out of [`dispatch`] to keep each router within
 /// the per-function line budget.
 async fn dispatch_commit_phase(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
@@ -549,13 +549,13 @@ fn misrouted<T>(
 /// [`reserve_outlet_economy`] derives it from the caller context's economy policy
 /// / outlet registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
-/// The resulting `Send` [`OutletEconomyReservation`](crate::context::shared::outlets::OutletEconomyReservation) is a `#[must_use]` RAII
+/// The resulting `Send` [`OutletEconomyReservation`](scp_runtime_core::context::shared::outlets::OutletEconomyReservation) is a `#[must_use]` RAII
 /// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
 /// terminal non-commit path. The staged saga state is Class-S sync-persisted
 /// fail-closed BEFORE the reply, so a crash in the coalesce window cannot
 /// acknowledge a Prepare-A whose reservation did not durably land.
 async fn prepare_a(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     caller_context_id: &[u8; 32],
@@ -663,7 +663,7 @@ async fn prepare_a(
         .reserve_outlet_economy(
             cell,
             deps,
-            crate::context::domains::ReserveOutletEconomyRequest {
+            scp_runtime_core::context::domains::ReserveOutletEconomyRequest {
                 context_id: &context_id_hex,
                 invoker_did: caller_did,
                 spending_ucan: None,
@@ -753,7 +753,7 @@ async fn prepare_a(
         // (non-persisting — the combinator above already persisted the Class-S
         // restore; this reversal rides the run-loop coalesce, matching the prior
         // inline no-extra-persist behaviour).
-        crate::context::shared::outlets::rollback_outlet_economy(
+        scp_runtime_core::context::shared::outlets::rollback_outlet_economy(
             cell.class_c_view(),
             deps,
             reservation.ticket,
@@ -876,7 +876,7 @@ fn validate_outbound_caller(
 /// per-caller limit, so an exhausted per-interface window short-circuits before
 /// the per-caller window is touched (matching `invoke_cross_context` order).
 fn consume_outbound_interface_rate_limit(
-    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     caller_did: &DID,
     outlet_registration_id: &str,
@@ -966,7 +966,7 @@ fn consume_outbound_interface_rate_limit(
 /// eviction bound a mechanical function of the configured ceiling at runtime,
 /// not merely a `cfg(test)` invariant.
 fn consume_inbound_interface_rate_limit(
-    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     outlet_registration_id: &str,
 ) -> Result<(), SagaReject> {
@@ -1045,7 +1045,7 @@ fn consume_inbound_interface_rate_limit(
 
 /// Owned inputs for [`prepare_b`], grouped to keep the handler signature within
 /// the clippy argument budget. Mirrors the
-/// [`SagaPhaseMessage::PrepareB`](crate::context::actor::commands::SagaPhaseMessage::PrepareB)
+/// [`SagaPhaseMessage::PrepareB`](scp_runtime_core::context::actor::commands::SagaPhaseMessage::PrepareB)
 /// payload (minus the reply channel).
 struct PrepareBRequest {
     saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -1073,7 +1073,7 @@ struct PrepareBRequest {
 /// Class-S sync-persists fail-closed before replying. Any check failure ⇒ typed
 /// rejection with no staging.
 async fn prepare_b(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     req: PrepareBRequest,
     reply: tokio::sync::oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
@@ -1692,7 +1692,7 @@ fn commit_b_reserve(
 /// captured) re-emits the STORED bytes verbatim — no re-invoke, no re-append,
 /// no re-sign.
 async fn commit_b_settle(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     output_bytes: Vec<u8>,
@@ -1793,7 +1793,7 @@ fn reemit_committed_settle(
 //       stays durable) / `(false, original_err)` (re-persist succeeded) mapping.
 // No Class-S mutation is left outside a combinator.
 async fn commit_b_first_settle(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     output_bytes: &[u8],
@@ -1921,13 +1921,13 @@ async fn commit_b_first_settle(
 
 /// Post-capture half of [`commit_b_first_settle`] (step 2): append the
 /// `OutletInvoked` event-log leaf, and on append failure roll the capture back +
-/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep).
 /// Split out of [`commit_b_first_settle`] only to stay within the per-function
 /// line budget — the behaviour is exactly the prior inline append path. See
 /// FLAG-COMMIT-B on the capture side for why this is a two-combinator
 /// decomposition rather than `commit_class_s_then_append`.
 async fn commit_b_settle_finalize(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     target_hex: &str,
@@ -1967,7 +1967,7 @@ async fn commit_b_settle_finalize(
         Ok(outlet_invoked_payload_bytes) => {
             deps.event_log
                 .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
+                    scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                     &target_context_id,
                     scp_event_log::EventType::OutletInvoked,
                     &caller_did_str,
@@ -2113,7 +2113,7 @@ fn jcs_receipt_bytes(receipt: &CrossContextOutletReceipt) -> Result<Vec<u8>, Con
 /// off-mailbox seal task folds chunks into and seals at close.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_b_streaming(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     req: PrepareBRequest,
     reserved: scp_protocol::economy::types::Amount,
@@ -2228,13 +2228,16 @@ async fn prepare_b_streaming(
 /// seal→settle window — money ops need no signing key), or (c) mark a
 /// witness-absent saga `NeedsRepair` for the key-bearing truncated close.
 fn stream_settle_check_witness(
-    cell: &crate::context::actor::class_s::ClassSCell,
+    cell: &scp_runtime_core::context::actor::class_s::ClassSCell,
     saga_id: &SagaId,
     reply: tokio::sync::oneshot::Sender<
-        Result<crate::context::actor::commands::StreamWitnessRecoveryStatus, ContextError>,
+        Result<
+            scp_runtime_core::context::actor::commands::StreamWitnessRecoveryStatus,
+            ContextError,
+        >,
     >,
 ) -> Outcome<()> {
-    use crate::context::actor::commands::StreamWitnessRecoveryStatus;
+    use scp_runtime_core::context::actor::commands::StreamWitnessRecoveryStatus;
     let generation = cell.generation;
     let status = match cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
         // Witness absent — seal never landed (or was rolled back).
@@ -2290,7 +2293,7 @@ fn stream_settle_check_witness(
 /// gone, the committed witness is present) or was aborted (slot absent) — a late
 /// or re-delivered append after close never errors the seal task.
 async fn stream_capture_append(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     chunk: OutletStreamChunk,
@@ -2368,12 +2371,12 @@ async fn stream_capture_append(
 /// gate, post-Prepare-B) into the durable streaming prepared slot, then Class-S
 /// sync-persists **KEEP** — the counter release is a durable settlement input
 /// the seal (and crash recovery) read to build the close-time
-/// [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement).
+/// [`StreamSettlement`](scp_runtime_core::context::outlets::invoke::StreamSettlement).
 ///
 /// Idempotent no-op if the saga already sealed (slot cleared) or aborted (slot
 /// absent) — a late fold after close never errors the driver.
 async fn stream_stage_counter_reserve(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     amount_cumulative_reserved: u64,
@@ -2434,7 +2437,7 @@ async fn stream_stage_counter_reserve(
 /// fail-closed. On a REPLAY (this `SagaId` already sealed) re-emits the STORED
 /// receipt + root verbatim — no re-invoke, no re-append, no re-sign.
 async fn commit_b_stream_settle(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     terminal_status: &StreamTerminalStatus,
@@ -2482,7 +2485,7 @@ async fn commit_b_stream_settle(
     }
 }
 
-/// Rebuild the close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+/// Rebuild the close-time [`StreamSettlement`](scp_runtime_core::context::outlets::invoke::StreamSettlement)
 /// from a durable committed-streaming witness (SCP-OUT-046 CRITICAL). The seal
 /// copies every settlement input into the witness at seal (the prepared slot is
 /// removed there), so keyless crash recovery — and an idempotent re-driven
@@ -2490,8 +2493,8 @@ async fn commit_b_stream_settle(
 /// and no staged slot. Money ops need no signing key, so this needs none.
 fn rebuild_stream_settlement(
     committed: &CommittedStreamingOutletInvocation,
-) -> crate::context::outlets::invoke::StreamSettlement {
-    crate::context::outlets::invoke::StreamSettlement {
+) -> scp_runtime_core::context::outlets::invoke::StreamSettlement {
+    scp_runtime_core::context::outlets::invoke::StreamSettlement {
         context_id: hex_context_id(&committed.target_context_id),
         invoker_did: committed.invoker_did.clone(),
         reserved: committed.reserved,
@@ -2500,10 +2503,9 @@ fn rebuild_stream_settlement(
         billed_count: committed.billed_count,
         request_id: committed.request_id,
         outlet_id: committed.outlet_registration_id.clone(),
-        economic_policy_snapshot: committed
-            .economic_policy
-            .clone()
-            .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy }),
+        economic_policy_snapshot: committed.economic_policy.clone().map(|policy| {
+            scp_runtime_core::context::outlets::invoke::EconomicPolicySnapshot { policy }
+        }),
         amount_cumulative_reserved: committed.amount_cumulative_reserved,
         reserved_chunks: committed.reserved_chunks,
         ucan_cid: committed.ucan_cid.clone(),
@@ -2567,7 +2569,7 @@ fn reemit_committed_stream_settle(
 /// once the `OutletInvoked` append has run.
 #[allow(clippy::too_many_lines)]
 async fn commit_b_stream_first_settle(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     terminal_status: &StreamTerminalStatus,
@@ -2672,7 +2674,7 @@ async fn commit_b_stream_first_settle(
         // (the actor cannot dispatch to its own mailbox — re-entrant deadlock).
         // Crash recovery builds the IDENTICAL settlement from the same durable
         // prefix, so normal close and recovery settle identically.
-        let settlement = crate::context::outlets::invoke::StreamSettlement {
+        let settlement = scp_runtime_core::context::outlets::invoke::StreamSettlement {
             context_id: hex_context_id(&target_context_id),
             invoker_did: prepared.caller_did.clone(),
             reserved: prepared.reserved,
@@ -2681,10 +2683,9 @@ async fn commit_b_stream_first_settle(
             billed_count,
             request_id: prepared.request_id,
             outlet_id: prepared.outlet_registration_id.clone(),
-            economic_policy_snapshot: prepared
-                .economic_policy
-                .clone()
-                .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy }),
+            economic_policy_snapshot: prepared.economic_policy.clone().map(|policy| {
+                scp_runtime_core::context::outlets::invoke::EconomicPolicySnapshot { policy }
+            }),
             amount_cumulative_reserved: prepared.amount_cumulative_reserved,
             reserved_chunks: prepared.reserved_chunks,
             ucan_cid: prepared.ucan_cid.clone(),
@@ -2778,17 +2779,17 @@ struct CommitBStreamCaptured {
     outlet_registration_id: String,
     /// The complete close-time settlement built from the durable ledger
     /// (SCP-OUT-046) — the off-mailbox seal task applies it.
-    settlement: crate::context::outlets::invoke::StreamSettlement,
+    settlement: scp_runtime_core::context::outlets::invoke::StreamSettlement,
 }
 
 /// Post-capture half of [`commit_b_stream_first_settle`]: append the B-side
 /// `OutletInvoked` (streaming shape — real root, `chunks_billed`,
 /// `stream_chunk_count`, terminal status), and on append failure roll the capture
 /// back + re-stage the owned slot + re-persist via
-/// [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep). Mirrors [`commit_b_settle_finalize`].
+/// [`ClassSCell::commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep). Mirrors [`commit_b_settle_finalize`].
 #[allow(clippy::too_many_arguments)]
 async fn commit_b_stream_settle_finalize(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     target_hex: &str,
@@ -2835,7 +2836,7 @@ async fn commit_b_stream_settle_finalize(
         Ok(bytes) => {
             deps.event_log
                 .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
+                    scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                     &target_context_id,
                     scp_event_log::EventType::OutletInvoked,
                     &caller_did_str,
@@ -3013,7 +3014,7 @@ fn cross_context_invoked_leaf(
 /// (the reservation's RAII ticket is consumed, so a true double-settle cannot
 /// occur — but the durable marker is the idempotency witness).
 async fn commit_a(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     req: CommitARequest,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
@@ -3035,7 +3036,7 @@ async fn commit_a(
         // corrupt the WRONG context. On a mismatch the helper voids only the
         // external escrow and consumes the ticket (mirrors `settle_outlet_economy`).
         let class_c_economy_reversed =
-            crate::context::shared::outlets::rollback_outlet_economy_generation_checked(
+            scp_runtime_core::context::shared::outlets::rollback_outlet_economy_generation_checked(
                 cell.class_c_view(),
                 deps,
                 req.reservation.reservation.generation,
@@ -3168,7 +3169,7 @@ async fn commit_a(
         Ok((invoked_leaf_secs, invoked_payload_bytes)) => {
             deps.event_log
                 .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
+                    scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                     &req.caller_context_id,
                     scp_event_log::EventType::CrossContextOutletInvoked,
                     req.caller_did.as_ref(),
@@ -3281,7 +3282,7 @@ fn commit_a_check_witness(
 /// (no slot, no record) — or a generation-mismatch caller Abort that touched
 /// nothing — is a clean no-op with no redundant persist.
 async fn abort(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     reservation: Option<PreparedAFields>,
@@ -3361,7 +3362,7 @@ async fn abort(
     let (local_rollback_ran, had_caller_record_consumed) = match reservation {
         Some(prepared) => {
             let carrier_ran =
-                crate::context::shared::outlets::rollback_outlet_economy_generation_checked(
+                scp_runtime_core::context::shared::outlets::rollback_outlet_economy_generation_checked(
                     cell.class_c_view(),
                     deps,
                     prepared.reservation.generation,
@@ -3533,7 +3534,7 @@ async fn sign_divergence_marker(
 #[allow(clippy::too_many_arguments)]
 async fn emit_divergence_marker(
     context_id: [u8; 32],
-    snapshot: Result<crate::context::state::ContextSnapshot, ContextError>,
+    snapshot: Result<scp_runtime_core::context::state::ContextSnapshot, ContextError>,
     deps: &ActorDeps,
     saga_id: &SagaId,
     nonce: [u8; 16],
@@ -3590,7 +3591,7 @@ async fn emit_divergence_marker(
     if let Err(err) = deps
         .event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id,
             scp_event_log::EventType::CrossContextDivergenceMarker,
             scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
@@ -3633,18 +3634,18 @@ fn hex_output_hash(output_bytes: &[u8]) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The saga domain's [`SagaDomain`](crate::context::domains::SagaDomain)
+/// The saga domain's [`SagaDomain`](scp_runtime_core::context::domains::SagaDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Saga;
 
 #[async_trait::async_trait]
-impl crate::context::domains::SagaDomain for Saga {
+impl scp_runtime_core::context::domains::SagaDomain for Saga {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::SagaPhaseMessage,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::SagaPhaseMessage,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 }
@@ -3669,10 +3670,10 @@ mod tests {
     use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
     use super::*;
-    use crate::context::actor::deps::ActorDeps;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::persistence::ContextPersistence;
-    use crate::context::supervisor::supervisor::Supervisor;
+    use scp_runtime_core::context::actor::deps::ActorDeps;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::persistence::ContextPersistence;
+    use scp_runtime_core::context::supervisor::supervisor::Supervisor;
     use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     const CALLER: &str = "did:dht:z6MkCallerPrincipalXX";
@@ -3788,7 +3789,7 @@ mod tests {
         // per-minute ceiling is correspondingly lower.
         const {
             assert!(
-                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS
+                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS
                     > DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 "the saga dedup TTL must strictly exceed the freshness skew tolerance \
                  so an in-window envelope's nonce is always still remembered"
@@ -3797,7 +3798,8 @@ mod tests {
 
         // Distinct nonces a caller can land within one TTL window at a given
         // per-minute accept ceiling.
-        let window_minutes = crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS / 60;
+        let window_minutes =
+            scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS / 60;
         assert_eq!(
             window_minutes, 10,
             "saga dedup TTL window is 10 minutes (600s)"
@@ -3835,7 +3837,7 @@ mod tests {
         let st = target_state(0x5B, OTHER, CALLER).await;
         assert_eq!(
             st.class_s.xctx_nonce_dedup.ttl_secs(),
-            crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+            scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             "the test fixture must seed the production saga dedup TTL, not NonceDedup::new()'s \
              default (which is coterminous with the skew tolerance)"
         );
@@ -3845,7 +3847,7 @@ mod tests {
 
     struct TestEventLog;
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for TestEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -3890,7 +3892,7 @@ mod tests {
                 async fn persist_context(
                     &self,
                     _: &str,
-                    _: &crate::context::state::ContextSnapshot,
+                    _: &scp_runtime_core::context::state::ContextSnapshot,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     $persist
                 }
@@ -3898,7 +3900,7 @@ mod tests {
                     &self,
                     _: &str,
                 ) -> Result<
-                    Option<crate::context::state::ContextSnapshot>,
+                    Option<scp_runtime_core::context::state::ContextSnapshot>,
                     Box<dyn std::error::Error + Send + Sync>,
                 > {
                     Ok(None)
@@ -3926,7 +3928,7 @@ mod tests {
         outlet_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for CountingEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -3973,7 +3975,7 @@ mod tests {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
@@ -3986,7 +3988,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -4018,7 +4020,7 @@ mod tests {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == self.fail_at {
@@ -4031,7 +4033,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -4057,7 +4059,7 @@ mod tests {
         xctx_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for CrossContextCountingEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for CrossContextCountingEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -4107,7 +4109,7 @@ mod tests {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.persist_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4117,7 +4119,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -4144,13 +4146,15 @@ mod tests {
         issuer_key: ed25519_dalek::VerifyingKey,
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestSagaActor".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MktestSagaActor".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
         let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
@@ -4178,7 +4182,7 @@ mod tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
@@ -4191,15 +4195,17 @@ mod tests {
     async fn build_deps_with_providers(
         issuer_did: String,
         issuer_key: ed25519_dalek::VerifyingKey,
-        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+        event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider>,
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestSagaActor".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MktestSagaActor".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
         let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
                 Some(issuer_key)
@@ -4226,7 +4232,7 @@ mod tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
@@ -4371,7 +4377,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4390,7 +4396,7 @@ mod tests {
         // §6.2.4 "Reservation release on every terminal path") by rolling the
         // reservation back — dropping a live OutletEconomyTicket is a balance-
         // invariant violation by design.
-        crate::context::shared::outlets::rollback_outlet_economy(
+        scp_runtime_core::context::shared::outlets::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -4415,7 +4421,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4463,7 +4469,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4494,7 +4500,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4537,7 +4543,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4564,7 +4570,7 @@ mod tests {
              with no policy that is 0, so the budget must be untouched"
         );
 
-        crate::context::shared::outlets::rollback_outlet_economy(
+        scp_runtime_core::context::shared::outlets::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -4614,7 +4620,7 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4667,7 +4673,7 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4710,7 +4716,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x33, Some("proof-1".to_owned()), 2, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         let fields = expect_prepared_b(rx.await.unwrap(), "prepared-B");
@@ -4777,7 +4783,7 @@ mod tests {
         // The channel-authenticated caller role is "member", NOT in {admin}.
         let req = prepare_b_request_with_role(0x55, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13025));
@@ -4828,7 +4834,7 @@ mod tests {
 
         let req = prepare_b_request_with_role(0x56, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "an allowed role must be admitted");
@@ -4876,7 +4882,7 @@ mod tests {
 
         // The consume takes the field-granular `ClassCMut`; wrap the test state
         // in a `ClassSCell` to construct the view per call.
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         // Drain the base + burst budget (1 base + 5 burst = 6 admitted).
         for i in 0..6 {
             consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
@@ -4916,7 +4922,7 @@ mod tests {
         )
         .await;
 
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect_err("an inbound ceiling above the eviction-safe limit must reject");
         assert_eq!(reject.code, Some(13027));
@@ -4954,7 +4960,7 @@ mod tests {
         )
         .await;
 
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect("the maximum safe inbound ceiling must be admitted");
     }
@@ -4979,7 +4985,7 @@ mod tests {
 
         let req = prepare_b_request_with_role(0x5A, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "prepared-B");
@@ -5026,7 +5032,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x44, Some("proof-other".to_owned()), 1, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(
             out.result.is_err(),
@@ -5059,7 +5065,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x55, None, 1, stale_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13018));
@@ -5086,7 +5092,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x66, None, 1, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13019));
@@ -5125,7 +5131,7 @@ mod tests {
         first.saga_id = SagaId("original-saga".to_owned());
         first.asserted_nonce = replay_nonce;
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, first, tx).await;
         assert!(out.result.is_ok(), "first prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "first prepare_b accepts");
@@ -5140,7 +5146,7 @@ mod tests {
 
         // Project the live state to its Class-S snapshot — the persisted form a
         // restore rehydrates from. The nonce-dedup cache must be carried.
-        let snapshot = crate::context::snapshot::build_snapshot_from_state(&st_cell);
+        let snapshot = scp_runtime_core::context::snapshot::build_snapshot_from_state(&st_cell);
         assert!(
             snapshot.xctx_nonce_dedup.contains_key(&replay_nonce),
             "the nonce-dedup cache MUST be in the Class-S snapshot (crash-surviving)"
@@ -5154,7 +5160,7 @@ mod tests {
         restored.class_s.xctx_nonce_dedup =
             scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 snapshot.xctx_nonce_dedup,
-                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             );
 
         // Re-submit the SAME envelope under a FRESH SagaId after the "crash".
@@ -5163,7 +5169,8 @@ mod tests {
         replay.asserted_nonce = replay_nonce;
         let _ = now_secs; // freshness uses the clock; nonce dedup is the gate here.
         let (tx, rx) = oneshot::channel();
-        let mut restored_cell = crate::context::actor::class_s::ClassSCell::new(restored);
+        let mut restored_cell =
+            scp_runtime_core::context::actor::class_s::ClassSCell::new(restored);
         let out = prepare_b(&mut restored_cell, &deps, replay, tx).await;
         assert!(out.result.is_err(), "fresh-SagaId replay must be rejected");
         let reject = expect_prepare_b_reject(rx.await.unwrap());
@@ -5197,7 +5204,7 @@ mod tests {
         let caller = DID(CALLER.to_owned());
         let saga = SagaId("saga-same-node-restore".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0x6B; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         let staged = st_cell
@@ -5220,7 +5227,7 @@ mod tests {
         // Project the live state to its Class-S snapshot — the persisted form a
         // restore rehydrates from. The record MUST be carried (through the shared
         // snapshot helper).
-        let snapshot = crate::context::snapshot::build_snapshot_from_state(&st_cell);
+        let snapshot = scp_runtime_core::context::snapshot::build_snapshot_from_state(&st_cell);
         assert_eq!(
             snapshot.xctx_caller_reservations.get(&saga),
             Some(&staged),
@@ -5256,7 +5263,7 @@ mod tests {
         // Default max_chain_depth is 8; incoming 8 → 8+1 = 9 > 8 ⇒ reject.
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x77, None, 8, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13020));
@@ -5281,7 +5288,7 @@ mod tests {
         req.target_context_id = [0xEE; 32];
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13014));
@@ -5315,7 +5322,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x99, None, 1, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13017));
@@ -5340,7 +5347,7 @@ mod tests {
         // Ungated outlet (no proof) so every other check passes and we reach the
         // Class-S persist, which fails.
         let req = prepare_b_request(0xAA, None, 1, now_ms);
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_err());
         let err = rx.await.unwrap().expect_err("persist must fail-close");
@@ -5385,7 +5392,7 @@ mod tests {
     /// Stage a Prepare-B slot for `saga_id` by running the real `prepare_b`
     /// (ungated outlet) so Commit-B has the B-recorded provenance to sign over.
     async fn stage_prepared_b(
-        cell: &mut crate::context::actor::class_s::ClassSCell,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
         deps: &ActorDeps,
         ctx_byte: u8,
         saga_id: &str,
@@ -5411,7 +5418,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-1".to_owned());
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC1, &saga.0, now_ms).await;
 
         // Reserve: slot present, not yet committed ⇒ ReadyToExecute.
@@ -5463,7 +5470,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-replay".to_owned());
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC2, &saga.0, now_ms).await;
 
         let target_key = test_signer(0x66);
@@ -5527,7 +5534,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-jcs".to_owned());
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC3, &saga.0, now_ms).await;
 
         let target_key = test_signer(0x88);
@@ -5564,7 +5571,7 @@ mod tests {
         // reservation record staged at Prepare-A is the one Commit-A consumes.
         let saga = SagaId("saga-commit-a-1".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -5652,7 +5659,7 @@ mod tests {
         .await;
         let saga = SagaId("saga-commit-a-witness-failclose".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(
             &mut st_cell,
             &stage_deps,
@@ -5736,7 +5743,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-abort-b".to_owned());
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC5, &saga.0, now_ms).await;
         assert!(!st_cell.class_s.saga_pending.is_empty());
 
@@ -5771,7 +5778,7 @@ mod tests {
         // the durable reservation record Prepare-A staged.
         let saga = SagaId("saga-abort-a".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -5839,7 +5846,7 @@ mod tests {
         // Prepare-A consumes a hard-rate-limit token + records velocity (and
         // persists the deduction once via the spy).
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xC8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
@@ -5926,7 +5933,7 @@ mod tests {
     /// back locally as before.
     #[tokio::test]
     async fn rollback_generation_checked_voids_external_not_local_on_mismatch() {
-        use crate::context::shared::outlets::rollback_outlet_economy_generation_checked;
+        use scp_runtime_core::context::shared::outlets::rollback_outlet_economy_generation_checked;
 
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0xD1, OTHER, CALLER).await;
@@ -5940,7 +5947,7 @@ mod tests {
 
         // Reservation made at the live generation (0).
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -6051,7 +6058,7 @@ mod tests {
 
         let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD2; 32], &caller, OUTLET, tx).await;
         let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // Prepare-A staged the durable record + moved owned economy.
@@ -6253,7 +6260,7 @@ mod tests {
         .await;
         let now_ms = ok_deps.clock.now_millis();
         let saga = SagaId("saga-settle-failclose".to_owned());
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &ok_deps, 0xC9, &saga.0, now_ms).await;
 
         let fail_deps = build_deps(
@@ -6300,7 +6307,7 @@ mod tests {
         )
         .await;
         let now_ms = stage_deps.clock.now_millis();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &stage_deps, 0xCD, &saga.0, now_ms).await;
 
         // Settle deps: a counting event log + a persistence that FAILS the first
@@ -6371,8 +6378,8 @@ mod tests {
     /// holds.
     #[tokio::test]
     async fn receipt_signed_via_signer_verifies_against_target_key() {
-        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         use scp_platform::testing::InMemoryKeyCustody;
+        use scp_runtime_core::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
 
         let custody = InMemoryKeyCustody::new();
         let key = custody.import_ed25519_key(&[0xB7; 32]).await;
@@ -6421,7 +6428,7 @@ mod tests {
     /// preserves the proof index byte-for-byte.
     #[tokio::test]
     async fn commit_b_settle_persist_failure_restores_full_original_slot() {
-        use crate::context::supervisor::saga_prepared_state::{
+        use scp_runtime_core::context::supervisor::saga_prepared_state::{
             CrossContextOutletInvocationPrepared, SagaPreparedState,
         };
 
@@ -6455,7 +6462,7 @@ mod tests {
         )
         .await;
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = commit_b_settle(
             &mut st_cell,
             &fail_deps,
@@ -6500,13 +6507,15 @@ mod tests {
         issuer_key: ed25519_dalek::VerifyingKey,
         payment_adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestSagaActor".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MktestSagaActor".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
         let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
@@ -6534,7 +6543,7 @@ mod tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
@@ -6590,7 +6599,7 @@ mod tests {
         // `saga`.
         let saga = SagaId("saga-crash-recovery-refund".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // The durable record landed.
@@ -6699,7 +6708,7 @@ mod tests {
     /// is still reversed even though the live actor's generation has moved on.
     #[tokio::test]
     async fn reverse_caller_reservation_record_voids_external_escrow() {
-        use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+        use scp_runtime_core::context::supervisor::saga_prepared_state::CallerReservationRecord;
         use std::sync::atomic::Ordering;
 
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -6751,7 +6760,7 @@ mod tests {
 
         // The helper takes the field-granular `ClassCMut`; wrap the test state in
         // a `ClassSCell` to construct the view, then read results back via Deref.
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let ran = crate::context::outlets_helpers::reverse_caller_reservation_record(
             st_cell.class_c_view(),
             &deps,
@@ -6806,7 +6815,7 @@ mod tests {
 
         let saga = SagaId("saga-live-no-double".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDA; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
@@ -6886,7 +6895,7 @@ mod tests {
 
         let saga = SagaId("saga-commit-a-consumes".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDB; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
@@ -7000,7 +7009,7 @@ mod tests {
 
         // No panic here ⇒ the recovered ticket was balanced. (Pre-fix this
         // unwinds on the debug_assert in `OutletEconomyTicket::drop`.)
-        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_a(&mut st_cell, &deps, &saga, &[0xDC; 32], &caller, OUTLET, tx).await;
         assert!(
             out.result.is_ok(),

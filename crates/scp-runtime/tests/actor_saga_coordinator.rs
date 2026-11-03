@@ -4,7 +4,7 @@
 //! through `Initiated → PreparingA → PreparingB → Committing →
 //! Committed | Aborting → Aborted | NeedsRepair`. These tests exercise
 //! the FSM generically against a production-backed
-//! [`Supervisor`](scp_runtime::context::supervisor::Supervisor).
+//! [`Supervisor`](scp_runtime_core::context::supervisor::Supervisor).
 //!
 //! # Executor-less misuse guardrail
 //!
@@ -34,7 +34,9 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::supervisor::{RestoredContexts, SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_core::context::supervisor::{
+    RestoredContexts, SagaInput, Supervisor, SupervisorConfig,
+};
 use scp_runtime_types::context::supervisor::saga_journal::{
     JournalEntry, JournalError, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
     SagaTerminalState,
@@ -46,11 +48,11 @@ use scp_runtime_types::context::supervisor::saga_journal::{
 
 struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
+impl scp_runtime_core::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
-        _: &scp_runtime::context::state::ContextSnapshot,
+        _: &scp_runtime_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -58,7 +60,7 @@ impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
         &self,
         _: &str,
     ) -> Result<
-        Option<scp_runtime::context::state::ContextSnapshot>,
+        Option<scp_runtime_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -127,7 +129,7 @@ impl SagaJournal for RecordingJournal {
 }
 
 fn test_supervisor() -> Supervisor {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let (_, journal) = journal_with_shared_storage();
     let journal_dyn: Arc<dyn SagaJournal> = journal;
@@ -177,7 +179,7 @@ async fn saga_prepare_a_invalid_state_aborts_and_returns_error() {
 /// BEFORE compaction can erase it, then assert on the captured states.
 #[tokio::test]
 async fn saga_journal_records_every_phase_transition_on_abort() {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let storage = Arc::new(InMemoryStorage::new());
     let prod_journal: Arc<dyn SagaJournal> =
@@ -285,7 +287,7 @@ async fn saga_concurrent_start_rejects_with_saga_busy() {
 /// sequence is strictly increasing.
 #[tokio::test]
 async fn saga_journal_write_ordering_is_monotonic() {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let storage = Arc::new(InMemoryStorage::new());
     let prod_journal: Arc<dyn SagaJournal> =
@@ -361,7 +363,7 @@ async fn crash_recovery_initiated_state_is_discarded() {
     inject_entry(&journal, &saga_id, SagaState::Initiated, 0).await;
 
     // Build a fresh supervisor that shares the journal's storage.
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed_journal = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed_journal;
@@ -398,7 +400,7 @@ async fn crash_recovery_preparing_a_state_is_discarded() {
     inject_entry(&journal, &saga_id, SagaState::Initiated, 0).await;
     inject_entry(&journal, &saga_id, SagaState::PreparingA, 1).await;
 
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
@@ -433,7 +435,7 @@ async fn crash_recovery_preparing_b_state_is_rolled_back() {
     inject_entry(&journal, &saga_id, SagaState::PreparingA, 0).await;
     inject_entry(&journal, &saga_id, SagaState::PreparingB, 1).await;
 
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
@@ -467,7 +469,7 @@ async fn crash_recovery_committing_state_triggers_needs_repair() {
     let saga_id = SagaId::new();
     inject_entry(&journal, &saga_id, SagaState::Committing, 0).await;
 
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
@@ -509,7 +511,7 @@ async fn crash_recovery_needs_repair_is_carryover() {
     let saga_id = SagaId::new();
     inject_entry(&journal, &saga_id, SagaState::NeedsRepair, 0).await;
 
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
@@ -556,7 +558,7 @@ async fn crash_recovery_terminal_states_are_noop() {
         .await
         .unwrap();
 
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;

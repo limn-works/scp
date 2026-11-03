@@ -5,9 +5,9 @@
 //!
 //! This module hosts the economy-domain helpers that actor handlers and
 //! migrated actor-shaped helper bodies call. Provider access flows
-//! through [`ActorDeps`](crate::context::actor::deps::ActorDeps);
+//! through [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps);
 //! per-context policy, velocity, and checkpoint state flow through
-//! [`PerContextState`](crate::context::actor::state::PerContextState).
+//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState).
 //!
 //! # Migration status
 //!
@@ -17,7 +17,7 @@
 
 #![allow(clippy::needless_pass_by_ref_mut)]
 
-use crate::context::shared::economy::{OwnedAuthInputs, record_payment_receipt};
+use scp_runtime_core::context::shared::economy::{OwnedAuthInputs, record_payment_receipt};
 use std::sync::Arc;
 
 use scp_did::DID;
@@ -26,9 +26,9 @@ use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
-use crate::context::shared::economy::PaidActionAuthorization;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::shared::economy::PaidActionAuthorization;
 use scp_runtime_types::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use scp_runtime_types::economy::integration;
 use scp_runtime_types::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
@@ -339,7 +339,7 @@ pub fn emit_payment_received_event(
         action: paid_action_label(&receipt.action_type).to_owned(),
         anchored: false,
     };
-    crate::context::state::emit_event_into(
+    scp_runtime_core::context::state::emit_event_into(
         receive_buffer,
         event,
         context_id,

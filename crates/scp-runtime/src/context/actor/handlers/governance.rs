@@ -1,5 +1,5 @@
 //! Governance handlers — see
-//! [`GovernanceCommand`](crate::context::actor::commands::GovernanceCommand)
+//! [`GovernanceCommand`](scp_runtime_core::context::actor::commands::GovernanceCommand)
 //! and plan row 10 of the commit ladder.
 //!
 //! # Dispatch shape
@@ -28,11 +28,11 @@
 //! # Read vs. mutate classification
 //!
 //! Only `GetProposal`, `ListProposals`, and `MigrationState` are read-
-//! only — the handler uses [`Outcome::ok(())`](crate::context::actor::outcome::Outcome::ok).
+//! only — the handler uses [`Outcome::ok(())`](scp_runtime_core::context::actor::outcome::Outcome::ok).
 //! Every other variant mutates per-context state (proposal lifecycle,
 //! vote tallies, executed-proposals replay set, ceiling / economic-
 //! policy slots, migration flags) and uses
-//! [`Outcome::ok_mutated(())`](crate::context::actor::outcome::Outcome::ok_mutated).
+//! [`Outcome::ok_mutated(())`](scp_runtime_core::context::actor::outcome::Outcome::ok_mutated).
 //! `AcknowledgeCommitFault` takes the fault marker out of the context
 //! — that is a mutation regardless of whether any observable state
 //! changes beyond the marker slot.
@@ -40,16 +40,16 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::actor::commands::{
+use scp_runtime_core::context::actor::commands::{
     ExecuteGovernanceActionPayload, GovernanceCommand, ProposeGovernanceActionCheckedReply,
     ProposeGovernanceActionPayload, ProposeGovernanceActionReply, VoteOnProposalPayload,
     VoteOnProposalReply,
 };
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`GovernanceCommand`] against actor-owned state and deps.
 ///
@@ -63,8 +63,8 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 /// The migration-window shim — `dispatch_from_shim`, the
 /// supervisor-shape `handle_*` helpers, and the `*_legacy` bodies they
 /// delegated to — was removed at Phase 2A finalization.
-pub(crate) async fn dispatch(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn dispatch(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -84,7 +84,7 @@ pub(crate) async fn dispatch(
               unified dispatch surface that pipeline-wiring tests assert"
 )]
 async fn dispatch_state(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -245,7 +245,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// which reads directly off `state.governance.engine`. Sync — no
 /// transport-timeout wrapping needed because there are no awaits.
 fn handle_get_proposal_actor(
-    state: &crate::context::actor::state::PerContextState,
+    state: &scp_runtime_core::context::actor::state::PerContextState,
     proposal_id: &scp_protocol::context::governance::ProposalId,
     reply: oneshot::Sender<
         Result<scp_protocol::context::governance::GovernanceProposal, ContextError>,
@@ -262,7 +262,7 @@ fn handle_get_proposal_actor(
 
 /// Handle [`GovernanceCommand::ListProposals`] (actor-shape, read-only).
 fn handle_list_proposals_actor(
-    state: &crate::context::actor::state::PerContextState,
+    state: &scp_runtime_core::context::actor::state::PerContextState,
     reply: oneshot::Sender<
         Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError>,
     >,
@@ -274,8 +274,10 @@ fn handle_list_proposals_actor(
 
 /// Handle [`GovernanceCommand::MigrationState`] (actor-shape, read-only).
 fn handle_migration_state_actor(
-    state: &crate::context::actor::state::PerContextState,
-    reply: oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
+    state: &scp_runtime_core::context::actor::state::PerContextState,
+    reply: oneshot::Sender<
+        Result<Option<scp_runtime_core::context::state::MigrationState>, ContextError>,
+    >,
 ) -> Outcome<()> {
     let migration = crate::context::governance_helpers::migration_state(state);
     let _ = reply.send(Ok(migration));
@@ -284,7 +286,7 @@ fn handle_migration_state_actor(
 
 /// Handle [`GovernanceCommand::TombstoneMigratedContext`] (actor-shape).
 async fn handle_tombstone_migrated_context_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -311,9 +313,11 @@ async fn handle_tombstone_migrated_context_actor(
 
 /// Handle [`GovernanceCommand::AcknowledgeCommitFault`] (actor-shape).
 fn handle_acknowledge_commit_fault_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
-    reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
+    reply: oneshot::Sender<
+        Result<scp_runtime_core::context::state::CommitFaultMarker, ContextError>,
+    >,
 ) -> Outcome<()> {
     let result = crate::context::governance_helpers::acknowledge_commit_fault(cell, context_id);
     let outcome = match &result {
@@ -326,7 +330,7 @@ fn handle_acknowledge_commit_fault_actor(
 
 /// Handle [`GovernanceCommand::WithdrawGovernanceVote`] (actor-shape).
 async fn handle_withdraw_governance_vote_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
@@ -360,7 +364,7 @@ async fn handle_withdraw_governance_vote_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] (actor-shape).
 async fn handle_apply_pending_ceiling_modification_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
@@ -399,7 +403,7 @@ async fn handle_apply_pending_ceiling_modification_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] (actor-shape).
 async fn handle_propose_governance_action_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionReply,
@@ -461,7 +465,7 @@ async fn handle_propose_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceActionChecked`] (actor-shape).
 async fn handle_propose_governance_action_checked_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionCheckedReply,
@@ -522,7 +526,7 @@ async fn handle_propose_governance_action_checked_actor(
 /// `GovernanceVote` capability path is reached through the dedicated
 /// `ApproveGovernanceProposal` / `RejectGovernanceProposal` commands.
 async fn handle_vote_on_proposal_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     approve: bool,
@@ -573,7 +577,7 @@ async fn handle_vote_on_proposal_actor(
 
 /// Handle [`GovernanceCommand::ApproveGovernanceProposal`] (actor-shape).
 async fn handle_approve_governance_proposal_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -623,7 +627,7 @@ async fn handle_approve_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::RejectGovernanceProposal`] (actor-shape).
 async fn handle_reject_governance_proposal_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -673,10 +677,12 @@ async fn handle_reject_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] (actor-shape).
 async fn handle_execute_governance_action_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     payload: ExecuteGovernanceActionPayload,
-    reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
+    reply: oneshot::Sender<
+        Result<scp_runtime_core::context::state::GovernanceActionResult, ContextError>,
+    >,
 ) -> Outcome<()> {
     let context_id = payload.context_id.clone();
 
@@ -737,7 +743,7 @@ async fn handle_execute_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] (actor-shape).
 async fn handle_apply_pending_economic_policy_change_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
@@ -788,7 +794,7 @@ async fn handle_apply_pending_economic_policy_change_actor(
 /// `Supervisor::contexts` DashMap directly); the actor-shape variant
 /// operates on `&mut state` and never touches the supervisor's DashMap.
 async fn handle_evaluate_periodic_consequences_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -797,7 +803,7 @@ async fn handle_evaluate_periodic_consequences_actor(
     use crate::context::governance_logic::{
         enforce_triggered_consequences, event_log_entries_for_consequences,
     };
-    use crate::context::shared::governance::EnforceConsequencesCtx;
+    use scp_runtime_core::context::shared::governance::EnforceConsequencesCtx;
 
     // Reads of the Class-C consequence config / membership go through the
     // cell's `Deref` (`&PerContextState`); no whole-state `&mut` is taken until
@@ -853,8 +859,9 @@ async fn handle_evaluate_periodic_consequences_actor(
     // applies a downward-auth GROW (idempotent across the sweep — one owed
     // persist). The token carrier (vs. a `bool`) makes a populated-but-undischarged
     // obligation a Drop-guard PANIC in debug/CI.
-    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
-        None;
+    let mut downward_auth_obligation: Option<
+        scp_runtime_core::context::actor::class_s::ClassSCommitToken,
+    > = None;
     {
         let mut view = cell.class_c_view();
         let mut split = view.consequence_split();
@@ -902,18 +909,18 @@ async fn handle_evaluate_periodic_consequences_actor(
 enum CommitRetryOutcomeKind {
     Success {
         attempts: u32,
-        operation: crate::context::state::CommitOperation,
+        operation: scp_runtime_core::context::state::CommitOperation,
     },
     Retry {
         error: String,
         next_attempt_at: u64,
         new_retry_count: u32,
-        operation: crate::context::state::CommitOperation,
+        operation: scp_runtime_core::context::state::CommitOperation,
     },
     Failed {
         reason: String,
         attempts: u32,
-        operation: crate::context::state::CommitOperation,
+        operation: scp_runtime_core::context::state::CommitOperation,
     },
 }
 struct CommitRetryOutcome {
@@ -931,11 +938,13 @@ struct CommitRetryOutcome {
 /// the `&mut state` borrow exclusively for the command's lifetime so
 /// no other command can interleave between Phase A and Phase B.
 async fn compute_commit_retry_outcomes(
-    snapshot: &[crate::context::state::PendingCommit],
+    snapshot: &[scp_runtime_core::context::state::PendingCommit],
     now: u64,
-    transport: &dyn crate::context::builder::ContextTransportProvider,
+    transport: &dyn scp_runtime_core::context::builder::ContextTransportProvider,
 ) -> Vec<CommitRetryOutcome> {
-    use crate::context::state::{MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, commit_retry_backoff};
+    use scp_runtime_core::context::state::{
+        MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, commit_retry_backoff,
+    };
 
     let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
     for (idx, pending) in snapshot.iter().enumerate() {
@@ -1036,14 +1045,14 @@ async fn compute_commit_retry_outcomes(
 /// member holds the notion, so two honest members would diverge at equal
 /// event count (§9.9.3). No durable consumer reads them.
 fn apply_commit_retry_outcomes(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     outcomes: Vec<CommitRetryOutcome>,
 ) {
     use scp_protocol::context::membership::ContextEvent;
 
-    use crate::context::state::CommitFaultMarker;
+    use scp_runtime_core::context::state::CommitFaultMarker;
 
     // Coalesced: all mutations are Class-C / structural (the pending-commit
     // queue, the fault marker, and the local-only broadcast-retry lifecycle
@@ -1142,11 +1151,11 @@ fn apply_commit_retry_outcomes(
 /// between phases — this preserves the legacy "queue is only mutated
 /// by this task between phases" invariant.
 async fn handle_process_pending_commits_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::state::PendingCommit;
+    use scp_runtime_core::context::state::PendingCommit;
 
     // Reads go through the cell's `Deref` (`&PerContextState`).
     if cell.commit_fault.is_some() {
@@ -1183,7 +1192,7 @@ async fn handle_process_pending_commits_actor(
 /// THIS actor's context (phases 1 through 5), on actor-owned state.
 ///
 /// Called by the actor's own `governance_timeout` interval arm
-/// ([`ContextActor::on_governance_timeout`](crate::context::actor::ContextActor))
+/// ([`ContextActor::on_governance_timeout`](scp_runtime_core::context::actor::ContextActor))
 /// each 60 s wake — the ACTOR-OWNED replacement for the retired
 /// supervisor-driven `EvaluateTimeouts` mailbox hop (ADR-049 Decision-1
 /// / finding A3).
@@ -1192,8 +1201,8 @@ async fn handle_process_pending_commits_actor(
 /// `Ok(false)` signals stop (context no longer `Active`) so the caller
 /// nulls the interval. `mutated` marks the actor dirty for the coalesced
 /// persist, matching the retired mailbox handler's dirty semantics.
-pub(crate) async fn evaluate_governance_timeouts(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn evaluate_governance_timeouts(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
 ) -> Outcome<bool> {
     use std::collections::HashSet;
@@ -1332,41 +1341,41 @@ pub(crate) async fn evaluate_governance_timeouts(
             deps,
             &mut cell.class_c_view(),
             &context_id,
-            crate::context::shared::lifecycle::DistributionScope::All,
+            scp_runtime_core::context::shared::lifecycle::DistributionScope::All,
         )
         .await;
 
     Outcome::ok_mutated(true)
 }
 
-/// The governance domain's [`GovernanceDomain`](crate::context::domains::GovernanceDomain)
+/// The governance domain's [`GovernanceDomain`](scp_runtime_core::context::domains::GovernanceDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Governance;
 
 #[async_trait::async_trait]
-impl crate::context::domains::GovernanceDomain for Governance {
+impl scp_runtime_core::context::domains::GovernanceDomain for Governance {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::GovernanceCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::GovernanceCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn evaluate_governance_timeouts(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-    ) -> crate::context::actor::outcome::Outcome<bool> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<bool> {
         evaluate_governance_timeouts(cell, deps).await
     }
 
     async fn enforce_triggered_consequences(
         &self,
-        state: &mut crate::context::actor::class_s::ConsequenceStateSplit<'_>,
-        args: &crate::context::shared::governance::EnforceConsequencesCtx<'_>,
-        obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+        state: &mut scp_runtime_core::context::actor::class_s::ConsequenceStateSplit<'_>,
+        args: &scp_runtime_core::context::shared::governance::EnforceConsequencesCtx<'_>,
+        obligation: &mut Option<scp_runtime_core::context::actor::class_s::ClassSCommitToken>,
     ) -> bool {
         crate::context::governance_logic::enforce_triggered_consequences(state, args, obligation)
             .await
@@ -1377,7 +1386,7 @@ impl crate::context::domains::GovernanceDomain for Governance {
         receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
         context_id: &str,
         now: u64,
-        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+        event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
     ) -> Result<(Vec<scp_event_log::Event>, u64), scp_protocol::context::ContextError> {
         crate::context::governance_logic::event_log_entries_for_consequences(
             receive_buffer,
@@ -1392,7 +1401,7 @@ impl crate::context::domains::GovernanceDomain for Governance {
         receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
         context_id: &str,
         now: u64,
-        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+        event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
     ) -> (Vec<scp_event_log::Event>, u64) {
         crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
             receive_buffer,
@@ -1404,14 +1413,14 @@ impl crate::context::domains::GovernanceDomain for Governance {
 
     fn execute_propose_context_migration<'a>(
         &'a self,
-        cell: &'a mut crate::context::actor::class_s::ClassSCell,
-        deps: &'a crate::context::actor::deps::ActorDeps,
-        proposal: crate::context::domains::ProposeMigrationRequest<'a>,
+        cell: &'a mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &'a scp_runtime_core::context::actor::deps::ActorDeps,
+        proposal: scp_runtime_core::context::domains::ProposeMigrationRequest<'a>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = Result<
-                        crate::context::state::MigrationProposedResult,
+                        scp_runtime_core::context::state::MigrationProposedResult,
                         scp_protocol::context::ContextError,
                     >,
                 > + Send
@@ -1433,12 +1442,12 @@ impl crate::context::domains::GovernanceDomain for Governance {
 
     async fn execute_revoke(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         did: &scp_did::DID,
         access: scp_protocol::context::governance::AccessScope,
-        meta: crate::context::shared::governance::CommitMeta<'_>,
+        meta: scp_runtime_core::context::shared::governance::CommitMeta<'_>,
     ) -> Result<usize, scp_protocol::context::ContextError> {
         crate::context::governance_helpers::execute_revoke(
             cell, deps, context_id, did, access, meta,
@@ -1448,10 +1457,10 @@ impl crate::context::domains::GovernanceDomain for Governance {
 
     async fn keep_broadcast_failure(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
-        failure: crate::context::shared::governance::BroadcastFailure,
+        failure: scp_runtime_core::context::shared::governance::BroadcastFailure,
     ) -> Result<(), scp_protocol::context::ContextError> {
         crate::context::governance_helpers::keep_broadcast_failure(cell, deps, context_id, failure)
             .await
@@ -1459,11 +1468,11 @@ impl crate::context::domains::GovernanceDomain for Governance {
 
     async fn try_broadcast_commit(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
         commit_bytes: Vec<u8>,
-        operation: &crate::context::state::CommitOperation,
-    ) -> Option<crate::context::shared::governance::BroadcastFailure> {
+        operation: &scp_runtime_core::context::state::CommitOperation,
+    ) -> Option<scp_runtime_core::context::shared::governance::BroadcastFailure> {
         crate::context::governance_helpers::try_broadcast_commit(
             deps,
             context_id,
@@ -1497,13 +1506,13 @@ mod consequence_fail_closed_tests {
     };
     use tokio::sync::oneshot;
 
-    use crate::context::ContextError;
-    use crate::context::actor::class_s::ClassSCell;
-    use crate::context::actor::deps::ActorDeps;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::builder::ContextEventLogProvider;
-    use crate::context::persistence::ContextPersistence;
-    use crate::context::providers::MerkleEventLogProvider;
+    use scp_protocol::context::ContextError;
+    use scp_runtime_core::context::actor::class_s::ClassSCell;
+    use scp_runtime_core::context::actor::deps::ActorDeps;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::builder::ContextEventLogProvider;
+    use scp_runtime_core::context::persistence::ContextPersistence;
+    use scp_runtime_core::context::providers::MerkleEventLogProvider;
 
     const ADMIN: &str = "did:dht:z6MkAdminFailClosed";
     const SUBJECT: &str = "did:dht:z6MkSubjectFailClosed";
@@ -1516,7 +1525,7 @@ mod consequence_fail_closed_tests {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
@@ -1524,7 +1533,7 @@ mod consequence_fail_closed_tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -1546,15 +1555,17 @@ mod consequence_fail_closed_tests {
     /// in-memory Merkle event log (the sweep reads the receive buffer for the
     /// non-convergent `MessageVelocity` evidence; the durable log stays empty).
     async fn build_fail_closed_deps() -> ActorDeps {
-        use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
+        use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            ADMIN.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                ADMIN.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<
@@ -1577,7 +1588,7 @@ mod consequence_fail_closed_tests {
             mls_storage,
             crate::domain_handlers(),
         );
-        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
             .await
@@ -1711,14 +1722,14 @@ mod consequence_fail_closed_tests {
         // The send path requires an Active context handle.
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
         // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
         // under its DECODED digest. Resolve the explicit arg the same way the
         // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_str);
 
         // Free (non-paid) send: no token, a local test signer, not broadcast.
         let result = crate::context::messaging_helpers::finalize_send(
@@ -1729,8 +1740,8 @@ mod consequence_fail_closed_tests {
             &DID(SUBJECT.to_owned()),
             0,
             b"payload",
-            crate::context::supervisor::MessageSigner::Active(
-                &crate::context::actor::signer::CommandSigner::local_ed25519(
+            scp_runtime_core::context::supervisor::MessageSigner::Active(
+                &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
                     ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
                 ),
             ),
@@ -1770,14 +1781,14 @@ mod consequence_fail_closed_tests {
         // The receive cascade requires an Active context handle.
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
         // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
         // under its DECODED digest. Resolve the explicit arg the same way the
         // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_str);
 
         let inner = scp_protocol::envelope::inner::InnerEnvelope {
             version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -1797,8 +1808,9 @@ mod consequence_fail_closed_tests {
             extensions: std::collections::HashMap::new(),
         };
 
-        let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_sink: Option<
+            scp_runtime_core::context::actor::class_s::ClassSCommitToken,
+        > = None;
         let mut view = cell.class_c_view();
         let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut view,
@@ -1870,9 +1882,9 @@ mod consequence_fail_closed_tests {
         use scp_protocol::context::builder::ContextCreationError;
 
         use super::super::{CommitRetryOutcomeKind, compute_commit_retry_outcomes};
-        use crate::context::ContextError;
-        use crate::context::builder::ContextTransportProvider;
-        use crate::context::state::{CommitOperation, PendingCommit};
+        use scp_protocol::context::ContextError;
+        use scp_runtime_core::context::builder::ContextTransportProvider;
+        use scp_runtime_core::context::state::{CommitOperation, PendingCommit};
 
         /// Records every `send_message` call (routing ID, payload and blob
         /// TTL in seconds) on a channel and accepts it.

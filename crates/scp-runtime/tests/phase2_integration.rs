@@ -41,8 +41,8 @@ use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
 };
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::invoke::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::outlets::invoke::{
     has_outlet_call_capability, invoke_outlet_aggregating,
 };
 
@@ -552,7 +552,7 @@ async fn phase2_end_to_end_integration() {
         &bob_did,
         None,
         calculator_executor,
-        None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None::<&mut scp_runtime_core::context::outlets::invoke::OutletEconomyContext<'_>>,
         None,
     )
     .await
@@ -621,7 +621,7 @@ async fn phase2_end_to_end_integration() {
         .await
         .expect("generate bob checkpoint key");
 
-    let alice_signer = scp_runtime::context::actor::CommandSigner::from_custody(
+    let alice_signer = scp_runtime_core::context::actor::CommandSigner::from_custody(
         scp_platform::signer::CustodySigner::new(
             std::sync::Arc::clone(&custody),
             alice_checkpoint_key,
@@ -634,7 +634,7 @@ async fn phase2_end_to_end_integration() {
         .await
         .expect("Alice checkpoint");
 
-    let bob_signer = scp_runtime::context::actor::CommandSigner::from_custody(
+    let bob_signer = scp_runtime_core::context::actor::CommandSigner::from_custody(
         scp_platform::signer::CustodySigner::new(
             std::sync::Arc::clone(&custody),
             bob_checkpoint_key,

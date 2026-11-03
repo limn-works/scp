@@ -1,12 +1,12 @@
 //! Per-domain handler modules. See plan §"Submodule organization".
 //!
 //! Each submodule implements the handlers for one sub-enum of
-//! [`ContextCommand`](crate::context::actor::commands::ContextCommand).
+//! [`ContextCommand`](scp_runtime_core::context::actor::commands::ContextCommand).
 //! The dispatch entry point is a free `dispatch` function taking the
 //! actor-owned state cell and deps (`(&mut ClassSCell, &ActorDeps,
 //! SubCommand)` — `standing` takes deps only, its state being
 //! supervisor-scoped) and returning an
-//! [`Outcome`](crate::context::actor::outcome::Outcome).
+//! [`Outcome`](scp_runtime_core::context::actor::outcome::Outcome).
 //!
 //! # Dispatch shape
 //!

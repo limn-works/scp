@@ -121,6 +121,8 @@ scp-relay-client = { path = "../scp-relay-client" }
 scp-runtime = { path = "../scp-runtime", features = ["testing"] }
 # The outlet-stream trackers and signer those tests drive live in scp-runtime-types (ADR-070).
 scp-runtime-types = { path = "../scp-runtime-types", features = ["testing"] }
+# The supervisor, actor and outlet dispatch those tests drive live in scp-runtime-core (ADR-070).
+scp-runtime-core = { path = "../scp-runtime-core", features = ["testing"] }
 # `tests/phase5_integration.rs` drives the ADR-024 media session lifecycle and the
 # MLS group calls it keys from. That test and `tests/perf_baseline.rs` live in this
 # crate, not in scp-runtime, because both need a crate that depends on scp-runtime

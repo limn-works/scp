@@ -3,7 +3,7 @@
 //! directory in ADR-049 §15; the helpers in
 //! [`crate::context::lifecycle_helpers`] call into these primitives.
 
-use crate::context::shared::lifecycle::build_identity_assessment;
+use scp_runtime_core::context::shared::lifecycle::build_identity_assessment;
 use std::collections::HashMap;
 
 use scp_protocol::context::ContextError;
@@ -85,10 +85,10 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-/// Runs [`validate_params`](crate::context::params_validation::validate_params),
+/// Runs [`validate_params`](scp_runtime_core::context::params_validation::validate_params),
 /// the one validator of every check that reads only `ContextParams`, on
 /// imported or restored params with
-/// [`ParamsOrigin::Existing`](crate::context::params_validation::ParamsOrigin::Existing),
+/// [`ParamsOrigin::Existing`](scp_runtime_core::context::params_validation::ParamsOrigin::Existing),
 /// and returns [`ContextError::ImportRejected`] on failure, so the bridge
 /// translators surface `SCP-CTX-2092` as they do for
 /// [`validate_consequence_rules_for_import`]. The template check does not
@@ -102,9 +102,9 @@ pub fn validate_consequence_rules_for_import(
 pub(super) fn validate_context_params_for_import(
     params: &scp_protocol::context::ContextParams,
 ) -> Result<(), ContextError> {
-    crate::context::params_validation::validate_params(
+    scp_runtime_core::context::params_validation::validate_params(
         params,
-        crate::context::params_validation::ParamsOrigin::Existing,
+        scp_runtime_core::context::params_validation::ParamsOrigin::Existing,
     )
     .map_err(|e| ContextError::ImportRejected {
         reason: format!("context_params invalid: {e}"),
@@ -125,7 +125,7 @@ pub(super) fn validate_context_params_for_import(
 ///
 /// Reads the `sybil_policy` directly so callers may pass
 /// `state.handle.params().sybil_policy.as_ref()` from the unified
-/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1). When `None`, passes
+/// [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1). When `None`, passes
 /// unconditionally. When `Some`, constructs an
 /// [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) from the member's available trust signals
 /// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
@@ -136,7 +136,7 @@ pub(super) fn validate_context_params_for_import(
 /// configured and the assessment fails.
 pub fn evaluate_sybil_resistance(
     sybil_policy: Option<&scp_protocol::trust::sybil::ContextSybilPolicy>,
-    governance: &super::state::GovernanceState,
+    governance: &scp_runtime_core::context::state::GovernanceState,
     member_did: &DID,
     now: u64,
 ) -> Result<(), ContextError> {
@@ -159,7 +159,7 @@ pub fn evaluate_sybil_resistance(
 /// into `participation_cache`. Budget spend is NOT recorded here — that is
 /// `enforce_join_economy`'s responsibility (#1537). Takes the `&mut participation_cache` field and a
 /// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
-/// unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
+/// unified [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the
 /// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
 /// `state_mut()`) is needed.
@@ -171,11 +171,11 @@ pub fn post_join_bookkeeping(
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
     context_id: &str,
     member_did: &DID,
-    deps: &crate::context::actor::deps::ActorDeps,
+    deps: &scp_runtime_core::context::actor::deps::ActorDeps,
 ) {
     let now = deps.clock.now_secs();
     let event_log = deps.event_log.as_ref();
-    let context_id_bytes = super::state::context_id_to_bytes(context_id);
+    let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(context_id);
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
@@ -215,20 +215,20 @@ pub fn post_join_bookkeeping(
 /// AND-composition (spec §19.5), and records spend against the joiner's
 /// budget. Takes a `&mut GovernanceState` and `member_count` directly so
 /// callers may pass disjoint sub-borrows of the unified
-/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1).
+/// [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1).
 ///
 /// # Errors
 ///
 /// Returns [`ContextError::PermissionDenied`] if the auto-accept guard
 /// rejects, or any error surfaced by `enforce_economy`.
 pub fn enforce_join_economy(
-    governance: &mut super::state::GovernanceState,
+    governance: &mut scp_runtime_core::context::state::GovernanceState,
     member_count: usize,
     joiner_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     context_id: &str,
-    deps: &crate::context::actor::deps::ActorDeps,
+    deps: &scp_runtime_core::context::actor::deps::ActorDeps,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         governance.economic_policy.as_ref(),
@@ -243,9 +243,8 @@ pub fn enforce_join_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    deps.domains
-        .economy
-        .enforce_economy(crate::context::shared::economy::EnforceEconomyRequest {
+    deps.domains.economy.enforce_economy(
+        scp_runtime_core::context::shared::economy::EnforceEconomyRequest {
             economic_policy: governance.economic_policy.as_ref(),
             budget_tracker: &mut governance.budget_tracker,
             velocity_tracker: &governance.velocity_tracker,
@@ -261,5 +260,6 @@ pub fn enforce_join_economy(
             nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
             revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
             key_resolver: &deps.key_resolver,
-        })
+        },
+    )
 }

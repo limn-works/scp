@@ -111,7 +111,7 @@ use std::time::Duration;
 
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_core::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
 use scp_runtime_types::context::actor::sequence::{SendSequenceTracker, SequenceReservation};
 use scp_runtime_types::context::supervisor::saga_journal::{
     ProtocolRepositorySagaJournal, SagaJournal,
@@ -254,8 +254,8 @@ async fn send_future_cancelled_after_commit_keeps_sequence() {
 /// in `tests/actor_saga_coordinator.rs` (integration test files cannot share
 /// a module, so the constructor is replicated).
 fn test_supervisor() -> Supervisor {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(scp_runtime::context::persistence::NoOpContextPersistence);
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
+        Arc::new(scp_runtime_core::context::persistence::NoOpContextPersistence);
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
     )));
