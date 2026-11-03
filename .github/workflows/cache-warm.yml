@@ -13,6 +13,9 @@ on:
       mode:
         default: measure
         type: string
+      artifact_run:
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -284,3 +287,37 @@ jobs:
           start=$(date +%s)
           CARGO_TERM_COLOR=never python3 scripts/tests/workspace-cache/exactness.py
           echo "EXACTNESS seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  clippy-proof:
+    if: inputs.mode == 'clippy-proof'
+    name: clippy-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: clippy-packages
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: actions/download-artifact@v4
+        with:
+          name: ws-clippy-packages
+          path: ${{ runner.temp }}/ws
+          run-id: ${{ inputs.artifact_run }}
+          github-token: ${{ github.token }}
+      - name: Restore
+        run: python3 scripts/ci-workspace-cache.py restore --target target --archive "$RUNNER_TEMP/ws/ws.tar.zst"
+      - name: Clippy proofs
+        run: bash scripts/ws-clippy-proof.sh
