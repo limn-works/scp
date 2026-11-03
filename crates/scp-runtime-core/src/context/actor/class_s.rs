@@ -4971,12 +4971,12 @@ mod tests {
         const KNOWN_SUBSUME_SITES: [(&str, &str, usize); 2] = [
             (
                 "messaging_helpers.rs",
-                include_str!("../../../../scp-runtime/src/context/messaging_helpers.rs"),
+                include_str!("../../../../scp-runtime-messaging/src/helpers.rs"),
                 1,
             ),
             (
                 "governance_helpers.rs",
-                include_str!("../../../../scp-runtime/src/context/governance_helpers.rs"),
+                include_str!("../../../../scp-runtime-governance/src/helpers.rs"),
                 1,
             ),
         ];

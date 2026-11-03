@@ -14,7 +14,7 @@ categories = ["cryptography", "network-programming"]
 # Turns on `testing` in every runtime crate and in the scp dependencies the
 # tests use. Only test builds enable it; see `scp-runtime-core`'s manifest for
 # why no shipped artifact resolves it.
-testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-runtime-core/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
+testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-runtime-core/testing", "scp-runtime-messaging/testing", "scp-runtime-lifecycle/testing", "scp-runtime-governance/testing", "scp-runtime-broadcast/testing", "scp-runtime-economy/testing", "scp-runtime-trust-recovery/testing", "scp-runtime-standing/testing", "scp-runtime-ttl-close/testing", "scp-runtime-outlets/testing", "scp-runtime-push/testing", "scp-runtime-queries/testing", "scp-runtime-saga/testing", "scp-runtime-lifecycle-control/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
 # Forwards to `scp-runtime-core/allow_unencrypted_storage`, which gates
 # `ProtocolRepository::new_for_testing()`.
 allow_unencrypted_storage = ["scp-runtime-core/allow_unencrypted_storage"]
@@ -23,13 +23,27 @@ allow_unencrypted_storage = ["scp-runtime-core/allow_unencrypted_storage"]
 # crate's non-dev dependency enables it.
 saga-witness-test-mint = ["scp-runtime-core/saga-witness-test-mint"]
 # Forwards to `scp-runtime-core/outlet-capability-test-grant`
-# (`Supervisor::test_grant_member_capability`), an authority-escalation test
+# (`Supervisor::test_grant_member_capability`) and to the messaging crate's match arm
+# for the command variant it gates, an authority-escalation test
 # seam. Deliberately NOT implied by `testing`.
-outlet-capability-test-grant = ["scp-runtime-core/outlet-capability-test-grant"]
+outlet-capability-test-grant = ["scp-runtime-core/outlet-capability-test-grant", "scp-runtime-messaging/outlet-capability-test-grant"]
 
 [dependencies]
 scp-runtime-types = { path = "../scp-runtime-types", version = "=0.1.0-beta.2" }
 scp-runtime-core = { path = "../scp-runtime-core", version = "=0.1.0-beta.2" }
+scp-runtime-messaging = { path = "../scp-runtime-messaging", version = "=0.1.0-beta.2" }
+scp-runtime-lifecycle = { path = "../scp-runtime-lifecycle", version = "=0.1.0-beta.2" }
+scp-runtime-governance = { path = "../scp-runtime-governance", version = "=0.1.0-beta.2" }
+scp-runtime-broadcast = { path = "../scp-runtime-broadcast", version = "=0.1.0-beta.2" }
+scp-runtime-economy = { path = "../scp-runtime-economy", version = "=0.1.0-beta.2" }
+scp-runtime-trust-recovery = { path = "../scp-runtime-trust-recovery", version = "=0.1.0-beta.2" }
+scp-runtime-standing = { path = "../scp-runtime-standing", version = "=0.1.0-beta.2" }
+scp-runtime-ttl-close = { path = "../scp-runtime-ttl-close", version = "=0.1.0-beta.2" }
+scp-runtime-outlets = { path = "../scp-runtime-outlets", version = "=0.1.0-beta.2" }
+scp-runtime-push = { path = "../scp-runtime-push", version = "=0.1.0-beta.2" }
+scp-runtime-queries = { path = "../scp-runtime-queries", version = "=0.1.0-beta.2" }
+scp-runtime-saga = { path = "../scp-runtime-saga", version = "=0.1.0-beta.2" }
+scp-runtime-lifecycle-control = { path = "../scp-runtime-lifecycle-control", version = "=0.1.0-beta.2" }
 openmls = { workspace = true }
 openmls_traits = { workspace = true }
 openmls_basic_credential = { workspace = true }

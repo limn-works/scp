@@ -12,7 +12,7 @@
 //! primitives in isolation. The *live-pipeline* counterpart, which drives the
 //! real `build_encrypted_envelope` send helper and the real `verify_and_unwrap`
 //! receive helper over a two-party MLS group, lives in
-//! `crates/scp-runtime/src/context/agent_binding_pipeline_tests.rs` (SCP-AB-021).
+//! `crates/scp-runtime-messaging/src/agent_binding_pipeline_tests.rs` (SCP-AB-021).
 //!
 //! Exercises the full agent binding flow:
 //!
