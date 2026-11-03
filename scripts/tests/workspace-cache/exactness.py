@@ -95,9 +95,14 @@ def unit_key(msg: dict) -> str:
     return f"{pkg_name(msg)}:{'/'.join(t['kind'])}:{t['name']}:{files}"
 
 
+# Workspace package id -> name, from `cargo metadata`. A package id leaves the name out
+# when it equals the directory's (`path+file:///.../scp-node#0.1.0`), so the id alone
+# does not carry it.
+PACKAGE_NAMES: dict[str, str] = {}
+
+
 def pkg_name(msg: dict) -> str:
-    # path+file:///.../crates/scp-ffi/common#scp-ffi-common@0.1.0
-    return msg["package_id"].split("#", 1)[1].split("@", 1)[0]
+    return PACKAGE_NAMES[msg["package_id"]]
 
 
 def dep_info_inputs(msg: dict) -> set[str]:
@@ -137,6 +142,7 @@ def reverse_deps() -> dict[str, set[str]]:
         ).stdout
     )
     names = {p["id"]: p["name"] for p in meta["packages"] if p["source"] is None}
+    PACKAGE_NAMES.update(names)
     rdeps: dict[str, set[str]] = {n: set() for n in names.values()}
     for node in meta["resolve"]["nodes"]:
         if node["id"] not in names:
