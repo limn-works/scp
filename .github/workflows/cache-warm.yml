@@ -419,3 +419,42 @@ jobs:
           run_reader "$r" mid
           edit root crates/scp-crypto/src/lib.rs
           run_reader "$r" root
+
+  why:
+    if: inputs.mode == 'why'
+    name: why
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - name: Write, pack, clean, restore, rerun with the fingerprint log
+        run: |
+          source scripts/ws-exp.sh
+          run_reader pyo3 writer
+          ls -la target/debug/deps | command grep -E ' (lib)?scp_ffi[.-]' || true
+          for d in target/debug/.fingerprint/scp-ffi-*; do echo "== $d"; ls "$d"; done
+          python3 scripts/ci-workspace-cache.py pack --target target --out "$RUNNER_TEMP/ws.tar.zst"
+          tar -tf "$RUNNER_TEMP/ws.tar.zst" --zstd | command grep -E 'scp_ffi[.-]|scp-ffi-' | command grep -v common | head -60
+          python3 scripts/ci-workspace-cache.py clean --target target
+          python3 scripts/ci-workspace-cache.py restore --target target --archive "$RUNNER_TEMP/ws.tar.zst"
+          ls -la target/debug/deps | command grep -E ' (lib)?scp_ffi[.-]' || true
+          export CARGO_LOG=cargo::core::compiler::fingerprint=info
+          CARGO_TERM_COLOR=never cargo build -p scp-ffi --features server 2>&1 | command grep -iE 'dirty|stale|missing|Compiling scp' | head -40
+          CARGO_TERM_COLOR=never cargo nextest run --no-run -p scp-ffi --features server --lib 2>&1 | command grep -iE 'dirty|stale|missing|Compiling scp' | head -40
