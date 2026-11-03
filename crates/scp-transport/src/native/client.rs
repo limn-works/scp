@@ -841,6 +841,7 @@ impl NativeRelayClient {
                 ref_id: None,
                 routing_id: *routing_id,
                 since,
+                after_blob: None,
                 limit: None,
             };
             let _response = self.send_request(msg).await?;
@@ -878,8 +879,8 @@ impl NativeRelayClient {
     /// # Errors
     ///
     /// - [`TransportError::NotConnected`] if the client is not connected.
-    /// - [`TransportError::SendFailed`] if `blob_ttl` exceeds the `u32` wire
-    ///   field.
+    /// - [`TransportError::SendFailed`] if `blob_ttl` lies outside
+    ///   `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
     /// - [`TransportError::RelayRejected`] with the relay's code if the relay
     ///   answers `ERR`, so a caller such as the push registrar can tell a
     ///   `4xxx` refusal from a retryable `5xxx` failure (ADR-004).
@@ -894,15 +895,20 @@ impl NativeRelayClient {
         // match the identity-layer RelayPublisher. A DID record's 7-day TTL
         // (604800) fits comfortably; reject an out-of-range value loudly rather
         // than silently truncating.
-        let blob_ttl = u32::try_from(blob_ttl).map_err(|_| {
-            TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
-        })?;
+        let blob_ttl = u32::try_from(blob_ttl)
+            .map_err(|_| {
+                TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
+            })
+            .and_then(|secs| {
+                scp_relay_client::PublishTtl::new(secs)
+                    .map_err(|e| TransportError::SendFailed(e.to_string()))
+            })?;
 
         let msg = ClientMessage::Publish {
             ref_id: None,
             routing_id: *routing_id,
             recipient_hint: None,
-            blob_ttl,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(blob_ttl),
             blob,
         };
 
@@ -1053,6 +1059,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id: *routing_id,
             since,
+            after_blob: None,
             limit,
         };
         assign_ref_id(&mut msg, &ref_id);
@@ -1290,7 +1297,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 60,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             blob: payload,
         };
 
@@ -1335,7 +1342,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0x01],
         };
         assign_ref_id(&mut msg, "test-1");
@@ -1518,7 +1527,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_data.clone(),
         };
@@ -1565,7 +1574,7 @@ mod tests {
             routing_id,
             blob_id: correct_blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_data,
         };
@@ -1598,7 +1607,7 @@ mod tests {
             routing_id,
             blob_id: original_blob_id, // Hash of original, not tampered.
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: tampered_blob,
         };
@@ -1627,7 +1636,7 @@ mod tests {
             routing_id,
             blob_id: correct_blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: empty_blob,
         };
@@ -1667,7 +1676,7 @@ mod tests {
             routing_id: routing_id_b,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload.clone(),
         };
@@ -1695,7 +1704,7 @@ mod tests {
             routing_id: routing_id_a,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload,
         };
@@ -1740,7 +1749,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload.clone(),
         };
@@ -1780,7 +1789,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload,
         };
@@ -1856,7 +1865,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0x01],
         };
 
@@ -1889,7 +1900,9 @@ mod tests {
                 ref_id: None,
                 routing_id: [i; 32],
                 recipient_hint: None,
-                blob_ttl: 3600,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<
+                    3600,
+                >()),
                 blob: vec![i],
             };
 
@@ -1940,7 +1953,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0xDE, 0xAD],
         };
 
@@ -2088,20 +2103,13 @@ mod tests {
     /// normal resolution yielded zero candidates.
     #[tokio::test]
     async fn query_raw_e2e_returns_all_frames_and_completes_promptly() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
-        // This test exercises the CLIENT's multi-candidate collection over
-        // NON-validating storage (the frames use dummy key/signature bytes —
-        // exactly what a validating relay would reject). A validating relay
-        // collapses a DID routing_id to a single slot (SCP-RELAYRES-003), which
-        // is a separate, relay-side property; here we want the relay to keep and
-        // return every published blob so the client's sift path is exercised.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2146,14 +2154,13 @@ mod tests {
     /// and returns every well-framed blob beside it.
     #[tokio::test]
     async fn query_drops_a_malformed_blob_and_returns_the_framed_one() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2196,16 +2203,13 @@ mod tests {
     /// empty. This behavioral test fails if the flag is silently flipped.
     #[tokio::test]
     async fn query_raw_twice_same_did_returns_record_both_times() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
-        // Client-side dedup-bypass behavior over NON-validating storage (the
-        // dummy-signature frame is not relay-valid). See the sibling test above.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2287,7 +2291,7 @@ mod tests {
                             routing_id: *routing_id,
                             blob_id,
                             recipient_hint: None,
-                            blob_ttl: 3600,
+                            blob_ttl: Some(3600),
                             stored_at: 1_700_000_000,
                             blob,
                         }
@@ -2332,7 +2336,7 @@ mod tests {
                     routing_id: *routing_id,
                     blob_id,
                     recipient_hint: None,
-                    blob_ttl: 3600,
+                    blob_ttl: Some(3600),
                     stored_at: 1_700_000_000,
                     blob,
                 }]

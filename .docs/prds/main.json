@@ -13870,7 +13870,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/public_records/mod.rs",
         "crates/scp-node/src/public_records/admission.rs",
@@ -13884,7 +13884,15 @@
         "crates/scp-transport/src/native/postgres_blob.rs",
         "crates/scp-transport/src/native/redb_blob.rs",
         "crates/scp-transport/src/native/s3_blob.rs",
-        "crates/scp-transport/src/native/sqlite_blob.rs"
+        "crates/scp-transport/src/native/sqlite_blob.rs",
+        "crates/scp-kel/src/retained.rs",
+        "crates/scp-kel/src/rank/tests.rs",
+        "crates/scp-protocol/src/crypto/anchored_key.rs",
+        "crates/scp-protocol/src/node/binding.rs",
+        "crates/scp-protocol/src/node/list.rs",
+        "crates/scp-protocol/src/context/operator_binding.rs",
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-transport/src/native/public_records.rs"
       ],
       "description": "Every conforming node validates the public records it stores, as defense in depth and never as a trust dependency (ADR-065 decisions 1 and 2, `09-security-model.md` §9.10.12). A node admits and selects each retained kind by the per-kind table of §9.10.12, keeps a retained record with no TTL, and charges four quota classes keyed on routing id: retained public records, KeyPackage sets, identity private state, and TTL-bearing blobs (ADR-065 decision 3, `09-security-model.md` §9.18.B). The non-validating storage class goes. A QUERY pages by the (`stored_at`, `blob_id`) cursor, the criteria SCP-RELAYRES-009 carried before its withdrawal. `scp:wit:` admission is SCP-369's, private state SCP-373's, and KeyPackage sets SCP-374's. Node backend execution plan code PR C4.",
       "acceptanceCriteria": [
@@ -13894,12 +13902,16 @@
         "`BlobStorage::store` takes `retain`, and every backend (`combined.rs`, `local_cache.rs`, `postgres_blob.rs`, `redb_blob.rs`, `s3_blob.rs`, `sqlite_blob.rs`) keeps a retained record past every TTL purge: one test per backend",
         "The four quota classes exist, each keyed on routing id with no stored value; a write past a class's limit is refused and leaves the other three classes' counts unchanged: a test per class (`09-security-model.md` §9.18.B)",
         "A QUERY carrying `after_blob` returns only the blobs whose (`stored_at`, `blob_id`) pair sorts strictly after (`since`, `after_blob`); a QUERY carrying `after_blob` without `since` receives `ERR` `4002`; a query and a backfill are served in ascending (`stored_at`, `blob_id`) order: a test per boundary, one for the refusal, and one that stores blobs out of order (`10-infrastructure-and-self-hosting.md` §10.4.1)",
+        "A node's `scp:nls:` admission and selection read the governor chains it retains under `09-security-model.md` §9.7.4.2 R9 as `scp_kel::RetainedChain`, which only `scp_kel::RetainedLog` constructs, from event units it validates and ranks itself; `compile_fail` doctests show that no public path builds a `RetainedChain` or a `RetainedLog` from a `ValidatedChain`, beside a positive control. scp-protocol's party verifiers (`VerifiedNodeBinding`, `VerifiedNodeListEntry`, `VerifiedNodeListRecord`, `ContextOperatorBinding`) take a `ResolvedState` only, and store admission goes through `AdmittedNodeListEntry` and `AdmittedNodeListRecord`, which take a `RetainedChain` and which no party consumer accepts: `compile_fail` doctests show each direction refused. A test each shows a node admitting a record whose signer the held governor chain names at `signing_key_state_head`, refusing a record with `4040` when it holds no governor log, refusing a record under another identity, refusing a record whose (`context_id`, `governor`) no configured node-list pointer names, and dropping a record after a later governor event marks its signing key `Compromised`, at every pinned context of that governor (`03-identity.md` §3.10.10, `09-security-model.md` §9.10.12)",
+        "Every retained record carries a persisted per-routing-id admission order on every backend, and every \"held earliest\" tie-break of §9.10.12 and §9.7.4.2 R9 reads it, never `stored_at` or `blob_id`: a test per kind (`scp:svc:`, `scp:nls:`, `scp:wcf:`) at a held-sequence tie keeps the first admitted, and a replay of two forks admitted in one second keeps the admission order",
+        "A PUBLISH's lifetime is one `scp_relay_client::BlobLifetime`, `Retained` or `Ttl(seconds)`, whose decoder maps the `retain` and `blob_ttl` keys and refuses both, neither, or `retain: false` with the §9.10.12 codes; no runtime validator re-checks the pair",
         "The non-validating storage class and its tests are deleted: `git grep` for its type name over `crates/` prints nothing",
         "No `unwrap()` or `expect()` in library code",
         "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
         "Add `crates/scp-node/src/public_records/` with admission, selection and quota per kind.",
+        "Read `scp:nls:` admission and selection from the governor chains the node retains, as `RetainedChain`.",
         "Add `retain` to `BlobStorage::store` and honor it in every backend's purge.",
         "Serve QUERY by the (`stored_at`, `blob_id`) cursor.",
         "Delete the non-validating storage class and its tests."
@@ -13908,6 +13920,10 @@
         "SCP-364"
       ],
       "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.10.12 Node Record Frames"

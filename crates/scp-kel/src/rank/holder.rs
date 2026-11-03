@@ -81,8 +81,9 @@ pub enum HoldError {
 /// again later is re-ranked as if the party saw it for the first time", so
 /// it takes a new moment.
 ///
-/// S5 (SCP-007 part) is the caller that wires this holder into a validating
-/// store.
+/// The node's public-record store holds every `scp:did:` chain through one
+/// (`09-security-model.md` §9.10.12, "What a node admits, keeps and serves,
+/// per kind").
 #[derive(Debug, Clone)]
 pub struct AcceptedChainHolder {
     /// The accepted chain as the set's basis, and the retained suffixes;
@@ -150,8 +151,7 @@ impl AcceptedChainHolder {
     /// through [`RetentionSet::rerank`], which re-admits the chain accepted
     /// before.
     ///
-    /// S5 (SCP-007 part) is the caller that wires this into a validating
-    /// store, which calls it after every frame it accepts.
+    /// A validating store calls it after every frame it accepts.
     ///
     /// # Errors
     ///

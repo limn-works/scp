@@ -551,6 +551,7 @@ jobs:
           cargo nextest run --no-run -p scp-transport --features push-store --lib
           cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib
           cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
+          cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_conformance --test s3_blob_conformance
       # rust-test-optional-features's `node-relay` leg.
       - name: Compile every scp-node and scp-relay feature set the node-relay leg tests
         if: steps.cache.outputs.cache-hit != 'true'

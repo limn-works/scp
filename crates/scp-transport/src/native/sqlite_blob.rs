@@ -15,7 +15,11 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
-use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_clock};
+use super::sql_blob;
+use super::storage::{
+    BlobStorage, ClockFn, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+    system_clock,
+};
 
 /// `SQLite`-backed blob storage for relay-side encrypted message blobs.
 ///
@@ -31,13 +35,14 @@ use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_cloc
 ///     blob_id BLOB PRIMARY KEY,
 ///     routing_id BLOB NOT NULL,
 ///     recipient_hint BLOB,
-///     blob_ttl INTEGER NOT NULL,
+///     blob_ttl INTEGER,          -- NULL: a retained record
+///     admission INTEGER,         -- a retained record's admission counter; NULL on a TTL blob
 ///     stored_at INTEGER NOT NULL,
-///     expires_at INTEGER NOT NULL,
+///     expires_at INTEGER,        -- NULL: never expires
 ///     blob BLOB NOT NULL
 /// ) WITHOUT ROWID;
 ///
-/// CREATE INDEX idx_routing ON blobs (routing_id, stored_at);
+/// CREATE INDEX idx_routing ON blobs (routing_id, stored_at, blob_id);
 /// CREATE INDEX idx_expiry ON blobs (expires_at);
 /// ```
 ///
@@ -136,21 +141,8 @@ impl SqliteBlobStore {
         )
         .map_err(|e| StorageError::Internal(format!("sqlite pragma: {e}")))?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS blobs (
-                blob_id BLOB PRIMARY KEY,
-                routing_id BLOB NOT NULL,
-                recipient_hint BLOB,
-                blob_ttl INTEGER NOT NULL,
-                stored_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                blob BLOB NOT NULL
-            ) WITHOUT ROWID;
-
-            CREATE INDEX IF NOT EXISTS idx_routing ON blobs (routing_id, stored_at);
-            CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);",
-        )
-        .map_err(|e| StorageError::Internal(format!("sqlite schema: {e}")))?;
+        conn.execute_batch(sql_blob::SCHEMA)
+            .map_err(|e| StorageError::Internal(format!("sqlite schema: {e}")))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -167,198 +159,54 @@ impl BlobStorage for SqliteBlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: StoredLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        let stored_at = (self.clock)();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
-
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT OR REPLACE INTO blobs
-                (blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                blob_id.as_slice(),
-                routing_id.as_slice(),
-                recipient_hint.map(|h| h.to_vec()),
-                blob_ttl,
-                stored_at,
-                expires_at,
-                blob,
-            ],
-        )
-        .map_err(|e| StorageError::Internal(format!("sqlite insert: {e}")))?;
-
-        Ok(StoredBlob {
+        let stored = StoredBlob {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
-            stored_at,
+            lifetime,
+            stored_at: (self.clock)(),
             blob,
-        })
+        };
+        sql_blob::store(&*self.conn.lock().await, stored)
     }
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        let conn = self.conn.lock().await;
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT routing_id, recipient_hint, blob_ttl, stored_at, blob
-                 FROM blobs WHERE blob_id = ?1 AND expires_at > ?2",
-            )
-            .map_err(|e| StorageError::Internal(format!("sqlite prepare: {e}")))?;
-
-        let result = stmt.query_row(rusqlite::params![blob_id.as_slice(), now], |row| {
-            let routing_id_vec: Vec<u8> = row.get(0)?;
-            let hint_opt: Option<Vec<u8>> = row.get(1)?;
-            let blob_ttl: u32 = row.get(2)?;
-            let stored_at: u64 = row.get(3)?;
-            let blob: Vec<u8> = row.get(4)?;
-
-            let routing_id: [u8; 32] = routing_id_vec.as_slice().try_into().map_err(|_| {
-                rusqlite::Error::InvalidColumnType(
-                    0,
-                    "routing_id".to_owned(),
-                    rusqlite::types::Type::Blob,
-                )
-            })?;
-
-            let recipient_hint = hint_opt
-                .map(|h| -> Result<[u8; 32], rusqlite::Error> {
-                    h.as_slice().try_into().map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(
-                            1,
-                            "recipient_hint".to_owned(),
-                            rusqlite::types::Type::Blob,
-                        )
-                    })
-                })
-                .transpose()?;
-
-            Ok(StoredBlob {
-                routing_id,
-                blob_id: *blob_id,
-                recipient_hint,
-                blob_ttl,
-                stored_at,
-                blob,
-            })
-        });
-
-        match result {
-            Ok(blob) => Ok(Some(blob)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(StorageError::Internal(format!("sqlite get: {e}"))),
-        }
+        sql_blob::get(&*self.conn.lock().await, blob_id, now)
     }
 
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        let conn = self.conn.lock().await;
-
-        let since_ts = since.unwrap_or(0);
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT blob_id, recipient_hint, blob_ttl, stored_at, blob
-                 FROM blobs
-                 WHERE routing_id = ?1 AND expires_at > ?2 AND stored_at > ?3
-                 ORDER BY stored_at ASC
-                 LIMIT ?4",
-            )
-            .map_err(|e| StorageError::Internal(format!("sqlite prepare: {e}")))?;
-
-        let rows = stmt
-            .query_map(
-                rusqlite::params![routing_id.as_slice(), now, since_ts, limit],
-                |row| {
-                    let blob_id_vec: Vec<u8> = row.get(0)?;
-                    let hint_opt: Option<Vec<u8>> = row.get(1)?;
-                    let blob_ttl: u32 = row.get(2)?;
-                    let stored_at: u64 = row.get(3)?;
-                    let blob: Vec<u8> = row.get(4)?;
-
-                    let blob_id: [u8; 32] = blob_id_vec.as_slice().try_into().map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(
-                            0,
-                            "blob_id".to_owned(),
-                            rusqlite::types::Type::Blob,
-                        )
-                    })?;
-
-                    let recipient_hint = hint_opt
-                        .map(|h| -> Result<[u8; 32], rusqlite::Error> {
-                            h.as_slice().try_into().map_err(|_| {
-                                rusqlite::Error::InvalidColumnType(
-                                    1,
-                                    "recipient_hint".to_owned(),
-                                    rusqlite::types::Type::Blob,
-                                )
-                            })
-                        })
-                        .transpose()?;
-
-                    Ok(StoredBlob {
-                        routing_id: *routing_id,
-                        blob_id,
-                        recipient_hint,
-                        blob_ttl,
-                        stored_at,
-                        blob,
-                    })
-                },
-            )
-            .map_err(|e| StorageError::Internal(format!("sqlite query: {e}")))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| StorageError::Internal(format!("sqlite row: {e}")))?);
-        }
-        Ok(results)
+        sql_blob::query(
+            &*self.conn.lock().await,
+            routing_id,
+            cursor,
+            filter,
+            limit,
+            now,
+        )
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
-        let conn = self.conn.lock().await;
-
-        let rows_affected = conn
-            .execute(
-                "DELETE FROM blobs WHERE blob_id = ?1",
-                rusqlite::params![blob_id.as_slice()],
-            )
-            .map_err(|e| StorageError::Internal(format!("sqlite delete: {e}")))?;
-
-        Ok(rows_affected > 0)
+        sql_blob::delete(&*self.conn.lock().await, blob_id)
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = (self.clock)();
-        let conn = self.conn.lock().await;
-
-        let rows_affected = conn
-            .execute(
-                "DELETE FROM blobs WHERE expires_at <= ?1",
-                rusqlite::params![now],
-            )
-            .map_err(|e| StorageError::Internal(format!("sqlite purge: {e}")))?;
-
-        Ok(rows_affected)
+        sql_blob::purge_expired(&*self.conn.lock().await, now)
     }
 
     async fn count(&self) -> Result<usize, StorageError> {
-        let conn = self.conn.lock().await;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .map_err(|e| StorageError::Internal(format!("sqlite count: {e}")))?;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        Ok(count as usize)
+        sql_blob::count(&*self.conn.lock().await)
     }
 }
 

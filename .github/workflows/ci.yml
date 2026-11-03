@@ -1779,8 +1779,9 @@ jobs:
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep of the workspace leg leaves off. The first command lints the
-          # backends' own modules and their `#[ignore]`d unit tests, which need a
-          # live PostgreSQL or S3 endpoint to run. The `cloud-blobs` step below
+          # backends' own modules and their unit tests, which the transport-blob
+          # leg of rust-test-optional-features runs against live PostgreSQL and
+          # S3-compatible containers. The `cloud-blobs` step below
           # lints each binary's cloud-blobs build.
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           # The same build with `webpush`, which scp-node enables and scp-relay
@@ -2212,6 +2213,31 @@ jobs:
           # builds them. Each `--test` names one target; a target that stops
           # existing fails this command.
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
+          # The PostgreSQL and S3 blob stores' unit tests (persistence spec
+          # §17.7; `BlobStorage::store(retain)` and purge for each backend,
+          # SCP-366) need live servers. GitHub's `services:` cannot pass a
+          # container its command, and these two of the seven legs alone need
+          # the servers, so this step starts them. Each image is pinned by its
+          # index digest (the tag names the version the digest was read
+          # from), and each port binds to loopback only, so the runner's
+          # network never reaches the throwaway credentials. Every test
+          # creates its own PostgreSQL database and its own S3 key prefix, so
+          # nextest's parallel processes share no rows.
+          docker run -d --name scp-ci-postgres -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+          docker run -d --name scp-ci-s3 -p 127.0.0.1:9090:9090 -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=scp-test adobe/s3mock:4.7.0@sha256:468ba0b0e87f20ad54fbb6085e98c143f5bd1e384a844fa12a58535b4e39d4aa
+          for _ in $(seq 60); do docker exec scp-ci-postgres pg_isready -U postgres && break; sleep 1; done
+          docker exec scp-ci-postgres pg_isready -U postgres
+          for _ in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:9090/scp-test && break; sleep 1; done
+          curl -sf -o /dev/null http://127.0.0.1:9090/scp-test
+          export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+          export S3_TEST_ENDPOINT=http://127.0.0.1:9090 S3_TEST_BUCKET=scp-test
+          export AWS_ACCESS_KEY_ID=scp-ci AWS_SECRET_ACCESS_KEY=scp-ci AWS_REGION=us-east-1
+          # Each filter selects one backend's module; `--no-tests=fail` fails
+          # the run when a rename or a re-gate leaves it selecting nothing.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib -E 'test(/^native::postgres_blob::tests::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib -E 'test(/^native::s3_blob::tests::/)'
+          # The §17.11 conformance suite, applied to each live backend.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_conformance --test s3_blob_conformance
       - name: Run node and relay tests
         if: matrix.group == 'node-relay'
         run: |

@@ -24,7 +24,12 @@ use std::collections::HashSet;
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
-use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+use scp_transport::native::storage::{
+    BlobStorage, InMemoryBlobStorage, LifetimeFilter, QueryCursor, StoredLifetime,
+};
+
+/// The TTL the relay-side test blobs are stored under.
+const HOUR: StoredLifetime = StoredLifetime::Ttl(3600);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,20 +220,23 @@ async fn relay_blobs_queryable_without_resubscribe() {
     let blob_data_1 = vec![1, 2, 3, 4, 5];
     let blob_id_1 = make_blob_id(&blob_data_1);
     blob_storage
-        .store(routing_id, blob_id_1, None, 3600, blob_data_1.clone())
+        .store(routing_id, blob_id_1, None, HOUR, blob_data_1.clone())
         .await
         .unwrap();
 
     let blob_data_2 = vec![6, 7, 8, 9, 10];
     let blob_id_2 = make_blob_id(&blob_data_2);
     blob_storage
-        .store(routing_id, blob_id_2, None, 3600, blob_data_2.clone())
+        .store(routing_id, blob_id_2, None, HOUR, blob_data_2.clone())
         .await
         .unwrap();
 
     // Query blobs by routing_id (simulating post-restart blob delivery
     // without re-subscribing -- the blob data is already in storage).
-    let blobs = blob_storage.query(&routing_id, None, 100).await.unwrap();
+    let blobs = blob_storage
+        .query(&routing_id, QueryCursor::All, LifetimeFilter::Any, 100)
+        .await
+        .unwrap();
     assert_eq!(blobs.len(), 2, "both blobs should be queryable");
 
     // Verify blob contents via get.
@@ -302,7 +310,7 @@ async fn combined_node_client_and_relay_data_coexist() {
     let blob_data = vec![42, 43, 44, 45];
     let blob_id = make_blob_id(&blob_data);
     relay_storage
-        .store(routing_id, blob_id, None, 3600, blob_data.clone())
+        .store(routing_id, blob_id, None, HOUR, blob_data.clone())
         .await
         .unwrap();
 
@@ -313,7 +321,7 @@ async fn combined_node_client_and_relay_data_coexist() {
             routing_id,
             blob_id_2,
             Some([0xEE; 32]),
-            7200,
+            StoredLifetime::Ttl(7200),
             blob_data_2.clone(),
         )
         .await
@@ -341,7 +349,10 @@ async fn combined_node_client_and_relay_data_coexist() {
     assert_eq!(active, vec![ctx_id]);
 
     // --- Verify relay data ---
-    let blobs = relay_storage.query(&routing_id, None, 100).await.unwrap();
+    let blobs = relay_storage
+        .query(&routing_id, QueryCursor::All, LifetimeFilter::Any, 100)
+        .await
+        .unwrap();
     assert_eq!(blobs.len(), 2);
 
     let retrieved = relay_storage.get(&blob_id).await.unwrap().unwrap();
@@ -393,14 +404,14 @@ async fn combined_node_multiple_contexts_independent() {
     let data_a = vec![1, 2, 3];
     let id_a = make_blob_id(&data_a);
     relay_storage
-        .store(routing_a, id_a, None, 3600, data_a.clone())
+        .store(routing_a, id_a, None, HOUR, data_a.clone())
         .await
         .unwrap();
 
     let data_b = vec![4, 5, 6];
     let id_b = make_blob_id(&data_b);
     relay_storage
-        .store(routing_b, id_b, None, 3600, data_b.clone())
+        .store(routing_b, id_b, None, HOUR, data_b.clone())
         .await
         .unwrap();
 
@@ -445,11 +456,17 @@ async fn combined_node_multiple_contexts_independent() {
     assert_eq!(active, vec!["combined-multi-1", "combined-multi-2"]);
 
     // Blob routing isolation.
-    let blobs_a = relay_storage.query(&routing_a, None, 100).await.unwrap();
+    let blobs_a = relay_storage
+        .query(&routing_a, QueryCursor::All, LifetimeFilter::Any, 100)
+        .await
+        .unwrap();
     assert_eq!(blobs_a.len(), 1);
     assert_eq!(blobs_a[0].blob, data_a);
 
-    let blobs_b = relay_storage.query(&routing_b, None, 100).await.unwrap();
+    let blobs_b = relay_storage
+        .query(&routing_b, QueryCursor::All, LifetimeFilter::Any, 100)
+        .await
+        .unwrap();
     assert_eq!(blobs_b.len(), 1);
     assert_eq!(blobs_b[0].blob, data_b);
 
@@ -760,7 +777,7 @@ async fn combined_node_storage_both_traits_roundtrip() {
         routing_id,
         blob_id,
         None,
-        3600,
+        HOUR,
         blob_data.clone(),
     )
     .await

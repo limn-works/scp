@@ -23,7 +23,7 @@ The `Storage` trait (defined in `scp-platform`) is deliberately thin — six asy
 ```
 Relay Server (blob routing, TTL enforcement, subscription registry)
         |
-BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
+BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL or retain)
         |
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
@@ -777,7 +777,8 @@ One adapter covers the entire S3-compatible ecosystem: AWS S3, MinIO, Ceph, Seaw
 ```
 {bucket}/
   blobs/{blob_id_hex}                    # blob content
-  routing/{routing_id_hex}/{blob_id_hex} # routing index (empty object, metadata has stored_at/expires_at)
+  routing/{routing_id_hex}/r/{blob_id_hex} # routing index of a retained record (empty object, metadata has stored_at and admission)
+  routing/{routing_id_hex}/t/{blob_id_hex} # routing index of a TTL blob (empty object, metadata has stored_at and expires_at)
   expiry/{expires_at}/{blob_id_hex}      # expiry index (for efficient TTL enforcement via prefix listing)
 ```
 
@@ -788,15 +789,18 @@ CREATE TABLE blobs (
     blob_id BLOB PRIMARY KEY,
     routing_id BLOB NOT NULL,
     recipient_hint BLOB,
-    blob_ttl INTEGER NOT NULL,
+    blob_ttl INTEGER,          -- NULL: a retained record (09-security-model.md §9.10.12)
     stored_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    expires_at INTEGER,        -- NULL: never expires
+    admission INTEGER,         -- a retained record's admission counter; NULL on a TTL blob
     blob BLOB NOT NULL
 ) WITHOUT ROWID;
 
-CREATE INDEX idx_routing ON blobs (routing_id, stored_at);
+CREATE INDEX idx_routing ON blobs (routing_id, stored_at, blob_id);
 CREATE INDEX idx_expiry ON blobs (expires_at);
 ```
+
+**Retained records and the lifetime filter.** A retained record (`09-security-model.md` §9.10.12) carries no TTL and an admission counter, the order the node admitted it in at its routing id, which every backend persists with the record: the `admission` column here and in PostgreSQL, the serialized `StoredBlob` in redb, and the routing object's metadata in S3. `BlobStorage::query` takes a lifetime filter (any, retained only, TTL only) that every backend applies before its limit, inside the query: the SQL backends in the `WHERE` clause, redb and the in-memory store before they copy a body, and S3 by listing only the class prefix the filter names (`r/` or `t/`) and reading each routing object's metadata before any body, so S3 reads no body of a blob the filter drops or the limit cuts. An overwrite of a `blob_id` leaves no routing or expiry index entry of the blob it replaces (S3 deletes those objects, redb those multimap entries), and S3's TTL purge re-reads a blob's metadata before it deletes it and skips a retained or unexpired blob.
 
 ### RedbBlobStore
 
@@ -818,14 +822,14 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 **Trait methods (with defaults):**
 
-- `store_streaming(routing_id, blob_id, recipient_hint, blob_ttl, content_length: Option<u64>, body: BlobBodyStream) -> Result<BlobMetadata, StorageError>` — Default: collects stream to `Vec<u8>`, delegates to `store()`, drops the blob body from the result.
+- `store_streaming(routing_id, blob_id, recipient_hint, lifetime, content_length: Option<u64>, body: BlobBodyStream) -> Result<BlobMetadata, StorageError>` — Default: collects stream to `Vec<u8>`, delegates to `store()`, drops the blob body from the result.
 - `get_streaming(blob_id) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError>` — Default: calls `get()`, splits `StoredBlob` into metadata + single-chunk stream.
 
 **Content length:** `store_streaming` accepts an optional content length hint. Backends MAY use this for pre-allocation or capacity checks. Backends MUST NOT trust it for security decisions — the actual streamed length governs.
 
 **blob_id computation:** For `store_streaming`, the caller provides the `blob_id` (SHA-256 of the complete blob content). The relay computes this incrementally via streaming SHA-256 as it receives the blob over the wire, before calling `store_streaming`. The storage layer does not re-hash.
 
-**Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams directly to/from S3 using the AWS SDK's `ByteStream` without buffering the full blob.
+**Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams to and from S3 through the AWS SDK's `ByteStream` and never buffers a whole blob. A streaming store holds at most one 8 MiB part in memory. A body that ends within the first part goes up as one `PutObject` of its exact length, and a longer body goes up as a multipart upload, which the store aborts on any failure so the object stays unchanged. The `content_length` hint is advisory: it sizes only the first buffer, never the request, and the stored `content_length` is the number of bytes the body yielded.
 
 ## 17.8 Platform-Specific Key Custody
 
@@ -1044,7 +1048,7 @@ Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get
 blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
 ```
 
-The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.
+The conformance suite generates 28 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, streaming get for expired blob, a retained record survives every purge, four `after` cursor cases over blobs tied at one second (the cursor's own blob, the last tied blob, below every tied blob, above every tied blob), blobs stored out of order served ascending, the admission counter round-trips (0, an interior value, `i64::MAX`), the lifetime filter applies before the limit, and an overwrite leaves no index of the replaced blob.
 
 ## 17.12 Third-Party Adapter Candidates
 

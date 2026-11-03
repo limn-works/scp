@@ -47,16 +47,16 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
-use crate::native::server::DidRecordValidation;
+use crate::native::public_records::{self, PublicRecords};
 use crate::native::storage::BlobStorage;
+use crate::native::storage::QueryCursor;
 use crate::relay::push_gate::{self, LiveRelayUrl, PushRole};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
 use scp_relay_client::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
-    RelayMessage,
+    BlobLifetime, ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_QUERY_LIMIT, RelayMessage,
+    RelayProtocolError,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,21 +118,14 @@ pub struct QuicListenerConfig {
     /// forwarding each stored blob to subscribers (BLACK-001 mitigation).
     /// Set to 0 to disable jitter (useful for tests).
     pub delivery_jitter_ms: u64,
-    /// Whether this QUIC listener validates public DID-record frames and enforces
-    /// the single slot-exclusive slot per DID-domain `routing_id` (§3.10.2,
-    /// ADR-004 "DID-Record Slot-Exclusivity"), exactly like the WebSocket relay.
-    ///
-    /// When a QUIC listener shares a validating relay's blob store and slot
-    /// registry, this MUST match the relay's
-    /// [`RelayConfig::did_record_validation`](crate::native::server::RelayConfig::did_record_validation)
-    /// so co-deployed transports enforce one consistent set of claimed slots —
-    /// otherwise a QUIC-reaching attacker could co-locate junk with the genuine
-    /// slot in the shared store. Defaults to
-    /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
-    /// the canonical SCP-native behavior; set `Disabled` to store DID frames
-    /// opaquely like a foreign transport. Never a trust dependency (the client
-    /// always re-verifies, RELAYRES-002).
-    pub did_record_validation: DidRecordValidation,
+    /// Whether this listener stores public records, and through which store
+    /// (§9.10.12). When it shares a relay's blob store it MUST equal that
+    /// relay's
+    /// [`RelayConfig::public_records`](crate::native::server::RelayConfig::public_records),
+    /// so a retained record reaches the shared store only through the one
+    /// admission whichever transport carries it. Defaults to
+    /// [`PublicRecords::Refused`].
+    pub public_records: PublicRecords,
     /// The relay's live reserved entries, from which each reserved push
     /// routing ID derives (§10.7.1 step 2, "Tier 3 relays"). When this
     /// listener shares a relay's blob store, it MUST be a clone of that
@@ -162,10 +155,7 @@ impl QuicListenerConfig {
             rate_limit_publishes_per_second: DEFAULT_RATE_LIMIT_PUBLISHES_PER_SECOND,
             rate_limit_subscribes_per_minute: DEFAULT_RATE_LIMIT_SUBSCRIBES_PER_MINUTE,
             delivery_jitter_ms: DEFAULT_DELIVERY_JITTER_MS,
-            // Mirror RelayConfig's default: an SCP-native transport validates by
-            // default. The node wiring overrides this to match the co-deployed
-            // WebSocket relay's configured mode.
-            did_record_validation: DidRecordValidation::Enabled,
+            public_records: PublicRecords::Refused,
             relay_url,
             push: PushRole::Disabled,
         }
@@ -235,21 +225,15 @@ pub struct QuicListener<S: BlobStorage> {
     subscriptions: SubscriptionRegistry,
     connection_tracker: ConnectionTracker,
     publish_rate_limiter: PublishRateLimiter,
-    did_slots: DidSlotRegistry,
 }
 
 impl<S: BlobStorage + 'static> QuicListener<S> {
     /// Creates a new QUIC listener with the given configuration and shared state.
     ///
     /// The `storage`, `subscriptions`, `publish_rate_limiter`,
-    /// `connection_tracker`, and `did_slots` are shared with the WebSocket relay
-    /// server (and any UDP/DTLS listener), enabling cross-transport message
-    /// delivery, unified rate limiting, and — crucially — a **single shared
-    /// DID-record slot index** so slot-exclusivity holds across every transport
-    /// that reaches the same blob store, not just WebSocket (ADR-037 AC3, spec
-    /// §10.14.3, §3.10.2). Obtain the shared registry via
-    /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
-    /// and pass `config.did_record_validation` equal to the relay's mode.
+    /// and `connection_tracker` are shared with the WebSocket relay server
+    /// (and any UDP/DTLS listener), enabling cross-transport message
+    /// delivery and unified rate limiting (ADR-037 AC3, spec §10.14.3).
     #[must_use]
     pub const fn new(
         config: QuicListenerConfig,
@@ -257,7 +241,6 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
         subscriptions: SubscriptionRegistry,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
-        did_slots: DidSlotRegistry,
     ) -> Self {
         Self {
             config,
@@ -265,7 +248,6 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
             subscriptions,
             connection_tracker,
             publish_rate_limiter,
-            did_slots,
         }
     }
 
@@ -304,7 +286,6 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
         let config = self.config.clone();
         let conn_tracker = Arc::clone(&self.connection_tracker);
         let rate_limiter = self.publish_rate_limiter.clone();
-        let did_slots = self.did_slots.clone();
 
         tokio::spawn(async move {
             accept_loop(
@@ -315,7 +296,6 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
                 config,
                 conn_tracker,
                 rate_limiter,
-                did_slots,
             )
             .await;
         });
@@ -414,7 +394,6 @@ async fn accept_loop<S: BlobStorage + 'static>(
     config: QuicListenerConfig,
     conn_tracker: ConnectionTracker,
     rate_limiter: PublishRateLimiter,
-    did_slots: DidSlotRegistry,
 ) {
     loop {
         let incoming = tokio::select! {
@@ -478,7 +457,6 @@ async fn accept_loop<S: BlobStorage + 'static>(
         let config = config.clone();
         let conn_tracker = Arc::clone(&conn_tracker);
         let rate_limiter = rate_limiter.clone();
-        let did_slots = did_slots.clone();
 
         tokio::spawn(async move {
             match incoming.await {
@@ -491,7 +469,6 @@ async fn accept_loop<S: BlobStorage + 'static>(
                         subscriptions,
                         config,
                         rate_limiter,
-                        did_slots,
                     )
                     .await;
                 }
@@ -527,7 +504,6 @@ async fn handle_connection<S: BlobStorage + 'static>(
     subscriptions: SubscriptionRegistry,
     config: QuicListenerConfig,
     rate_limiter: PublishRateLimiter,
-    did_slots: DidSlotRegistry,
 ) {
     // Track this connection's subscriptions for cleanup on disconnect.
     let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -558,7 +534,6 @@ async fn handle_connection<S: BlobStorage + 'static>(
         let rate_limiter = rate_limiter.clone();
         let my_subs = Arc::clone(&my_subscriptions);
         let sub_rate_limiter = Arc::clone(&subscribe_rate_limiter);
-        let did_slots = did_slots.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_stream(
@@ -571,7 +546,6 @@ async fn handle_connection<S: BlobStorage + 'static>(
                 config,
                 rate_limiter,
                 sub_rate_limiter,
-                did_slots,
             )
             .await
             {
@@ -639,17 +613,19 @@ async fn handle_stream<S: BlobStorage + 'static>(
     config: QuicListenerConfig,
     rate_limiter: PublishRateLimiter,
     subscribe_rate_limiter: Arc<tokio::sync::Mutex<SubscribeRateLimiter>>,
-    did_slots: DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Read the initial client message from the stream.
-    let client_msg = read_client_message(recv).await?;
+    let client_msg = match read_client_message(recv).await? {
+        Ok(client_msg) => client_msg,
+        Err(e) => return write_and_finish(send, &public_records::decode_refusal(&e)).await,
+    };
 
     match client_msg {
         ClientMessage::Publish {
             ref_id,
             routing_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             blob,
         } => {
             handle_publish(
@@ -657,14 +633,13 @@ async fn handle_stream<S: BlobStorage + 'static>(
                 ref_id,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
+                lifetime,
                 &blob,
                 ip,
                 &storage,
                 &subscriptions,
                 &config,
                 &rate_limiter,
-                &did_slots,
             )
             .await
         }
@@ -684,7 +659,6 @@ async fn handle_stream<S: BlobStorage + 'static>(
                 &my_subscriptions,
                 &config,
                 &subscribe_rate_limiter,
-                &did_slots,
             )
             .await
         }
@@ -692,24 +666,16 @@ async fn handle_stream<S: BlobStorage + 'static>(
             ref_id,
             routing_id,
             since,
+            after_blob,
             limit,
         } => {
             handle_query(
-                send, ref_id, routing_id, since, limit, &storage, &config, &did_slots,
+                send, ref_id, routing_id, since, after_blob, limit, &storage, &config,
             )
             .await
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(
-                send,
-                ref_id,
-                blob_id,
-                ip,
-                &storage,
-                &did_slots,
-                &rate_limiter,
-            )
-            .await
+            handle_delete(send, ref_id, blob_id, ip, &storage, &config, &rate_limiter).await
         }
         ClientMessage::Ping { ts } => handle_ping(send, ts).await,
         ClientMessage::Unsubscribe { ref_id, routing_id } => {
@@ -748,7 +714,9 @@ async fn handle_stream<S: BlobStorage + 'static>(
 /// Uses a length-prefixed frame: 4 bytes big-endian length, then the
 /// `MessagePack` payload. This is necessary because QUIC streams are byte
 /// streams, not message-oriented like WebSocket frames.
-async fn read_client_message(mut recv: RecvStream) -> Result<ClientMessage, StreamError> {
+async fn read_client_message(
+    mut recv: RecvStream,
+) -> Result<Result<ClientMessage, RelayProtocolError>, StreamError> {
     // Read the 4-byte length prefix.
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
@@ -768,12 +736,10 @@ async fn read_client_message(mut recv: RecvStream) -> Result<ClientMessage, Stre
         .await
         .map_err(|e| StreamError::Read(e.to_string()))?;
 
-    // Drop the deserializer's Display string: rmp_serde can embed excerpts of
-    // the attacker-controlled malformed MessagePack bytes, which would then be
-    // logged at the stream-handler error site (error = %e). Keep a static
-    // description so no input bytes reach the relay's logs.
-    ClientMessage::from_bytes(&buf)
-        .map_err(|_| StreamError::Protocol("failed to deserialize message".to_string()))
+    // A frame that does not decode is answered on the stream with
+    // `decode_refusal`, which logs its code and never the deserializer's
+    // text, so no input bytes reach the relay's logs.
+    Ok(ClientMessage::from_bytes(&buf))
 }
 
 /// Writes a relay message to a QUIC send stream.
@@ -820,33 +786,21 @@ async fn write_and_finish(mut send: SendStream, msg: &RelayMessage) -> Result<()
 // Operation handlers
 // ---------------------------------------------------------------------------
 
-/// Handles a PUBLISH operation on a QUIC stream.
-///
-/// When `config.did_record_validation` is
-/// [`Enabled`](crate::native::server::DidRecordValidation::Enabled) this runs the
-/// **same** OPTIONAL DID-record frame validation / slot-exclusivity the
-/// WebSocket native relay applies, over the **same shared** [`DidSlotRegistry`]
-/// (§3.10.2, ADR-004 "DID-Record Slot-Exclusivity", SCP-RELAYRES-003) — so a
-/// DID `routing_id`'s single slot is enforced identically whether a PUBLISH
-/// arrives over WebSocket or QUIC; an attacker cannot use QUIC to co-locate junk
-/// with the genuine slot in a shared store. When `Disabled` (a foreign /
-/// non-validating deployment) it stores every blob opaquely. Never a trust
-/// dependency either way: the resolver re-verifies every record independently
-/// (RELAYRES-002).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Handles a PUBLISH operation on a QUIC stream through the public-record
+/// admission every transport shares (§9.10.12).
+#[allow(clippy::too_many_arguments)]
 async fn handle_publish<S: BlobStorage>(
     send: SendStream,
     ref_id: Option<String>,
     routing_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
-    blob_ttl: u32,
+    lifetime: BlobLifetime,
     blob: &[u8],
     ip: IpAddr,
     storage: &Arc<S>,
     subscriptions: &SubscriptionRegistry,
     config: &QuicListenerConfig,
     rate_limiter: &PublishRateLimiter,
-    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Check rate limit.
     if !rate_limiter.check(ip).await {
@@ -873,16 +827,6 @@ async fn handle_publish<S: BlobStorage>(
         return write_and_finish(send, &err).await;
     }
 
-    // Validate TTL.
-    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&blob_ttl) {
-        let err = RelayMessage::Err {
-            ref_id,
-            code: code::TTL_TOO_LONG,
-            msg: format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {blob_ttl}"),
-        };
-        return write_and_finish(send, &err).await;
-    }
-
     // Push interception (§10.7.1, ADR-004 "Push registration interception"),
     // the same gate every relay transport runs: a PUBLISH to the reserved push
     // routing ID is answered here and never reaches storage or a subscriber.
@@ -899,50 +843,26 @@ async fn handle_publish<S: BlobStorage>(
         return write_and_finish(send, &reply).await;
     }
 
-    // Compute blob_id = SHA-256(blob).
-    let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
-
-    // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
-    // the WebSocket/UDP/WebTransport transports route through (§3.10.2). This
-    // handler only emits the wire response and delivers to subscribers on Accepted.
-    let stored = match did_slots
-        .gate_publish(
-            config.did_record_validation,
-            storage.as_ref(),
-            routing_id,
-            recipient_hint,
-            blob_ttl,
-            blob,
-            blob_id,
-        )
-        .await
+    let stored = match public_records::admit_publish(
+        &config.public_records,
+        storage.as_ref(),
+        routing_id,
+        recipient_hint,
+        lifetime,
+        blob,
+    )
+    .await
     {
-        DidPublishGate::Accepted(stored) => stored,
-        DidPublishGate::Rejected { code, msg } => {
-            let err = RelayMessage::Err { ref_id, code, msg };
-            return write_and_finish(send, &err).await;
+        Ok(stored) => stored,
+        Err(refusal) => {
+            let (code, msg) = refusal.into_parts();
+            return write_and_finish(send, &RelayMessage::Err { ref_id, code, msg }).await;
         }
-        // Store the blob (opaque path — non-DID blobs, or every blob when
-        // did_record_validation is Disabled).
-        DidPublishGate::FallThrough => match storage
-            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "QUIC: blob store failed");
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: code::STORAGE_FULL,
-                    msg: "internal error".to_owned(),
-                };
-                return write_and_finish(send, &err).await;
-            }
-        },
     };
+    let blob_id = stored.blob_id;
 
-    // Every stored blob, DID record or opaque, takes the one path below:
-    // deliver, answer, then queue the wakes.
+    // Every stored blob takes the one path below: deliver, answer, then
+    // queue the wakes.
 
     // Deliver to active subscribers with optional jitter (BLACK-001).
     let _failed_deliveries =
@@ -980,7 +900,6 @@ async fn handle_subscribe<S: BlobStorage>(
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &QuicListenerConfig,
     subscribe_rate_limiter: &Arc<tokio::sync::Mutex<SubscribeRateLimiter>>,
-    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Check subscribe rate limit.
     {
@@ -1052,31 +971,30 @@ async fn handle_subscribe<S: BlobStorage>(
     };
     write_relay_message(&mut send, &ok).await?;
 
-    // Backfill if `since` is provided. Slot-exclusivity rule (c) applies via the
-    // shared storage-authoritative QUERY gate: a claimed DID routing_id backfills
-    // ONLY its single genuine record (even on a cold index).
+    // Backfill if `since` is provided.
     if let Some(since_ts) = since {
-        if let Ok(blobs) = did_slots
-            .gate_query(
-                &config.relay_url,
-                config.did_record_validation,
-                storage.as_ref(),
-                routing_id,
-                Some(since_ts),
-                MAX_QUERY_LIMIT,
-            )
-            .await
+        match public_records::query_blobs(
+            &config.relay_url,
+            storage.as_ref(),
+            routing_id,
+            QueryCursor::Since(since_ts),
+            MAX_QUERY_LIMIT,
+        )
+        .await
         {
-            for stored in blobs {
-                let blob_msg = RelayMessage::Blob {
-                    routing_id: stored.routing_id,
-                    blob_id: stored.blob_id,
-                    recipient_hint: stored.recipient_hint,
-                    blob_ttl: stored.blob_ttl,
-                    stored_at: stored.stored_at,
-                    blob: stored.blob,
+            Ok(blobs) => {
+                for stored in blobs {
+                    write_relay_message(&mut send, &public_records::blob_message(stored)).await?;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "QUIC: backfill query failed");
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::INTERNAL_ERROR,
+                    msg: "internal error".to_owned(),
                 };
-                write_relay_message(&mut send, &blob_msg).await?;
+                return write_and_finish(send, &err).await;
             }
         }
 
@@ -1139,10 +1057,10 @@ async fn handle_query<S: BlobStorage>(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     since: Option<u64>,
+    after_blob: Option<[u8; 32]>,
     limit: Option<u32>,
     storage: &Arc<S>,
     config: &QuicListenerConfig,
-    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
@@ -1159,19 +1077,23 @@ async fn handle_query<S: BlobStorage>(
         return write_and_finish(send, &err).await;
     }
 
-    // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY gate:
-    // a claimed DID `routing_id` returns ONLY its single genuine record (even on
-    // a cold index); ordinary routing_ids pass through unchanged.
-    let blobs = match did_slots
-        .gate_query(
-            &config.relay_url,
-            config.did_record_validation,
-            storage.as_ref(),
-            routing_id,
-            since,
-            effective_limit,
-        )
-        .await
+    let Some(cursor) = QueryCursor::from_wire(since, after_blob) else {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::MISSING_FIELD,
+            msg: "after_blob requires since".to_string(),
+        };
+        return write_and_finish(send, &err).await;
+    };
+
+    let blobs = match public_records::query_blobs(
+        &config.relay_url,
+        storage.as_ref(),
+        routing_id,
+        cursor,
+        effective_limit,
+    )
+    .await
     {
         Ok(b) => b,
         Err(e) => {
@@ -1185,16 +1107,8 @@ async fn handle_query<S: BlobStorage>(
         }
     };
 
-    for stored in &blobs {
-        let blob_msg = RelayMessage::Blob {
-            routing_id: stored.routing_id,
-            blob_id: stored.blob_id,
-            recipient_hint: stored.recipient_hint,
-            blob_ttl: stored.blob_ttl,
-            stored_at: stored.stored_at,
-            blob: stored.blob.clone(),
-        };
-        write_relay_message(&mut send, &blob_msg).await?;
+    for stored in blobs {
+        write_relay_message(&mut send, &public_records::blob_message(stored)).await?;
     }
 
     // Emit query_complete event.
@@ -1205,38 +1119,36 @@ async fn handle_query<S: BlobStorage>(
     write_and_finish(send, &event).await
 }
 
-/// Handles a DELETE operation on a QUIC stream.
+/// Handles a DELETE operation on a QUIC stream: `4041` for a retained
+/// record (§9.10.12), `5000` when storage fails, `OK` otherwise.
 async fn handle_delete<S: BlobStorage>(
     send: SendStream,
     ref_id: Option<String>,
     blob_id: [u8; 32],
     ip: IpAddr,
     storage: &Arc<S>,
-    did_slots: &DidSlotRegistry,
+    config: &QuicListenerConfig,
     rate_limiter: &PublishRateLimiter,
 ) -> Result<(), StreamError> {
-    // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
-    // rate-limited DELETE gate — the SAME chokepoint every transport routes
-    // through. Storage-backed, so immune to a cold index; non-slot blobs proceed.
-    match did_slots
-        .gate_delete(storage.as_ref(), &blob_id, rate_limiter, ip)
-        .await
+    let reply = match public_records::delete_blob(
+        &config.public_records,
+        storage.as_ref(),
+        &blob_id,
+        rate_limiter,
+        ip,
+    )
+    .await
     {
-        DidDeleteGate::Rejected { code, msg } => {
-            let err = RelayMessage::Err { ref_id, code, msg };
-            return write_and_finish(send, &err).await;
+        Ok(()) => RelayMessage::Ok {
+            ref_id,
+            blob_id: None,
+        },
+        Err(refusal) => {
+            let (code, msg) = refusal.into_parts();
+            RelayMessage::Err { ref_id, code, msg }
         }
-        DidDeleteGate::Proceed => {}
-    }
-
-    // Best-effort deletion.
-    let _ = storage.delete(&blob_id).await;
-
-    let ok = RelayMessage::Ok {
-        ref_id,
-        blob_id: None,
     };
-    write_and_finish(send, &ok).await
+    write_and_finish(send, &reply).await
 }
 
 /// Handles a PING on a QUIC stream. Returns PONG and closes.
@@ -1263,6 +1175,7 @@ mod tests {
     use super::*;
     use crate::native::storage::InMemoryBlobStorage;
     use quinn::ClientConfig;
+    use scp_relay_client::MAX_BLOB_TTL;
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
@@ -1320,67 +1233,10 @@ mod tests {
             Arc::clone(&subscriptions),
             publish_rate_limiter,
             connection_tracker,
-            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
 
         (handle, addr, certs, storage, subscriptions)
-    }
-
-    /// Helper: start a test QUIC listener that shares an explicit
-    /// [`DidSlotRegistry`] with its blob store, and return it alongside the
-    /// storage so a test can assert slot-exclusivity end-to-end over QUIC.
-    fn start_test_listener_validating() -> (
-        QuicShutdownHandle,
-        SocketAddr,
-        Vec<CertificateDer<'static>>,
-        Arc<InMemoryBlobStorage>,
-    ) {
-        let (server_config, certs) = test_server_config();
-        let storage = Arc::new(InMemoryBlobStorage::new());
-        let subscriptions = subscription::new_registry();
-        let publish_rate_limiter = PublishRateLimiter::new(100);
-        let connection_tracker = rate_limit::new_connection_tracker();
-
-        let config = QuicListenerConfig {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Enabled,
-            ..QuicListenerConfig::defaults(push_gate::test_relay_url())
-        };
-
-        let listener = QuicListener::new(
-            config,
-            Arc::clone(&storage),
-            Arc::clone(&subscriptions),
-            publish_rate_limiter,
-            connection_tracker,
-            DidSlotRegistry::new(),
-        );
-        let (handle, addr) = listener.start(server_config).unwrap();
-
-        (handle, addr, certs, storage)
-    }
-
-    /// Builds a genuine, self-consistent DID-record frame at the signing key's
-    /// own DID-domain `routing_id`, returning `(routing_id, blob_id, bytes)`.
-    fn genuine_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
-        use ed25519_dalek::{Signer, SigningKey};
-        use scp_dht::bep44_signable;
-        use scp_identity::{did_from_ed25519_public_key, did_routing_id};
-        use scp_protocol::envelope::did_record::DidRecordV1;
-
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let vk = sk.verifying_key();
-        let did = did_from_ed25519_public_key(&vk.to_bytes());
-        let rid = did_routing_id(&did);
-        let signature: ed25519_dalek::Signature = sk.sign(&bep44_signable(value, seq));
-        let bytes = DidRecordV1::try_new(vk.to_bytes(), seq, signature.to_bytes(), value.to_vec())
-            .unwrap()
-            .encode();
-        let mut bid = [0u8; 32];
-        bid.copy_from_slice(&Sha256::digest(&bytes));
-        (rid, bid, bytes)
     }
 
     /// Helper: connect a QUIC client to the test listener.
@@ -1400,12 +1256,19 @@ mod tests {
         connection: &quinn::Connection,
         msg: &ClientMessage,
     ) -> Vec<RelayMessage> {
+        send_bytes_and_recv(connection, &msg.to_bytes().unwrap()).await
+    }
+
+    /// Helper: send raw frame bytes on a QUIC stream and read the response.
+    async fn send_bytes_and_recv(
+        connection: &quinn::Connection,
+        payload: &[u8],
+    ) -> Vec<RelayMessage> {
         let (mut send, recv) = connection.open_bi().await.unwrap();
 
-        let payload = msg.to_bytes().unwrap();
         let len = u32::try_from(payload.len()).unwrap();
         send.write_all(&len.to_be_bytes()).await.unwrap();
-        send.write_all(&payload).await.unwrap();
+        send.write_all(payload).await.unwrap();
         send.finish().unwrap();
 
         read_all_responses(recv).await
@@ -1520,7 +1383,7 @@ mod tests {
             ref_id: Some("test-1".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob.clone(),
         };
 
@@ -1560,7 +1423,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![99u8; 50],
         };
         let _ = send_and_recv(&connection, &publish).await;
@@ -1570,6 +1433,7 @@ mod tests {
             ref_id: Some("q-1".to_string()),
             routing_id,
             since: None,
+            after_blob: None,
             limit: None,
         };
         let responses = send_and_recv(&connection, &query).await;
@@ -1664,7 +1528,7 @@ mod tests {
             ref_id: Some("size-1".to_string()),
             routing_id: [4u8; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![],
         };
 
@@ -1689,16 +1553,12 @@ mod tests {
         let (handle, addr, certs, _storage, _subs) = start_test_listener();
         let connection = connect_client(addr, &certs).await;
 
-        // TTL of 0 should be rejected.
-        let msg = ClientMessage::Publish {
-            ref_id: Some("ttl-1".to_string()),
-            routing_id: [5u8; 32],
-            recipient_hint: None,
-            blob_ttl: 0,
-            blob: vec![1u8; 10],
-        };
-
-        let responses = send_and_recv(&connection, &msg).await;
+        // A frame with blob_ttl 0 is refused.
+        let frame = crate::native::public_records::publish_frame_with_ttl(
+            "ttl-1", [5u8; 32], 0, &[1u8; 10],
+        )
+        .unwrap();
+        let responses = send_bytes_and_recv(&connection, &frame).await;
         assert_eq!(responses.len(), 1);
         match &responses[0] {
             RelayMessage::Err {
@@ -1726,7 +1586,7 @@ mod tests {
             ref_id: Some("ttl-max".to_string()),
             routing_id: [6u8; 32],
             recipient_hint: None,
-            blob_ttl: MAX_BLOB_TTL,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::MAX),
             blob: vec![1u8; 10],
         };
         let responses = send_and_recv(&connection, &at_max).await;
@@ -1736,14 +1596,14 @@ mod tests {
             other => panic!("expected OK, got {other:?}"),
         }
 
-        let over_max = ClientMessage::Publish {
-            ref_id: Some("ttl-over".to_string()),
-            routing_id: [6u8; 32],
-            recipient_hint: None,
-            blob_ttl: MAX_BLOB_TTL + 1,
-            blob: vec![2u8; 10],
-        };
-        let responses = send_and_recv(&connection, &over_max).await;
+        let over_max = crate::native::public_records::publish_frame_with_ttl(
+            "ttl-over",
+            [6u8; 32],
+            MAX_BLOB_TTL + 1,
+            &[2u8; 10],
+        )
+        .unwrap();
+        let responses = send_bytes_and_recv(&connection, &over_max).await;
         assert_eq!(responses.len(), 1);
         match &responses[0] {
             RelayMessage::Err {
@@ -1769,6 +1629,7 @@ mod tests {
             ref_id: Some("lim-1".to_string()),
             routing_id: [6u8; 32],
             since: None,
+            after_blob: None,
             limit: Some(0),
         };
 
@@ -1834,7 +1695,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![88u8; 20],
         };
         let pub_responses = send_and_recv(&pub_conn, &publish_msg).await;
@@ -1918,7 +1779,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![77u8; 10],
         };
         let _ = send_and_recv(&connection, &publish_msg).await;
@@ -2052,7 +1913,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![55u8; 30],
         };
         let _ = send_and_recv(&connection, &publish_msg).await;
@@ -2125,7 +1986,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
 
@@ -2133,211 +1994,17 @@ mod tests {
         assert_eq!(responses.len(), 1);
 
         // Verify the blob is in the shared storage.
-        let blobs = storage.query(&routing_id, None, 100).await.unwrap();
+        let blobs = storage
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
+            .await
+            .unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].blob, blob_data);
-
-        connection.close(0u32.into(), b"done");
-        handle.shutdown();
-    }
-
-    /// A validating QUIC listener enforces DID-record slot-exclusivity exactly
-    /// like the WebSocket relay: a genuine frame claims the slot, later junk at
-    /// the same `routing_id` is rejected, and QUERY returns only the slot — closing
-    /// the Fix 1 gap where QUIC bypassed the registry entirely.
-    #[tokio::test]
-    async fn quic_did_record_slot_exclusivity_enforced() {
-        let (handle, addr, certs, storage) = start_test_listener_validating();
-        let connection = connect_client(addr, &certs).await;
-
-        // Publish a genuine DID-record frame over QUIC → claims the slot.
-        let (rid, bid, frame) = genuine_frame(7, 5, b"did-doc");
-        let publish = ClientMessage::Publish {
-            ref_id: Some("p".into()),
-            routing_id: rid,
-            recipient_hint: None,
-            blob_ttl: 3600,
-            blob: frame,
-        };
-        let responses = send_and_recv(&connection, &publish).await;
-        assert!(
-            matches!(responses.as_slice(), [RelayMessage::Ok { .. }]),
-            "genuine frame should be accepted, got {responses:?}",
-        );
-
-        // Opaque junk at the claimed routing_id over QUIC → rejected (rule a).
-        let junk = ClientMessage::Publish {
-            ref_id: Some("j".into()),
-            routing_id: rid,
-            recipient_hint: None,
-            blob_ttl: 3600,
-            blob: vec![0x80u8; 64],
-        };
-        let responses = send_and_recv(&connection, &junk).await;
-        match responses.as_slice() {
-            [RelayMessage::Err { code, .. }] => {
-                assert_eq!(*code, code::DID_RECORD_REJECTED);
-            }
-            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
-        }
-
-        // The junk never reached storage: exactly the slot blob is present.
-        let stored = storage.query(&rid, None, 100).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].blob_id, bid);
-
-        // QUERY over QUIC returns ONLY the slot (rule c).
-        let query = ClientMessage::Query {
-            ref_id: Some("q".into()),
-            routing_id: rid,
-            since: None,
-            limit: Some(100),
-        };
-        let responses = send_and_recv(&connection, &query).await;
-        let blobs: Vec<_> = responses
-            .iter()
-            .filter_map(|m| match m {
-                RelayMessage::Blob { blob_id, .. } => Some(*blob_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(blobs, vec![bid], "QUERY must return only the slot");
-
-        connection.close(0u32.into(), b"done");
-        handle.shutdown();
-    }
-
-    /// A lower-seq genuine frame published over QUIC after a higher-seq slot is
-    /// established is rejected as non-superseding (single highest-seq slot).
-    #[tokio::test]
-    async fn quic_lower_seq_frame_rejected() {
-        let (handle, addr, certs, _storage) = start_test_listener_validating();
-        let connection = connect_client(addr, &certs).await;
-
-        let (rid, _bid9, frame9) = genuine_frame(8, 9, b"v9");
-        let (_rid, _bid3, frame3) = genuine_frame(8, 3, b"v3");
-
-        let ok = send_and_recv(
-            &connection,
-            &ClientMessage::Publish {
-                ref_id: None,
-                routing_id: rid,
-                recipient_hint: None,
-                blob_ttl: 3600,
-                blob: frame9,
-            },
-        )
-        .await;
-        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
-
-        let rejected = send_and_recv(
-            &connection,
-            &ClientMessage::Publish {
-                ref_id: None,
-                routing_id: rid,
-                recipient_hint: None,
-                blob_ttl: 3600,
-                blob: frame3,
-            },
-        )
-        .await;
-        match rejected.as_slice() {
-            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
-            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
-        }
-
-        connection.close(0u32.into(), b"done");
-        handle.shutdown();
-    }
-
-    /// Fix B: an unauthenticated DELETE of a claimed DID slot's blob over QUIC is
-    /// rejected and the slot survives; DELETE of a non-slot blob still succeeds.
-    #[tokio::test]
-    async fn quic_delete_of_claimed_slot_blob_rejected() {
-        let (handle, addr, certs, storage) = start_test_listener_validating();
-        let connection = connect_client(addr, &certs).await;
-
-        let (rid, bid, frame) = genuine_frame(41, 5, b"did-doc");
-        let ok = send_and_recv(
-            &connection,
-            &ClientMessage::Publish {
-                ref_id: None,
-                routing_id: rid,
-                recipient_hint: None,
-                blob_ttl: 3600,
-                blob: frame,
-            },
-        )
-        .await;
-        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
-
-        // Attacker computes blob_id = SHA-256(genuine record) and DELETEs it.
-        let deleted = send_and_recv(
-            &connection,
-            &ClientMessage::Delete {
-                ref_id: Some("d".into()),
-                blob_id: bid,
-            },
-        )
-        .await;
-        match deleted.as_slice() {
-            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
-            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
-        }
-
-        // Slot survives in storage and remains claimed.
-        let stored = storage.query(&rid, None, 100).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].blob_id, bid);
-
-        // A DELETE of an unrelated (non-slot) blob still succeeds.
-        let ok = send_and_recv(
-            &connection,
-            &ClientMessage::Delete {
-                ref_id: None,
-                blob_id: [0xEE; 32],
-            },
-        )
-        .await;
-        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
-
-        connection.close(0u32.into(), b"done");
-        handle.shutdown();
-    }
-
-    /// Fix B round 3: the QUIC DELETE gate is storage-backed, so it protects a
-    /// genuine DID record even when the slot index is COLD. Pre-seed the shared
-    /// store directly (index never learns of it), then an attacker DELETE of the
-    /// `blob_id` is rejected and the record survives.
-    #[tokio::test]
-    async fn quic_delete_of_cold_index_did_slot_blob_rejected() {
-        let (handle, addr, certs, storage) = start_test_listener_validating();
-
-        // Deposit a genuine frame straight into the shared store (no PUBLISH), so
-        // the listener's slot index stays cold.
-        let (rid, bid, frame) = genuine_frame(43, 5, b"did-doc");
-        storage.store(rid, bid, None, 3600, frame).await.unwrap();
-
-        let connection = connect_client(addr, &certs).await;
-        let deleted = send_and_recv(
-            &connection,
-            &ClientMessage::Delete {
-                ref_id: Some("d".into()),
-                blob_id: bid,
-            },
-        )
-        .await;
-        match deleted.as_slice() {
-            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
-            other => panic!(
-                "expected DID_RECORD_REJECTED (cold-index storage-backed gate), got {other:?}"
-            ),
-        }
-
-        // The genuine record survives.
-        let stored = storage.query(&rid, None, 100).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].blob_id, bid);
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();
@@ -2366,7 +2033,6 @@ mod tests {
             subscription::new_registry(),
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
         live.set(new.clone());
@@ -2379,7 +2045,7 @@ mod tests {
                     ref_id: Some("push".into()),
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: 3600,
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob: vec![0x42; 64],
                 },
             )
@@ -2391,7 +2057,18 @@ mod tests {
                 ),
                 "{responses:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         connection.close(0u32.into(), b"done");
@@ -2425,6 +2102,7 @@ mod tests {
                 ref_id: Some("q".into()),
                 routing_id,
                 since: None,
+                after_blob: None,
                 limit: None,
             },
         )
@@ -2489,7 +2167,6 @@ mod tests {
             subscription::new_registry(),
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
         let rid = fixture.entry_a.push_routing_id();
@@ -2501,7 +2178,7 @@ mod tests {
                 ref_id: Some("p".into()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: 3600,
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             },
         )
@@ -2558,7 +2235,6 @@ mod tests {
             subscription::new_registry(),
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
         let connection = connect_client(addr, &certs).await;
@@ -2566,7 +2242,7 @@ mod tests {
             ref_id: Some("push".into()),
             routing_id: rid,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![0x42; 64],
         };
 
@@ -2582,7 +2258,18 @@ mod tests {
                 ),
                 "{responses:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         let responses = send_and_recv(&connection, &publish(fixture.bridge_own_id)).await;
         assert!(
@@ -2597,7 +2284,12 @@ mod tests {
         );
         assert_eq!(
             storage
-                .query(&fixture.bridge_own_id, None, 100)
+                .query(
+                    &fixture.bridge_own_id,
+                    crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
+                    100
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -2632,7 +2324,6 @@ mod tests {
             subscription::new_registry(),
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
         let connection = connect_client(addr, &certs).await;
@@ -2644,7 +2335,7 @@ mod tests {
                 ref_id: Some("push".into()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: 3600,
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             };
             let responses = send_and_recv(&connection, &publish).await;
@@ -2655,7 +2346,18 @@ mod tests {
                 ),
                 "{responses:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         connection.close(0u32.into(), b"done");
         handle.shutdown();
@@ -2663,9 +2365,8 @@ mod tests {
 
     // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
     //
-    // A DID record and an opaque blob reach storage through different gate
-    // arms; both must wake. Each test fails when this transport's `notify`
-    // is removed.
+    // A blob the listener stores must wake. Each test fails when this
+    // transport's `notify` is removed.
     #[cfg(all(feature = "push-store", feature = "testing"))]
     mod wake {
         use super::*;
@@ -2687,7 +2388,6 @@ mod tests {
                 subscription::new_registry(),
                 PublishRateLimiter::new(100),
                 rate_limit::new_connection_tracker(),
-                DidSlotRegistry::new(),
             );
             let (handle, addr) = listener.start(server_config).unwrap();
             let connection = connect_client(addr, &certs).await;
@@ -2697,7 +2397,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: 3600,
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob,
                 },
             )
@@ -2715,12 +2415,6 @@ mod tests {
             harness.wait_for_wakes(1).await.unwrap();
             connection.close(0u32.into(), b"done");
             handle.shutdown();
-        }
-
-        #[tokio::test]
-        async fn quic_did_record_publish_wakes() {
-            let (rid, _bid, frame) = genuine_frame(62, 1, b"did-doc");
-            publish_and_wake(rid, frame).await;
         }
 
         /// Also the QUIC-only relay with push enabled: the drain runs with

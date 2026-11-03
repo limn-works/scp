@@ -42,5 +42,5 @@ fn make_combined_blob_store() -> (CombinedNodeStorage, Arc<AtomicU64>) {
 // 13 storage conformance tests (spec section 17.11).
 scp_testing::storage_conformance!(make_combined_storage());
 
-// 11 blob store conformance tests (spec section 17.7).
+// The blob store conformance suite (spec section 17.11).
 scp_testing::blob_store_conformance!(make_combined_blob_store());

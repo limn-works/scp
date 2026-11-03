@@ -1723,9 +1723,9 @@ where
 /// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) for one honest
 /// reason: no relay-client bind exists yet, so there is no relay to QUERY. That
 /// wiring is SCP-RELAYRES-006. It is emphatically NOT because the node's own
-/// loopback relay is unsuitable — it ships `DidRecordValidation::Enabled` by
-/// default and per §3.10.2/§3.10.4 IS a DID-document QUERY source; §10.4's
-/// "protocol-unaware" design goal is scoped to encrypted payload blobs. Until
+/// loopback relay is unsuitable — it admits every public record through the
+/// node's public-record store (`09-security-model.md` §9.10.12) and per
+/// §3.10.2/§3.10.4 IS a DID-document QUERY source. Until
 /// SCP-RELAYRES-006, the relay-client bind, lands, DID resolution here flows
 /// through the DHT layer (and cache) alone.
 fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(

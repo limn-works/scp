@@ -2,10 +2,9 @@
 //! (`09-security-model.md` §9.7.4.2 R6, R7, R9) over chains that fork from
 //! Vector 41, each suffix signed here.
 //!
-//! These tests sit in the crate because `AcceptedChainHolder` stays
-//! crate-private until S5 (SCP-007 part) wires it into a validating store,
-//! and because the retention tests drive `RetentionSet` and the holder with
-//! bounds small enough to reach. They compile the integration tests' spec 25 fixtures by path.
+//! These tests sit in the crate because the retention tests drive
+//! `RetentionSet` and the holder with bounds small enough to reach, which
+//! only the crate can construct. They compile the integration tests' spec 25 fixtures by path.
 //!
 //! Every expected rank and resolution is the test's own model of R6, read
 //! from the kinds of the events a test built: a suffix ranks by its first
@@ -1044,3 +1043,160 @@ fn chains_of_two_identifiers_are_refused() -> TestResult {
 mod retention;
 
 mod verdict;
+
+/// Vector 41 extended by `count` `KeyState` events, each changing only the
+/// witnessing interval, to `base_interval + i` at the i-th.
+fn key_state_run(keys: &Keys, from: &Base, count: u32, base_interval: u32) -> Result<Base, Error> {
+    let mut base = from.clone();
+    for step in 1..=count {
+        let mut changed = v41_changed()?;
+        changed.witnessing_interval = base_interval + step;
+        let preimage = key_state_on(&base, changed);
+        let unit = keys.sign(&base, &preimage)?;
+        base = base.then(&Wire::of(&preimage).fields(), unit, base.root.clone());
+    }
+    Ok(base)
+}
+
+/// The units of `base` from position `from` on.
+fn units_from(base: &Base, from: usize) -> Vec<&[u8]> {
+    base.units.iter().skip(from).map(Vec::as_slice).collect()
+}
+
+/// `03-identity.md` §3.10.10 `RetainedLog` and `RetainedChain`: a log
+/// admits Vector 41, then Vector 55, then Vector 54 as three frames, and
+/// retains both chains in the order it first held each, each read at its
+/// head and at a past event, with an event off the chain refused.
+#[test]
+fn retained_log_reads_every_chain_it_holds() -> TestResult {
+    use crate::{NotOnChain, RetainedChain, RetainedLog, key_state_at, replay};
+
+    let v54 = v41_v54()?;
+    let v55 = v41_v55()?;
+    let v54_digest: [u8; 32] = fixtures::array(V54_DIGEST)?;
+    let v55_digest: [u8; 32] = fixtures::array(V55_DIGEST)?;
+
+    let mut log = RetainedLog::new(v54.identifier);
+    assert!(log.retained().is_empty());
+    assert_eq!(log.admit(&units_from(&v54, 0)[..1])?, first_held());
+    assert!(matches!(
+        log.admit(&units_from(&v55, 1))?,
+        HoldOutcome::AcceptedExtended { .. }
+    ));
+    assert!(matches!(
+        log.admit(&units_from(&v54, 1))?,
+        HoldOutcome::AcceptedReplaced { .. }
+    ));
+    let retained = log.retained();
+    assert_eq!(
+        retained
+            .iter()
+            .map(RetainedChain::head_digest)
+            .collect::<Vec<_>>(),
+        vec![v55_digest, v54_digest]
+    );
+    for (held, base) in retained.iter().zip([&v55, &v54]) {
+        let chain = chain_of(base)?;
+        assert_eq!(held.identifier(), &chain.identifier());
+        assert_eq!(held.key_state(), replay(&chain).key_state());
+        assert_eq!(held.head_sequence(), 1);
+        let past = key_state_at(&chain, &v41_digest())?.key_state().clone();
+        assert_eq!(held.key_state_at(&v41_digest())?, past);
+        assert_eq!(
+            held.key_state_at(&[0x5A; 32]),
+            Err(NotOnChain { digest: [0x5A; 32] })
+        );
+    }
+    Ok(())
+}
+
+/// R10's frame admission: a first event the log holds, a successor of no
+/// held event, another identifier's inception and an empty frame are each
+/// refused, and the log is unchanged after every refusal.
+#[test]
+fn retained_log_refuses_frames_frame_admission_refuses() -> TestResult {
+    use crate::{FrameRefusal, RetainedChain, RetainedLog};
+
+    let keys = Keys::new()?;
+    let run = key_state_run(&keys, &v41()?, 2, 7_200)?;
+    let mut log = RetainedLog::new(run.identifier);
+    let empty: [&[u8]; 0] = [];
+    assert_eq!(log.admit(&empty), Err(FrameRefusal::Empty));
+    assert_eq!(
+        log.admit(&units_from(&run, 2)),
+        Err(FrameRefusal::Unanchored)
+    );
+    assert_eq!(
+        log.admit(&units_from(&v42()?, 0)),
+        Err(FrameRefusal::Unanchored)
+    );
+    assert_eq!(log.admit(&units_from(&run, 0)[..2])?, first_held());
+    let heads = |log: &RetainedLog| {
+        log.retained()
+            .iter()
+            .map(RetainedChain::head_digest)
+            .collect::<Vec<_>>()
+    };
+    let before = heads(&log);
+    assert_eq!(
+        log.admit(&units_from(&run, 0)),
+        Err(FrameRefusal::FirstHeld)
+    );
+    assert_eq!(
+        log.admit(&units_from(&run, 1)),
+        Err(FrameRefusal::FirstHeld)
+    );
+    assert_eq!(heads(&log), before);
+    assert!(matches!(
+        log.admit(&units_from(&run, 2))?,
+        HoldOutcome::AcceptedExtended { .. }
+    ));
+    assert_eq!(heads(&log), vec![run.head]);
+    Ok(())
+}
+
+/// R3 inside one frame: with e0..e5 held, the frame [f5, g6], where f5
+/// names e4 and g6 names e5, is refused at g6 with a predecessor mismatch,
+/// because g6 does not extend the unit before it; the log keeps one chain.
+/// f5 alone is held as a divergent suffix.
+#[test]
+fn retained_log_refuses_a_unit_that_does_not_extend_the_one_before() -> TestResult {
+    use crate::{EventDefect, FrameRefusal, RetainedChain, RetainedLog};
+
+    let keys = Keys::new()?;
+    let e4 = key_state_run(&keys, &v41()?, 4, 7_200)?;
+    let e5 = key_state_run(&keys, &e4, 1, 8_000)?;
+    let f5 = key_state_run(&keys, &e4, 1, 9_000)?;
+    let g6 = key_state_run(&keys, &e5, 1, 10_000)?;
+    let mut log = RetainedLog::new(e5.identifier);
+    assert_eq!(log.admit(&units_from(&e5, 0))?, first_held());
+
+    let (Some(f5_unit), Some(g6_unit)) = (f5.units.get(5), g6.units.get(6)) else {
+        return Err("f5 and g6 units".into());
+    };
+    let frame: [&[u8]; 2] = [f5_unit, g6_unit];
+    match log.admit(&frame) {
+        Err(FrameRefusal::Illegal { index, discarded }) => {
+            assert_eq!(index, 1);
+            assert!(matches!(
+                discarded.defect(),
+                EventDefect::PredecessorMismatch { .. }
+            ));
+        }
+        other => return Err(format!("expected Illegal at index 1, got {other:?}").into()),
+    }
+    let heads = |log: &RetainedLog| {
+        log.retained()
+            .iter()
+            .map(RetainedChain::head_digest)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(heads(&log), vec![e5.head]);
+    assert!(matches!(
+        log.admit(&frame[..1])?,
+        HoldOutcome::HeldDivergent { .. } | HoldOutcome::AcceptedReplaced { .. }
+    ));
+    assert_eq!(heads(&log).len(), 2);
+    assert!(heads(&log).contains(&f5.head));
+    Ok(())
+}

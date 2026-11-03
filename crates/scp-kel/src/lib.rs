@@ -18,6 +18,7 @@ mod preimage;
 mod rank;
 pub mod recovery_store;
 mod relation;
+mod retained;
 mod routing;
 mod signature;
 mod validate;
@@ -50,15 +51,16 @@ pub use preimage::{
     prerotation_commitment,
 };
 pub use rank::{
-    Admission, AdoptedBasis, BasisKind, ChainPairing, Divergence, ForkRank, NoResolution,
-    PersistedBasis, PersistedRetention, PersistedSuffix, Rerank, ResolveError, RestoreError,
-    RetainedSuffix, RetentionBasis, RetentionError, RetentionSet, SetResolution, TieClass,
-    UnrelatedChains, pair_chains, resolve_set,
+    AcceptedChainHolder, Admission, AdoptedBasis, BasisKind, ChainPairing, Divergence, ForkRank,
+    HoldError, HoldOutcome, NoResolution, PersistedBasis, PersistedRetention, PersistedSuffix,
+    Rerank, ResolveError, RestoreError, RetainedSuffix, RetentionBasis, RetentionError,
+    RetentionSet, SetResolution, TieClass, UnrelatedChains, pair_chains, resolve_set,
 };
 pub use relation::{
     ChainRelation, EntryAdoption, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
     WithheldEvent, classify_relation,
 };
+pub use retained::{FrameRefusal, RetainedChain, RetainedLog};
 pub use routing::{RoutingKind, node_list_routing_id, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,

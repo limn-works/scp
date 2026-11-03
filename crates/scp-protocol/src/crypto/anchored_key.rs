@@ -1,20 +1,69 @@
 //! The signer keys §9.7.1's log-anchored and current-key classes name, read
-//! from the key state a resolution of the signer's key-event log accepted.
+//! from the signer's key-event log as a party resolved it or a validating
+//! store retains it.
 //!
 //! Sources: `09-security-model.md` §9.7.1 log-anchored and current-key rows;
 //! §9.7.4.2 R8; §9.5.2 **`ContextOperatorBinding`** "Class"; §9.6.3 "The
-//! binding" and "The record"; `03-identity.md` §3.10.10 `ResolvedState`.
+//! binding" and "The record"; `03-identity.md` §3.10.10 `ResolvedState`,
+//! `RetainedLog` and `RetainedChain`; §9.10.12.
 //!
 //! A verifier that takes a bare key trusts its caller to have read the key
-//! at the right position of the right identity's log. These functions take
-//! the [`ResolvedState`] only the verdict classifier constructs, and read the
-//! key there, so a caller cannot hand in the signer's current key for a
-//! log-anchored signature, another identity's key, a key from a position the
-//! signed object does not name, or a chain no resolution adopted.
+//! at the right position of the right identity's log. These functions read
+//! the key from a `KeyStateSource`, a crate-private trait with two
+//! implementors: a party's [`ResolvedState`], which only the verdict
+//! classifier constructs, and a validating store's [`RetainedChain`], which
+//! only a [`RetainedLog`](scp_kel::RetainedLog) constructs. The trait is
+//! private so the two sources reach separate public entry points: a party's
+//! verifiers take a `ResolvedState` only, and a store's admission entry
+//! points take a `RetainedChain` and return types no party consumer accepts
+//! (`03-identity.md` §3.10.10). The identity check and the head-on-chain
+//! refusal are the same for both.
 
 use scp_crypto::p256::P256PublicKey;
-use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole};
-use scp_kel::ResolvedState;
+use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole, KeyState};
+use scp_kel::{NotOnChain, ResolvedState, RetainedChain};
+
+/// The key state a log-anchored or current-key read takes the signer's key
+/// from. Crate-private: no caller outside scp-protocol names it, so a public
+/// verifier fixes which source it takes.
+pub(crate) trait KeyStateSource {
+    /// The identifier the chain's inception recomputes to.
+    fn identifier(&self) -> &Identifier;
+
+    /// The key state at the chain's head.
+    fn key_state(&self) -> &KeyState;
+
+    /// The key state at the chain's event whose preimage digest is `digest`.
+    fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain>;
+}
+
+impl KeyStateSource for ResolvedState {
+    fn identifier(&self) -> &Identifier {
+        Self::identifier(self)
+    }
+
+    fn key_state(&self) -> &KeyState {
+        Self::key_state(self)
+    }
+
+    fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain> {
+        Self::key_state_at(self, digest)
+    }
+}
+
+impl KeyStateSource for RetainedChain {
+    fn identifier(&self) -> &Identifier {
+        Self::identifier(self)
+    }
+
+    fn key_state(&self) -> &KeyState {
+        Self::key_state(self)
+    }
+
+    fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain> {
+        Self::key_state_at(self, digest)
+    }
+}
 
 /// Why a signer's key could not be read from the resolved key state handed
 /// in.
@@ -36,17 +85,17 @@ pub enum AnchoredKeyError {
     ActiveKey,
 }
 
-/// The log-anchored class: the `#active` key `Current` at the event of the
-/// resolved chain whose §9.5.1 preimage digest is `key_state_head`, when
+/// The log-anchored class: the `#active` key `Current` at the event of
+/// `resolved`'s chain whose §9.5.1 preimage digest is `key_state_head`, when
 /// `resolved` is `signer`'s.
 ///
-/// `resolved` is the key state the verifier's resolution of `signer`
-/// accepted (§9.7.4.2 R14), read at a past position through
-/// [`ResolvedState::key_state_at`]. §9.7.1's first-seen rule for a later
-/// `Compromised` marking stays the caller's, because it reads when the
-/// verifier first saw the object.
+/// `resolved` is the key state a party's resolution of `signer` accepted
+/// (§9.7.4.2 R14) or a chain a validating store retains (§9.10.12), read at a
+/// past position through [`KeyStateSource::key_state_at`]. §9.7.1's
+/// first-seen rule for a later `Compromised` marking stays the caller's,
+/// because it reads when the verifier first saw the object.
 pub(crate) fn active_at(
-    resolved: &ResolvedState,
+    resolved: &impl KeyStateSource,
     signer: &Identifier,
     key_state_head: &[u8; 32],
 ) -> Result<P256PublicKey, AnchoredKeyError> {
@@ -59,10 +108,10 @@ pub(crate) fn active_at(
     active_of(&state.keys)
 }
 
-/// The current-key class: the `#active` key `Current` at the head of the
-/// resolved chain, when `resolved` is `signer`'s.
+/// The current-key class: the `#active` key `Current` at the head of
+/// `resolved`'s chain, when `resolved` is `signer`'s.
 pub(crate) fn current_active(
-    resolved: &ResolvedState,
+    resolved: &impl KeyStateSource,
     signer: &Identifier,
 ) -> Result<P256PublicKey, AnchoredKeyError> {
     if resolved.identifier() != signer {
@@ -122,6 +171,46 @@ mod tests {
         assert_eq!(
             active_at(&resolved, &alice.identifier, &[0x22; 32]),
             Err(AnchoredKeyError::HeadNotOnChain)
+        );
+        Ok(())
+    }
+
+    /// `03-identity.md` §3.10.10: a store-held `RetainedChain` and a party's
+    /// `ResolvedState` of one log give the same key at every position, and
+    /// the same identity and head-on-chain refusals.
+    #[test]
+    fn a_retained_chain_reads_as_the_resolved_state_does() -> TestResult {
+        let alice = incept(0x51, 0x52, 0x53)?;
+        let first_head = alice.head;
+        let alice = alice.rotate(0x54)?;
+        let resolved = alice.resolved()?;
+        let retained = alice.retained()?;
+        let bob = incept(0x61, 0x62, 0x63)?;
+        for head in [first_head, alice.head, [0x22; 32]] {
+            assert_eq!(
+                active_at(&retained, &alice.identifier, &head),
+                active_at(&resolved, &alice.identifier, &head)
+            );
+            assert_eq!(
+                active_at(&retained, &bob.identifier, &head),
+                Err(AnchoredKeyError::IdentityMismatch)
+            );
+        }
+        assert_eq!(
+            active_at(&retained, &alice.identifier, &first_head)?,
+            key(0x52).public_key()
+        );
+        assert_eq!(
+            active_at(&retained, &alice.identifier, &[0x22; 32]),
+            Err(AnchoredKeyError::HeadNotOnChain)
+        );
+        assert_eq!(
+            current_active(&retained, &alice.identifier)?,
+            key(0x54).public_key()
+        );
+        assert_eq!(
+            current_active(&retained, &bob.identifier),
+            Err(AnchoredKeyError::IdentityMismatch)
         );
         Ok(())
     }

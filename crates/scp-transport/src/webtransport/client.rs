@@ -886,12 +886,14 @@ impl TransportAdapter for WebTransportAdapter {
                     // WebSocket path: serialize ClientMessage with ref_id,
                     // send over WebSocket, correlate response by ref_id.
                     let ref_id = self.next_ref_id();
+                    let blob_ttl = scp_relay_client::PublishTtl::new(envelope.blob_ttl)
+                        .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
                     let msg = ClientMessage::Publish {
                         ref_id: Some(ref_id.clone()),
                         routing_id,
                         recipient_hint,
-                        blob_ttl: envelope.blob_ttl,
+                        lifetime: BlobLifetime::Ttl(blob_ttl),
                         blob,
                     };
 
@@ -1299,6 +1301,7 @@ impl TransportAdapter for WebTransportAdapter {
                         ref_id: Some(ref_id.clone()),
                         routing_id: routing_id_bytes,
                         since,
+                        after_blob: None,
                         limit: None,
                     };
 
@@ -1687,7 +1690,7 @@ mod tests {
             routing_id: routing_a,
             blob_id: *crate::traits::BlobId::from_sha256(&blob_bytes).as_bytes(),
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_bytes,
         };

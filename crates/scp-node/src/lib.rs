@@ -17,6 +17,7 @@ pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
 pub mod projection;
+pub mod public_records;
 mod published_state;
 mod republish;
 pub mod self_host;
@@ -1482,7 +1483,12 @@ impl<S: Storage> ApplicationNode<S> {
         let blobs = self
             .state
             .blob_storage
-            .query(&routing_id, None, MAX_BLOB_QUERY)
+            .query(
+                &routing_id,
+                scp_transport::native::storage::QueryCursor::All,
+                scp_transport::native::storage::LifetimeFilter::Any,
+                MAX_BLOB_QUERY,
+            )
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
@@ -1648,7 +1654,7 @@ impl<S: Storage> ApplicationNode<S> {
                 routing_id,
                 manifest_blob_id,
                 None,
-                86400 * 30,
+                scp_transport::native::storage::StoredLifetime::Ttl(86400 * 30),
                 manifest_bytes,
             )
             .await
@@ -3473,7 +3479,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
-    #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
     own_lookup: scp_transport::relay::push_endpoint::OwnAddressLookup,
@@ -3615,8 +3620,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         default_site_routing_id: std::sync::RwLock::new(None),
         #[cfg(feature = "quic")]
         publish_rate_limiter,
-        #[cfg(feature = "quic")]
-        did_slot_registry,
         #[cfg(feature = "quic")]
         quic_server_config,
         // Set to `true` by `serve()` once the QUIC listener binds (§10.14.3).
@@ -3805,7 +3808,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
-    #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port
@@ -3943,8 +3945,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
         #[cfg(feature = "quic")]
         publish_rate_limiter,
-        #[cfg(feature = "quic")]
-        did_slot_registry,
         #[cfg(feature = "quic")]
         quic_server_config: None,
         // No QUIC config means `serve()` never sets this; stays `false`.
@@ -8020,7 +8020,9 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![1],
         };
         ws.send(Message::Binary(
@@ -8121,7 +8123,9 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: 3600,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<
+                    3600,
+                >()),
                 blob: vec![1],
             },
         )
@@ -8142,6 +8146,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 since: None,
+                after_blob: None,
                 limit: None,
             },
         )

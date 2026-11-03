@@ -239,6 +239,29 @@ impl ValidatedChain {
         self.head().sequence
     }
 
+    /// Each event's preimage digest, from the inception to the head: what a
+    /// store reads to tell which of the events it holds lie on this chain
+    /// (§9.7.4.2 R9: "An event is identified by its preimage digest").
+    pub fn event_digests(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        std::iter::once(&self.state.inception)
+            .chain(&self.state.later)
+            .map(|event| event.digest)
+    }
+
+    /// The preimage digest of the chain's event at `position`, or `None`
+    /// past the head. Positions run from zero without a gap, so it reads one
+    /// event and walks none.
+    pub(crate) fn digest_at(&self, position: u64) -> Option<[u8; 32]> {
+        position
+            .checked_sub(1)
+            .map_or(Some(self.state.inception.digest), |later| {
+                usize::try_from(later)
+                    .ok()
+                    .and_then(|index| self.state.later.get(index))
+                    .map(|event| event.digest)
+            })
+    }
+
     pub(super) fn head(&self) -> &ChainEvent {
         self.state.later.last().unwrap_or(&self.state.inception)
     }

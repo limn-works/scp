@@ -159,7 +159,7 @@ pub async fn deliver_to_subscribers(
         routing_id: stored.routing_id,
         blob_id: stored.blob_id,
         recipient_hint: stored.recipient_hint,
-        blob_ttl: stored.blob_ttl,
+        blob_ttl: stored.lifetime.ttl(),
         stored_at: stored.stored_at,
         blob: stored.blob.clone(),
     };

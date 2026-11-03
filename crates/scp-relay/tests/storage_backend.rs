@@ -432,7 +432,13 @@ async fn sqlite_blob_persistence_across_reopens() {
             .expect("failed to open sqlite backend");
 
         let stored = backend
-            .store(routing_id, blob_id, None, 3600, blob_data.clone())
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                scp_transport::native::storage::StoredLifetime::Ttl(3600),
+                blob_data.clone(),
+            )
             .await
             .expect("failed to store blob");
 

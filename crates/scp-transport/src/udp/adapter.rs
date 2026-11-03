@@ -247,11 +247,14 @@ impl TransportAdapter for UdpDtlsAdapter {
                 );
             }
 
+            let blob_ttl = scp_relay_client::PublishTtl::new(blob_ttl)
+                .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
             let msg = ClientMessage::Publish {
                 ref_id: None,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(blob_ttl),
                 blob,
             };
 
@@ -321,6 +324,7 @@ impl TransportAdapter for UdpDtlsAdapter {
                 ref_id: None,
                 routing_id: routing_id_bytes,
                 since,
+                after_blob: None,
                 limit: None,
             };
 

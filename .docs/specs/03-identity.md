@@ -1570,7 +1570,11 @@ pub struct ResolutionOutcome {
 /// The key state a resolution accepted: the state replaying the validated
 /// chain derived, and the instant of the resolution. Only the verdict
 /// classifier constructs it, on `Confirmed` or `Adopted`, so every
-/// verification decision that reads key state reads one a resolution accepted.
+/// verification decision a party makes on key state reads one a resolution
+/// accepted. A validating store's admission and selection
+/// (`09-security-model.md` §9.10.12) read the chains the store retains under
+/// `09-security-model.md` §9.7.4.2 R9 instead, as `RetainedChain` below.
+/// Store admission is availability only and grants no trust.
 pub struct ResolvedState { /* the validated chain, the replayed state, the identifier, the head's digest and sequence, and the resolution instant; private */ }
 
 impl ResolvedState {
@@ -1597,6 +1601,55 @@ impl ResolvedState {
     /// false where `now` precedes the resolution instant, because a clock
     /// stepped backward would otherwise extend that bound.
     pub fn is_fresh(&self, now: SystemTime) -> bool;
+}
+
+/// One chain a validating store retains under `09-security-model.md`
+/// §9.7.4.2 R9, accepted or suffix, with the key state replaying it derives.
+/// Only `RetainedLog` below constructs it, from the chains it holds, and a
+/// `RetainedLog` takes event units and never a validated chain: it validates
+/// each frame's units against the chains it holds and ranks the result under
+/// R9 itself. No caller can present a chain the log did not validate and
+/// rank. It carries no verdict and no resolution instant: a store admits a
+/// record for availability, and no party's trust decision reads a
+/// `RetainedChain`. A party's verifier of a log-anchored or current-key
+/// signature (`09-security-model.md` §9.7.1) takes a `ResolvedState` only. A
+/// store's admission of a node-list record or entry (§9.10.12) has its own
+/// entry points, which take a `RetainedChain` and return admitted types that
+/// are distinct from a party's verified types, so no party consumer accepts a
+/// value a store verified.
+pub struct RetainedChain { /* the validated chain, the replayed state, the identifier; private */ }
+
+impl RetainedChain {
+    /// The identifier the retained chain's inception recomputes to.
+    pub fn identifier(&self) -> &Identifier;
+    /// The preimage digest of the retained chain's head event.
+    pub fn head_digest(&self) -> [u8; 32];
+    /// The key state at the retained chain's head.
+    pub fn key_state(&self) -> &KeyState;
+    /// The key state at the retained chain's event whose
+    /// `09-security-model.md` §9.5.1 preimage digest is `digest`, read as
+    /// `ResolvedState::key_state_at` reads it. `NotOnChain` where no event of
+    /// the retained chain has that digest.
+    pub fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain>;
+}
+
+/// One identifier's key-event log as a validating store holds it
+/// (`09-security-model.md` §9.10.12): the chains it retains under
+/// `09-security-model.md` §9.7.4.2 R9, built from the event units of the
+/// frames the store admitted, in the order it admitted them.
+pub struct RetainedLog { /* the identifier and the R9 holder; private */ }
+
+impl RetainedLog {
+    pub fn new(identifier: Identifier) -> Self;
+    /// Admits one frame's event units under R10's frame admission and R3:
+    /// the first unit is the identifier's inception or extends an event of
+    /// a chain the log holds, and is not an event the log holds; each later
+    /// unit extends the unit before it; each passes R3's check order. It then
+    /// holds the extended chain under R9. Each unit is validated once,
+    /// against the chain it extends, and never replayed with the log.
+    pub fn admit(&mut self, units: &[&[u8]]) -> Result<HoldOutcome, FrameRefusal>;
+    /// Every chain the log retains, accepted or suffix, as `RetainedChain`.
+    pub fn retained(&self) -> Vec<RetainedChain>;
 }
 
 /// The commitment the latest reveal-authorized event fixed, or the

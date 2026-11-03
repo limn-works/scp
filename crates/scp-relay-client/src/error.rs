@@ -47,23 +47,35 @@ pub mod code {
     /// The client has too many active subscriptions on this connection.
     pub const TOO_MANY_SUBSCRIPTIONS: u16 = 4021;
 
-    /// A validating SCP-native relay rejected a PUBLISH at a DID-domain
-    /// `routing_id` (§3.10.2 relay-side validation, §9.10.12, ADR-004
-    /// "DID-Record Slot-Exclusivity").
+    /// A node refused a public record at admission (ADR-004 error codes).
     ///
-    /// The blob decoded as a `DidRecordV1` frame but failed the
-    /// `SHA-256("scp:did:" || did(public_key)) == routing_id` binding or the
-    /// BEP44 signature; or its `seq` did not supersede the stored slot (and it
-    /// was not a byte-identical equal-`seq` refresh); or it was a non-frame /
-    /// wrong-binding / invalid-signature blob published to a `routing_id` whose
-    /// DID slot is already claimed (slot-exclusivity rule (a)).
+    /// Under `09-security-model.md` §9.10.12 that covers a record that fails a
+    /// decoder rule or its identifier-to-routing-id binding, a key-event frame
+    /// whose first event the node can place on no chain it holds, an
+    /// inception that fails R2's binding, and a retained PUBLISH to a server
+    /// that stores no public records. Any other R3 failure is
+    /// `KEY_EVENT_ILLEGAL`.
     ///
-    /// Do not retry as-is. This is a **defense-in-depth availability** measure,
-    /// never a trust dependency: the client re-verifies every record
-    /// independently, so a relay's acceptance or rejection is never a client
-    /// trust input. A non-validating relay would have stored the same blob
-    /// opaquely and resolution would still be correct via client re-verification.
+    /// Do not retry as-is. A node's refusal is availability, never a trust
+    /// input: the client re-verifies every record it reads.
     pub const DID_RECORD_REJECTED: u16 = 4040;
+
+    /// A DELETE named a retained record, which no DELETE removes (ADR-004
+    /// operation 5, `09-security-model.md` §9.10.12).
+    pub const RETAINED_RECORD: u16 = 4041;
+
+    /// A node refused a PUBLISH at its own identity's `KeyPackage` routing id
+    /// whose blob is not a `KeyPackage` whose attestation verifies for that
+    /// identity (`10-infrastructure-and-self-hosting.md` §10.7.1).
+    pub const KEY_PACKAGE_REJECTED: u16 = 4042;
+
+    /// A node refused a key-event frame that passed admission because an
+    /// event in it fails R3.
+    ///
+    /// The failing step is one of `09-security-model.md` §9.7.4.2 R3's check
+    /// order that neither the §9.10.12 decoder rules nor an inception's R2
+    /// binding already rejected. The node stored no event of the frame.
+    pub const KEY_EVENT_ILLEGAL: u16 = 4044;
 
     /// The relay does not support the BRIDGE operation (section 10.12.4).
     /// The client should try a different relay configured with
@@ -173,6 +185,45 @@ pub enum RelayProtocolError {
         /// Maximum allowed size in bytes.
         max: usize,
     },
+
+    /// A PUBLISH whose `retain` and `blob_ttl` keys name no lifetime
+    /// (`09-security-model.md` §9.10.12).
+    #[error("PUBLISH lifetime: {error}")]
+    Lifetime {
+        /// The PUBLISH's `ref`, when it fits `MAX_REF_ID_LEN`.
+        ref_id: Option<String>,
+        /// Which forbidden combination it carries.
+        error: crate::protocol::LifetimeError,
+    },
+}
+
+impl RelayProtocolError {
+    /// The ADR-004 code a relay answers this error with: the lifetime's own
+    /// code for [`Lifetime`](Self::Lifetime), `4000` `INVALID_MESSAGE` for a
+    /// frame that does not decode or exceeds the size cap, and `4003`
+    /// `INVALID_FIELD` for a decoded message that fails a constraint.
+    #[must_use]
+    pub const fn code(&self) -> u16 {
+        match self {
+            Self::Lifetime { error, .. } => error.code(),
+            Self::ValidationFailed(_) => code::INVALID_FIELD,
+            Self::SerializationFailed(_)
+            | Self::DeserializationFailed(_)
+            | Self::MessageTooLarge { .. } => code::INVALID_MESSAGE,
+        }
+    }
+
+    /// The `ref` a reply to this error echoes, when the error carries one.
+    #[must_use]
+    pub fn ref_id(&self) -> Option<String> {
+        match self {
+            Self::Lifetime { ref_id, .. } => ref_id.clone(),
+            Self::SerializationFailed(_)
+            | Self::DeserializationFailed(_)
+            | Self::ValidationFailed(_)
+            | Self::MessageTooLarge { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +315,10 @@ mod tests {
         assert_eq!(code::LIMIT_EXCEEDED, 4012);
         assert_eq!(code::RATE_LIMITED, 4020);
         assert_eq!(code::TOO_MANY_SUBSCRIPTIONS, 4021);
+        assert_eq!(code::DID_RECORD_REJECTED, 4040);
+        assert_eq!(code::RETAINED_RECORD, 4041);
+        assert_eq!(code::KEY_PACKAGE_REJECTED, 4042);
+        assert_eq!(code::KEY_EVENT_ILLEGAL, 4044);
         assert_eq!(code::BRIDGE_NOT_SUPPORTED, 4030);
         assert_eq!(code::BRIDGE_LIMIT_EXCEEDED, 4031);
         assert_eq!(code::BRIDGE_TARGET_NOT_FOUND, 4032);

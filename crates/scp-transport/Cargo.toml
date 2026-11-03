@@ -31,7 +31,7 @@ webpush = ["push-store"]
 # durability-only (spec §17.17.2) and absent from every build without it.
 testing = []
 postgres-blob = ["dep:sqlx"]
-s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-http-client", "dep:http-body"]
+s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-http-client"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
@@ -130,7 +130,6 @@ aws-sdk-s3 = { version = "1", optional = true, default-features = false, feature
 # defaults named back.
 aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
 aws-smithy-http-client = { version = "1", optional = true, default-features = false, features = ["rustls-ring"] }
-http-body = { version = "1", optional = true }
 # default-features disabled to avoid quinn's `platform-verifier` feature, which
 # pulls in `aws-lc-rs`. scp-transport is ring-only (see the `rustls` dep below),
 # and a second rustls provider makes the process-default crypto provider
@@ -258,6 +257,18 @@ required-features = ["s3-blob"]
 name = "postgres_blob_fail_closed"
 path = "tests/postgres_blob_fail_closed.rs"
 required-features = ["postgres-blob"]
+
+# The PostgreSQL and S3 conformance targets need live servers; CI's
+# blob-backend step starts them and runs each target by name.
+[[test]]
+name = "postgres_blob_conformance"
+path = "tests/postgres_blob_conformance.rs"
+required-features = ["postgres-blob"]
+
+[[test]]
+name = "s3_blob_conformance"
+path = "tests/s3_blob_conformance.rs"
+required-features = ["s3-blob"]
 
 [[test]]
 name = "combined_conformance"

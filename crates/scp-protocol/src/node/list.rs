@@ -26,14 +26,14 @@
 //! was `Current` at `signing_key_state_head`. Both read the key from the
 //! governor's validated key-event log, never from a key the caller names.
 
-use scp_crypto::p256::{P256Error, SIGNATURE_LEN, verify_prehash_strict};
+use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{DidError, Identifier, NodeEntryUrlError, NodeId, NodeUrl};
-use scp_kel::{NodeKeyError, ResolvedState, node_list_routing_id};
+use scp_kel::{NodeKeyError, ResolvedState, RetainedChain, node_list_routing_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::binding::{
-    NODE_KEY_LEN, NodeBinding, NodeBindingError, VerifiedNodeBinding, node_url_hash,
+    NODE_KEY_LEN, NodeBinding, NodeBindingError, VerifiedNodeBinding, check_binding, node_url_hash,
 };
 use crate::crypto::anchored_key::{AnchoredKeyError, active_at, current_active};
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
@@ -105,9 +105,10 @@ impl VerifiedNodeListEntry {
     /// Checks that `binding.url_hash` is the SHA-256 of `url`, so a binding
     /// signed for one URL cannot be listed under another, then verifies the
     /// binding under the operator's `#active` at `binding.key_state_head` on
-    /// `operator`, the key state the verifier's resolution of `binding.operator`
-    /// accepted (see
-    /// [`VerifiedNodeBinding::verify`]).
+    /// `operator`, the [`ResolvedState`] a party's resolution of
+    /// `binding.operator` accepted (see [`VerifiedNodeBinding::verify`]). A
+    /// validating store admits an entry through
+    /// [`AdmittedNodeListEntry::admit`] instead.
     ///
     /// # Errors
     ///
@@ -117,9 +118,7 @@ impl VerifiedNodeListEntry {
         entry: NodeListEntry,
         operator: &ResolvedState,
     ) -> Result<Self, NodeListEntryError> {
-        if node_url_hash(&entry.url) != entry.binding.url_hash {
-            return Err(NodeListEntryError::UrlHashMismatch);
-        }
+        check_url_hash(&entry)?;
         Ok(Self {
             binding: VerifiedNodeBinding::verify(entry.binding, operator)?,
             url: entry.url,
@@ -143,6 +142,115 @@ impl VerifiedNodeListEntry {
     #[must_use]
     pub const fn free(&self) -> bool {
         self.free
+    }
+}
+
+/// §9.6.3 acceptance step 3's URL check: `binding.url_hash` is the SHA-256
+/// of the entry's `url`, so a binding signed for one URL is not listed under
+/// another.
+fn check_url_hash(entry: &NodeListEntry) -> Result<(), NodeListEntryError> {
+    if node_url_hash(&entry.url) == entry.binding.url_hash {
+        Ok(())
+    } else {
+        Err(NodeListEntryError::UrlHashMismatch)
+    }
+}
+
+/// A [`NodeListEntry`] a validating store admitted (§9.10.12).
+///
+/// The store ran the three checks of §9.6.3 acceptance step 3, with the
+/// operator's key read from a chain it retains under §9.7.4.2 R9
+/// (`03-identity.md` §3.10.10).
+///
+/// It carries the node key and `NodeId` a store's conflict-statement
+/// admission reads, and never a [`VerifiedNodeBinding`] or a
+/// [`VerifiedNodeListEntry`], so no party consumer accepts a value a store
+/// verified:
+///
+/// ```compile_fail,E0599
+/// fn leak(
+///     admitted: &scp_protocol::node::AdmittedNodeListEntry,
+/// ) -> &scp_protocol::node::VerifiedNodeBinding {
+///     admitted.binding()
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// fn leak(
+///     admitted: scp_protocol::node::AdmittedNodeListEntry,
+/// ) -> scp_protocol::node::VerifiedNodeListEntry {
+///     admitted
+/// }
+/// ```
+///
+/// A party's verifier refuses the store's chain:
+///
+/// ```compile_fail,E0308
+/// fn verify(
+///     entry: scp_protocol::node::NodeListEntry,
+///     held: &scp_kel::RetainedChain,
+/// ) -> bool {
+///     scp_protocol::node::VerifiedNodeListEntry::verify(entry, held).is_ok()
+/// }
+/// ```
+///
+/// The positive control admits under the store's chain:
+///
+/// ```
+/// fn admit(
+///     entry: &scp_protocol::node::NodeListEntry,
+///     held: &scp_kel::RetainedChain,
+/// ) -> Option<scp_did::NodeId> {
+///     scp_protocol::node::AdmittedNodeListEntry::admit(entry, held)
+///         .ok()
+///         .map(|admitted| *admitted.node_id())
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedNodeListEntry {
+    operator: Identifier,
+    node_key: P256PublicKey,
+    node_id: NodeId,
+}
+
+impl AdmittedNodeListEntry {
+    /// The checks of [`VerifiedNodeListEntry::verify`], with the operator's
+    /// `#active` at `binding.key_state_head` read from `operator`, a chain of
+    /// `binding.operator` the store retains.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeListEntryError::UrlHashMismatch`] or
+    /// [`NodeListEntryError::Binding`].
+    pub fn admit(
+        entry: &NodeListEntry,
+        operator: &RetainedChain,
+    ) -> Result<Self, NodeListEntryError> {
+        check_url_hash(entry)?;
+        let (node_key, node_id) = check_binding(&entry.binding, operator)?;
+        Ok(Self {
+            operator: entry.binding.operator,
+            node_key,
+            node_id,
+        })
+    }
+
+    /// The operator identity the binding names.
+    #[must_use]
+    pub const fn operator(&self) -> &Identifier {
+        &self.operator
+    }
+
+    /// The node key, decoded and checked.
+    #[must_use]
+    pub const fn node_key(&self) -> &P256PublicKey {
+        &self.node_key
+    }
+
+    /// The `NodeId` of the node key.
+    #[must_use]
+    pub const fn node_id(&self) -> &NodeId {
+        &self.node_id
     }
 }
 
@@ -437,8 +545,8 @@ pub enum NodeListKeyClass {
     Attribution,
 }
 
-/// A [`NodeListRecord`] whose governor signature verified, with the class it
-/// verified under.
+/// A [`NodeListRecord`] whose governor signature verified, with the class and
+/// the governor key it verified under.
 ///
 /// [`Self::verify`] is the only constructor, and the type has no
 /// `Deserialize`. The entries are not verified here: each entry's operator
@@ -447,12 +555,16 @@ pub enum NodeListKeyClass {
 pub struct VerifiedNodeListRecord {
     record: NodeListRecord,
     class: NodeListKeyClass,
+    signing_key: P256PublicKey,
 }
 
 impl VerifiedNodeListRecord {
     /// Verifies `record`'s signature strictly under the governor key `class`
-    /// names, read from `governor`, the key state the verifier's resolution of
-    /// `record.governor` accepted: the `#active` at the chain's head for
+    /// names, read from `governor`, the [`ResolvedState`] a party's
+    /// resolution of `record.governor` accepted (`03-identity.md` §3.10.10).
+    /// A validating store admits a record through
+    /// [`AdmittedNodeListRecord::admit`] instead. The key is the `#active` at
+    /// the chain's head for
     /// [`NodeListKeyClass::Standing`], and the `#active` at
     /// `signing_key_state_head` for [`NodeListKeyClass::Attribution`].
     ///
@@ -474,9 +586,12 @@ impl VerifiedNodeListRecord {
             }
         }
         .map_err(NodeListError::GovernorKey)?;
-        verify_prehash_strict(&governor_active, &record.digest()?, &record.signature)
-            .map_err(NodeListError::Signature)?;
-        Ok(Self { record, class })
+        check_record_signature(&record, &governor_active)?;
+        Ok(Self {
+            record,
+            class,
+            signing_key: governor_active,
+        })
     }
 
     /// Borrows the record this value verified.
@@ -491,7 +606,134 @@ impl VerifiedNodeListRecord {
         self.class
     }
 
+    /// The governor key the signature verified under: the `#active` that
+    /// [`Self::class`] names, read from the key state [`Self::verify`] took.
+    #[must_use]
+    pub const fn signing_key(&self) -> &P256PublicKey {
+        &self.signing_key
+    }
+
     /// Returns the record this value verified, dropping the verified marker.
+    #[must_use]
+    pub fn into_record(self) -> NodeListRecord {
+        self.record
+    }
+}
+
+/// The governor signature over `record`'s preimage, strict.
+fn check_record_signature(
+    record: &NodeListRecord,
+    governor_active: &P256PublicKey,
+) -> Result<(), NodeListError> {
+    verify_prehash_strict(governor_active, &record.digest()?, &record.signature)
+        .map_err(NodeListError::Signature)
+}
+
+/// A [`NodeListRecord`] a validating store admitted (§9.10.12).
+///
+/// Its governor signature verifies under the `#active` that was `Current` at
+/// `signing_key_state_head` on a governor chain the store retains under
+/// §9.7.4.2 R9 (`03-identity.md` §3.10.10), the log-anchored class.
+///
+/// It is not a [`VerifiedNodeListRecord`] and converts into none, so no party
+/// consumer accepts a record a store verified:
+///
+/// ```compile_fail,E0308
+/// fn leak(
+///     admitted: scp_protocol::node::AdmittedNodeListRecord,
+/// ) -> scp_protocol::node::VerifiedNodeListRecord {
+///     admitted
+/// }
+/// ```
+///
+/// A party's verifier refuses the store's chain:
+///
+/// ```compile_fail,E0308
+/// fn verify(
+///     record: scp_protocol::node::NodeListRecord,
+///     held: &scp_kel::RetainedChain,
+/// ) -> bool {
+///     scp_protocol::node::VerifiedNodeListRecord::verify(
+///         record,
+///         scp_protocol::node::NodeListKeyClass::Attribution,
+///         held,
+///     )
+///     .is_ok()
+/// }
+/// ```
+///
+/// and the store's entry point refuses a party's resolution:
+///
+/// ```compile_fail,E0308
+/// fn admit(
+///     record: scp_protocol::node::NodeListRecord,
+///     resolved: &scp_kel::ResolvedState,
+/// ) -> bool {
+///     scp_protocol::node::AdmittedNodeListRecord::admit(record, resolved).is_ok()
+/// }
+/// ```
+///
+/// The positive controls:
+///
+/// ```
+/// fn admit(
+///     record: scp_protocol::node::NodeListRecord,
+///     held: &scp_kel::RetainedChain,
+/// ) -> bool {
+///     scp_protocol::node::AdmittedNodeListRecord::admit(record, held).is_ok()
+/// }
+/// fn verify(
+///     record: scp_protocol::node::NodeListRecord,
+///     resolved: &scp_kel::ResolvedState,
+/// ) -> bool {
+///     scp_protocol::node::VerifiedNodeListRecord::verify(
+///         record,
+///         scp_protocol::node::NodeListKeyClass::Attribution,
+///         resolved,
+///     )
+///     .is_ok()
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedNodeListRecord {
+    record: NodeListRecord,
+    signing_key: P256PublicKey,
+}
+
+impl AdmittedNodeListRecord {
+    /// Verifies `record`'s signature strictly under the governor's `#active`
+    /// at `signing_key_state_head` on `governor`, a chain of
+    /// `record.governor` the store retains.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeListError::GovernorKey`] when `governor` is another identity's
+    /// or its chain does not hold `signing_key_state_head`,
+    /// [`NodeListError::Signature`] when the signature fails, or a digest
+    /// error.
+    pub fn admit(record: NodeListRecord, governor: &RetainedChain) -> Result<Self, NodeListError> {
+        let signing_key = active_at(governor, &record.governor, &record.signing_key_state_head)
+            .map_err(NodeListError::GovernorKey)?;
+        check_record_signature(&record, &signing_key)?;
+        Ok(Self {
+            record,
+            signing_key,
+        })
+    }
+
+    /// Borrows the record this value admitted.
+    #[must_use]
+    pub const fn record(&self) -> &NodeListRecord {
+        &self.record
+    }
+
+    /// The governor key the signature verified under.
+    #[must_use]
+    pub const fn signing_key(&self) -> &P256PublicKey {
+        &self.signing_key
+    }
+
+    /// Returns the record this value admitted.
     #[must_use]
     pub fn into_record(self) -> NodeListRecord {
         self.record
@@ -516,12 +758,6 @@ pub enum NodeListFrameError {
     /// The frame's `governor` differs from the record's.
     #[error("node-list frame governor differs from the record's governor")]
     GovernorMismatch,
-    /// A PUBLISH at `scp:nls:` without `retain`.
-    #[error("node-list PUBLISH does not set retain")]
-    RetainMissing,
-    /// A PUBLISH carrying both `retain` and `blob_ttl`.
-    #[error("node-list PUBLISH carries both retain and blob_ttl")]
-    RetainWithTtl,
     /// The PUBLISH routing id is not `SHA-256("scp:nls:" ‖ context_id)` over
     /// the record's `context_id`.
     #[error("node-list PUBLISH routing id does not derive from the record's context_id")]
@@ -573,30 +809,23 @@ pub fn decode_node_list_frame(bytes: &[u8]) -> Result<NodeListRecord, NodeListFr
 
 /// The structural admission of a PUBLISH at a `scp:nls:` routing id (§9.10.12).
 ///
-/// It checks that `retain` is set, `blob_ttl` is absent, the blob decodes as a
-/// node-list frame, and `routing_id` derives from the record's `context_id`.
+/// It checks that the blob decodes as a node-list frame and that `routing_id`
+/// derives from the record's `context_id`. The PUBLISH's lifetime is no input:
+/// `scp_relay_client::BlobLifetime` refuses both keys, neither key and
+/// `retain: false` on decode, and only a `Retained` PUBLISH reaches a store.
 ///
-/// The node's remaining admission step, the governor signature under the
-/// `#active` at `signing_key_state_head` in the governor key state the node
-/// holds, reads key state this function does not hold; the caller runs
-/// [`VerifiedNodeListRecord::verify`] under [`NodeListKeyClass::Attribution`]
-/// on the returned record.
+/// The node's remaining admission steps read key state and configuration this
+/// function does not hold: the caller checks the record's (`context_id`,
+/// `governor`) pair against its node-list pointers and runs
+/// [`AdmittedNodeListRecord::admit`] on a governor chain it retains.
 ///
 /// # Errors
 ///
 /// [`NodeListFrameError`] names the first rule the PUBLISH breaks.
 pub fn check_node_list_publish(
     routing_id: &[u8; 32],
-    retain: bool,
-    blob_ttl: Option<u32>,
     blob: &[u8],
 ) -> Result<NodeListRecord, NodeListFrameError> {
-    if !retain {
-        return Err(NodeListFrameError::RetainMissing);
-    }
-    if blob_ttl.is_some() {
-        return Err(NodeListFrameError::RetainWithTtl);
-    }
     let record = decode_node_list_frame(blob)?;
     if node_list_routing_id(&record.context_id) != *routing_id {
         return Err(NodeListFrameError::RoutingIdMismatch);
@@ -853,6 +1082,18 @@ mod tests {
             verdict(&by_new_key, NodeListKeyClass::Standing),
             Ok(NodeListKeyClass::Standing)
         );
+        // Each verified value carries the key its class read.
+        let signer = |r: &NodeListRecord, class| {
+            VerifiedNodeListRecord::verify(r.clone(), class, &resolved).map(|v| *v.signing_key())
+        };
+        assert_eq!(
+            signer(&by_old_key, NodeListKeyClass::Attribution),
+            Ok(key(9).public_key())
+        );
+        assert_eq!(
+            signer(&by_new_key, NodeListKeyClass::Standing),
+            Ok(key(10).public_key())
+        );
         assert_eq!(
             VerifiedNodeListRecord::verify(
                 by_old_key,
@@ -1064,37 +1305,92 @@ mod tests {
     }
 
     #[test]
-    fn publish_rule_retain_is_required() -> TestResult {
+    fn publish_rule_routing_id_derives_from_the_context_id() -> TestResult {
         let (record, bytes) = frame()?;
-        let routing = node_list_routing_id(&record.context_id);
         assert_eq!(
-            check_node_list_publish(&routing, false, None, &bytes),
-            Err(NodeListFrameError::RetainMissing)
-        );
-        assert_eq!(
-            check_node_list_publish(&routing, true, None, &bytes)?,
+            check_node_list_publish(&node_list_routing_id(&record.context_id), &bytes)?,
             record
         );
-        Ok(())
-    }
-
-    #[test]
-    fn publish_rule_retain_with_blob_ttl_is_refused() -> TestResult {
-        let (record, bytes) = frame()?;
-        let routing = node_list_routing_id(&record.context_id);
         assert_eq!(
-            check_node_list_publish(&routing, true, Some(60), &bytes),
-            Err(NodeListFrameError::RetainWithTtl)
+            check_node_list_publish(&node_list_routing_id("other"), &bytes),
+            Err(NodeListFrameError::RoutingIdMismatch)
         );
         Ok(())
     }
 
+    /// The classifier's nls row: a node-list frame is of its kind only at
+    /// the routing id its own `context_id` derives, and of no kind at another
+    /// context's id or at an identifier-derived id of its governor.
     #[test]
-    fn publish_rule_routing_id_derives_from_the_context_id() -> TestResult {
-        let (_, bytes) = frame()?;
+    fn a_node_list_frame_classifies_only_at_its_context_routing_id() -> TestResult {
+        use super::super::kind::{NodeRecordKind, classify_node_record};
+        let (record, bytes) = frame()?;
         assert_eq!(
-            check_node_list_publish(&node_list_routing_id("other"), true, None, &bytes),
-            Err(NodeListFrameError::RoutingIdMismatch)
+            classify_node_record(&node_list_routing_id(&record.context_id), &bytes),
+            Some(NodeRecordKind::NodeList)
+        );
+        for elsewhere in [
+            node_list_routing_id("other"),
+            scp_kel::routing_id(scp_kel::RoutingKind::KeyEvents, &record.governor),
+            scp_kel::routing_id(scp_kel::RoutingKind::ServiceRecord, &record.governor),
+        ] {
+            assert_eq!(classify_node_record(&elsewhere, &bytes), None);
+        }
+        Ok(())
+    }
+
+    /// A store admits the record and each entry under the chains it retains,
+    /// with the same key a party's verification reads at
+    /// `signing_key_state_head`; another identity's chain, a head off the
+    /// chain, a wrong signer and a moved URL are refused.
+    #[test]
+    fn a_store_admits_under_the_chain_it_retains() -> TestResult {
+        let gov = governor()?;
+        let record = record_of(&gov, &key(9))?;
+        let admitted = AdmittedNodeListRecord::admit(record.clone(), &gov.retained()?)?;
+        let verified = VerifiedNodeListRecord::verify(
+            record.clone(),
+            NodeListKeyClass::Attribution,
+            &gov.resolved()?,
+        )?;
+        assert_eq!(admitted.signing_key(), verified.signing_key());
+        assert_eq!(admitted.record(), &record);
+        assert_eq!(
+            AdmittedNodeListRecord::admit(record.clone(), &operator()?.retained()?),
+            Err(NodeListError::GovernorKey(
+                AnchoredKeyError::IdentityMismatch
+            ))
+        );
+        let mut off_chain = record.clone();
+        off_chain.signing_key_state_head = [0x22; 32];
+        assert_eq!(
+            AdmittedNodeListRecord::admit(off_chain, &gov.retained()?),
+            Err(NodeListError::GovernorKey(AnchoredKeyError::HeadNotOnChain))
+        );
+        assert!(matches!(
+            AdmittedNodeListRecord::admit(record_of(&gov, &key(8))?, &gov.retained()?),
+            Err(NodeListError::Signature(_))
+        ));
+
+        let op = operator()?;
+        for entry in &record.entries {
+            let admitted = AdmittedNodeListEntry::admit(entry, &op.retained()?)?;
+            let verified = VerifiedNodeListEntry::verify(entry.clone(), &op.resolved()?)?;
+            assert_eq!(admitted.node_key(), verified.binding().node_key());
+            assert_eq!(admitted.node_id(), verified.binding().node_id());
+            assert_eq!(admitted.operator(), &entry.binding.operator);
+            assert!(matches!(
+                AdmittedNodeListEntry::admit(entry, &gov.retained()?),
+                Err(NodeListEntryError::Binding(NodeBindingError::OperatorKey(
+                    AnchoredKeyError::IdentityMismatch
+                )))
+            ));
+        }
+        let mut moved = entry(2, "wss://a.example.com/scp/v1", true)?;
+        moved.url = NodeUrl::new("wss://c.example.com/scp/v1")?;
+        assert_eq!(
+            AdmittedNodeListEntry::admit(&moved, &op.retained()?),
+            Err(NodeListEntryError::UrlHashMismatch)
         );
         Ok(())
     }

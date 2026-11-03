@@ -83,7 +83,7 @@ async fn quic_publish_then_query_roundtrips() {
         ref_id: Some("pub-1".to_owned()),
         routing_id,
         recipient_hint: None,
-        blob_ttl: 3600,
+        lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
         blob: blob.clone(),
     };
     let pub_responses = send_and_recv(&conn, &publish).await;
@@ -105,6 +105,7 @@ async fn quic_publish_then_query_roundtrips() {
         ref_id: Some("q-1".to_owned()),
         routing_id,
         since: None,
+        after_blob: None,
         limit: None,
     };
     let query_responses = send_and_recv(&conn, &query).await;
@@ -163,7 +164,7 @@ async fn quic_push_reply(
         ref_id: Some("push".to_owned()),
         routing_id,
         recipient_hint: None,
-        blob_ttl: 3600,
+        lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
         blob: vec![0xC1],
     };
     let replies = send_and_recv(&conn, &publish).await;
