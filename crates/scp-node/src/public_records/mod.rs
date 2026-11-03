@@ -496,4 +496,224 @@ mod tests {
                 .is_empty()
         );
     }
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// An identity whose one root key signs each event, its inception
+    /// unit, and the snapshot its sequence-1 forks change.
+    struct Forking {
+        root: scp_crypto::p256::P256SecretKey,
+        id: Identifier,
+        inception: Vec<u8>,
+        inception_digest: [u8; 32],
+        snapshot: scp_kel::KeyStateSnapshot,
+    }
+
+    impl Forking {
+        fn key(seed: u8) -> scp_crypto::p256::P256SecretKey {
+            use scp_crypto::p256::{P256SecretKey, SeedLabel};
+            P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
+        }
+
+        fn entry(seed: u8, role: scp_did::KeyRole) -> scp_did::KeyEntry {
+            scp_did::KeyEntry {
+                key: Self::key(seed).public_key().to_compressed(),
+                role,
+                condition: scp_did::KeyCondition::Current,
+                compromised_from: 0,
+                custody_type: scp_did::CustodyType::Passkey,
+                key_algorithm: scp_did::KeyAlgorithm::EcdsaP256Sha256,
+            }
+        }
+
+        fn root_group() -> scp_kel::SignerGroup {
+            scp_kel::SignerGroup {
+                indices: vec![0],
+                forms: vec![scp_kel::SignatureForm::Raw],
+            }
+        }
+
+        /// `(unit, event digest, inception identifier)`: `BE32(len) ‖
+        /// signed preimage ‖ the root's raw signature`.
+        fn signed(
+            root: &scp_crypto::p256::P256SecretKey,
+            preimage: &scp_kel::EventPreimage,
+        ) -> TestResult<(Vec<u8>, [u8; 32], Option<Identifier>)> {
+            use sha2::{Digest, Sha256};
+            let encoded = scp_kel::encode_preimage(preimage)?;
+            let bytes = encoded.signed_preimage();
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let mut unit = u32::try_from(bytes.len())?.to_be_bytes().to_vec();
+            unit.extend_from_slice(&bytes);
+            unit.extend_from_slice(&scp_crypto::p256::sign_prehash_rfc6979(root, &digest)?);
+            Ok((unit, encoded.event_digest(), encoded.inception_identifier()))
+        }
+
+        /// An inception with one root member, one `#active` key and a
+        /// commitment to one next key.
+        fn new() -> TestResult<Self> {
+            use scp_did::{CommitmentEntry, CustodyType, FixedCommitment, KeyAlgorithm, KeyRole};
+            use scp_kel::{Continuation, EventPreimage, InceptionFields, KeyStateSnapshot};
+            let root = Self::key(0x30);
+            let snapshot = KeyStateSnapshot {
+                root_threshold: 1,
+                keys: vec![
+                    Self::entry(0x30, KeyRole::RootMember),
+                    Self::entry(0x31, KeyRole::Active),
+                ],
+                witnesses: vec![Identifier::from_bytes([0x77; 32])],
+                witnessing_interval: 3600,
+                service_key_role: KeyRole::Active,
+                delegator: Identifier::ZERO,
+            };
+            let next = Self::key(0x32).public_key().to_compressed();
+            let (inception, inception_digest, id) = Self::signed(
+                &root,
+                &EventPreimage::inception(InceptionFields {
+                    root_group: Self::root_group(),
+                    key_state: snapshot.clone(),
+                    continuation: Continuation::FixesCommitment(FixedCommitment {
+                        commitments: vec![CommitmentEntry {
+                            commitment: scp_kel::prerotation_commitment(&next),
+                            custody_type: CustodyType::Passkey,
+                            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+                        }],
+                        next_threshold: 1,
+                    }),
+                }),
+            )?;
+            Ok(Self {
+                root,
+                id: id.ok_or("an inception derives its identifier")?,
+                inception,
+                inception_digest,
+                snapshot,
+            })
+        }
+
+        /// A sequence-1 `KeyState` that changes only the witnessing
+        /// interval to `interval`: its frame, its digest and its unit.
+        fn fork(&self, interval: u32) -> TestResult<(Vec<u8>, [u8; 32], Vec<u8>)> {
+            let (unit, digest, _) = Self::signed(
+                &self.root,
+                &scp_kel::EventPreimage::key_state(scp_kel::KeyStateFields {
+                    identifier: self.id,
+                    sequence: 1,
+                    predecessor_digest: self.inception_digest,
+                    root_group: Self::root_group(),
+                    key_state: scp_kel::KeyStateSnapshot {
+                        witnessing_interval: interval,
+                        ..self.snapshot.clone()
+                    },
+                    seals: Vec::new(),
+                }),
+            )?;
+            let frame = scp_protocol::node::encode_key_event_frame(&self.id, 1, &[&unit])?;
+            Ok((frame, digest, unit))
+        }
+
+        /// The retained PUBLISH of `blob` at the identity's `scp:did:` id.
+        fn publish(&self, blob: &[u8]) -> TestResult<RetainedPublish> {
+            use sha2::{Digest, Sha256};
+            let routing = routing_id(RoutingKind::KeyEvents, &self.id);
+            Ok(RetainedPublish {
+                kind: scp_protocol::node::classify_node_record(&routing, blob)
+                    .ok_or("a retained kind")?,
+                routing_id: routing,
+                recipient_hint: None,
+                blob_id: Sha256::digest(blob).into(),
+                blob: blob.to_vec(),
+            })
+        }
+    }
+
+    /// The accepted chain's head: the first chain the log retains, in
+    /// first-held order.
+    fn accepted(held: &selection::HeldLog) -> TestResult<[u8; 32]> {
+        Ok(held
+            .retained()
+            .first()
+            .ok_or("the log holds a chain")?
+            .head_digest())
+    }
+
+    /// Two `scp:did:` forks that tie under R6, admitted in one clock second:
+    /// the fork admitted first stays the accepted chain, and a restarted
+    /// store's replay of the blob store keeps it accepted, whichever fork
+    /// has the smaller `blob_id` (§9.10.12 "Held earliest is admission
+    /// order", SCP-366).
+    #[tokio::test]
+    async fn a_replay_of_two_did_forks_admitted_in_one_second_keeps_the_admission_order()
+    -> TestResult {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use scp_kel::{HoldOutcome, RetainedChain, RetainedLog};
+        use scp_transport::native::storage::InMemoryBlobStorage;
+
+        const INCEPTED_AT: u64 = 1_700_000_000;
+        const FORKED_AT: u64 = INCEPTED_AT + 1;
+
+        let identity = Forking::new()?;
+        let routing = routing_id(RoutingKind::KeyEvents, &identity.id);
+        let inception_frame =
+            scp_protocol::node::encode_key_event_frame(&identity.id, 0, &[&identity.inception])?;
+        let fork_a = identity.fork(7200)?;
+        let fork_b = identity.fork(10_800)?;
+        let terms = || PublicRecordTerms {
+            quotas: QuotaLimits::UNBOUNDED,
+            node_lists: BTreeSet::new(),
+        };
+        let heads = |held: &selection::HeldLog| -> Vec<[u8; 32]> {
+            held.retained()
+                .iter()
+                .map(RetainedChain::head_digest)
+                .collect()
+        };
+
+        // Both orders: in one of them the fork admitted second has the
+        // smaller `blob_id`, so a replay ordered by `blob_id` within the
+        // second would accept the other fork.
+        for (first, second) in [(&fork_a, &fork_b), (&fork_b, &fork_a)] {
+            // The tie, read off a log: the second fork is held divergent
+            // and leaves the first accepted.
+            let mut log = RetainedLog::new(identity.id);
+            for unit in [&identity.inception, &first.2] {
+                assert!(matches!(
+                    log.admit(&[unit.as_slice()])?,
+                    HoldOutcome::AcceptedExtended { .. }
+                ));
+            }
+            assert!(matches!(
+                log.admit(&[second.2.as_slice()])?,
+                HoldOutcome::HeldDivergent { .. }
+            ));
+
+            let now = Arc::new(AtomicU64::new(INCEPTED_AT));
+            let clock = Arc::clone(&now);
+            let storage =
+                InMemoryBlobStorage::with_clock(Arc::new(move || clock.load(Ordering::SeqCst)));
+            let store = NodePublicRecords::new(terms());
+            store
+                .admit(&storage, identity.publish(&inception_frame)?)
+                .await?;
+            now.store(FORKED_AT, Ordering::SeqCst);
+            store.admit(&storage, identity.publish(&first.0)?).await?;
+            store.admit(&storage, identity.publish(&second.0)?).await?;
+
+            let stored = selection::load_retained(&storage, &routing).await?;
+            assert_eq!(stored.len(), 3);
+            assert!(stored[1..].iter().all(|blob| blob.stored_at == FORKED_AT));
+            let live = selection::held_log(&storage, &store.logs, &identity.id).await?;
+            assert_eq!(live.retained().len(), 2);
+            assert_eq!(accepted(&live)?, first.1);
+
+            // A restarted store replays the blob store into an empty cache
+            // and holds the same chains with the same one accepted.
+            let restarted = NodePublicRecords::new(terms());
+            let replayed = selection::held_log(&storage, &restarted.logs, &identity.id).await?;
+            assert_eq!(accepted(&replayed)?, first.1);
+            assert_eq!(heads(&replayed), heads(&live));
+        }
+        Ok(())
+    }
 }

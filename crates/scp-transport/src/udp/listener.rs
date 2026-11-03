@@ -1630,7 +1630,7 @@ mod tests {
         match &response {
             RelayMessage::Err { ref_id, code, .. } => {
                 assert_eq!(ref_id.as_deref(), Some("ttl-0"));
-                assert_eq!(*code, 400);
+                assert_eq!(*code, scp_relay_client::code::TTL_TOO_LONG);
             }
             other => panic!("expected Err for invalid TTL, got: {other:?}"),
         }
