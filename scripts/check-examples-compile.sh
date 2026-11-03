@@ -15,9 +15,10 @@
 # WHAT THIS PROVES AND THE WHOLE OF IT. Assertion 1 compiles each example under
 # the feature closure cargo gives a dev target, which is NOT the crate's default
 # feature set and is NOT what a consumer of the published crate gets. Measured:
-# `cargo clippy -p scp-runtime --example identity` builds with
-# `--cfg feature="testing"` and `--cfg feature="allow_unencrypted_storage"`, while
-# `scp-runtime` declares no `default` key at all. Cargo unifies a crate's
+# `cargo clippy -p scp-runtime --example identity` enables no feature of
+# `scp-runtime` itself, yet compiles `scp-dht` and `scp-platform` with their
+# `testing` features, because `scp-runtime`'s `[dev-dependencies]` turn those on and
+# its `default` feature set does not. Cargo unifies a crate's
 # dev-dependency features into its dev targets and no invocation switches that
 # off, so per-package scope narrows the closure without emptying it. Cargo also
 # strips path-only DEV-dependencies from a published manifest, and with them the
