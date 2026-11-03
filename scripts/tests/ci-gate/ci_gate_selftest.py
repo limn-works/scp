@@ -5438,7 +5438,11 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
     )
     # Controls: a step that always hashes the file rekeys every group on each warm
     # edit, and one that never hashes it leaves a warm group's stale entry an exact
-    # match that skips the save.
+    # match that skips the save. Every group the workflows hold today is one
+    # cache-warm.yml writes, so the first control reads a planted group name that no
+    # workflow writes; without it, hashing the file into every group matches the
+    # live set exactly and nothing is reported.
+    planted_groups = groups | {"planted-group-cache-warm-does-not-write"}
     test = 'if grep -Eq "^[[:space:]]+shared-key:'
     for label, replacement, reported in (
         (
@@ -5454,7 +5458,7 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
     ):
         planted = manifest_step["run"].replace(test, replacement)
         check(f"the planting for a wrapper {label} replaced its test", planted != manifest_step["run"])
-        planted_gaps = wrapper_warm_key_gaps(planted, groups, warm_text)
+        planted_gaps = wrapper_warm_key_gaps(planted, planted_groups, warm_text)
         check(
             f"a wrapper {label} is reported",
             any(reported in gap for gap in planted_gaps),
@@ -11160,6 +11164,338 @@ def check_script_reads(doc: dict, paths: list[str]) -> None:
     )
 
 
+# GitHub's status check functions, which parse_condition's grammar does not read.
+# writes_off_main substitutes each with a comparison that grammar reads: `always()`
+# is true on every run, and the other three may answer either way.
+STATUS_FUNCTIONS = (
+    (re.compile(r"\balways\s*\(\s*\)"), "'always' == 'always'"),
+    (re.compile(r"!\s*cancelled\s*\(\s*\)"), "status.cancelled != 'true'"),
+    (re.compile(r"\bcancelled\s*\(\s*\)"), "status.cancelled == 'true'"),
+    (re.compile(r"\bsuccess\s*\(\s*\)"), "status.success == 'true'"),
+    (re.compile(r"\bfailure\s*\(\s*\)"), "status.failure == 'true'"),
+)
+
+# Each ref operand, with the one value it reads on a run of `main`.
+MAIN_REF = {"github.ref": "refs/heads/main", "github.ref_name": "main"}
+
+
+def main_only_triggers(doc: dict) -> bool:
+    """Report whether every event that starts this workflow runs it on `main`.
+
+    `schedule` runs on the default branch, and a `push` trigger whose `branches`
+    filter names `main` alone and that names no tags runs on `main` alone.
+    `workflow_dispatch` and `workflow_call` run on whatever ref started them.
+    """
+    triggers = doc.get(True, doc.get("on"))
+    if isinstance(triggers, str):
+        triggers = {triggers: None}
+    elif isinstance(triggers, list):
+        triggers = dict.fromkeys(triggers)
+    if not isinstance(triggers, dict) or not triggers:
+        return False
+    for event, config in triggers.items():
+        if event == "schedule":
+            continue
+        if (
+            event == "push"
+            and isinstance(config, dict)
+            and config.get("branches") == ["main"]
+            and not (config.get("tags") or config.get("tags-ignore"))
+        ):
+            continue
+        return False
+    return True
+
+
+def actions_cache_write(step: dict) -> str | None:
+    """Name the Actions-cache entry one step can save, or None.
+
+    cache_write names every cache a step writes. Two of those are judged here
+    only in part: `cache-to` writes the Actions cache only with `type=gha` (a
+    registry layer cache lives in the registry), and
+    `gradle/actions/setup-gradle` saves only on the default branch unless its
+    `cache-read-only` input is given, so a step that leaves that input out
+    writes nothing on another ref, and a step that gives it is judged.
+    """
+    name = cache_write(step)
+    if name is None:
+        return None
+    inputs = step.get("with") or {}
+    if name.startswith("layer cache ") and "type=gha" not in str(inputs.get("cache-to")):
+        return None
+    if name == "the Gradle user-home cache" and "cache-read-only" not in inputs:
+        return None
+    return name
+
+
+def writes_off_main(job: dict, step: dict) -> bool:
+    """Report whether a run on a ref other than `main` can reach a step and save.
+
+    The job's `if:`, the step's `if:` and, for the rust-cache wrapper, its
+    `save-if` are joined with `&&`. `github.ref` compared with
+    `'refs/heads/main'`, and `github.ref_name` compared with `'main'`, read
+    unequal. Every other comparison that names an operand other than a literal
+    may come out either way, one answer per pair of operands. The step writes
+    off `main` when some choice of answers makes the whole expression true. A
+    step under no condition writes on every ref. An expression outside
+    parse_condition's grammar raises ValueError.
+    """
+    texts = [job.get("if"), step.get("if")]
+    if str(step.get("uses") or "").split("@", 1)[0] == RUST_CACHE_ACTION:
+        texts.append((step.get("with") or {}).get("save-if"))
+    parts = []
+    for text in texts:
+        text = str(text if text is not None else "").strip()
+        wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.DOTALL)
+        text = (wrapped.group(1) if wrapped else text).strip()
+        for pattern, replacement in STATUS_FUNCTIONS:
+            text = pattern.sub(replacement, text)
+        if text:
+            parts.append(f"({text})")
+    if not parts:
+        return True
+    tree = parse_condition(" && ".join(parts))
+
+    # GitHub reads names and compares strings without regard to case.
+    def literal(token: str) -> str | None:
+        quoted = re.fullmatch(r"'([^']*)'", token)
+        if quoted:
+            return quoted.group(1).lower()
+        if token.lower() in ("true", "false") or token.isdigit():
+            return token.lower()
+        return None
+
+    def known(node: tuple) -> bool | None:
+        left, right = node[1].lower(), node[2].lower()
+        for name, other in ((left, right), (right, left)):
+            if name in MAIN_REF and literal(other) == MAIN_REF[name]:
+                return False
+        if literal(left) is not None and literal(right) is not None:
+            return literal(left) == literal(right)
+        return None
+
+    free: list[tuple[str, ...]] = []
+
+    def collect(node: tuple) -> None:
+        if node[0] in ("or", "and"):
+            for part in node[1]:
+                collect(part)
+        elif known(node) is None:
+            pair = tuple(sorted((node[1].lower(), node[2].lower())))
+            if pair not in free:
+                free.append(pair)
+
+    def value(node: tuple, answers: dict) -> bool:
+        if node[0] in ("or", "and"):
+            results = [value(part, answers) for part in node[1]]
+            return any(results) if node[0] == "or" else all(results)
+        equal = known(node)
+        if equal is None:
+            equal = answers[tuple(sorted((node[1].lower(), node[2].lower())))]
+        return equal if node[0] == "==" else not equal
+
+    collect(tree)
+    return any(
+        value(tree, {pair: bool(mask >> index & 1) for index, pair in enumerate(free)})
+        for mask in range(2 ** len(free))
+    )
+
+
+def main_only_gaps(documents: list[tuple[Path, dict]]) -> tuple[list[str], list[str]]:
+    """Return (judged, gaps): each Actions-cache writer read, and each one that can
+    save on a ref other than `main`.
+
+    CRITERION: a step that saves an Actions cache entry saves it only on a run of
+    `refs/heads/main`.
+
+    WHY: GitHub serves an entry to the ref that saved it and to the default
+    branch, never to a sibling branch, a pull request or a merge-queue ref. An
+    entry saved anywhere but `main` can be restored only by a later run on the
+    same ref, while it counts against the repository's 10 GB cap from the moment
+    it is saved. The cap evicts the least recently used entries, so a burst of
+    such entries (three napi release builds on one pull request ref saved 1.9 GB
+    on 2026-11-03) pushes out the entries every pull request restores.
+    `actions/cache` restores and saves in one step, so it passes only where a
+    condition holds the whole step to `main`; a reader on other refs uses
+    `actions/cache/restore`, or the rust-cache wrapper with `save-if: false`.
+
+    SCOPE: every workflow file. A workflow whose every trigger runs on `main`
+    passes whole. A condition this grammar cannot read is reported.
+    """
+    judged: list[str] = []
+    gaps: list[str] = []
+    for path, doc in documents:
+        if main_only_triggers(doc):
+            continue
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                name = actions_cache_write(step)
+                if name is None:
+                    continue
+                where = f"{path.name}: {job_id}: {step.get('name') or step.get('uses')}"
+                judged.append(where)
+                try:
+                    off_main = writes_off_main(job, step)
+                except ValueError as unreadable:
+                    gaps.append(
+                        f"{where} writes {name} under a condition this check "
+                        f"cannot read ({unreadable})"
+                    )
+                    continue
+                if off_main:
+                    gaps.append(f"{where} can save {name} on a ref other than `main`")
+    return judged, gaps
+
+
+def check_cache_writers_save_on_main_only(documents: list[tuple[Path, dict]]) -> None:
+    judged, gaps = main_only_gaps(documents)
+    # The detector has to read the writers these workflows hold today, or the gap
+    # check below passes over an empty set.
+    for expected in (
+        "ci.yml: napi-addon: ",
+        "ci.yml: xcframework: ",
+        "fuzz.yml: fuzz-nightly: Save corpus cache",
+        "fuzz.yml: fuzz-weekly: Save corpus cache",
+    ):
+        check(
+            f"main-only: {expected!r} is read as an Actions-cache writer",
+            any(where.startswith(expected) for where in judged),
+            "; ".join(judged),
+        )
+    check("every Actions-cache writer saves only on `main`", not gaps, "; ".join(gaps))
+
+
+def check_main_only_detects_an_off_main_writer(documents: list[tuple[Path, dict]]) -> None:
+    """Planted cases: each writer marked True must be reported, each False accepted."""
+    combined = "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830"
+    save = "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"
+    build = "docker/build-push-action@v6"
+    gradle = "gradle/actions/setup-gradle@v4"
+    any_ref = {"pull_request": None, "push": None}
+    main_only = {"push": {"branches": ["main"]}, "schedule": [{"cron": "0 3 * * *"}]}
+    on_main = "${{ github.ref == 'refs/heads/main' && matrix.target == 'a' }}"
+    cases = (
+        ("combined actions/cache", any_ref, None, {"uses": combined}, True),
+        ("save under always()", any_ref, None, {"uses": save, "if": "always()"}, True),
+        (
+            "save under a cache-hit test alone",
+            any_ref,
+            None,
+            {"uses": save, "if": "steps.c.outputs.cache-hit != 'true'"},
+            True,
+        ),
+        (
+            "save under a ref test joined by ||",
+            any_ref,
+            None,
+            {"uses": save, "if": "github.ref == 'refs/heads/main' || failure()"},
+            True,
+        ),
+        (
+            "save under a ref test that names another branch",
+            any_ref,
+            None,
+            {"uses": save, "if": "github.ref == 'refs/heads/release'"},
+            True,
+        ),
+        (
+            "rust-cache under a matrix test alone",
+            any_ref,
+            None,
+            {"uses": RUST_CACHE_ACTION, "with": {"save-if": "${{ matrix.target == 'a' }}"}},
+            True,
+        ),
+        (
+            "save under a function this check cannot read",
+            any_ref,
+            None,
+            {"uses": save, "if": "startsWith(github.ref, 'refs/heads/')"},
+            True,
+        ),
+        (
+            "save in a workflow a dispatch on any ref starts",
+            {"push": {"branches": ["main"]}, "workflow_dispatch": None},
+            None,
+            {"uses": save},
+            True,
+        ),
+        ("gha layer cache", any_ref, None, {"uses": build, "with": {"cache-to": "type=gha"}}, True),
+        (
+            "setup-gradle told to write on every ref",
+            any_ref,
+            None,
+            {"uses": gradle, "with": {"cache-read-only": False}},
+            True,
+        ),
+        (
+            "save gated to main",
+            any_ref,
+            None,
+            {"uses": save, "if": "always() && github.ref == 'refs/heads/main'"},
+            False,
+        ),
+        (
+            "rust-cache gated to main",
+            any_ref,
+            None,
+            {"uses": RUST_CACHE_ACTION, "with": {"save-if": on_main}},
+            False,
+        ),
+        (
+            "rust-cache that never saves",
+            any_ref,
+            None,
+            {"uses": RUST_CACHE_ACTION, "with": {"save-if": False}},
+            False,
+        ),
+        (
+            "save in a job gated to main",
+            any_ref,
+            "github.ref_name == 'main'",
+            {"uses": save},
+            False,
+        ),
+        ("save in a workflow only main starts", main_only, None, {"uses": save}, False),
+        (
+            "registry layer cache",
+            any_ref,
+            None,
+            {"uses": build, "with": {"cache-to": "type=registry,ref=r"}},
+            False,
+        ),
+        ("setup-gradle on its default", any_ref, None, {"uses": gradle}, False),
+    )
+    for label, triggers, job_if, step, expected in cases:
+        job: dict = {"runs-on": "ubuntu-latest", "steps": [step]}
+        if job_if is not None:
+            job["if"] = job_if
+        judged, gaps = main_only_gaps([(Path("planted.yml"), {True: triggers, "jobs": {"j": job}})])
+        check(
+            f"main-only: {label} is {'reported' if expected else 'accepted'}",
+            bool(gaps) is expected,
+            "; ".join(gaps) or "; ".join(judged) or "nothing judged",
+        )
+    # fuzz.yml's corpus saves, with their ref test removed, must be reported.
+    for path, doc in documents:
+        if path.name != "fuzz.yml":
+            continue
+        mutant = copy.deepcopy(doc)
+        changed = 0
+        for job in mutant["jobs"].values():
+            for step in job.get("steps") or []:
+                if isinstance(step, dict) and step.get("name") == "Save corpus cache":
+                    step["if"] = "always()"
+                    changed += 1
+        _, gaps = main_only_gaps([(path, mutant)])
+        check(
+            "main-only: fuzz.yml's corpus saves under `always()` alone are reported",
+            changed == 2 and len(gaps) == 2,
+            f"changed {changed}; {'; '.join(gaps)}",
+        )
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -13516,6 +13852,12 @@ def run_push_writers(inputs: Inputs) -> None:
     check_push_writer_mutants(workflow)
 
 
+def run_main_only_writers(inputs: Inputs) -> None:
+    print("main-only-writers — every Actions-cache writer saves only on `main`")
+    check_cache_writers_save_on_main_only(inputs.documents)
+    check_main_only_detects_an_off_main_writer(inputs.documents)
+
+
 def run_macos_bridges(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
@@ -14348,6 +14690,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "package-writers": run_package_writers,
     "needs-condition": run_needs_condition,
     "push-writers": run_push_writers,
+    "main-only-writers": run_main_only_writers,
     "macos-bridges": run_macos_bridges,
     "prose-route": run_prose_route,
     "coverage": run_coverage,
@@ -14408,6 +14751,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "package-writers",
         "needs-condition",
         "push-writers",
+        "main-only-writers",
         "macos-bridges",
         "coverage",
         "path-closure",

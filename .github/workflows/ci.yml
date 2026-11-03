@@ -190,9 +190,13 @@ env:
 # A rename abandons the entry `main` holds under the old name, so a group keeps its name
 # unless that entry holds a directory its members no longer read.
 #
-# The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
-# 10 GB: it writes `fuzz-run`, holding `fuzz/target/<host triple>/release` under
-# `cargo fuzz run`'s RUSTFLAGS (its group comment on job fuzz-nightly says more). The
+# The cap is per repository, so the groups above, the Gradle entries kotlin-test
+# restores, and every other workflow's entries share the same 10 GB. The newest entry
+# of each sums to 8.7 GB (2026-11-03), and the budget is 9 GB: least-recently-used
+# eviction removes superseded entries first only while the current set fits under the
+# cap with room for one push's new entries. Only a run on `main` saves an entry, which
+# ci_gate_selftest.py's main-only-writers check holds every workflow to; fuzz.yml
+# keeps only its corpus entries, for the reason its fuzz-nightly comment gives. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the comment
 # above job pyo3-module counts them.
 #

@@ -206,35 +206,16 @@ jobs:
           CRATE: ${{ steps.cargo-fuzz.outputs.path }}
         run: cargo +${{ needs.toolchain.outputs.channel }} install --locked --path "$CRATE"
 
-      # Cargo cache groups for this workflow. The 10 GB cache cap is per repository, so
-      # these entries compete with the six groups ci.yml writes (its header comment lists
-      # them); before this block, one nightly run plus one weekly run wrote eighteen
-      # entries, one per matrix leg, each a separate copy of the same compiled
-      # dependencies, and every one on `refs/heads/main`, where GitHub's least-recently-
-      # used eviction reads them as fresher than the ci.yml entries every pull request
-      # needs. One group replaces the eighteen:
+      # No Cargo cache. The 10 GB cache cap is per repository, and the groups
+      # cache-warm.yml writes for pull requests fill most of it; an entry holding
+      # `cargo fuzz run`'s AddressSanitizer build of the dependencies (394 MB on
+      # 2026-11-03) pushed that set over the 9 GB budget the repository keeps
+      # under the cap, while it saved each leg here about 90 to 120 s of compile time
+      # once a night. ci.yml's header comment states the budget.
       #
-      #   fuzz-run      `fuzz/target/<host triple>/release`, compiled by `cargo fuzz run`
-      #                 with cargo-fuzz's default RUSTFLAGS (AddressSanitizer, coverage,
-      #                 `-Cdebug-assertions`, `-Coverflow-checks`). Every leg of
-      #                 fuzz-nightly and of fuzz-weekly builds with those flags. The
-      #                 writer is fuzz-nightly's `fuzz_outer_envelope` leg; every other
-      #                 leg reads.
-      #
-      # Neither group is ci.yml's `fuzz` group: that job runs `cargo check` under the dev
-      # profile into `fuzz/target/debug`, a directory cargo shares nothing with.
-      # `scripts/check-workflow-compile-steps.py` holds every rust-cache step to this
-      # shape: a `shared-key`, a `save-if`, and one writer per group, on main.
-      - uses: ./.github/actions/rust-cache
-        with:
-          workspaces: "fuzz -> target"
-          shared-key: fuzz-run
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.target == 'fuzz_outer_envelope' }}
-
       # Every crate fuzz/Cargo.lock names, downloaded once with retries on the channel the
       # `cargo fuzz` commands below name; every later cargo command in this job runs with
-      # CARGO_NET_OFFLINE=true. It runs after rust-cache, which hashes every CARGO_*
-      # variable into its key. fetch.sh states why.
+      # CARGO_NET_OFFLINE=true. fetch.sh states why.
       - uses: ./.github/actions/cargo-fetch
         with:
           working-directory: fuzz
@@ -274,8 +255,11 @@ jobs:
             fuzz/corpus/${{ matrix.target }} \
             || true
 
+      # Only main's entry is read back: a dispatch on another branch saves an entry
+      # that only a later run on that same branch could restore, and it
+      # counts against the repository's 10 GB cache cap meanwhile.
       - name: Save corpus cache
-        if: always()
+        if: always() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
@@ -364,19 +348,11 @@ jobs:
           CRATE: ${{ steps.cargo-fuzz.outputs.path }}
         run: cargo +${{ needs.toolchain.outputs.channel }} install --locked --path "$CRATE"
 
-      # Reads group `fuzz-run`, which fuzz-nightly writes every night (see the group
-      # comment on that job). Every leg here reads and none writes: the six targets
-      # this job fuzzes are six of the thirteen fuzz-nightly builds with the same flags.
-      - uses: ./.github/actions/rust-cache
-        with:
-          workspaces: "fuzz -> target"
-          shared-key: fuzz-run
-          save-if: false
-
+      # No Cargo cache, for the reason fuzz-nightly's comment gives.
+      #
       # Every crate fuzz/Cargo.lock names, downloaded once with retries on the channel the
       # `cargo fuzz` commands below name; every later cargo command in this job runs with
-      # CARGO_NET_OFFLINE=true. It runs after rust-cache, which hashes every CARGO_*
-      # variable into its key. fetch.sh states why.
+      # CARGO_NET_OFFLINE=true. fetch.sh states why.
       - uses: ./.github/actions/cargo-fetch
         with:
           working-directory: fuzz
@@ -415,8 +391,11 @@ jobs:
             fuzz/corpus/${{ matrix.target }} \
             || true
 
+      # Only main's entry is read back: a dispatch on another branch saves an entry
+      # that only a later run on that same branch could restore, and it
+      # counts against the repository's 10 GB cache cap meanwhile.
       - name: Save corpus cache
-        if: always()
+        if: always() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
