@@ -37,8 +37,6 @@
 //! as `SCP-CRYPTO-4062` before the handler budget expires (ADR-049
 //! Decision 7a).
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -50,9 +48,7 @@ use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
 use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 
-/// Per-call transport budget for mutation handlers. Plan §"Transport
-/// timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`MessagingCommand`] against actor-owned state and deps.
 ///
@@ -722,7 +718,7 @@ async fn handle_test_grant_member_capability(
 /// harness recovered through the REAL §9.17 pull round trip, not one minted
 /// locally. Rejects an inactive context so a mis-targeted test fails loudly.
 /// Routes the store through the non-persisting `class_c_view` (the run loop
-/// persists on `mutated`), mirroring [`generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+/// persists on `mutated`), mirroring [`generate_context_access_key`](crate::context::shared::queries::generate_context_access_key).
 #[cfg(feature = "testing")]
 fn handle_test_install_access_key(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -948,13 +944,15 @@ async fn handle_deliver_incoming(
     // queued until a full reconnection sends `SendQueuedSenderKeys`.
     match mode {
         crate::context::actor::commands::DeliveryMode::Live => {
-            crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-                deps,
-                &mut cell.class_c_view(),
-                context_id,
-                crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
-            )
-            .await;
+            deps.domains
+                .lifecycle
+                .drain_and_deliver_sender_keys(
+                    deps,
+                    &mut cell.class_c_view(),
+                    context_id,
+                    crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+                )
+                .await;
         }
         crate::context::actor::commands::DeliveryMode::PullOnly => {}
     }
@@ -1030,11 +1028,11 @@ async fn handle_send_queued_sender_keys(
 ) -> Outcome<()> {
     let result = {
         let mut view = cell.class_c_view();
-        let drain = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        let drain = deps.domains.lifecycle.drain_and_deliver_sender_keys(
             deps,
             &mut view,
             context_id,
-            crate::context::lifecycle_helpers::DistributionScope::All,
+            crate::context::shared::lifecycle::DistributionScope::All,
         );
         match tokio::time::timeout(HANDLER_TIMEOUT, drain).await {
             Ok(report) => Ok(report),
@@ -1227,7 +1225,7 @@ async fn handle_rotate_pseudonym(
 /// Handle [`MessagingCommand::ReportDegradedMode`] (actor-shape).
 ///
 /// Synchronous pure-emit handler: delegates to the actor-shape
-/// [`queries_helpers::report_degraded_mode`](crate::context::queries_helpers::report_degraded_mode)
+/// [`crate::context::shared::queries::report_degraded_mode`](crate::context::shared::queries::report_degraded_mode)
 /// which writes a `DegradedMode` event into `state.receive_buffer` (and
 /// the optional broadcast channel on `deps.event_tx`) only when the
 /// supplied `compat` is the `DegradedMode` variant. All other
@@ -1248,7 +1246,7 @@ fn handle_report_degraded_mode(
     // `DegradedMode` event lands in the receive buffer via the non-persisting
     // `class_c_view`. `report_degraded_mode` is field-narrowed to the single
     // `&mut ReceiveBuffer` it mutates.
-    crate::context::queries_helpers::report_degraded_mode(
+    crate::context::shared::queries::report_degraded_mode(
         cell.class_c_view().receive_buffer_mut(),
         deps,
         context_id,
@@ -1263,7 +1261,7 @@ fn handle_report_degraded_mode(
 ///
 /// Forces a signed consistency checkpoint from the current event-log
 /// state via
-/// [`force_create_checkpoint_view`](crate::context::queries_helpers::force_create_checkpoint_view),
+/// [`force_create_checkpoint_view`](crate::context::shared::queries::force_create_checkpoint_view),
 /// which reaches the three Class-C checkpoint fields through a
 /// non-persisting [`class_c_view`](crate::context::actor::class_s::ClassSCell::class_c_view)
 /// (the run loop coalesce-persists), then broadcasts it to peers via
@@ -1301,7 +1299,7 @@ async fn handle_build_local_checkpoint(
             let mut view = cell.class_c_view();
             let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
             let mls_epoch = view.epoch_mut().mls_epoch;
-            crate::context::queries_helpers::force_create_checkpoint_view(
+            crate::context::shared::queries::force_create_checkpoint_view(
                 &mut view,
                 context_id,
                 broadcast_context_is_none,
@@ -1382,7 +1380,7 @@ fn handle_compare_remote_checkpoint(
     // equivocation dedup set + receive-buffer emit land through the non-persisting
     // `class_c_view`. `compare_remote_checkpoint` is narrowed to the Class-C view:
     // it reads membership and mutates `last_seen_remote_checkpoint` + `receive_buffer`.
-    let result = crate::context::queries_helpers::compare_remote_checkpoint(
+    let result = deps.domains.queries.compare_remote_checkpoint(
         &mut cell.class_c_view(),
         deps,
         context_id,
@@ -1498,6 +1496,64 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+/// The messaging domain's [`MessagingDomain`](crate::context::domains::MessagingDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Messaging;
+
+#[async_trait::async_trait]
+impl crate::context::domains::MessagingDomain for Messaging {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::MessagingCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn decrypt_and_dispatch(
+        &self,
+        deps: &crate::context::actor::deps::ActorDeps,
+        crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
+        context_id: &str,
+        context_id_bytes: &[u8; 32],
+        encrypted_blob: &[u8],
+        denied: &std::collections::HashSet<String>,
+    ) -> Result<crate::context::shared::messaging::Dispatched, scp_protocol::context::ContextError>
+    {
+        crate::context::messaging_helpers::decrypt_and_dispatch(
+            deps,
+            crypto_state,
+            context_id,
+            context_id_bytes,
+            encrypted_blob,
+            denied,
+        )
+        .await
+    }
+
+    async fn finalize_send(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        send: crate::context::domains::FinalizeSendRequest<'_>,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        crate::context::messaging_helpers::finalize_send(
+            cell,
+            deps,
+            send.context_id,
+            send.context_id_bytes,
+            send.sender_did,
+            send.sequence,
+            send.payload,
+            send.signer,
+            send.token,
+            send.is_broadcast,
+        )
+        .await
     }
 }
 

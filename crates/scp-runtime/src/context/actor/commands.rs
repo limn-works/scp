@@ -49,11 +49,6 @@ use scp_protocol::context::ContextError;
 /// `clippy::type_complexity`.
 type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u64), ContextError>>;
 
-/// Re-export of the receive-path outcome classifier so FFI bridges can name
-/// the [`DeliverIncomingReply`] payload type via
-/// `scp_core::context::actor::commands::DeliverOutcome`.
-pub use crate::context::messaging_helpers::DeliverOutcome;
-
 /// Whether handling a delivered envelope may send (ADR-029 §2, push-wake pull
 /// mode, step 4).
 ///
@@ -1063,7 +1058,7 @@ pub enum LifecycleCommand {
 
     /// Generate and store a per-member access key for explicit
     /// lifecycle management (§9.17.2 step 1). Mirrors
-    /// `queries_helpers::generate_context_access_key`.
+    /// `crate::context::shared::queries::generate_context_access_key`.
     ///
     /// Requires `ContextClose` capability on the caller. Overwrites any
     /// existing key for the same `(context_id, member_did)` pair.
@@ -1080,7 +1075,7 @@ pub enum LifecycleCommand {
 
     /// Revoke (remove) a member's access key from the context's
     /// access key store (§9.17.2 step 3, ADR-038). Mirrors
-    /// `queries_helpers::revoke_context_access_key`.
+    /// `crate::context::shared::queries::revoke_context_access_key`.
     ///
     /// Requires `ContextClose` capability on the caller.
     RevokeContextAccessKey {
@@ -1120,7 +1115,7 @@ pub enum LifecycleCommand {
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point
-    /// `lifecycle_helpers::flush_all_contexts`
+    /// `crate::context::shared::lifecycle::flush_all_contexts`
     /// (and its sync wrapper). The supervisor iterates
     /// `supervisor.actors` and sends one of these commands per actor;
     /// each actor flushes its own state with no cross-actor lock.
@@ -1785,7 +1780,7 @@ pub enum BroadcastCommand {
     },
 
     /// Evaluate a subscriber's broadcast-key request. Mirrors
-    /// `broadcast_helpers::handle_broadcast_key_request`.
+    /// `crate::context::shared::broadcast::handle_broadcast_key_request`.
     ///
     /// Read-mostly (no per-context mutation) — handler reports
     /// `mutated: false`.
@@ -1974,7 +1969,7 @@ pub struct RecoveryNotifyContactPayload {
 /// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
     /// Creates a governance-aware checkpoint for a context. Mirrors
-    /// `trust_recovery_helpers::create_governance_checkpoint`.
+    /// `crate::context::shared::trust_recovery::create_governance_checkpoint`.
     CreateGovernanceCheckpoint {
         /// Boxed owned payload.
         payload: Box<CreateGovernanceCheckpointPayload>,
@@ -2163,7 +2158,7 @@ pub struct TtlTimerPayload {
     /// create-base derivation. Every member computes the identical absolute
     /// deadline, so the `ContextExpired`/`ContextClosed` leaf timestamp is
     /// convergent-by-construction (§7.3.1, §9.9.3). Ignored by `ResetTtlTimer`.
-    pub deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
+    pub deadline_override: Option<crate::context::supervisor::handle::ConvergentDeadline>,
 }
 
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
@@ -2270,7 +2265,7 @@ pub enum PushCommand {
     /// `Closed`, `Expired` or `Tombstoned` context.
     Routes {
         /// Oneshot reply channel.
-        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
+        reply: oneshot::Sender<Option<crate::context::push_routes::ContextPushRoutes>>,
     },
     /// This context's push-wake pull target (ADR-029 §2, push-wake pull
     /// mode): its ID, relay set, and the shared and current pseudonym routing
@@ -2278,7 +2273,7 @@ pub enum PushCommand {
     /// `None` unless the context is `Active`.
     WakeTarget {
         /// Oneshot reply channel.
-        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextWakeTarget>>,
+        reply: oneshot::Sender<Option<crate::context::push_routes::ContextWakeTarget>>,
     },
 }
 
@@ -2359,7 +2354,7 @@ pub enum OutletsCommand {
         /// no invocation caveats). `narrow()` folds every parent's value-caveats
         /// into the leaf, so the leaf `nb` IS the effective narrowed set. The
         /// caveats and CID are bundled into one
-        /// [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
+        /// [`InvocationCaveatBinding`](crate::context::outlets::invoke::InvocationCaveatBinding)
         /// so "caveats present ⟹ cid present" holds by construction — a
         /// counter-bearing caveat can never reach the gate without its counter
         /// key. The bundle is an internal runtime-API param: the SDK-facing FFI
@@ -2367,7 +2362,7 @@ pub enum OutletsCommand {
         /// caveat set without forging the invocation UCAN. `None` when the
         /// invocation UCAN carried no caveats. Boxed to keep the variant payload
         /// pointer-sized.
-        caveat_binding: Option<Box<crate::context::outlets_helpers::InvocationCaveatBinding>>,
+        caveat_binding: Option<Box<crate::context::outlets::invoke::InvocationCaveatBinding>>,
         /// The invocation input, checked against the caveat's `input_schema`
         /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
         /// payload pointer-sized.
@@ -2377,7 +2372,7 @@ pub enum OutletsCommand {
         now_secs: u64,
         /// Oneshot reply channel carrying the Phase-1 reservation.
         reply: oneshot::Sender<
-            Result<Box<crate::context::outlets_helpers::OutletEconomyReservation>, ContextError>,
+            Result<Box<crate::context::shared::outlets::OutletEconomyReservation>, ContextError>,
         >,
     },
 
@@ -2387,7 +2382,7 @@ pub enum OutletsCommand {
     /// voids the escrow and reverses budget / velocity / rate-limit.
     ///
     /// See `crate::context::outlets_helpers::settle_outlet_economy_capture`
-    /// and `crate::context::outlets_helpers::rollback_outlet_economy`.
+    /// and `crate::context::shared::outlets::rollback_outlet_economy`.
     SettleOutletEconomy {
         /// Context identifier string.
         context_id: String,
@@ -2395,11 +2390,11 @@ pub enum OutletsCommand {
         invoker_did: scp_did::DID,
         /// Capture-or-rollback request carrying the in-flight ticket.
         /// Boxed so the variant payload stays pointer-sized.
-        request: Box<crate::context::outlets_helpers::OutletSettleRequest>,
+        request: Box<crate::context::shared::outlets::OutletSettleRequest>,
         /// Oneshot reply channel carrying the Phase-3 settle outcome
         /// (consequences + receipt + committed cost).
         reply: oneshot::Sender<
-            Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+            Result<crate::context::shared::outlets::OutletSettleOutcome, ContextError>,
         >,
     },
 
@@ -2434,7 +2429,7 @@ pub enum OutletsCommand {
         now_secs: u64,
         /// Oneshot reply channel carrying the streaming open reservation.
         reply: oneshot::Sender<
-            Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+            Result<Box<crate::context::shared::outlets::StreamEconomyReservation>, ContextError>,
         >,
     },
 
@@ -3030,7 +3025,7 @@ pub struct PreparedAFields {
     /// not-commit). Produced via the existing
     /// `reserve_outlet_economy`
     /// mechanism so Prepare-A reuses the single-context reserve/settle split.
-    pub reservation: crate::context::outlets_helpers::OutletEconomyReservation,
+    pub reservation: crate::context::shared::outlets::OutletEconomyReservation,
 }
 
 impl std::fmt::Debug for PreparedAFields {
@@ -3900,6 +3895,33 @@ impl ContextCommand {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Classified result of delivering one incoming envelope (§9.9.2).
+///
+/// Replaces the prior `Option<(Vec<u8>, String)>` return so the receive path
+/// can distinguish three outcomes that callers must treat differently:
+///
+/// - [`DeliverOutcome::Application`] — a decrypted user message; the bridge
+///   forwards `(plaintext, sender_did)` to the language binding's receive
+///   channel.
+/// - [`DeliverOutcome::Heartbeat`] — a suppression-detection heartbeat
+///   (§9.9.2); processed internally, never surfaced as content, and the
+///   bridge records it against the transport-layer `HeartbeatMonitor` to keep
+///   the gap-detection baseline fresh. Distinct from `Handled` precisely so
+///   the bridge knows to call `record_heartbeat_received`.
+/// - [`DeliverOutcome::Handled`] — any other internally-processed message
+///   (MLS Commit/Proposal, consistency checkpoint, pseudonym announcement, or
+///   an out-of-order arrival buffered for later); no plaintext to surface and
+///   nothing for the bridge to do.
+#[derive(Debug)]
+pub enum DeliverOutcome {
+    /// Decrypted application message: `(plaintext, sender_did)`.
+    Application((Vec<u8>, String)),
+    /// A suppression-detection heartbeat was received and processed (§9.9.2).
+    Heartbeat,
+    /// An internal protocol message was processed; nothing to surface.
+    Handled,
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -283,6 +283,7 @@ fn node_on(store: Arc<Store>, clock: Arc<TestClock>) -> Node {
         Some(tx),
         Some(Arc::clone(&clock) as Arc<dyn scp_clock::Clock>),
         mls_storage(),
+        crate::domain_handlers(),
     );
     Node {
         supervisor,

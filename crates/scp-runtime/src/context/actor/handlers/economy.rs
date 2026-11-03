@@ -11,17 +11,13 @@
 //! no-mailbox-context fallback now lives on
 //! [`Supervisor::dispatch_economy_direct`](crate::context::supervisor::Supervisor::dispatch_economy_direct).
 
-use std::time::Duration;
-
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::economy::receipt::ReceiptVerificationError;
 
-/// Per-call transport budget for economy handlers. Plan §"Transport
-/// timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch an [`EconomyCommand`] against actor-owned state and
 /// capability-reduced dependencies.
@@ -87,4 +83,79 @@ async fn handle_verify_payment_receipts(
     let _ = reply.send(results);
     // Verify payment receipts is a pure read — mutated=false.
     Outcome::ok(())
+}
+
+/// The economy domain's [`EconomyDomain`](crate::context::domains::EconomyDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Economy;
+
+#[async_trait::async_trait]
+impl crate::context::domains::EconomyDomain for Economy {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::EconomyCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn authorize_paid_action_hold(
+        &self,
+        inputs: crate::context::shared::economy::OwnedAuthInputs,
+        payer_did: &scp_did::DID,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::shared::economy::PaidActionAuthorization>,
+        scp_protocol::context::ContextError,
+    > {
+        crate::context::economy_helpers::authorize_paid_action_hold(inputs, payer_did, context_id)
+            .await
+    }
+
+    fn authorize_paid_action_prepare(
+        &self,
+        state: &crate::context::actor::state::PerContextState,
+        deps: &crate::context::actor::deps::ActorDeps,
+        action_type: scp_protocol::economy::types::PaidActionType,
+        payer_did: &scp_did::DID,
+    ) -> Option<crate::context::shared::economy::OwnedAuthInputs> {
+        crate::context::economy_helpers::authorize_paid_action_prepare(
+            state,
+            deps,
+            action_type,
+            payer_did,
+        )
+    }
+
+    async fn capture_and_verify_paid_action(
+        &self,
+        auth: crate::context::shared::economy::PaidActionAuthorization,
+    ) -> Result<Option<crate::economy::adapter::PaymentReceipt>, scp_protocol::context::ContextError>
+    {
+        crate::context::economy_helpers::capture_and_verify_paid_action(auth).await
+    }
+
+    fn emit_payment_received_event(
+        &self,
+        receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
+        deps: &crate::context::actor::deps::ActorDeps,
+        receipt: &crate::economy::adapter::PaymentReceipt,
+        context_id: &str,
+    ) {
+        crate::context::economy_helpers::emit_payment_received_event(
+            receive_buffer,
+            deps,
+            receipt,
+            context_id,
+        );
+    }
+
+    fn enforce_economy(
+        &self,
+        req: crate::context::shared::economy::EnforceEconomyRequest<'_>,
+    ) -> Result<Option<scp_protocol::economy::types::Amount>, scp_protocol::context::ContextError>
+    {
+        crate::context::economy_logic::enforce_economy(req)
+    }
 }

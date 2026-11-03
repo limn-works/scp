@@ -533,7 +533,7 @@ pub async fn finalize_close(
     event_log: &dyn ContextEventLogProvider,
     // Timestamp recorded on the `ContextClosed` leaf. This lower-level producer
     // records whatever instant the caller supplies. The sole production caller,
-    // `ttl_close_helpers::finalize_close`, is the EXPLICIT Closing→Closed path and
+    // `crate::context::shared::ttl_close::finalize_close`, is the EXPLICIT Closing→Closed path and
     // passes the ACTUAL local close instant (`clock.now_secs()`): the convergent
     // TTL deadline would be a future instant unrelated to when the close happened
     // (F4). Cross-member convergence of an explicit governance close is anchored by
@@ -544,7 +544,7 @@ pub async fn finalize_close(
     timestamp_secs: u64,
 ) -> Result<(), ContextError> {
     // Validate state transition BEFORE any key destruction (which the caller,
-    // `ttl_close_helpers::finalize_close`, performs on the ACTOR-owned crypto
+    // `crate::context::shared::ttl_close::finalize_close`, performs on the ACTOR-owned crypto
     // AFTER this returns Ok). Key destruction is irreversible — once destroyed
     // (sender keys, MLS signer, and MLS provider storage zeroized), encrypted content becomes
     // permanently unreadable. If the transition fails
@@ -559,7 +559,7 @@ pub async fn finalize_close(
     // ACTOR-owned (the provider holds none — its `destroy_mls_group` /
     // `destroy_sender_key` methods are DELETED). The actual key destruction for
     // Ephemeral/Summary scope is performed by the caller
-    // (`ttl_close_helpers::finalize_close`) on the actor-owned crypto via the
+    // (`crate::context::shared::ttl_close::finalize_close`) on the actor-owned crypto via the
     // `ClassSCell`, AFTER this transition succeeds. This function only stamps
     // the terminal leaf and issues the best-effort relay ciphertext delete —
     // the latter still gated on `needs_key_destruction`: Full scope retains
@@ -774,7 +774,7 @@ pub(crate) fn apply_ttl_terminal_transition(
     //    `is_complete()` never held and the actor re-armed a retry FOREVER (a
     //    resource-exhaustion liveness bug). The honest DESTRUCTION PROVENANCE is
     //    NOT lost: it lives in the observed `DisposalOutcome`, which the CLOSE
-    //    finalize seam (`ttl_close_helpers::finalize_close`) consumes to build the
+    //    finalize seam (`crate::context::shared::ttl_close::finalize_close`) consumes to build the
     //    truthful `KeyDestructionAttestation`. The TTL-expiry path builds NO
     //    success attestation; on FAILURE the per-step bits surface via
     //    `ExpiryFailed` as an honest "step executed" diagnostic (not an
@@ -1459,7 +1459,7 @@ mod tests {
         // `RELAY_DELETE_BUDGET` (5 s) — well within `HANDLER_TIMEOUT` (30 s) —
         // rather than the relay's 3600 s stall.
         let outcome = tokio::time::timeout(
-            crate::context::actor::handlers::ttl_close::HANDLER_TIMEOUT,
+            crate::context::actor::HANDLER_TIMEOUT,
             super::try_ttl_expiry_cleanup(
                 &handle,
                 None,

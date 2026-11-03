@@ -1115,7 +1115,7 @@ impl SupervisorHandle {
         context_id: &str,
         params: scp_protocol::context::params::ContextParams,
         // The ABSOLUTE convergent expiry deadline to record, as a
-        // [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+        // [`ConvergentDeadline`](ConvergentDeadline)
         // — the arming-seam newtype that can only be minted from the single
         // authoritative source (B1). `None` (initial-create / spawn-from-Welcome)
         // lets the actor handler derive the convergent create base
@@ -1123,7 +1123,7 @@ impl SupervisorHandle {
         // `Some` — the deadline `convergent_ttl_deadline` derived from the event
         // log — so a prior extension survives and a `None`-remaining Active
         // snapshot still re-arms (D1/D2). See `TtlTimerPayload::deadline_override`.
-        deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
+        deadline_override: Option<ConvergentDeadline>,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
 
@@ -1242,6 +1242,60 @@ const fn _assert_send_sync() {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A convergent TTL expiry deadline (absolute Unix seconds), resolved from the
+/// single authoritative source and safe to arm a timer with.
+///
+/// # Why a newtype (ADR-049 §9 — the single-source TTL-deadline invariant)
+///
+/// The deadline is *the* security-critical quantity of the TTL subsystem: it is
+/// the instant at which key material is destroyed. Passing it as a bare `u64`
+/// lets any scalar — a stale persisted cache, an attacker-supplied snapshot
+/// field, a local `now()+ttl` — masquerade as "the convergent deadline" (the
+/// M3 scalar-trust hole). `ConvergentDeadline` closes that at the type level:
+/// its field is PRIVATE and it has a CLOSED constructor set, so a value can only
+/// come from a sanctioned derivation:
+///
+/// 1. [`convergent_ttl_deadline`] — the prune-immune snapshot create base raised
+///    to the highest fail-safe `TtlExtended` leaf in the (Merkle-validated) log
+///    (the partitioned single-source derivation).
+/// 2. [`convergent_ttl_deadline_secs`] — the prune-immune create base
+///    (`creation_timestamp_secs + params.ttl`) from the persisted snapshot, used
+///    both at create-arm time and as the base inside `convergent_ttl_deadline`.
+/// 3. [`ConvergentDeadline::extend`] — raises an already-convergent deadline by
+///    an agreed additional duration (the TTL-extension primitive).
+///
+/// There is deliberately **no** `from_raw` / `Deserialize` (B1/B2): admitting a
+/// `ConvergentDeadline` from arbitrary bytes would reconstruct a "trusted"
+/// deadline from an untrusted scalar and re-open the M3 hole. The arming seam
+/// [`start_ttl_timer`] / [`dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer) accept ONLY this type, so
+/// every armed deadline is convergent by construction. The type is TRANSIENT —
+/// it lives only on the arming path and is never persisted; the durable
+/// [`TtlTimer::deadline_unix_secs`](crate::context::ttl::TtlTimer) cache stays a
+/// plain `Option<u64>` (an untrusted cache re-derived from the log on every
+/// restore/import).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvergentDeadline(pub u64);
+
+impl ConvergentDeadline {
+    /// The absolute deadline as Unix seconds. Unwrapped ONLY at the persistence
+    /// cache write ([`start_ttl_timer`]) and when recording a leaf's
+    /// `old`/`new` deadline fields — never to reconstruct a new
+    /// `ConvergentDeadline` from the result.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    /// Raises this convergent deadline by `additional_secs` (saturating), the
+    /// TTL-extension primitive. The result is convergent because both inputs
+    /// are — every member extends the SAME recorded convergent deadline by the
+    /// SAME agreed duration (§7.3.1).
+    #[must_use]
+    pub const fn extend(self, additional_secs: u64) -> Self {
+        Self(self.0.saturating_add(additional_secs))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1295,6 +1349,7 @@ mod tests {
             persistence,
             journal,
             SupervisorConfig::default(),
+            crate::domain_handlers(),
         ));
         let handle = SupervisorHandle::wrap(&sup);
         (sup, handle)

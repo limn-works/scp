@@ -434,6 +434,7 @@ impl FullStackNode {
                 Some(events.clone()),
                 None,
                 Arc::clone(&mls_storage),
+                scp_core::context::domain_handlers(),
             );
             (
                 manager,
@@ -549,6 +550,7 @@ impl FullStackNode {
             None,
             Arc::clone(&observation.mls_storage),
             scp_core::context::supervisor::single_custody_source(custody),
+            scp_core::context::domain_handlers(),
         ))
     }
 

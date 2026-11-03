@@ -1372,6 +1372,7 @@ fn build_supervisor(
             Some(clock),
             durable,
             wrapping_custody_source(bi),
+            scp_core::context::domain_handlers(),
         ),
     )
 }

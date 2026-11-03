@@ -504,6 +504,7 @@ mod tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 

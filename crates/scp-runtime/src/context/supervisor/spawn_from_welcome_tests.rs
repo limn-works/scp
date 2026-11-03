@@ -361,6 +361,7 @@ fn bob_supervisor_over<C: KeyCustody + 'static>(
         None,
         mls_storage,
         crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
+        crate::domain_handlers(),
     )
 }
 
@@ -387,6 +388,7 @@ fn bob_supervisor_with_resolver(
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     );
     (sup, crypto)
 }
@@ -414,6 +416,7 @@ fn alice_supervisor() -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     );
     (sup, crypto)
 }
@@ -569,6 +572,7 @@ async fn run_join_with_wrapping_key_loss(
             None,
             None,
             Arc::clone(&mls_storage),
+            crate::domain_handlers(),
         )
     };
 
@@ -1764,7 +1768,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 /// (fail-open) fails the first two assertions.
 #[test]
 fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error() {
-    use crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable;
+    use crate::context::snapshot::welcome_snapshot_crypto_is_durable;
 
     // A populated crypto blob is durable — the spawn may proceed.
     assert!(
@@ -3164,6 +3168,7 @@ fn alice_supervisor_with_transport(
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     );
     (sup, crypto)
 }
@@ -4273,6 +4278,7 @@ fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     )
 }
 
@@ -4609,6 +4615,7 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
             Some(tx),
             Some(Arc::clone(&clock) as Arc<dyn scp_clock::Clock>),
             fresh_mls_storage(),
+            crate::domain_handlers(),
         );
         (sup, rx)
     };
@@ -4835,6 +4842,7 @@ fn alice_supervisor_counting_bob_deliveries(
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     );
     (sup, deliveries)
 }

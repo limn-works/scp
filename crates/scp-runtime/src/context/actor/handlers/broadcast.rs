@@ -23,8 +23,6 @@
 //! serializes publishes, so two publishes never share a sequence. A publish
 //! stalls its own context for up to `SIGN_TIMEOUT` while custody answers.
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, TokenNbCaveatResolver,
@@ -42,10 +40,11 @@ use crate::context::actor::commands::{
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
-use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 
-/// Per-call transport budget for broadcast handlers.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::shared::economy::ContextRevocationChecker;
+use crate::context::shared::economy::KeyResolverDidResolver;
+
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`BroadcastCommand`] against actor-owned cell and deps.
 ///
@@ -387,7 +386,7 @@ async fn handle_handle_broadcast_key_request(
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
-        crate::context::broadcast_helpers::handle_broadcast_key_request(
+        crate::context::shared::broadcast::handle_broadcast_key_request(
             cell,
             deps,
             author_did,
@@ -642,6 +641,59 @@ fn handle_seed_broadcast_author(
 // let the subscribe succeed; an absent, wrong-signer, or wrong-audience token
 // must be rejected.
 // ---------------------------------------------------------------------------
+/// The broadcast domain's [`BroadcastDomain`](crate::context::domains::BroadcastDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Broadcast;
+
+#[async_trait::async_trait]
+impl crate::context::domains::BroadcastDomain for Broadcast {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::BroadcastCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn block_broadcast_subscriber(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        author_did: &scp_did::DID,
+        subscriber_did: &scp_did::DID,
+    ) -> Result<scp_protocol::context::broadcast::BlockResult, scp_protocol::context::ContextError>
+    {
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            cell,
+            deps,
+            context_id,
+            author_did,
+            subscriber_did,
+        )
+        .await
+    }
+
+    async fn unblock_broadcast_subscriber(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        author_did: &scp_did::DID,
+        subscriber_did: &scp_did::DID,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            cell,
+            deps,
+            context_id,
+            author_did,
+            subscriber_did,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -839,6 +891,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         let deps = supervisor
@@ -1163,8 +1216,8 @@ mod tests {
         scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON
     }
 
-    fn commit_meta(pid_byte: u8) -> crate::context::governance_helpers::CommitMeta<'static> {
-        crate::context::governance_helpers::CommitMeta {
+    fn commit_meta(pid_byte: u8) -> crate::context::shared::governance::CommitMeta<'static> {
+        crate::context::shared::governance::CommitMeta {
             pid: [pid_byte; 32],
             actor_did: CREATOR_DID,
             timestamp_secs: 1_700_000_000,
@@ -1639,7 +1692,7 @@ mod tests {
         let (pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         assert!(
             matches!(
-                crate::context::broadcast_helpers::handle_broadcast_key_request(
+                crate::context::shared::broadcast::handle_broadcast_key_request(
                     &mut cell, &deps, &creator, &creator, &pubkey,
                 )
                 .expect("serve decision"),
@@ -1686,7 +1739,7 @@ mod tests {
         );
 
         // Serve path: the banned author requests a broadcast key → DENIED.
-        let decision = crate::context::broadcast_helpers::handle_broadcast_key_request(
+        let decision = crate::context::shared::broadcast::handle_broadcast_key_request(
             &mut cell, &deps, &creator, &creator, &pubkey,
         )
         .expect("serve decision");
@@ -3552,12 +3605,12 @@ mod tests {
             "fixture",
             60,
             false,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [0x77; 32],
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            crate::context::governance_helpers::MigrationBootstrap::reserve(
+            crate::context::shared::governance::MigrationBootstrap::reserve(
                 &deps,
                 &ctx_hex,
                 &[0x77; 32],
@@ -3635,12 +3688,12 @@ mod tests {
             "fixture",
             60,
             false,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid,
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            crate::context::governance_helpers::MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
+            crate::context::shared::governance::MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
                 .expect("reserve the migration's bootstrap"),
         )
         .await;
@@ -3675,13 +3728,13 @@ mod tests {
     /// cannot run without the lock.
     #[tokio::test]
     async fn a_busy_migration_bootstrap_fails_at_once_and_holds_nothing() {
-        use crate::context::governance_helpers::MigrationBootstrap;
+        use crate::context::shared::governance::MigrationBootstrap;
 
         let (supervisor, deps, _appends, _recorded) = build_supervisor_and_deps().await;
         let ctx_hex = "ab".repeat(32);
         let pid = [0x79; 32];
         let destination =
-            crate::context::governance_helpers::migration_destination_id(&ctx_hex, &pid);
+            crate::context::shared::governance::migration_destination_id(&ctx_hex, &pid);
         // Whether some operation holds the first-state claim of `destination`.
         let claimed = |deps: &ActorDeps| {
             let free = deps.supervisor.claim_first_state(&destination).is_ok();

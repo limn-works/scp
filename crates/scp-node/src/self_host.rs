@@ -885,6 +885,7 @@ where
         Some(clock),
         durable,
         wrapping_custody,
+        scp_core::context::domain_handlers(),
     );
 
     supervisor.register_local_did(author_did.clone()).await;

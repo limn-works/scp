@@ -19,12 +19,26 @@ use crate::context::push_helpers;
 pub(crate) fn dispatch(state: &PerContextState, cmd: PushCommand) -> Outcome<()> {
     match cmd {
         PushCommand::Routes { reply } => {
-            let _ = reply.send(push_helpers::push_routes(state));
+            let _ = reply.send(crate::context::push_routes::push_routes(state));
             Outcome::ok(())
         }
         PushCommand::WakeTarget { reply } => {
             let _ = reply.send(push_helpers::wake_target(state));
             Outcome::ok(())
         }
+    }
+}
+
+/// The push domain's [`PushDomain`](crate::context::domains::PushDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Push;
+
+impl crate::context::domains::PushDomain for Push {
+    fn dispatch(
+        &self,
+        state: &crate::context::actor::state::PerContextState,
+        cmd: crate::context::actor::commands::PushCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(state, cmd)
     }
 }

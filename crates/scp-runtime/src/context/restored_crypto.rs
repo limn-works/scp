@@ -171,7 +171,7 @@ pub(in crate::context) struct VerifiedRestoredCrypto {
 impl VerifiedRestoredCrypto {
     /// Consumes `restored` and verifies its group's committed
     /// `scp_context_params` (`0xFF02`) extension through the shared binding
-    /// check [`verify_scp_context_binding`](crate::context::lifecycle_helpers::verify_scp_context_binding)
+    /// check [`verify_scp_context_binding`](verify_scp_context_binding)
     /// (spec 05 §5.13.3 rules 1-9), with `snapshot_creation_timestamp_secs`
     /// as the recorded creation timestamp the committed `T0` must equal.
     ///
@@ -197,7 +197,7 @@ impl VerifiedRestoredCrypto {
         let binding = match owned.as_ref() {
             None => RestoredBinding::Keyless,
             Some(group) => RestoredBinding::Committed {
-                t0: crate::context::lifecycle_helpers::verify_scp_context_binding(
+                t0: verify_scp_context_binding(
                     group
                         .mls_group
                         .group_context_extension()
@@ -233,7 +233,7 @@ impl VerifiedRestoredCrypto {
     }
 
     /// Merges the verified floors into the Supervisor-owned registry through
-    /// [`restore_crypto_state_with_floor_guard`](crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard)
+    /// [`restore_crypto_state_with_floor_guard`](restore_crypto_state_with_floor_guard)
     /// and returns the owned crypto, now floor-guarded, for the hydrate and
     /// seed steps.
     ///
@@ -247,12 +247,7 @@ impl VerifiedRestoredCrypto {
         ctx_id_bytes: &[u8; 32],
         trusted_local: bool,
     ) -> Result<FloorGuardedCrypto, ContextError> {
-        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
-            deps,
-            ctx_id_bytes,
-            &self.floors,
-            trusted_local,
-        )?;
+        restore_crypto_state_with_floor_guard(deps, ctx_id_bytes, &self.floors, trusted_local)?;
         Ok(FloorGuardedCrypto { owned: self.owned })
     }
 }
@@ -292,5 +287,199 @@ impl FloorGuardedCrypto {
     /// `None` for a keyless snapshot.
     pub(in crate::context) fn into_owned(self) -> Option<OwnedMlsCryptoState> {
         self.owned
+    }
+}
+
+/// §23.17 Invariant 2/3/4 — the SINGLE floor-guarded crypto-restore path for
+/// import, `PrepareForReplace`, respawn, and restore.
+///
+/// Merges the floors of a
+/// [`VerifiedRestoredCrypto`](crate::context::restored_crypto::VerifiedRestoredCrypto)
+/// INTO the authoritative Supervisor-owned Class-M registry (ADR-049 PR-6).
+/// EVERY crypto-restore site — the actor-side `PrepareForReplace` handler,
+/// `import_context`, and `restore_context` — routes through here so the replay
+/// (floor-regression) guard cannot be bypassed.
+///
+/// The input is [`VerifiedFloors`](crate::context::restored_crypto::VerifiedFloors),
+/// which only a `VerifiedRestoredCrypto` yields, so floors from a group whose
+/// `0xFF02` binding (spec 05 §5.13.3) was not verified cannot reach the
+/// registry.
+///
+/// The registry is the authoritative live floor home and is NOT torn down here,
+/// so there is no pre-teardown "capture" step: the snapshot floors are the merge
+/// INPUT (`incoming`) and the live registry floors are the merge target. The
+/// registry merge guards on `incoming.is_empty()` (NOT the live floors), so a
+/// COLD restart (empty live registry, non-empty snapshot) still POPULATES the
+/// registry — closing the cold-restart replay window (D2).
+///
+/// Import and restore reach it through
+/// [`VerifiedRestoredCrypto::merge_floors`](crate::context::restored_crypto::VerifiedRestoredCrypto::merge_floors),
+/// which returns the owned group for the seed only after this merge succeeds.
+/// The terminating `PrepareForReplace` actor calls it with the floors alone
+/// and seeds nothing (ADR-049 PR-7 C3 seed-vs-terminal resolution).
+///
+/// `trusted_local` selects the spec §23.17.2 merge semantics:
+///
+/// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
+///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
+///   (`restore_all_contexts`). A lower restored floor is the expected
+///   coalesce-lag case and is MAX-merged with the live registry floor; the
+///   restore PROCEEDS (never rejected for a regression). Only an overshoot
+///   beyond `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
+/// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
+///   per-sender floor regression is rejected (snapshot-mediated replay guard).
+///
+/// # Errors
+///
+/// Returns `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the
+/// §23.17 replay-protection rejection the registry's `validate_and_merge_*`
+/// sink returns) if a per-sender floor regresses (import path) or overshoots
+/// (both paths), and the registry is left unchanged (validate-before-apply
+/// across both axes).
+pub fn restore_crypto_state_with_floor_guard(
+    deps: &ActorDeps,
+    ctx_id_bytes: &[u8; 32],
+    floors: &crate::context::restored_crypto::VerifiedFloors,
+    trusted_local: bool,
+) -> Result<(), ContextError> {
+    // #2148 (ADR-049 birth-into-actor): the crypto is ACTOR-owned end to end —
+    // the provider holds NO per-context state, so there is no provider-resident
+    // crypto to tear down first.
+
+    // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
+    // `MergePolicy`: a trusted-local respawn max-merges and tolerates the
+    // coalesce-lag regression (Inv-2); an untrusted import rejects any
+    // regression (Inv-3). BOTH enforce the epoch-poisoning overshoot ceiling.
+    let policy = if trusted_local {
+        scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
+    } else {
+        scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
+    };
+
+    // THE D2 sink: merge the snapshot floors (`incoming`) INTO the authoritative
+    // registry (`local` = the live, non-torn-down registry). ONE cross-axis
+    // validating merge — BOTH the epoch AND the recv-sequence floors are
+    // validated before EITHER is applied, so a rejection on either axis leaves
+    // the WHOLE registry entry UNCHANGED. The merge guards on
+    // `incoming.is_empty()` — NOT on the live floors — so on a COLD restart
+    // (empty live registry, NON-empty snapshot) it RUNS and POPULATES the
+    // registry, closing D2. FAIL-CLOSED via `?`; `From<FloorAdvanceError>` maps
+    // a rejection to `ContextError::CryptoFailed`. On rejection
+    // `VerifiedRestoredCrypto::merge_floors` drops the owned group at its `?`
+    // return (zeroizing on drop), so a rejected restore is never seeded onto an
+    // actor and writes no durable snapshot.
+    deps.supervisor.validate_and_merge_all_floors(
+        ctx_id_bytes,
+        floors.sender_epochs().to_vec(),
+        floors.recv_sequence().to_vec(),
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        policy,
+    )?;
+
+    Ok(())
+}
+
+/// Verifies a joined or rehydrated MLS group's committed `scp_context_params`
+/// (`0xFF02`) group-context extension against the context's declared identity
+/// and parameters (spec §5.13.3, finding FFI-02).
+///
+/// This is the single binding check shared by every point where an SCP context
+/// group enters the live provider from a *caller-supplied* description of its
+/// parameters:
+///
+/// - **join** (`Supervisor::spawn_actor_from_welcome`) — the joiner reads the
+///   just-joined group's extension (before install) and verifies it against the
+///   `WelcomeJoinRequest.params` the (untrusted) inviter supplied;
+/// - **import** (`import_context`) and **restore / respawn** (`restore_context`)
+///   — the layer reads the *rehydrated* group's extension and verifies it
+///   against the snapshot's `context_params`.
+///
+/// It enforces validation **rule 1** (every SCP context group MUST carry the
+/// `0xFF02` extension) plus **rules 2–6** (`context_id`, governance / ceiling
+/// hashes, ceiling policy, mode, parent structure) and **rule 8** (the committed
+/// genesis `creator_did` MUST equal the presented `creator_did`) via
+/// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against).
+/// The extension is folded into the MLS key schedule at group creation, so it
+/// is the group's cryptographic attestation of its own parameters: a malicious
+/// inviter (or a forged / internally-inconsistent snapshot) that presents
+/// benign `params` while the real group commits divergent
+/// governance / ceiling / mode / `context_id` is refused here, *before* any
+/// authority (governance engine, ceiling, admin set) is built from those
+/// params.
+///
+/// `creator_did` is the genesis creator/admin the caller presents — the
+/// (untrusted) bundle's `creator_did` on a Welcome-based join, or the snapshot's
+/// `role_state.creator_did` on import/restore. Rule 8 refuses the group unless
+/// it equals the `creator_did` the group cryptographically committed at
+/// creation, so no authority is ever built for a substituted admin (the sole
+/// anchor for DID-less governance models such as `SingleAdmin`).
+///
+/// It also enforces **rule 9**: the committed `creation_timestamp_secs` must
+/// not exceed 2^53 − 1, must not lie later than `now_secs` plus the 5-minute
+/// future bound of `09-security-model.md` §9.8.2
+/// ([`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`](scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS)),
+/// and, on import and restore, must equal the creation timestamp the snapshot
+/// recorded (`snapshot_creation_timestamp_secs`; `None` on a Welcome join,
+/// which presents no snapshot). An extension that omits the field fails to
+/// decode, so it arrives here as an unreadable `read`.
+///
+/// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
+/// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
+/// `Err(msg)` = the group is unreadable / the `0xFF02` payload is malformed.
+/// On rejection the returned reason is prefixed with `site` so each caller can
+/// wrap it in its site-idiomatic [`ContextError`] variant while sharing this
+/// one check. Returns the committed `T0`, which the caller installs as the
+/// pseudonym-rotation base and the TTL base, only when the extension is
+/// present AND every binding rule holds.
+///
+/// # Errors
+///
+/// Returns the `site`-prefixed rejection reason when the extension is absent
+/// or unreadable, or when any binding rule fails.
+pub fn verify_scp_context_binding(
+    read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
+    context_id: &str,
+    creator_did: &str,
+    params: &scp_protocol::context::ContextParams,
+    now_secs: u64,
+    snapshot_creation_timestamp_secs: Option<u64>,
+    site: &str,
+) -> Result<u64, String> {
+    match read {
+        Ok(Some(ext)) => {
+            ext.verify_against(
+                &context_id.to_owned(),
+                &scp_did::DID::from(creator_did.to_owned()),
+                params,
+            )
+            .map_err(|e| {
+                format!(
+                    "{site} refused: scp_context_params (0xFF02) binding mismatch \
+                     (§5.13.3 rules 2-6, 8): {e}"
+                )
+            })?;
+            let t0 = ext.committed_creation_timestamp(now_secs).map_err(|e| {
+                format!(
+                    "{site} refused: scp_context_params (0xFF02) creation timestamp \
+                     rejected (§5.13.3 rule 9): {e}"
+                )
+            })?;
+            match snapshot_creation_timestamp_secs {
+                Some(recorded) if recorded != t0 => Err(format!(
+                    "{site} refused: the snapshot records creation timestamp {recorded}, \
+                     the scp_context_params (0xFF02) extension commits {t0} \
+                     (§5.13.3 rules 7, 9)"
+                )),
+                _ => Ok(t0),
+            }
+        }
+        Ok(None) => Err(format!(
+            "{site} refused: the MLS group carries no scp_context_params (0xFF02) \
+             group-context extension — not an SCP context (§5.13.3 rule 1)"
+        )),
+        Err(e) => Err(format!(
+            "{site} refused: scp_context_params (0xFF02) group-context extension \
+             unreadable (§5.13.3): {e}"
+        )),
     }
 }

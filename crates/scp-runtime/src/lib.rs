@@ -48,3 +48,32 @@ pub mod well_known;
 
 // Re-export the MLS module's primary types at the crate level for convenience.
 pub use crypto::mls;
+
+/// Builds the 13 domain handlers every [`Supervisor`] takes as its last
+/// constructor argument (ADR-070 §3).
+///
+/// This is the one production constructor of
+/// [`DomainHandlers`](context::domains::DomainHandlers): each field holds the
+/// field-less struct that forwards to its domain's functions.
+///
+/// [`Supervisor`]: context::supervisor::Supervisor
+#[must_use]
+pub fn domain_handlers() -> context::domains::DomainHandlers {
+    use context::actor::handlers;
+    use std::sync::Arc;
+    context::domains::DomainHandlers {
+        messaging: Arc::new(handlers::messaging::Messaging),
+        lifecycle: Arc::new(handlers::lifecycle::Lifecycle),
+        governance: Arc::new(handlers::governance::Governance),
+        broadcast: Arc::new(handlers::broadcast::Broadcast),
+        economy: Arc::new(handlers::economy::Economy),
+        trust_recovery: Arc::new(handlers::trust_recovery::TrustRecovery),
+        standing: Arc::new(handlers::standing::Standing),
+        ttl_close: Arc::new(handlers::ttl_close::TtlClose),
+        outlets: Arc::new(handlers::outlets::Outlets),
+        push: Arc::new(handlers::push::Push),
+        queries: Arc::new(handlers::queries::Queries),
+        saga: Arc::new(handlers::saga::Saga),
+        lifecycle_control: Arc::new(handlers::lifecycle_control::LifecycleControl),
+    }
+}

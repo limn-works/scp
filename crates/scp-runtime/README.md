@@ -39,7 +39,8 @@ Three types anchor the model:
 ## Quick Start
 
 The `Supervisor` is the single entry point. In production, FFI bridges build
-one via `Supervisor::with_providers_and_journal` (durable saga journal). Tests
+one via `Supervisor::with_providers_and_journal` (durable saga journal), passing
+`scp_runtime::domain_handlers()` as its last argument (ADR-070). Tests
 and local setups use the `test_supervisor` convenience constructor, which
 wires an in-memory MLS storage backend and no-op persistence:
 

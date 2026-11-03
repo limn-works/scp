@@ -187,7 +187,7 @@ async fn destroy_handle(custody: &dyn WrappingCustody, handle: &KeyHandle) {
 /// loaded.
 ///
 /// `Debug` prints only the public point; the handle stays out of logs.
-pub(crate) struct IdentityWrappingKey {
+pub struct IdentityWrappingKey {
     custody: Arc<dyn WrappingCustody>,
     handle: KeyHandle,
     public: [u8; 65],

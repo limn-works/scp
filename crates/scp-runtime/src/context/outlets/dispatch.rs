@@ -147,7 +147,7 @@ pub trait StreamEscrowRefundSink: Send + Sync {
 /// can early-return. Without a guard, the debited hold would be stranded:
 /// the invoker is charged the full estimate with no refund path.
 ///
-/// This ticket mirrors the [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// This ticket mirrors the [`EconomyTicket`](crate::context::shared::economy::EconomyTicket)
 /// Drop-guard discipline: it is `#[must_use]`, and its
 /// `Drop` impl refunds the hold (via [`StreamEscrowRefundSink::refund`])
 /// when the ticket was NOT consumed. The pump-spawn path calls
@@ -314,7 +314,7 @@ pub enum OpenStreamRejection {
     /// [`ContextError::OutletContextNotActive`](crate::context::ContextError::OutletContextNotActive)
     /// carrier (SCP-OUT-031 PR-2a; formerly a raw `SCP-OUTLET-6080`
     /// `PermissionDenied`), which the supervisor-side reverse-map
-    /// ([`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection))
+    /// ([`reserve_error_to_open_rejection`](crate::context::shared::outlets::reserve_error_to_open_rejection))
     /// reads TYPED into this rejection — carrying `current_state` forward for
     /// the terminal-chunk diagnostic. This shapes it identically to the
     /// in-stream `protocol.context-closed-mid-stream` terminal chunk the pump

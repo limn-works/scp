@@ -39,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Each identity's wrapping key lives in its key custody; a host passes
         // its own custody here.
         single_custody_source(Arc::new(InMemoryKeyCustody::new())),
+        scp_runtime::domain_handlers(),
     );
 
     // 2. Register our DID so the manager recognizes us as a local participant.

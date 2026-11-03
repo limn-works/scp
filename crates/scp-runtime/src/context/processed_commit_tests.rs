@@ -42,8 +42,9 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::pseudonym_rotation::PseudonymRotationState;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::governance_helpers::{CommitMeta, execute_reset_member};
+use crate::context::governance_helpers::execute_reset_member;
 use crate::context::persistence::ContextPersistence;
+use crate::context::shared::governance::CommitMeta;
 use crate::context::state::{ContextSnapshot, context_id_to_bytes};
 use crate::context::supervisor::supervisor::Supervisor;
 
@@ -233,6 +234,7 @@ async fn member_deps(
         None,
         None,
         mls_storage,
+        crate::domain_handlers(),
     );
     supervisor.register_local_did(DID::from(did)).await;
     let deps = supervisor
@@ -327,7 +329,7 @@ async fn deliver(
     member: &mut Member,
     ctx: &str,
     blob: Vec<u8>,
-) -> Result<crate::context::messaging_helpers::DeliverOutcome, ContextError> {
+) -> Result<crate::context::actor::commands::DeliverOutcome, ContextError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _outcome = crate::context::actor::handlers::messaging::dispatch(
         &mut member.cell,
@@ -388,7 +390,7 @@ async fn trio(ctx: &str) -> (Member, Member) {
     .expect("Bob merges the add");
     assert!(matches!(
         dispatched,
-        crate::context::messaging_helpers::Dispatched::Commit { .. }
+        crate::context::shared::messaging::Dispatched::Commit { .. }
     ));
 
     activate(&mut alice_state, &[ALICE, BOB, CAROL]);

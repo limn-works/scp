@@ -796,7 +796,7 @@ pub struct CommittedStreamingOutletInvocation {
 ///
 /// Prepare-A durably persists the caller's velocity / budget / hard-rate-limit
 /// deductions and authorizes the external payment escrow, but the live
-/// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
+/// [`OutletEconomyReservation`](crate::context::shared::outlets::OutletEconomyReservation)
 /// RAII carrier that holds the means to reverse them lives ONLY in the
 /// supervisor's in-memory saga context — it dies with an actor/process crash.
 /// On a `PreparingB`-window crash the §17.16.4 recovery sweep re-drives the

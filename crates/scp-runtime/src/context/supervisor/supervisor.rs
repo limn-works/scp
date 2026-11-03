@@ -1719,14 +1719,14 @@ pub struct SagaSigners {
 /// the B-side leaf, SCP-OUT-046 AC5). The same-context caller installs both.
 ///
 /// The §7.3.8 post-input check is `'static` (built by
-/// [`build_stream_post_input_hook`](crate::context::outlets_helpers::build_stream_post_input_hook),
+/// [`build_stream_post_input_hook`](crate::context::shared::outlets::build_stream_post_input_hook),
 /// which clones the effective caveats + counter-store `Arc` into the closure
 /// rather than borrowing the binding), so this struct carries no lifetime — the
 /// caller need not keep `caveat_binding` alive past the helper call.
 struct OutletStreamPhase1 {
     /// The in-actor economy reservation — context/role snapshots, spawn
     /// generation, the debited `reserved_escrow`, and the acceptance-time policy.
-    reservation: crate::context::outlets_helpers::StreamEconomyReservation,
+    reservation: crate::context::shared::outlets::StreamEconomyReservation,
     /// The armed open-failure escrow guard. On a successful open the caller
     /// `consume`s it (the pump's close-time settlement then owns the refund); on
     /// a rejection the caller drops it so its `Drop` reverses the debited hold.
@@ -1858,6 +1858,9 @@ pub struct Supervisor {
     /// invisible to that actor's `local_dids` view — breaking the
     /// author-DID-controlled gate on broadcast key requests.
     pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
+    /// The 13 domain handlers (ADR-070 §3). Core reaches domain code only
+    /// through this value; every actor's `ActorDeps::domains` shares it.
+    pub(crate) domains: Arc<crate::context::domains::DomainHandlers>,
     /// Per-identity DHKEM(P-256) wrapping keys (spec 09 §9.16.1), the only
     /// writer of each identity's key. [`Self::load_wrapping_key`] fills an
     /// entry from durable storage (or generates and stores one) at every entry
@@ -2071,7 +2074,7 @@ pub struct Supervisor {
     /// Context ids whose first-state writes a create, import, Welcome join,
     /// standing-context create or migration create has started and not yet
     /// committed or rolled back
-    /// ([`crate::context::lifecycle_helpers::FirstStateRollback`]). A
+    /// ([`crate::context::shared::lifecycle::FirstStateRollback`]). A
     /// rollback drains those writes with `bootstrap_spawn_lock` released, so
     /// this set, not the lock, keeps another bootstrap of the id from
     /// writing or spawning between the failure and the rollback: a second
@@ -2442,6 +2445,8 @@ struct ProviderBootstrap {
     /// `Supervisor::with_providers` built it.
     #[cfg(any(test, feature = "testing"))]
     testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
+    /// The 13 domain handlers the supervisor and every actor call (ADR-070).
+    domains: crate::context::domains::DomainHandlers,
 }
 
 impl Supervisor {
@@ -2470,8 +2475,9 @@ impl Supervisor {
         persistence: Arc<dyn ContextPersistence>,
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Self {
-        Self::with_in_memory_wrapping_custody(persistence, saga_journal, health_config)
+        Self::with_in_memory_wrapping_custody(persistence, saga_journal, health_config, domains)
     }
 
     /// `new_inner` over one shared in-memory wrapping custody, which
@@ -2481,6 +2487,7 @@ impl Supervisor {
         persistence: Arc<dyn ContextPersistence>,
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Self {
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
         let supervisor = Self::new_inner(
@@ -2489,6 +2496,7 @@ impl Supervisor {
             health_config,
             crate::crypto::wrapping::single_custody_source(Arc::clone(&custody)),
             in_memory_relay_contacts(),
+            domains,
         );
         let _ = supervisor.testing_wrapping_custody.set(custody);
         supervisor
@@ -2532,6 +2540,7 @@ impl Supervisor {
         health_config: SupervisorConfig,
         wrapping_custody: WrappingCustodySource,
         relay_contacts: Arc<dyn crate::store::sync::RelayContactStore>,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Self {
         // Synchronous critical section only; the guard is provably never held
         // across an `.await` (check-disjoint + insert, or remove-on-drop, are
@@ -2631,6 +2640,7 @@ impl Supervisor {
             outlet_stream_origin_admission: Arc::new(std::sync::RwLock::new(
                 OriginAdmissionTracker::new(),
             )),
+            domains: Arc::new(domains),
         }
     }
 
@@ -2663,7 +2673,7 @@ impl Supervisor {
     /// cannot reach a provider-less supervisor.
     #[must_use]
     #[cfg(any(test, feature = "testing"))]
-    pub fn for_query_shim() -> Self {
+    pub fn for_query_shim(domains: crate::context::domains::DomainHandlers) -> Self {
         let persistence: Arc<dyn ContextPersistence> =
             Arc::new(crate::context::persistence::NoOpContextPersistence);
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoOpSagaJournal);
@@ -2671,6 +2681,7 @@ impl Supervisor {
             persistence,
             saga_journal,
             SupervisorConfig::default(),
+            domains,
         )
     }
 
@@ -2708,6 +2719,7 @@ impl Supervisor {
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
         let wrapping_custody = crate::crypto::wrapping::single_custody_source(Arc::clone(&custody));
@@ -2723,6 +2735,7 @@ impl Supervisor {
             mls_storage,
             wrapping_custody,
             Some(custody),
+            domains,
         )
     }
 
@@ -2744,6 +2757,7 @@ impl Supervisor {
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         wrapping_custody: WrappingCustodySource,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
         Self::with_test_providers(
             crypto,
@@ -2757,6 +2771,7 @@ impl Supervisor {
             mls_storage,
             wrapping_custody,
             None,
+            domains,
         )
     }
 
@@ -2775,6 +2790,7 @@ impl Supervisor {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         wrapping_custody: WrappingCustodySource,
         testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
         let helper_persistence: Option<Arc<dyn ContextPersistence>> = persistence.map(Arc::from);
         let persistence: Arc<dyn ContextPersistence> = helper_persistence.as_ref().map_or_else(
@@ -2794,6 +2810,7 @@ impl Supervisor {
             durable: DurableProviders::with_noop_journal(mls_storage),
             wrapping_custody,
             testing_wrapping_custody,
+            domains,
         })
     }
 
@@ -2860,7 +2877,8 @@ impl Supervisor {
     ///     crypto, transport, event_log, key_resolver,
     ///     None, // E0308: expected `Box<dyn ContextPersistence>`
     ///     None, None, None, durable, wrapping_custody,
-    /// );
+    ///     scp_runtime::domain_handlers(),
+    /// , crate::domain_handlers());
     /// # }
     /// ```
     #[must_use]
@@ -2876,6 +2894,7 @@ impl Supervisor {
         clock: Option<Arc<dyn Clock>>,
         durable: DurableProviders,
         wrapping_custody: WrappingCustodySource,
+        domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
         let persistence: Arc<dyn ContextPersistence> = Arc::from(persistence);
         Self::bootstrap(ProviderBootstrap {
@@ -2892,6 +2911,7 @@ impl Supervisor {
             wrapping_custody,
             #[cfg(any(test, feature = "testing"))]
             testing_wrapping_custody: None,
+            domains,
         })
     }
 
@@ -2913,6 +2933,7 @@ impl Supervisor {
             clock,
             durable,
             wrapping_custody,
+            domains,
             ..
         } = providers;
         // `into_parts` is `pub(crate)`, so this is the single in-crate site that
@@ -2924,6 +2945,7 @@ impl Supervisor {
             SupervisorConfig::default(),
             wrapping_custody,
             relay_contacts,
+            domains,
         ));
         #[cfg(any(test, feature = "testing"))]
         if let Some(custody) = testing_wrapping_custody {
@@ -3893,7 +3915,7 @@ impl Supervisor {
     /// Takes `self: &Arc<Self>` so the returned
     /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
     /// wraps a cloned `Arc` of the same supervisor instance — not a
-    /// fresh `Supervisor::for_query_shim()`. Without this the handle
+    /// fresh `Supervisor::for_query_shim(crate::domain_handlers())`. Without this the handle
     /// would point at a dangling second supervisor and
     /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
     /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
@@ -3961,6 +3983,7 @@ impl Supervisor {
             payment_adapter: self.payment_adapter_ref().map(Arc::clone),
             local_dids: self.local_dids_shared(),
             owned_identity,
+            domains: Arc::clone(&self.domains),
         })
     }
 
@@ -4347,7 +4370,7 @@ impl Supervisor {
                 }
                 // The arm owns the first-state guard outside the timeout, so a
                 // create that fails or times out puts back what it wrote.
-                let first_state = match crate::context::lifecycle_helpers::FirstStateRollback::new(
+                let first_state = match crate::context::shared::lifecycle::FirstStateRollback::new(
                     &deps,
                     &context_id,
                 ) {
@@ -4365,25 +4388,23 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
-                let fut = crate::context::lifecycle_helpers::create_context(
+                let fut = deps.domains.lifecycle.create_context(
                     &deps,
-                    p.context_id,
-                    p.params,
-                    p.creator_did,
-                    p.local_pseudonym,
-                    p.relay_urls,
-                    &first_state,
+                    crate::context::domains::CreateContextRequest {
+                        context_id: p.context_id,
+                        params: p.params,
+                        creator_did: p.creator_did,
+                        local_pseudonym: p.local_pseudonym,
+                        relay_urls: p.relay_urls,
+                        first_state: &first_state,
+                    },
                 );
-                // `Box::pin` the create future: owned-state spawn keeps the
-                // freshly built `PerContextState` live across the spawn
-                // await inside `create_context`, so the future is large
-                // (>16 KiB). Heap-boxing it keeps this lifecycle frame off
-                // the stack.
-                let (outcome, reply_result) = match tokio::time::timeout(
-                    LIFECYCLE_TIMEOUT,
-                    Box::pin(fut),
-                )
-                .await
+                // The trait method returns the create future already boxed:
+                // owned-state spawn keeps the freshly built `PerContextState`
+                // live across the spawn await, so the future is large
+                // (>16 KiB), and the heap box keeps it off this frame.
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
                 {
                     Ok(Ok(spawned)) => (Outcome::ok_mutated(()), Ok(spawned)),
                     Ok(Err(e)) => {
@@ -4413,7 +4434,7 @@ impl Supervisor {
                         Ok(()) => (outcome, Err(e)),
                         Err(rollback) => {
                             let folded =
-                                crate::context::lifecycle_helpers::fold_rollback_failure(
+                                crate::context::shared::lifecycle::fold_rollback_failure(
                                     &e, &rollback,
                                 );
                             let sketch = standing_outcome_error_sketch(&folded);
@@ -4542,7 +4563,7 @@ impl Supervisor {
                 // the `import_context` body).
                 // The arm owns the first-state guard outside the timeout, so an
                 // import that fails or times out puts back what it replaced.
-                let first_state = match crate::context::lifecycle_helpers::FirstStateRollback::new(
+                let first_state = match crate::context::shared::lifecycle::FirstStateRollback::new(
                     &deps,
                     &context_id,
                 ) {
@@ -4559,13 +4580,13 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
-                let fut = Box::pin(crate::context::lifecycle_helpers::import_context(
+                let fut = deps.domains.lifecycle.import_context_from_export(
                     &deps,
                     *export,
                     &verifying_key,
                     local_pseudonym,
                     &first_state,
-                ));
+                );
                 let import_result = tokio::time::timeout(LIFECYCLE_TIMEOUT, fut).await;
                 // `import_context` marks the replace gap when it despawns a
                 // prior actor (`despawn_for_replace`). `crash_window` ends
@@ -4607,7 +4628,7 @@ impl Supervisor {
                         Ok(()) => (outcome, Err(e)),
                         Err(rollback) => {
                             let folded =
-                                crate::context::lifecycle_helpers::fold_rollback_failure(
+                                crate::context::shared::lifecycle::fold_rollback_failure(
                                     &e, &rollback,
                                 );
                             let sketch = standing_outcome_error_sketch(&folded);
@@ -4675,12 +4696,12 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
-                let fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
+                let fut = deps.domains.lifecycle.restore_context(
                     &deps,
                     &p.context_id,
                     &handle,
                     None, // process-restart / dispatch arm: load the snapshot here
-                ));
+                );
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
                     .await
                 {
@@ -4769,7 +4790,7 @@ impl Supervisor {
                 let err = ContextError::InvalidState(
                     "LifecycleCommand::FlushSnapshot reached dispatch_lifecycle_direct — \
                      sweep variants must be dispatched via the iterating entry points in \
-                     `lifecycle_helpers::flush_all_contexts*`"
+                     `crate::context::shared::lifecycle::flush_all_contexts*`"
                         .to_owned(),
                 );
                 let sketch = ContextError::InvalidState(format!("{err}"));
@@ -6537,12 +6558,10 @@ impl Supervisor {
         // `tokio::time::timeout` cannot interrupt a blocking sync read, so the
         // genuine mitigation is removing the second read, not wrapping it. The
         // storage layer's `load_context` is contracted not to block unbounded.)
-        let restore_fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
-            &deps,
-            ctx_id,
-            &handle,
-            Some(snapshot.clone()),
-        ));
+        let restore_fut =
+            deps.domains
+                .lifecycle
+                .restore_context(&deps, ctx_id, &handle, Some(snapshot.clone()));
         match tokio::time::timeout(Self::LIFECYCLE_TIMEOUT, restore_fut).await {
             Ok(Ok(())) => {
                 // Respawn succeeded: clear the "silently dead" flag (the
@@ -8048,7 +8067,7 @@ impl Supervisor {
         asserted_timestamp_ms: u64,
         timeout_ms: Option<u32>,
         executor: Arc<E>,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         signers: SagaSigners,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<StreamingSagaHandle, SagaError>
@@ -8756,9 +8775,9 @@ impl Supervisor {
     /// identical).
     ///
     /// * `reached_needs_repair == true` — HOLD the escrow reserved for operator
-    ///   repair. The [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)'s `#[must_use]` drop guard would
+    ///   repair. The [`OutletEconomyReservation`](crate::context::shared::outlets::OutletEconomyReservation)'s `#[must_use]` drop guard would
     ///   normally fire on an unbalanced drop, so
-    ///   [`hold_external_for_repair`](crate::context::outlets_helpers::OutletEconomyTicket::hold_external_for_repair)
+    ///   [`hold_external_for_repair`](crate::context::shared::outlets::OutletEconomyTicket::hold_external_for_repair)
     ///   marks the carrier consumed WITHOUT voiding the external escrow (the
     ///   operation may have partially committed — B executed and charged — so
     ///   auto-voiding here would be a free-execution exploit).
@@ -9002,7 +9021,7 @@ impl Supervisor {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn test_standing_pair_context_digest(local_did: &DID, peer_did: &DID) -> [u8; 32] {
-        crate::context::standing_helpers::derive_standing_context_digest(local_did, peer_did)
+        crate::context::shared::standing::derive_standing_context_digest(local_did, peer_did)
     }
 
     /// Replay unresolved sagas from the journal on supervisor startup
@@ -11886,7 +11905,7 @@ impl Supervisor {
     /// Idempotent: registering the same DID twice is a no-op. Infallible: the
     /// registration is an insert into the supervisor-wide local-DID set.
     pub async fn register_local_did(&self, did: DID) {
-        crate::context::queries_helpers::register_local_did(self, did).await;
+        crate::context::shared::queries::register_local_did(self, did).await;
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
@@ -11895,7 +11914,7 @@ impl Supervisor {
     ///
     /// Currently always returns `Ok(_)`.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
-        Ok(crate::context::queries_helpers::is_local_did(self, did).await)
+        Ok(crate::context::shared::queries::is_local_did(self, did).await)
     }
 
     /// Restore every persisted context from the configured persistence
@@ -11929,7 +11948,7 @@ impl Supervisor {
     pub(crate) async fn restore_all_contexts(
         self: &Arc<Self>,
     ) -> Result<RestoredContexts, ContextError> {
-        let ids = crate::context::lifecycle_helpers::restore_all_contexts(self).await?;
+        let ids = self.domains.lifecycle.restore_all_contexts(self).await?;
         Ok(RestoredContexts::new(ids))
     }
 
@@ -12131,9 +12150,9 @@ impl Supervisor {
     /// # Errors
     ///
     /// The first context's flush failure when any flush did not land; see
-    /// [`crate::context::lifecycle_helpers::flush_all_contexts`].
+    /// [`crate::context::shared::lifecycle::flush_all_contexts`].
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts(self).await
+        crate::context::shared::lifecycle::flush_all_contexts(self).await
     }
 
     /// Shut down every context the supervisor owns and wait for every task
@@ -12159,7 +12178,7 @@ impl Supervisor {
     /// the sweep, because the actor is despawned either way, which closes its
     /// inbox. Returning means the drain finished.
     pub async fn shutdown_all_contexts(&self) {
-        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
+        self.domains.lifecycle.shutdown_all_contexts(self).await;
     }
 
     /// Runs [`Self::shutdown_all_contexts`] and then `after_drain` on a task
@@ -12734,7 +12753,7 @@ impl Supervisor {
         use scp_protocol::context::ContextState;
 
         let context_id =
-            crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
+            crate::context::shared::standing::generate_standing_context_id(local_did, peer_did);
 
         // Serialize this get-or-create against every other same-id
         // bootstrap (the `CreateContext` / `ImportContext` /
@@ -12833,26 +12852,31 @@ impl Supervisor {
                 // A recreate that fails puts back what it wrote (ADR-029
                 // Implementation), after the lock is released below.
                 let first_state =
-                    crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &context_id)?;
-                let created = Box::pin(crate::context::lifecycle_helpers::create_context(
-                    &deps,
-                    context_id.clone(),
-                    params,
-                    local_did.clone(),
-                    None,
-                    // §5.12.3.1: the local identity's relays host the recreated
-                    // standing context (PUSH-025).
-                    relay_urls,
-                    &first_state,
-                ))
-                .await
-                .map(|spawned| (deps.clone_for_spawn(), spawned))
-                .map_err(|e| match e {
-                    scp_protocol::context::builder::ContextCreationError::StateTransition(
-                        inner @ ContextError::SupervisorShutDown(_),
-                    ) => inner,
-                    other => ContextError::TransportFailed(other.to_string()),
-                });
+                    crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &context_id)?;
+                let created = deps
+                    .domains
+                    .lifecycle
+                    .create_context(
+                        &deps,
+                        crate::context::domains::CreateContextRequest {
+                            context_id: context_id.clone(),
+                            params,
+                            creator_did: local_did.clone(),
+                            local_pseudonym: None,
+                            // §5.12.3.1: the local identity's relays host the
+                            // recreated standing context (PUSH-025).
+                            relay_urls,
+                            first_state: &first_state,
+                        },
+                    )
+                    .await
+                    .map(|spawned| (deps.clone_for_spawn(), spawned))
+                    .map_err(|e| match e {
+                        scp_protocol::context::builder::ContextCreationError::StateTransition(
+                            inner @ ContextError::SupervisorShutDown(_),
+                        ) => inner,
+                        other => ContextError::TransportFailed(other.to_string()),
+                    });
                 (created, Some(first_state))
             }
             // A shutdown refusal keeps its typed `SCP-CTX-2138` (ADR-049
@@ -12903,7 +12927,7 @@ impl Supervisor {
         {
             return Err(match spawned {
                 Err(create_err) => {
-                    crate::context::lifecycle_helpers::fold_rollback_failure(&create_err, &rollback)
+                    crate::context::shared::lifecycle::fold_rollback_failure(&create_err, &rollback)
                 }
                 Ok(_) => rollback,
             });
@@ -12981,7 +13005,7 @@ impl Supervisor {
         let mut terminal_context_ids: Vec<String> = Vec::new();
         for (_key, peer_did) in &standing_entries {
             for local_did in &local_did_list {
-                let context_id = crate::context::standing_helpers::generate_standing_context_id(
+                let context_id = crate::context::shared::standing::generate_standing_context_id(
                     local_did, peer_did,
                 );
                 let Some(state) = self.read_context_state(&context_id).await else {
@@ -13061,7 +13085,7 @@ impl Supervisor {
                 .iter()
                 .filter(|(_key, peer_did)| {
                     local_did_set.iter().any(|local_did| {
-                        let cid = crate::context::standing_helpers::generate_standing_context_id(
+                        let cid = crate::context::shared::standing::generate_standing_context_id(
                             local_did, peer_did,
                         );
                         terminal_context_ids.contains(&cid)
@@ -13342,7 +13366,7 @@ impl Supervisor {
     /// `Ok(Some((plaintext, sender_did)))` for an application message.
     ///
     /// The driver only distinguishes application content from everything
-    /// else, so the receive-path [`DeliverOutcome`](crate::context::messaging_helpers::DeliverOutcome)
+    /// else, so the receive-path [`DeliverOutcome`](crate::context::actor::commands::DeliverOutcome)
     /// is collapsed back to `Option` here: a heartbeat encountered during
     /// catch-up is correctly treated as "no application content" (live
     /// heartbeat monitoring is the subscribe-loop's responsibility, not the
@@ -13364,7 +13388,7 @@ impl Supervisor {
         envelope_bytes: Vec<u8>,
         mode: crate::context::actor::commands::DeliveryMode,
     ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
-        use crate::context::messaging_helpers::DeliverOutcome;
+        use crate::context::actor::commands::DeliverOutcome;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DeliverIncoming {
             context_id: context_id.to_owned(),
@@ -14563,10 +14587,10 @@ impl Supervisor {
         context_id: &str,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         input: serde_json::Value,
         now_secs: u64,
-    ) -> Result<crate::context::outlets_helpers::OutletEconomyReservation, ContextError> {
+    ) -> Result<crate::context::shared::outlets::OutletEconomyReservation, ContextError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = OutletsCommand::ReserveOutletEconomy {
             context_id: context_id.to_owned(),
@@ -14591,7 +14615,7 @@ impl Supervisor {
 
     /// Dispatch the streaming open-time [`OutletsCommand::ReserveOutletStreamEconomy`]
     /// to the target context's actor and await the `Send`
-    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation).
+    /// [`StreamEconomyReservation`](crate::context::shared::outlets::StreamEconomyReservation).
     ///
     /// Mirrors [`Self::reserve_outlet_economy_via_actor`] for the
     /// streaming-native open path: the reserve runs inside the per-context
@@ -14614,7 +14638,7 @@ impl Supervisor {
         estimated_chunk_count: u32,
         max_per_action: Option<scp_protocol::economy::types::Amount>,
         now_secs: u64,
-    ) -> Result<crate::context::outlets_helpers::StreamEconomyReservation, ContextError> {
+    ) -> Result<crate::context::shared::outlets::StreamEconomyReservation, ContextError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = OutletsCommand::ReserveOutletStreamEconomy {
             context_id: context_id.to_owned(),
@@ -14734,8 +14758,8 @@ impl Supervisor {
         &self,
         context_id: &str,
         invoker_did: &DID,
-        request: crate::context::outlets_helpers::OutletSettleRequest,
-    ) -> Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError> {
+        request: crate::context::shared::outlets::OutletSettleRequest,
+    ) -> Result<crate::context::shared::outlets::OutletSettleOutcome, ContextError> {
         // No-actor pre-check: the reserve→execute→settle split runs the
         // executor OFF the actor mailbox, so the owning actor can be
         // despawned (shutdown / node teardown / import replace) during
@@ -14873,7 +14897,7 @@ impl Supervisor {
                 });
             }
             let receipt =
-                match crate::context::outlets_helpers::authorize_and_capture_stream_billed(
+                match crate::context::shared::outlets::authorize_and_capture_stream_billed(
                     adapter.as_ref(),
                     &policy,
                     &invoker_did,
@@ -15055,7 +15079,7 @@ impl Supervisor {
     /// Invoke a outlet under the full economy pipeline (actor model).
     ///
     /// Orchestrates the three-phase split through
-    /// `crate::context::outlets_helpers::invoke_outlet_with_economy`: the
+    /// `crate::context::shared::outlets::invoke_outlet_with_economy`: the
     /// economy reserve (Phase 1) and settle (Phase 3) run inside the
     /// per-context actor on owned state via the
     /// [`OutletsCommand::ReserveOutletEconomy`] / [`OutletsCommand::SettleOutletEconomy`]
@@ -15078,10 +15102,10 @@ impl Supervisor {
         input: serde_json::Value,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         timeout_ms: Option<u32>,
         executor: F,
-    ) -> Result<crate::context::outlets_helpers::ManagedOutletInvocationOutput, ContextError>
+    ) -> Result<crate::context::shared::outlets::ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
@@ -15115,7 +15139,7 @@ impl Supervisor {
         // clone once for the reserve mailbox round-trip.
         let reserve_input = input.clone();
 
-        crate::context::outlets_helpers::invoke_outlet_with_economy(
+        crate::context::shared::outlets::invoke_outlet_with_economy(
             registry,
             outlet_id,
             input,
@@ -15213,7 +15237,7 @@ impl Supervisor {
             Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
         >,
         handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
@@ -15229,7 +15253,7 @@ impl Supervisor {
         let spawner = self
             .tracked_spawner("open outlet stream")
             .map_err(|refused| {
-                crate::context::outlets_helpers::reserve_error_to_open_rejection(&refused)
+                crate::context::shared::outlets::reserve_error_to_open_rejection(&refused)
             })?;
         self.open_outlet_stream_with_spawner(
             &spawner,
@@ -15276,7 +15300,7 @@ impl Supervisor {
             Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
         >,
         handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
@@ -15415,7 +15439,7 @@ impl Supervisor {
         spawner: &TrackedSpawner,
         context_id: &str,
         invoker_did: &DID,
-        caveat_binding: Option<&crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<&crate::context::outlets::invoke::InvocationCaveatBinding>,
         mut params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<OutletStreamPhase1, crate::context::outlets::invoke::OutletStreamOpenError> {
         use crate::context::outlets::dispatch;
@@ -15465,7 +15489,7 @@ impl Supervisor {
             )
             .await
             .map_err(|err| {
-                crate::context::outlets_helpers::reserve_error_to_open_rejection(&err)
+                crate::context::shared::outlets::reserve_error_to_open_rejection(&err)
             })?;
 
         // Fill the manager-debited escrow hold + the acceptance-time economic
@@ -15514,7 +15538,7 @@ impl Supervisor {
         // (both minted from the same validated UCAN), so the pump's estimate
         // coercion, `max_billable` ceiling, and counter-CAS key all agree.
         let (caveat_post_input_check, counter_reservation) = match caveat_binding {
-            Some(binding) => match crate::context::outlets_helpers::build_stream_post_input_hook(
+            Some(binding) => match crate::context::shared::outlets::build_stream_post_input_hook(
                 &binding.caveats,
                 params.cost_per_chunk,
                 Some(&counter_store),
@@ -15645,7 +15669,7 @@ impl Supervisor {
         timeout_ms: Option<u32>,
         executor: Arc<E>,
         incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
-        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
@@ -16681,7 +16705,7 @@ impl Supervisor {
         // or times out after step 4 puts back what it wrote (ADR-029
         // Implementation).
         let first_state =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &context_id)?;
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &context_id)?;
 
         // Bound the whole locked long-running region under `LIFECYCLE_TIMEOUT`,
         // exactly as the `CreateContext` / `ImportContext` / `RestoreContext`
@@ -16771,19 +16795,18 @@ impl Supervisor {
                     //     2^53 − 1, or later than this joiner's clock plus the §9.8.2
                     //     future bound (rule 9). The returned committed `T0` is the
                     //     joiner's pseudonym-rotation base and TTL base (rule 9).
-                    let committed_t0 =
-                        crate::context::lifecycle_helpers::verify_scp_context_binding(
-                            joined_group
-                                .group_context_extension()
-                                .map_err(|e| e.to_string()),
-                            &context_id,
-                            creator_did.as_ref(),
-                            &params,
-                            deps.clock.now_secs(),
-                            None,
-                            "spawn-from-Welcome",
-                        )
-                        .map_err(ContextError::CryptoFailed)?;
+                    let committed_t0 = crate::context::restored_crypto::verify_scp_context_binding(
+                        joined_group
+                            .group_context_extension()
+                            .map_err(|e| e.to_string()),
+                        &context_id,
+                        creator_did.as_ref(),
+                        &params,
+                        deps.clock.now_secs(),
+                        None,
+                        "spawn-from-Welcome",
+                    )
+                    .map_err(ContextError::CryptoFailed)?;
 
                     // 2. #2148 (ADR-049 birth-into-actor) WELCOME seam: BIRTH the
                     //    joiner's crypto as OWNED material — the joined group (moved in
@@ -16928,7 +16951,7 @@ impl Supervisor {
                     #[cfg(not(any(test, feature = "testing")))]
                     let forced_non_durable = false;
                     if forced_non_durable
-                        || !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
+                        || !crate::context::snapshot::welcome_snapshot_crypto_is_durable(
                             &state.export_crypto_state(
                                 self.export_sender_key_epochs(&context_id_bytes),
                                 self.export_recv_sequence_floors(&context_id_bytes),
@@ -16958,7 +16981,7 @@ impl Supervisor {
                     //    before the early return, dispose the seeded `state`'s crypto — the
                     //    call is equivalent to the bare drop that follows — never a live
                     //    half-keyed actor and never an orphaned/clobbered durable snapshot.
-                    if let Err(e) = crate::context::lifecycle_helpers::persist_first_state(
+                    if let Err(e) = crate::context::shared::lifecycle::persist_first_state(
                         &state,
                         &deps,
                         &context_id,
@@ -17040,7 +17063,7 @@ impl Supervisor {
         let spawn_outcome = match spawn_outcome {
             Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
                 Ok(()) => Err(e),
-                Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
+                Err(rollback) => Err(crate::context::shared::lifecycle::fold_rollback_failure(
                     &e, &rollback,
                 )),
             },
@@ -17059,7 +17082,7 @@ impl Supervisor {
         // with no explicit deadline: the actor derives the convergent expiry
         // deadline on the same creator-assigned `creation_timestamp_secs +
         // params.ttl` basis the creator used.
-        crate::context::lifecycle_helpers::SpawnedContext::at_create_base(handle)
+        crate::context::shared::lifecycle::SpawnedContext::at_create_base(handle)
             .finalize(&deps)
             .await
     }
@@ -17221,7 +17244,7 @@ impl Supervisor {
             last_seen_remote_checkpoint: std::collections::HashMap::new(),
             routing,
             // §5.12.3.1: the bundle's relays host the context (PUSH-025).
-            relay_urls: crate::context::lifecycle_helpers::normalize_relay_urls(
+            relay_urls: crate::context::shared::lifecycle::normalize_relay_urls(
                 relay_urls.to_vec(),
             ),
             send_tracker: crate::context::actor::sequence::SendSequenceTracker::new(),
@@ -17234,7 +17257,7 @@ impl Supervisor {
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                    crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
                 ),
                 // §7.3.8 value-caveat counters: a fresh joiner carries none.
                 caveat_counters: HashMap::new(),
@@ -18314,7 +18337,7 @@ impl Supervisor {
     ///   does not answer within the reply bound.
     pub async fn wake_targets(
         &self,
-    ) -> Result<Vec<crate::context::push_helpers::ContextWakeTarget>, ContextError> {
+    ) -> Result<Vec<crate::context::push_routes::ContextWakeTarget>, ContextError> {
         let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
             |ctx_id| async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -18721,7 +18744,7 @@ impl Supervisor {
     /// Returns an owned `String` (rather than `&str`) so a future variant that
     /// carries both `local_did` and `peer_did` can derive its context_id on
     /// demand via
-    /// [`crate::context::standing_helpers::generate_standing_context_id`]
+    /// [`crate::context::shared::standing::generate_standing_context_id`]
     /// and route through an already-spawned per-context actor.
     const fn standing_command_context_id(cmd: &StandingCommand) -> Option<String> {
         match cmd {
@@ -19363,7 +19386,11 @@ mod tests {
     /// bridge cannot bind a node's relay transport to it.
     #[test]
     fn transport_slot_is_absent_without_providers() {
-        assert!(Supervisor::for_query_shim().transport_slot().is_none());
+        assert!(
+            Supervisor::for_query_shim(crate::domain_handlers())
+                .transport_slot()
+                .is_none()
+        );
     }
 
     /// The escrow-reversal join log names a panic as a panic without its
@@ -19631,7 +19658,12 @@ mod tests {
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
             InMemoryStorage::new(),
         )));
-        Supervisor::new(persistence, journal, SupervisorConfig::default())
+        Supervisor::new(
+            persistence,
+            journal,
+            SupervisorConfig::default(),
+            crate::domain_handlers(),
+        )
     }
 
     #[tokio::test]
@@ -19695,7 +19727,12 @@ mod tests {
         let cfg_zero = SupervisorConfig {
             max_concurrent_outlet_stream_pumps: 0,
         };
-        let s_zero = Supervisor::new(Arc::clone(&persistence), Arc::clone(&journal), cfg_zero);
+        let s_zero = Supervisor::new(
+            Arc::clone(&persistence),
+            Arc::clone(&journal),
+            cfg_zero,
+            crate::domain_handlers(),
+        );
         assert_eq!(
             s_zero.outlet_stream_pump_semaphore().available_permits(),
             MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize,
@@ -19705,7 +19742,7 @@ mod tests {
         let cfg_huge = SupervisorConfig {
             max_concurrent_outlet_stream_pumps: MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS + 1,
         };
-        let s_huge = Supervisor::new(persistence, journal, cfg_huge);
+        let s_huge = Supervisor::new(persistence, journal, cfg_huge, crate::domain_handlers());
         assert_eq!(
             s_huge.outlet_stream_pump_semaphore().available_permits(),
             MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize,
@@ -20439,12 +20476,12 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                crate::context::push_helpers::ContextWakeTarget {
+                crate::context::push_routes::ContextWakeTarget {
                     context_id: a.clone(),
                     relay_urls: vec!["wss://relay-a.example".to_owned()],
                     routing_ids: vec![scp_protocol::context::context_routing_id(&a), [0x5A; 32]],
                 },
-                crate::context::push_helpers::ContextWakeTarget {
+                crate::context::push_routes::ContextWakeTarget {
                     context_id: b.clone(),
                     relay_urls: vec!["wss://relay-b.example".to_owned()],
                     routing_ids: vec![scp_protocol::context::context_routing_id(&b), [0x5A; 32]],
@@ -21545,6 +21582,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -21673,6 +21711,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -23453,7 +23492,7 @@ mod tests {
             "a registry floor entry exists before the explicit close"
         );
 
-        crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
+        crate::context::shared::ttl_close::finalize_close(&mut cell, &deps, &handle)
             .await
             .expect("finalize_close on a Closing context succeeds");
 
@@ -23624,7 +23663,7 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         faulty.fail_nth_store(1);
-        let checkpoint = crate::context::trust_recovery_helpers::create_governance_checkpoint(
+        let checkpoint = crate::context::shared::trust_recovery::create_governance_checkpoint(
             &mut cell,
             &deps,
             &ctx_id,
@@ -23711,6 +23750,7 @@ mod tests {
             None,
             Some(clock_dyn),
             mls_storage,
+            crate::domain_handlers(),
         );
         let deps = test_actor_deps(&sup).await;
 
@@ -23816,6 +23856,7 @@ mod tests {
     /// whole point of making reset emit a leaf).
     #[tokio::test]
     async fn retry_stamps_reset_extended_convergent_deadline() {
+        use crate::context::ttl_close_helpers::handle_ttl_expiry;
         const T0: u64 = 1_700_000_000;
         const TTL_SECS: u64 = 3_600;
         const BASE_DEADLINE: u64 = T0 + TTL_SECS;
@@ -23858,6 +23899,7 @@ mod tests {
             None,
             Some(clock_dyn),
             mls_storage,
+            crate::domain_handlers(),
         );
         let deps = test_actor_deps(&sup).await;
 
@@ -23886,22 +23928,15 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
-        let out1 =
-            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
-                .await;
+        let out1 = handle_ttl_expiry(&mut cell, &deps, &handle, 0).await;
         assert!(
             !out1.result.is_complete(),
             "first attempt's append must fail (forcing a retry): {}",
             out1.result
         );
 
-        let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
-            &mut cell,
-            &deps,
-            &handle,
-            out1.result.completed_steps(),
-        )
-        .await;
+        let out2 =
+            handle_ttl_expiry(&mut cell, &deps, &handle, out1.result.completed_steps()).await;
         assert!(
             out2.result.is_complete(),
             "retry re-appends the ContextExpired leaf ⇒ complete: {}",
@@ -24749,10 +24784,10 @@ mod tests {
         let invoker = DID("did:example:invoker".to_owned());
 
         // A settle request for a context that has no actor registered.
-        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
+        let ticket = crate::context::shared::outlets::OutletEconomyTicket::new_for_test_no_escrow(
             invoker.clone(),
         );
-        let request = crate::context::outlets_helpers::OutletSettleRequest::Rollback {
+        let request = crate::context::shared::outlets::OutletSettleRequest::Rollback {
             generation: 1,
             ticket,
         };
@@ -26165,6 +26200,7 @@ mod tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -27304,6 +27340,7 @@ mod tests {
             None,
             None,
             Arc::clone(&mls_storage),
+            crate::domain_handlers(),
         );
         (supervisor, crypto, mls_storage)
     }
@@ -27372,7 +27409,7 @@ mod tests {
     /// (`for_query_shim` path).
     #[tokio::test]
     async fn build_actor_deps_fails_when_no_providers() {
-        let supervisor = Arc::new(Supervisor::for_query_shim());
+        let supervisor = Arc::new(Supervisor::for_query_shim(crate::domain_handlers()));
         let result = supervisor
             .build_actor_deps_loaded(&DID("did:example:none".to_owned()))
             .await;
@@ -27910,6 +27947,7 @@ mod tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -28562,7 +28600,7 @@ mod tests {
         use scp_protocol::context::{ContextParams, ContextState};
 
         // `build_actor_deps` fails: no providers are attached.
-        let sup = Arc::new(Supervisor::for_query_shim());
+        let sup = Arc::new(Supervisor::for_query_shim(crate::domain_handlers()));
         let id = hex::encode([0xC1u8; 32]);
         poison_crash_window(&sup, &id);
         let (cmd, rx) = reply_order_create(
@@ -28664,7 +28702,7 @@ mod tests {
         use scp_protocol::context::ContextState;
 
         // `build_actor_deps` fails after the export verifies.
-        let sup = Arc::new(Supervisor::for_query_shim());
+        let sup = Arc::new(Supervisor::for_query_shim(crate::domain_handlers()));
         let id = hex::encode([0xC3u8; 32]);
         poison_crash_window(&sup, &id);
         let (cmd, rx) = reply_order_import(&id, "did:key:reply-order-member").await;
@@ -28903,7 +28941,7 @@ mod tests {
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
         let deps = test_actor_deps(&sup).await;
         let claim =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx_key).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx_key).unwrap();
         let handle = sup
             .spawn_actor_with_state(state, deps, None)
             .await
@@ -29153,7 +29191,7 @@ mod tests {
         );
         assert!(fresh.export_recv_sequence_floors(&ctx).is_empty());
 
-        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
             &verified_test_floors(&ctx, &blob),
@@ -29266,7 +29304,7 @@ mod tests {
 
         // Untrusted import (trusted_local=false): blob floor 2 < live floor 9 →
         // RejectRegression → Err(CryptoFailed).
-        let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        let err = crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
             &verified_test_floors(&ctx, &blob),
@@ -29347,7 +29385,7 @@ mod tests {
         // Cold restart: fresh Supervisor, EMPTY registry (local=0), trusted_local.
         let fresh = supervisor_with_providers();
         let fresh_deps = test_actor_deps(&fresh).await;
-        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
             &verified_test_floors(&ctx, &blob),
@@ -29438,7 +29476,7 @@ mod tests {
         let epoch_before = importer.export_sender_key_epochs(&ctx);
         let recv_before = importer.export_recv_sequence_floors(&ctx);
 
-        let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        let err = crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
             &verified_test_floors(&ctx, &blob),
@@ -29559,7 +29597,7 @@ mod tests {
                 &std::collections::HashSet::new(),
             ))
             .map(|dispatched| match dispatched {
-                crate::context::messaging_helpers::Dispatched::Envelope(env) => Some(*env),
+                crate::context::shared::messaging::Dispatched::Envelope(env) => Some(*env),
                 _ => None,
             })
         };
@@ -29727,7 +29765,7 @@ mod tests {
         assert!(
             matches!(
                 opened,
-                crate::context::messaging_helpers::Dispatched::Commit { .. }
+                crate::context::shared::messaging::Dispatched::Commit { .. }
             ),
             "a Commit surfaces as a processed Commit, got {opened:?}"
         );
@@ -29859,7 +29897,7 @@ mod tests {
                 &std::collections::HashSet::new(),
             ))
             .expect("a recv at the just-advanced epoch must open");
-        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+        let crate::context::shared::messaging::Dispatched::Envelope(opened) = opened else {
             panic!("an Application envelope must surface, got {opened:?}");
         };
         assert_eq!(
@@ -29949,7 +29987,7 @@ mod tests {
         assert!(
             matches!(
                 opened,
-                crate::context::messaging_helpers::Dispatched::Handled
+                crate::context::shared::messaging::Dispatched::Handled
             ),
             "a KeyResponse surfaces no envelope, got {opened:?}"
         );
@@ -29976,7 +30014,7 @@ mod tests {
         )
         .await
         .expect("the installed sender key opens alice's message");
-        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+        let crate::context::shared::messaging::Dispatched::Envelope(opened) = opened else {
             panic!("an Application envelope must surface, got {opened:?}");
         };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
@@ -30198,7 +30236,7 @@ mod tests {
             assert!(
                 matches!(
                     got,
-                    Ok(crate::context::messaging_helpers::Dispatched::Handled)
+                    Ok(crate::context::shared::messaging::Dispatched::Handled)
                 ),
                 "delivery {n} of the same distribution is handled: {got:?}"
             );
@@ -30221,7 +30259,7 @@ mod tests {
         .expect("the installed key opens alice's message");
         assert!(matches!(
             opened,
-            crate::context::messaging_helpers::Dispatched::Envelope(_)
+            crate::context::shared::messaging::Dispatched::Envelope(_)
         ));
     }
 
@@ -30290,7 +30328,7 @@ mod tests {
         .expect("the newer key stays installed");
         assert!(matches!(
             opened,
-            crate::context::messaging_helpers::Dispatched::Envelope(_)
+            crate::context::shared::messaging::Dispatched::Envelope(_)
         ));
     }
 
@@ -30319,6 +30357,7 @@ mod tests {
             None,
             mls_storage,
             crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
+            crate::domain_handlers(),
         )
     }
 
@@ -30463,7 +30502,7 @@ mod tests {
         assert!(
             !matches!(
                 opened,
-                Ok(crate::context::messaging_helpers::Dispatched::Envelope(_))
+                Ok(crate::context::shared::messaging::Dispatched::Envelope(_))
             ),
             "no rotated sender key was installed: {opened:?}"
         );
@@ -30520,7 +30559,7 @@ mod tests {
         )
         .await
         .expect("the installed sender key opens alice's message");
-        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+        let crate::context::shared::messaging::Dispatched::Envelope(opened) = opened else {
             panic!("an Application envelope must surface, got {opened:?}");
         };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
@@ -30685,6 +30724,7 @@ mod tests {
             Some(Arc::new(TestClock::new(1_700_000_000))),
             mls_storage,
             wrapping_custody,
+            crate::domain_handlers(),
         )
     }
 
@@ -30866,6 +30906,7 @@ mod tests {
             crate::crypto::wrapping::single_custody_source(Arc::new(
                 scp_platform::testing::InMemoryKeyCustody::new(),
             )),
+            crate::domain_handlers(),
         )
     }
 
@@ -31098,10 +31139,10 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_never_busy() {
-        use crate::context::governance_helpers::{
-            CommitMeta, MigrationBootstrap, execute_propose_context_migration,
-            migration_destination_id,
-        };
+        use crate::context::governance_helpers::execute_propose_context_migration;
+        use crate::context::shared::governance::CommitMeta;
+        use crate::context::shared::governance::MigrationBootstrap;
+        use crate::context::shared::governance::migration_destination_id;
 
         let sup =
             first_contact_supervisor(Box::new(FailingSnapshotWrites), durable_over_one_store());
@@ -31454,7 +31495,7 @@ mod tests {
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
 
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &created).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &created).unwrap();
         let err = Box::pin(crate::context::lifecycle_helpers::create_context(
             &deps,
             created.clone(),
@@ -31505,7 +31546,7 @@ mod tests {
         let (export, signing_key) = first_contact_export(&imported).await;
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &imported).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &imported).unwrap();
         let err = Box::pin(crate::context::lifecycle_helpers::import_context(
             &deps,
             export,
@@ -31555,7 +31596,7 @@ mod tests {
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
 
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx).unwrap();
         Box::pin(crate::context::lifecycle_helpers::create_context(
             &deps,
             ctx.clone(),
@@ -31692,7 +31733,7 @@ mod tests {
             .unwrap();
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx).unwrap();
         let err = Box::pin(crate::context::lifecycle_helpers::create_context(
             &deps,
             ctx.clone(),
@@ -31804,13 +31845,13 @@ mod tests {
         let ctx = hex::encode(ctx_bytes);
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx).unwrap();
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_bytes,
             FIRST_CONTACT_NOW,
             identity.clone(),
         );
-        crate::context::lifecycle_helpers::persist_first_state(&state, &deps, &ctx, &guard)
+        crate::context::shared::lifecycle::persist_first_state(&state, &deps, &ctx, &guard)
             .await
             .unwrap();
         assert!(
@@ -31901,7 +31942,7 @@ mod tests {
         let ctx = hex::encode(ctx_bytes);
         let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
         let guard =
-            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx).unwrap();
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_bytes,
             FIRST_CONTACT_NOW,
@@ -31911,7 +31952,7 @@ mod tests {
         // task keeps waiting on the hung snapshot write.
         let abandoned = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            crate::context::lifecycle_helpers::persist_first_state(&state, &deps, &ctx, &guard),
+            crate::context::shared::lifecycle::persist_first_state(&state, &deps, &ctx, &guard),
         )
         .await;
         assert!(abandoned.is_err(), "the snapshot write hangs");
@@ -32543,7 +32584,7 @@ mod tests {
                 .expect("encrypted context");
             self.rt
                 .block_on(
-                    crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                    crate::context::shared::messaging::build_encrypted_envelope_actor(
                         &clock,
                         crypto,
                         Self::ALICE,
@@ -32577,7 +32618,7 @@ mod tests {
                 crate::crypto::mls::two_party_test_support::alice_signing_key(),
             );
             self.rt
-                .block_on(crate::context::messaging_helpers::build_inner_wire(
+                .block_on(crate::context::shared::messaging::build_inner_wire(
                     &clock,
                     ctx_str,
                     &DID::from(Self::ALICE),
@@ -32611,7 +32652,7 @@ mod tests {
         /// and that Bob's recv floor did not move.
         fn assert_integrity_rejection(
             &self,
-            result: &Result<crate::context::messaging_helpers::DeliverOutcome, ContextError>,
+            result: &Result<crate::context::actor::commands::DeliverOutcome, ContextError>,
         ) {
             assert!(
                 matches!(result, Err(ContextError::CryptoFailed(m)) if m == "content integrity check failed"),
@@ -32631,7 +32672,7 @@ mod tests {
             &mut self,
             ctx_str: &str,
             blob: Vec<u8>,
-        ) -> Result<crate::context::messaging_helpers::DeliverOutcome, ContextError> {
+        ) -> Result<crate::context::actor::commands::DeliverOutcome, ContextError> {
             use crate::context::actor::commands::MessagingCommand;
             self.rt.block_on(async {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -32751,7 +32792,7 @@ mod tests {
         assert!(
             matches!(
                 &accepted,
-                crate::context::messaging_helpers::DeliverOutcome::Application((pt, sender))
+                crate::context::actor::commands::DeliverOutcome::Application((pt, sender))
                     if pt.as_slice() == b"genuine at (1, 1)" && sender == DeliverFixture::ALICE
             ),
             "the genuine envelope must surface as Alice's application message, got {accepted:?}"
@@ -33236,7 +33277,7 @@ mod tests {
             ))
             .expect("a well-formed request is accepted on the receive path");
         assert!(
-            matches!(ok, crate::context::messaging_helpers::Dispatched::Handled),
+            matches!(ok, crate::context::shared::messaging::Dispatched::Handled),
             "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
         );
         assert_eq!(
@@ -33863,7 +33904,7 @@ mod tests {
                 .to_owned(),
         );
         let peer = DID("did:example:peer-revive-after-failed-respawn".to_owned());
-        let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
+        let ctx_key = crate::context::shared::standing::generate_standing_context_id(&local, &peer);
 
         // Empty persistence: the respawn fails, recording one crash and
         // `last_respawn_failed` without poisoning (1 < threshold).
@@ -33936,7 +33977,7 @@ mod tests {
 
         // Past a failed respawn below the poison threshold.
         let peer = DID("did:example:peer-failed-recreate-respawn".to_owned());
-        let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
+        let ctx_key = crate::context::shared::standing::generate_standing_context_id(&local, &peer);
         let respawn = sup.respawn_from_snapshot(&ctx_key, &local).await;
         assert!(matches!(respawn, Err(ContextError::ActorCrashed(_))));
         let failed = sup.standing_context(&local, &peer, Vec::new()).await;
@@ -33963,7 +34004,7 @@ mod tests {
 
         // Poisoned.
         let peer = DID("did:example:peer-failed-recreate-poisoned".to_owned());
-        let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
+        let ctx_key = crate::context::shared::standing::generate_standing_context_id(&local, &peer);
         {
             let mut entry = sup.crash_windows.entry(ctx_key.clone()).or_default();
             for _ in 0..CRASH_POISON_THRESHOLD {
@@ -34046,7 +34087,7 @@ mod tests {
             supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
         let local = DID("did:example:local".to_owned());
         let peer = DID("did:example:peer".to_owned());
-        let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
+        let ctx_key = crate::context::shared::standing::generate_standing_context_id(&local, &peer);
 
         // A registered actor no task drains: the checked read answers
         // `ActorBusy`, and the get-or-create returns it.
@@ -34818,7 +34859,7 @@ mod tests {
             &ctx_key,
             &target,
             scp_protocol::context::governance::AccessScope::Both,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [1u8; 32],
                 actor_did: admin.as_ref(),
                 timestamp_secs: 1_700_000_000,
@@ -35095,7 +35136,7 @@ mod tests {
         // Using this builder (not `snapshot_context`) is deliberate: it is the
         // Class-S persist path, so a field that this builder drops is exactly
         // the regression the test must catch.
-        let snap = crate::context::messaging_helpers::build_snapshot_from_state(&state);
+        let snap = crate::context::snapshot::build_snapshot_from_state(&state);
         let json = serde_json::to_vec(&snap).expect("snapshot serializes");
         let restored: crate::context::state::ContextSnapshot =
             serde_json::from_slice(&json).expect("snapshot deserializes");
@@ -35264,7 +35305,7 @@ mod tests {
         // calls before its reply.
         state.membership.remove_member(&removed);
         state.role_state.members.remove(removed.as_ref());
-        crate::context::messaging_helpers::persist_state_best_effort(&state, &deps, &ctx_key).await;
+        crate::context::snapshot::persist_state_best_effort(&state, &deps, &ctx_key).await;
 
         let handle = sup
             .spawn_actor_with_state(state, deps, None)
@@ -35346,7 +35387,7 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+        crate::context::snapshot::persist_state_fail_closed(&state, &deps, &ctx_key)
             .await
             .expect("fail-closed persist of the consumed nonce must succeed");
 
@@ -35732,7 +35773,7 @@ mod tests {
         state.access.read_exclusion_list.insert(requester.clone());
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
-        let decision = crate::context::broadcast_helpers::handle_broadcast_key_request(
+        let decision = crate::context::shared::broadcast::handle_broadcast_key_request(
             &mut cell,
             &deps,
             &author,
@@ -35931,7 +35972,7 @@ mod tests {
             &ctx_key,
             &banned,
             scp_protocol::context::governance::AccessScope::Read,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [2u8; 32],
                 actor_did: author.as_ref(),
                 timestamp_secs: 1_700_000_000,
@@ -36032,7 +36073,7 @@ mod tests {
             &ctx_key,
             &banned,
             scp_protocol::context::governance::AccessScope::Read,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [3u8; 32],
                 actor_did: author.as_ref(),
                 timestamp_secs: 1_700_000_000,
@@ -36044,7 +36085,7 @@ mod tests {
 
         // ONE round-trip through the EXACT production sync-persist builder carries
         // BOTH the exclusion set and the epoch advance.
-        let snap = crate::context::messaging_helpers::build_snapshot_from_state(&state);
+        let snap = crate::context::snapshot::build_snapshot_from_state(&state);
         let json = serde_json::to_vec(&snap).expect("snapshot serializes");
         let restored: crate::context::state::ContextSnapshot =
             serde_json::from_slice(&json).expect("snapshot deserializes");
@@ -36111,7 +36152,7 @@ mod tests {
             &ctx_key,
             &banned,
             scp_protocol::context::governance::AccessScope::Read,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [5u8; 32],
                 actor_did: author.as_ref(),
                 timestamp_secs: 1_700_000_000,
@@ -36163,7 +36204,7 @@ mod tests {
             &control_ctx_key,
             &banned,
             scp_protocol::context::governance::AccessScope::Read,
-            crate::context::governance_helpers::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [6u8; 32],
                 actor_did: author.as_ref(),
                 timestamp_secs: 1_700_000_000,
@@ -36317,7 +36358,7 @@ mod tests {
             .executed_proposals
             .insert(executed_id, 1_700_000_000);
         let deps = test_actor_deps(&sup).await;
-        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+        crate::context::snapshot::persist_state_fail_closed(&state, &deps, &ctx_key)
             .await
             .expect("fail-closed persist of executed proposal must succeed");
 
@@ -36382,7 +36423,7 @@ mod tests {
             .revoked_spending_ucan_cids
             .insert(revoked_cid.clone());
         let deps = test_actor_deps(&sup).await;
-        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+        crate::context::snapshot::persist_state_fail_closed(&state, &deps, &ctx_key)
             .await
             .expect("fail-closed persist of revocation must succeed");
 
@@ -36543,7 +36584,7 @@ mod tests {
         // production arm performs) and sync-persist via the SAME fail-closed
         // primitive that arm now calls before its reply.
         state.role_state.suspend_all(target.as_ref());
-        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+        crate::context::snapshot::persist_state_fail_closed(&state, &deps, &ctx_key)
             .await
             .expect("fail-closed persist of the suspend_all transition must succeed");
 
@@ -36621,7 +36662,7 @@ mod tests {
             .class_s
             .executed_proposals
             .insert(proposal_id, 1_700_000_000);
-        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+        crate::context::snapshot::persist_state_fail_closed(&state, &deps, &ctx_key)
             .await
             .expect("fail-closed persist of the executed-proposals marker must succeed");
 
@@ -36853,6 +36894,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -36961,6 +37003,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -37237,6 +37280,7 @@ mod tests {
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
             wrapping_custody,
+            crate::domain_handlers(),
         )
     }
 
@@ -39291,7 +39335,12 @@ mod tests {
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let persistence: Arc<dyn ContextPersistence> =
             Arc::new(crate::context::persistence::NoOpContextPersistence);
-        let supervisor = Supervisor::new(persistence, journal, SupervisorConfig::default());
+        let supervisor = Supervisor::new(
+            persistence,
+            journal,
+            SupervisorConfig::default(),
+            crate::domain_handlers(),
+        );
 
         let saga_id = SagaId("saga-durable-repair".to_owned());
         let unreachable_hex = hex::encode([0x9Au8; 32]);
@@ -39342,7 +39391,12 @@ mod tests {
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let persistence2: Arc<dyn ContextPersistence> =
             Arc::new(crate::context::persistence::NoOpContextPersistence);
-        let restarted = Supervisor::new(persistence2, journal2, SupervisorConfig::default());
+        let restarted = Supervisor::new(
+            persistence2,
+            journal2,
+            SupervisorConfig::default(),
+            crate::domain_handlers(),
+        );
         assert!(
             restarted.saga_repair_records_for(&saga_id).is_empty(),
             "a fresh supervisor starts with an empty in-memory repair cache"
@@ -39371,7 +39425,7 @@ mod tests {
     /// reservation semantics" — the two release differently).
     #[tokio::test]
     async fn xctx_needs_repair_releases_concurrency_slot() {
-        let supervisor = Arc::new(Supervisor::for_query_shim());
+        let supervisor = Arc::new(Supervisor::for_query_shim(crate::domain_handlers()));
         let ctx_id = [0x77u8; 32];
 
         // Drive a saga to NeedsRepair (commit-retry exhaustion).
@@ -39556,6 +39610,7 @@ mod tests {
             crate::crypto::wrapping::single_custody_source(Arc::new(
                 scp_platform::testing::InMemoryKeyCustody::new(),
             )),
+            crate::domain_handlers(),
         );
         (supervisor, journal)
     }
@@ -40638,6 +40693,7 @@ mod tests {
             crate::crypto::wrapping::single_custody_source(Arc::new(
                 scp_platform::testing::InMemoryKeyCustody::new(),
             )),
+            crate::domain_handlers(),
         );
         let caller_did = "did:dht:z6MkXctxWave8Caller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -40881,6 +40937,7 @@ mod tests {
             crate::crypto::wrapping::single_custody_source(Arc::new(
                 scp_platform::testing::InMemoryKeyCustody::new(),
             )),
+            crate::domain_handlers(),
         );
         (supervisor, persistence)
     }
@@ -42129,7 +42186,7 @@ mod tests {
         // difference from voiding is documented + asserted by the no-panic drop:
         // had the carrier been dropped WITHOUT being consumed, the debug-assert
         // in `OutletEconomyTicket::drop` would fire.
-        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
+        let ticket = crate::context::shared::outlets::OutletEconomyTicket::new_for_test_no_escrow(
             DID("did:dht:z6MkHoldRepair".to_owned()),
         );
         ticket.hold_external_for_repair();
@@ -42193,6 +42250,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -42249,10 +42307,10 @@ mod tests {
             },
             evaluated_cost: Amount(50),
         };
-        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_with_escrow(
+        let ticket = crate::context::shared::outlets::OutletEconomyTicket::new_for_test_with_escrow(
             invoker, escrow, policy,
         );
-        let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
+        let reservation = crate::context::shared::outlets::OutletEconomyReservation {
             handle,
             role_state,
             generation: 1,
@@ -42348,8 +42406,8 @@ mod tests {
         )
         .unwrap();
         let ticket =
-            crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(invoker);
-        let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
+            crate::context::shared::outlets::OutletEconomyTicket::new_for_test_no_escrow(invoker);
+        let reservation = crate::context::shared::outlets::OutletEconomyReservation {
             handle,
             role_state,
             generation: 1,
@@ -42473,10 +42531,10 @@ mod open_outlet_stream_tests {
     use super::Supervisor;
     use crate::context::actor::state::PerContextState;
     use crate::context::outlets::dispatch::{CancelIdentity, OpenStreamParams};
+    use crate::context::outlets::invoke::InvocationCaveatBinding;
     use crate::context::outlets::invoke::{MutableInvocation, OutletExecutor, OutletExecutorError};
     use crate::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
     use crate::context::outlets::stream::{AdmissionCaps, StreamIdentity};
-    use crate::context::outlets_helpers::InvocationCaveatBinding;
     use crate::economy::adapter::{CountingPaymentAdapter, PaymentAdapterDyn};
 
     const NOW: u64 = 1_700_000_000;
@@ -42550,6 +42608,7 @@ mod open_outlet_stream_tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 
@@ -43548,7 +43607,7 @@ mod open_outlet_stream_tests {
     ) -> (
         crate::context::outlets::dispatch::OpenStreamParams,
         scp_protocol::context::outlets::stream::OutletStreamOpen,
-        crate::context::outlets_helpers::InvocationCaveatBinding,
+        crate::context::outlets::invoke::InvocationCaveatBinding,
     ) {
         let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
         let caveats_binding = compute_caveats_binding(
@@ -43608,7 +43667,7 @@ mod open_outlet_stream_tests {
             session_id: None,
             timeout_ms: 5_000,
         };
-        let binding = crate::context::outlets_helpers::InvocationCaveatBinding {
+        let binding = crate::context::outlets::invoke::InvocationCaveatBinding {
             caveats,
             ucan_cid: UCAN_CID.to_owned(),
         };
@@ -44011,12 +44070,12 @@ mod streaming_saga_tests {
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::outlets::dispatch::OpenStreamParams;
+    use crate::context::outlets::invoke::InvocationCaveatBinding;
     use crate::context::outlets::invoke::{
         EconomicPolicySnapshot, MutableInvocation, OutletExecutor, OutletExecutorError,
     };
     use crate::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
     use crate::context::outlets::stream::{AdmissionCaps, StreamIdentity};
-    use crate::context::outlets_helpers::InvocationCaveatBinding;
     use crate::context::supervisor::saga_journal::{
         ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
     };
@@ -44253,6 +44312,7 @@ mod streaming_saga_tests {
             crate::crypto::wrapping::single_custody_source(Arc::new(
                 scp_platform::testing::InMemoryKeyCustody::new(),
             )),
+            crate::domain_handlers(),
         )
     }
 

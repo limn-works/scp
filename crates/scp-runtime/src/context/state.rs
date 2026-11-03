@@ -1037,7 +1037,7 @@ pub struct ContextSnapshot {
     /// The relay endpoints that host this context (§5.12.3.1), copied from
     /// [`PerContextState::relay_urls`](crate::context::actor::state::PerContextState::relay_urls).
     /// Restore and import install this set through
-    /// `lifecycle_helpers::normalize_relay_urls` (PUSH-025). No serde
+    /// `crate::context::shared::lifecycle::normalize_relay_urls` (PUSH-025). No serde
     /// default: a snapshot without the field fails to decode rather than
     /// restoring a context that silently lost its relays.
     pub relay_urls: Vec<String>,
@@ -1053,7 +1053,7 @@ pub struct ContextSnapshot {
     /// [`PerContextState::saga_pending`](crate::context::actor::state::PerContextState::saga_pending),
     /// a `HashMap<SagaId, SagaPreparedState>`. Each Prepare/Commit/Abort
     /// transition persists the snapshot containing this map SYNCHRONOUSLY —
-    /// via [`persist_state_fail_closed`](crate::context::messaging_helpers::persist_state_fail_closed)
+    /// via [`persist_state_fail_closed`](crate::context::snapshot::persist_state_fail_closed)
     /// — BEFORE the phase reply is acked, and a persist FAILURE FAILS CLOSED
     /// (the handler returns `Err`, never a best-effort `Ok`). Without this, a
     /// crash between Prepare and Commit would leave the supervisor
@@ -1069,7 +1069,7 @@ pub struct ContextSnapshot {
     /// sanctioned public-projection mirror
     /// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
     /// instead, populated through the shared
-    /// [`saga_pending_snapshot`](crate::context::messaging_helpers::saga_pending_snapshot)
+    /// [`saga_pending_snapshot`](crate::context::snapshot::saga_pending_snapshot)
     /// helper at every snapshot builder.
     ///
     /// # Local-only coordination state
@@ -1363,7 +1363,7 @@ pub struct VelocityTrackerSnapshot {
 /// field of this type while the handler-body migration is under way.
 /// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
-pub(crate) struct GovernanceState {
+pub struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
     pub(crate) engine: Box<dyn GovernanceEngine>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
@@ -1452,7 +1452,7 @@ pub(crate) struct GovernanceState {
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
-    /// [`ContextRevocationChecker`](crate::context::economy_logic::ContextRevocationChecker) adapter when validating
+    /// [`ContextRevocationChecker`](crate::context::shared::economy::ContextRevocationChecker) adapter when validating
     /// spending UCANs through the full cryptographic pipeline. Currently
     /// empty in steady state — spending UCAN revocation lists have not been
     /// wired through governance — but the field exists so the only change
@@ -1636,7 +1636,7 @@ impl GovernanceState {
 /// field of this type while the handler-body migration is under way.
 /// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
-pub(crate) struct EpochState {
+pub struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
     /// `Revoke`, `ResetMember`). Used to populate
@@ -2248,9 +2248,7 @@ pub(crate) fn fresh_governance_state(
         },
         outlet_interfaces: Vec::new(),
         pruning_policy: None,
-        message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
-            params.economic_policy.as_ref(),
-        ),
+        message_pricing: derive_message_pricing(params.economic_policy.as_ref()),
         hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
             scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
         ),
@@ -2592,6 +2590,25 @@ pub fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
         }
     }
     scp_protocol::context::context_id_bytes(context_id)
+}
+
+/// Returns the spec §19.7 default per-DID message pricing configuration.
+///
+/// Every context now uses the same baseline: per-DID escalating cost for
+/// `MessageSend`, `ContextJoin`, and `OutletInvoke`, plus the Matrix-style
+/// hard rate limit. The `_economic_policy` parameter is intentionally
+/// unused — it is kept in the signature so call-sites stay symmetrical
+/// with the old `derive_relay_pricing_config` while documenting that
+/// pricing is uniform across all contexts. Per-context pricing
+/// customization will land via governance in a follow-up PR.
+#[allow(clippy::unnecessary_wraps)]
+// Option return kept for forward compat
+// with per-context pricing customization landing via governance.
+#[must_use]
+pub fn derive_message_pricing(
+    _economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+) -> Option<scp_protocol::economy::antispam::ContextMessagePricingConfig> {
+    Some(scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default())
 }
 
 #[cfg(test)]

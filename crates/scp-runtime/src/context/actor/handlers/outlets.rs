@@ -14,7 +14,7 @@
 //! pipeline's non-`Send` executor runs supervisor-side between the
 //! [`OutletsCommand::ReserveOutletEconomy`] and [`OutletsCommand::SettleOutletEconomy`]
 //! mailbox round-trips (see
-//! [`crate::context::outlets_helpers::invoke_outlet_with_economy`]).
+//! [`crate::context::shared::outlets::invoke_outlet_with_economy`]).
 //!
 //! The cross-context outlet invocation saga (§6.2.4) is produced directly by
 //! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga) — it does not
@@ -30,8 +30,6 @@
 //! mailbox commands (which run on owned state) while the executor itself
 //! runs supervisor-side between the two round-trips.
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -39,9 +37,7 @@ use crate::context::actor::commands::OutletsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 
-/// Per-call transport budget for outlets handlers. Plan §"Transport
-/// timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`OutletsCommand`] against actor-owned state and
 /// capability-reduced dependencies.
@@ -457,11 +453,11 @@ async fn handle_reserve_outlet_economy(
     context_id: &str,
     invoker_did: &scp_did::DID,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-    caveat_binding: Option<&crate::context::outlets_helpers::InvocationCaveatBinding>,
+    caveat_binding: Option<&crate::context::outlets::invoke::InvocationCaveatBinding>,
     input: &serde_json::Value,
     now_secs: u64,
     reply: oneshot::Sender<
-        Result<Box<crate::context::outlets_helpers::OutletEconomyReservation>, ContextError>,
+        Result<Box<crate::context::shared::outlets::OutletEconomyReservation>, ContextError>,
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::outlets_helpers::reserve_outlet_economy(
@@ -502,7 +498,7 @@ async fn handle_reserve_outlet_economy(
 /// open-time economy reserve. Delegates to
 /// [`outlets_helpers::reserve_outlet_stream_economy`](crate::context::outlets_helpers::reserve_outlet_stream_economy)
 /// on owned state under a 30s timeout. On success replies with the `Send`
-/// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+/// [`StreamEconomyReservation`](crate::context::shared::outlets::StreamEconomyReservation)
 /// the supervisor carries across the off-mailbox pump.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_outlet_stream_economy(
@@ -515,7 +511,7 @@ async fn handle_reserve_outlet_stream_economy(
     max_per_action: Option<scp_protocol::economy::types::Amount>,
     now_secs: u64,
     reply: oneshot::Sender<
-        Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+        Result<Box<crate::context::shared::outlets::StreamEconomyReservation>, ContextError>,
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::outlets_helpers::reserve_outlet_stream_economy(
@@ -898,9 +894,9 @@ async fn handle_settle_outlet_economy(
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_did::DID,
-    request: crate::context::outlets_helpers::OutletSettleRequest,
+    request: crate::context::shared::outlets::OutletSettleRequest,
     reply: oneshot::Sender<
-        Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+        Result<crate::context::shared::outlets::OutletSettleOutcome, ContextError>,
     >,
 ) -> Outcome<()> {
     let settle_fut = crate::context::outlets_helpers::settle_outlet_economy(
@@ -928,4 +924,72 @@ async fn handle_settle_outlet_economy(
 
     let _ = reply.send(reply_result);
     outcome
+}
+
+/// The outlets domain's [`OutletsDomain`](crate::context::domains::OutletsDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Outlets;
+
+#[async_trait::async_trait]
+impl crate::context::domains::OutletsDomain for Outlets {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::OutletsCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn reserve_outlet_economy(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        reserve: crate::context::domains::ReserveOutletEconomyRequest<'_>,
+    ) -> Result<
+        crate::context::shared::outlets::OutletEconomyReservation,
+        scp_protocol::context::ContextError,
+    > {
+        crate::context::outlets_helpers::reserve_outlet_economy(
+            cell,
+            deps,
+            reserve.context_id,
+            reserve.invoker_did,
+            reserve.spending_ucan,
+            reserve.caveat_binding,
+            reserve.input,
+            reserve.now_secs,
+        )
+        .await
+    }
+
+    async fn reverse_caller_reservation_record(
+        &self,
+        view: crate::context::actor::class_s::ClassCMut<'_>,
+        deps: &crate::context::actor::deps::ActorDeps,
+        record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    ) -> bool {
+        crate::context::outlets_helpers::reverse_caller_reservation_record(view, deps, record).await
+    }
+
+    async fn settle_outlet_economy(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        invoker_did: &scp_did::DID,
+        request: crate::context::shared::outlets::OutletSettleRequest,
+    ) -> Result<
+        crate::context::shared::outlets::OutletSettleOutcome,
+        scp_protocol::context::ContextError,
+    > {
+        crate::context::outlets_helpers::settle_outlet_economy(
+            cell,
+            deps,
+            context_id,
+            invoker_did,
+            request,
+        )
+        .await
+    }
 }

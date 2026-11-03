@@ -76,34 +76,20 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
-use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
-use crate::context::messaging_helpers::{
-    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
-};
-use crate::context::outlets_helpers::reserve_outlet_economy;
+
+use crate::context::shared::economy::ContextRevocationChecker;
+use crate::context::shared::economy::KeyResolverDidResolver;
+
+use crate::context::shared::outlets::OutletSettleRequest;
+use crate::context::snapshot::build_snapshot_for_persist;
+use crate::context::snapshot::persist_snapshot_fail_closed;
+use crate::context::snapshot::persist_state_best_effort;
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
     CommittedOutletInvocation, CommittedStreamingOutletInvocation,
     CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
     SagaPreparedState,
 };
-
-/// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
-/// ([`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup)).
-///
-/// Set to **strictly more than** the §9.14 clock-skew tolerance the Prepare-B
-/// freshness check applies (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) — here exactly
-/// twice it. The two windows must NOT be coterminous: were the dedup TTL equal
-/// to the skew tolerance, a `nonce` recorded at the trailing edge of its
-/// freshness window could expire from the dedup cache while a replay carrying a
-/// *refreshed* `asserted_timestamp_ms` is still inside the freshness window —
-/// slipping past both gates (BLACK-XCTX-01). With the TTL strictly exceeding
-/// the skew tolerance, any envelope that passes the freshness check has its
-/// `nonce` still remembered by the dedup cache, closing the coterminous-window
-/// gap for the in-window case. See the *Freshness / anti-replay* clause of
-/// spec §6.2.4 for the forward obligation this leaves for an untrusted
-/// cross-node transport.
-pub(crate) const SAGA_NONCE_DEDUP_TTL_SECS: u64 = DEFAULT_CLOCK_SKEW_TOLERANCE_SECS * 2;
 
 /// Runtime configuration ceiling for an interface's inbound §6.2.0.2 rate
 /// (`InboundPolicy::max_calls_per_minute`) — the highest inbound rate B will
@@ -563,7 +549,7 @@ fn misrouted<T>(
 /// [`reserve_outlet_economy`] derives it from the caller context's economy policy
 /// / outlet registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
-/// The resulting `Send` [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation) is a `#[must_use]` RAII
+/// The resulting `Send` [`OutletEconomyReservation`](crate::context::shared::outlets::OutletEconomyReservation) is a `#[must_use]` RAII
 /// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
 /// terminal non-commit path. The staged saga state is Class-S sync-persisted
 /// fail-closed BEFORE the reply, so a crash in the coalesce window cannot
@@ -671,17 +657,22 @@ async fn prepare_a(
     // invocation. The cross-context saga Prepare-A leg is a later slice, so no
     // caveat binding is threaded here and the input is not schema-checked
     // against a caveat (`Null`); the counter gate stays inert.
-    let reservation = match reserve_outlet_economy(
-        cell,
-        deps,
-        &context_id_hex,
-        caller_did,
-        None,
-        None,
-        &serde_json::Value::Null,
-        now_secs,
-    )
-    .await
+    let reservation = match deps
+        .domains
+        .outlets
+        .reserve_outlet_economy(
+            cell,
+            deps,
+            crate::context::domains::ReserveOutletEconomyRequest {
+                context_id: &context_id_hex,
+                invoker_did: caller_did,
+                spending_ucan: None,
+                caveat_binding: None,
+                input: &serde_json::Value::Null,
+                now_secs,
+            },
+        )
+        .await
     {
         Ok(reservation) => reservation,
         Err(err) => {
@@ -762,7 +753,7 @@ async fn prepare_a(
         // (non-persisting — the combinator above already persisted the Class-S
         // restore; this reversal rides the run-loop coalesce, matching the prior
         // inline no-extra-persist behaviour).
-        crate::context::outlets_helpers::rollback_outlet_economy(
+        crate::context::shared::outlets::rollback_outlet_economy(
             cell.class_c_view(),
             deps,
             reservation.ticket,
@@ -3027,8 +3018,6 @@ async fn commit_a(
     req: CommitARequest,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::outlets_helpers::{OutletSettleRequest, settle_outlet_economy};
-
     let caller_hex = hex_context_id(&req.caller_context_id);
 
     // Idempotency: a prior Commit-A already recorded this saga. Re-ack as a
@@ -3046,7 +3035,7 @@ async fn commit_a(
         // corrupt the WRONG context. On a mismatch the helper voids only the
         // external escrow and consumes the ticket (mirrors `settle_outlet_economy`).
         let class_c_economy_reversed =
-            crate::context::outlets_helpers::rollback_outlet_economy_generation_checked(
+            crate::context::shared::outlets::rollback_outlet_economy_generation_checked(
                 cell.class_c_view(),
                 deps,
                 req.reservation.reservation.generation,
@@ -3096,8 +3085,10 @@ async fn commit_a(
         generation: req.reservation.reservation.generation,
         ticket: req.reservation.reservation.ticket,
     };
-    if let Err(err) =
-        settle_outlet_economy(cell, deps, &caller_hex, &req.caller_did, settle_request).await
+    let outlets = &deps.domains.outlets;
+    if let Err(err) = outlets
+        .settle_outlet_economy(cell, deps, &caller_hex, &req.caller_did, settle_request)
+        .await
     {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -3370,7 +3361,7 @@ async fn abort(
     let (local_rollback_ran, had_caller_record_consumed) = match reservation {
         Some(prepared) => {
             let carrier_ran =
-                crate::context::outlets_helpers::rollback_outlet_economy_generation_checked(
+                crate::context::shared::outlets::rollback_outlet_economy_generation_checked(
                     cell.class_c_view(),
                     deps,
                     prepared.reservation.generation,
@@ -3392,12 +3383,10 @@ async fn abort(
             let local_ran = if carrier_ran {
                 true
             } else if let Some(ref record) = record {
-                crate::context::outlets_helpers::reverse_caller_reservation_record(
-                    cell.class_c_view(),
-                    deps,
-                    record,
-                )
-                .await
+                deps.domains
+                    .outlets
+                    .reverse_caller_reservation_record(cell.class_c_view(), deps, record)
+                    .await
             } else {
                 // No record to reverse from (e.g. a generation-mismatch carrier
                 // for a saga whose record was already drained). Nothing local ran.
@@ -3426,12 +3415,11 @@ async fn abort(
             // Class-S removal is hoisted into the combinator `f` below.
             match cell.class_s.xctx_caller_reservations.get(saga_id).cloned() {
                 Some(record) => {
-                    let ran = crate::context::outlets_helpers::reverse_caller_reservation_record(
-                        cell.class_c_view(),
-                        deps,
-                        &record,
-                    )
-                    .await;
+                    let ran = deps
+                        .domains
+                        .outlets
+                        .reverse_caller_reservation_record(cell.class_c_view(), deps, &record)
+                        .await;
                     (ran, true)
                 }
                 None => (false, false),
@@ -3645,6 +3633,22 @@ fn hex_output_hash(output_bytes: &[u8]) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The saga domain's [`SagaDomain`](crate::context::domains::SagaDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Saga;
+
+#[async_trait::async_trait]
+impl crate::context::domains::SagaDomain for Saga {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::SagaPhaseMessage,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -3784,7 +3788,8 @@ mod tests {
         // per-minute ceiling is correspondingly lower.
         const {
             assert!(
-                SAGA_NONCE_DEDUP_TTL_SECS > DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS
+                    > DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 "the saga dedup TTL must strictly exceed the freshness skew tolerance \
                  so an in-window envelope's nonce is always still remembered"
             );
@@ -3792,7 +3797,7 @@ mod tests {
 
         // Distinct nonces a caller can land within one TTL window at a given
         // per-minute accept ceiling.
-        let window_minutes = SAGA_NONCE_DEDUP_TTL_SECS / 60;
+        let window_minutes = crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS / 60;
         assert_eq!(
             window_minutes, 10,
             "saga dedup TTL window is 10 minutes (600s)"
@@ -3830,7 +3835,7 @@ mod tests {
         let st = target_state(0x5B, OTHER, CALLER).await;
         assert_eq!(
             st.class_s.xctx_nonce_dedup.ttl_secs(),
-            SAGA_NONCE_DEDUP_TTL_SECS,
+            crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             "the test fixture must seed the production saga dedup TTL, not NonceDedup::new()'s \
              default (which is coterminous with the skew tolerance)"
         );
@@ -4170,6 +4175,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -4216,6 +4222,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -4381,7 +4388,7 @@ mod tests {
         // §6.2.4 "Reservation release on every terminal path") by rolling the
         // reservation back — dropping a live OutletEconomyTicket is a balance-
         // invariant violation by design.
-        crate::context::outlets_helpers::rollback_outlet_economy(
+        crate::context::shared::outlets::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -4555,7 +4562,7 @@ mod tests {
              with no policy that is 0, so the budget must be untouched"
         );
 
-        crate::context::outlets_helpers::rollback_outlet_economy(
+        crate::context::shared::outlets::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -5131,7 +5138,7 @@ mod tests {
 
         // Project the live state to its Class-S snapshot — the persisted form a
         // restore rehydrates from. The nonce-dedup cache must be carried.
-        let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(&st_cell);
+        let snapshot = crate::context::snapshot::build_snapshot_from_state(&st_cell);
         assert!(
             snapshot.xctx_nonce_dedup.contains_key(&replay_nonce),
             "the nonce-dedup cache MUST be in the Class-S snapshot (crash-surviving)"
@@ -5145,7 +5152,7 @@ mod tests {
         restored.class_s.xctx_nonce_dedup =
             scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 snapshot.xctx_nonce_dedup,
-                SAGA_NONCE_DEDUP_TTL_SECS,
+                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             );
 
         // Re-submit the SAME envelope under a FRESH SagaId after the "crash".
@@ -5211,7 +5218,7 @@ mod tests {
         // Project the live state to its Class-S snapshot — the persisted form a
         // restore rehydrates from. The record MUST be carried (through the shared
         // snapshot helper).
-        let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(&st_cell);
+        let snapshot = crate::context::snapshot::build_snapshot_from_state(&st_cell);
         assert_eq!(
             snapshot.xctx_caller_reservations.get(&saga),
             Some(&staged),
@@ -5917,7 +5924,7 @@ mod tests {
     /// back locally as before.
     #[tokio::test]
     async fn rollback_generation_checked_voids_external_not_local_on_mismatch() {
-        use crate::context::outlets_helpers::rollback_outlet_economy_generation_checked;
+        use crate::context::shared::outlets::rollback_outlet_economy_generation_checked;
 
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0xD1, OTHER, CALLER).await;
@@ -6522,6 +6529,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor

@@ -73,6 +73,11 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// budgets it backstops.
 pub const REPLY_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// Per-call transport budget inside an actor handler (plan §"Transport
+/// timeouts inside actor handlers"): 30 seconds. Every domain handler bounds
+/// its relay and event-log I/O with this one constant.
+pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Bounded reply-await mechanics
 // ---------------------------------------------------------------------------

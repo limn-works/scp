@@ -178,6 +178,7 @@ async fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     )
 }
 
@@ -280,6 +281,7 @@ fn participation_record_empty_log_errors() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
     // No log for this context → empty event set → core returns EmptyEventLog,
     // surfaced as the DEDICATED, machine-detectable `NoParticipationFacts`
@@ -366,6 +368,7 @@ async fn participation_record_is_context_isolated() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
 
     // A sees ONLY A's single role assignment and none of B's activity.
@@ -470,6 +473,7 @@ fn participation_record_fails_closed_on_root_error_with_events() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
 
     let err = supervisor
