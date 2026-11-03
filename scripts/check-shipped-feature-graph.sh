@@ -383,9 +383,10 @@ EOF
 #   - FFI bridges (scp-ffi / -napi / -uniffi): built `--no-default-features
 #     --features server` — their production bridge configuration.
 #   - Binaries (scp-node / scp-relay): built with DEFAULT features, so the
-#     feature-arg string is EMPTY. This matches the Dockerfile
-#     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
-#     shipping config. NEITHER binary has a `server` feature (scp-node's
+#     feature-arg string is EMPTY. This matches the Dockerfile, which builds
+#     each binary in its own invocation (`cargo build --release --offline
+#     -p scp-relay`, then `cargo build --release --offline -p scp-node`), and the
+#     `cargo publish` shipping config. NEITHER binary has a `server` feature (scp-node's
 #     `default` block is `["node-bin"]` and wires none; scp-relay's `[features]` table holds only the off-by-default `cloud-blobs`),
 #     so passing `--features server` here would ERROR — they are correctly gated
 #     with an empty feature-arg string, not with `--features server`.
@@ -394,8 +395,9 @@ EOF
 # above must stay in lockstep with the actual shipped build config, and
 # `assert_shipping_invocations_are_gated` reads the three files that carry those
 # commands and fails when they drift. The paragraph below names what those files
-# build — the Dockerfile
-# `cargo build --release -p scp-relay -p scp-node`, a
+# build — the Dockerfile's
+# `cargo build --release --offline -p scp-relay` and
+# `cargo build --release --offline -p scp-node`, a
 # `.github/workflows/release.yml` `cargo publish` step, `maturin`'s
 # `working-directory: bindings/python` wheel build, and a
 # `.github/workflows/build-matrix.yml` "Build shipped bridge artifacts" step,
