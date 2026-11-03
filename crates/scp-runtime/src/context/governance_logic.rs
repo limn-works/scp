@@ -2,20 +2,20 @@
 //! free-function logic hoisted out of the deleted `manager/` directory
 //! in ADR-049 §15.
 
-use crate::context::shared::governance::EnforceConsequencesCtx;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::trust::consequence::TriggeredConsequence;
+use scp_runtime_core::context::shared::governance::EnforceConsequencesCtx;
 
-use super::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut};
+use scp_runtime_core::context::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut};
 // Re-export the consequence split (defined in `class_s`) for the consequence
 // callers that reach it via this module's path. `pub(in crate::context)` matches
 // the type's `pub(crate)` effective reach within the context module tree without
 // tripping `redundant_pub_crate` (the module itself is private to `context`).
-pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
-use super::state::{context_id_to_bytes, emit_event_into};
+pub(in crate::context) use scp_runtime_core::context::actor::class_s::ConsequenceStateSplit;
+use scp_runtime_core::context::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // Consequence enforcement — synthetic actor DID + shared wire-stable labels
@@ -58,7 +58,7 @@ use scp_protocol::trust::consequence::{
 /// `target_did` back out of these bytes via
 /// `scp_protocol::trust::consequence::payload_target_is`.
 async fn append_consequence_event(
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     event_type: scp_event_log::EventType,
@@ -71,7 +71,7 @@ async fn append_consequence_event(
 ) {
     if let Err(e) = event_log
         .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             context_id_bytes,
             event_type,
             CONSEQUENCE_ACTOR_DID,
@@ -91,7 +91,7 @@ async fn append_consequence_event(
 }
 
 // `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
-// `super::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
+// `scp_runtime_core::context::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
 // struct — NOT an alias of `ClassCSplit` (ADR-049 §9 / RED-CS3 / R1): its
 // `role_state` is the consequence-only `ConsequenceRoleStateMut`, the one role
 // view that exposes the downward-authorization GROW mutators
@@ -481,7 +481,7 @@ async fn emit_consequence_enforced_success(
 ///    (`SuspendCapability` with a non-empty set, `SuspendAccess`, and the H10
 ///    `SuspendAll` escalation).
 /// 2. **`member_capabilities` REPLACEMENT** — `AssignRole` →
-///    [`ConsequenceRoleStateMut::system_assign_role`](crate::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role)
+///    [`ConsequenceRoleStateMut::system_assign_role`](scp_runtime_core::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role)
 ///    REPLACES `member_capabilities[member]` with
 ///    the new role's capability set. On a
 ///    DEMOTION (e.g. admin→member) this is a downward-auth shrink: the member
@@ -638,7 +638,7 @@ fn enforce_suspend(
 /// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
 /// keep all governance timing consistent with the `ContextManager`'s clock.
 ///
-/// Uses [`ConsequenceRoleStateMut::system_assign_role`](crate::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role) which bypasses the `RoleAssign`
+/// Uses [`ConsequenceRoleStateMut::system_assign_role`](scp_runtime_core::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role) which bypasses the `RoleAssign`
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_assign_role(
@@ -745,7 +745,7 @@ async fn emit_failure_escalation(
 /// This is the native runtime's thin adapter over the shared, convergence-
 /// critical [`scp_protocol::trust::consequence::merge_consequence_events`]: it
 /// acquires Source 1 (the persisted event log) from the
-/// [`ContextEventLogProvider`](crate::context::builder::ContextEventLogProvider)
+/// [`ContextEventLogProvider`](scp_runtime_core::context::builder::ContextEventLogProvider)
 /// and Source 2 (the receive buffer) from `receive_buffer`, then delegates the
 /// projection + buffer-gate merge so all honest members produce byte-identical
 /// merged event sets (§9.9.3 equivocation detection). All constants, the
@@ -763,7 +763,7 @@ async fn emit_failure_escalation(
 /// only reflect recent activity.
 ///
 /// Takes a borrowed [`ReceiveBuffer`] directly so the caller may build it from
-/// sub-borrows of the unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) without
+/// sub-borrows of the unified [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1) without
 /// holding the whole state across the merge.
 ///
 /// Returns `(merged_events, convergent_now)` where `convergent_now` is the max
@@ -792,7 +792,7 @@ pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
 ) -> Result<(Vec<scp_event_log::Event>, u64), ContextError> {
     // Source 1: Full event log history (persisted, with real timestamps and
     // actor_did). Acquired here from the provider.
@@ -818,7 +818,7 @@ pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
 ) -> (Vec<scp_event_log::Event>, u64) {
     event_log_entries_for_consequences(receive_buffer, context_id, now, event_log).unwrap_or_else(
         |e| {
@@ -890,10 +890,6 @@ mod convergence_tests {
     //! never on a string.
 
     use super::{ConsequenceStateSplit, enforce_triggered_consequences};
-    use crate::context::actor::state::PerContextState;
-    use crate::context::builder::ContextEventLogProvider;
-    use crate::context::providers::MerkleEventLogProvider;
-    use crate::context::shared::governance::EnforceConsequencesCtx;
     use scp_clock::SystemClock;
     use scp_did::DID;
     use scp_protocol::context::membership::ContextEvent;
@@ -901,6 +897,10 @@ mod convergence_tests {
         ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
         TriggeredConsequence,
     };
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::builder::ContextEventLogProvider;
+    use scp_runtime_core::context::providers::MerkleEventLogProvider;
+    use scp_runtime_core::context::shared::governance::EnforceConsequencesCtx;
     use std::time::Duration;
     use tokio::sync::broadcast;
 
@@ -943,7 +943,7 @@ mod convergence_tests {
         // exact digest — otherwise the durable append targets a different,
         // uninitialised context and is silently dropped.
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let storage_key = scp_runtime_core::context::state::context_id_to_bytes(&context_id_str);
 
         let event_log = MerkleEventLogProvider::new();
         event_log
@@ -1074,11 +1074,11 @@ mod convergence_tests {
     /// source from which convergent governance/consequence events may be drawn.
     async fn convergent_log() -> (MerkleEventLogProvider, String) {
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let storage_key = scp_runtime_core::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
         log.append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &storage_key,
             EventType::GovernanceAction,
             ADMIN,
@@ -1176,7 +1176,7 @@ mod convergence_tests {
     #[tokio::test]
     async fn an_unreadable_log_is_an_error_except_after_the_side_effect() {
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let storage_key = scp_runtime_core::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
         log.release_event_log(&storage_key);
@@ -1218,7 +1218,7 @@ mod convergence_tests {
     #[tokio::test]
     async fn per_author_messages_still_flow_from_buffer() {
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let storage_key = scp_runtime_core::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
 

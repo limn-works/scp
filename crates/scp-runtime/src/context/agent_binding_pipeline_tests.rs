@@ -4,7 +4,7 @@
 //! *live* scp-runtime message pipeline end to end — both halves of the wiring
 //! this story makes real:
 //!
-//! - **Send side (Part 2).** [`crate::context::shared::messaging::build_encrypted_envelope_actor`]
+//! - **Send side (Part 2).** [`scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor`]
 //!   — the production actor app-data seal the live `Supervisor::send_message` →
 //!   `messaging_helpers::send_message` → `encrypt_and_send` chain bottoms out in
 //!   — stamps the caller's chosen [`SigningKeyId`] into
@@ -22,7 +22,7 @@
 //!
 //! # Why this is a true pipeline test (and not a component test)
 //!
-//! [`crate::crypto::agent_binding_tests`] is a *component-level* test: it
+//! [`scp_runtime_core::crypto::agent_binding_tests`] is a *component-level* test: it
 //! hand-calls `create_inner_envelope` / `verify_inner_signature` /
 //! governance-engine internals in isolation. This module instead drives the two
 //! live messaging helpers this story wires (`build_encrypted_envelope_actor`
@@ -78,10 +78,10 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
-use crate::context::actor::state::PerContextState;
 use crate::context::messaging_helpers::verify_and_unwrap;
-use crate::context::shared::messaging::build_encrypted_envelope_actor;
-use crate::context::supervisor::MessageSigner;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor;
+use scp_runtime_core::context::supervisor::MessageSigner;
 
 const ALICE_DID: &str = "did:dht:z6MkAgentBindingPipelineAliceAliceAliceA";
 const BOB_DID: &str = "did:dht:z6MkAgentBindingPipelineBobBobBobBobBobBo";
@@ -150,12 +150,17 @@ fn setup_two_party(ctx_str: &str) -> (PerContextState, PerContextState, [u8; 32]
     // signature and seals to Bob's #active — the send / receive half below builds
     // its own document-derived `#agent`-aware resolver. The returned providers
     // are unused here, so they are discarded.
-    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+    let scp_runtime_core::crypto::mls::two_party_test_support::TwoPartyPair {
         alice_state,
         bob_state,
         ctx_bytes,
         ..
-    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE_DID, BOB_DID);
+    } = scp_runtime_core::crypto::mls::two_party_test_support::stand_up_two_party(
+        ctx_str,
+        ALICE_DID,
+        BOB_DID,
+        crate::domain_handlers(),
+    );
     (alice_state, bob_state, ctx_bytes)
 }
 
@@ -210,7 +215,7 @@ async fn build_send_blob(
     // `signing_key_id` and the key that signs come from one source — this is
     // exactly the invariant the #agent-persona slice asserts.
     let command_signer =
-        crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
+        scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
     let signer = match signing_key_id {
         SigningKeyId::Active => MessageSigner::Active(&command_signer),
         SigningKeyId::Agent => MessageSigner::Agent(&command_signer),
@@ -450,12 +455,12 @@ mod live_supervisor_send {
     use scp_protocol::context::{ContextError, context_id_bytes};
 
     use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
-    use crate::context::ContextHandle;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::builder::ContextTransportProvider;
-    use crate::context::supervisor::key_package_actor::KeyPackageCommand;
-    use crate::context::supervisor::{MessageSigner, Supervisor};
-    use crate::crypto::mls::provider::NodeMlsFactory;
+    use scp_runtime_core::context::ContextHandle;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::builder::ContextTransportProvider;
+    use scp_runtime_core::context::supervisor::key_package_actor::KeyPackageCommand;
+    use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor};
+    use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
     /// captures. Mirrors the `scp-testing` `CapturingTransport` (which lives in
@@ -554,9 +559,11 @@ mod live_supervisor_send {
         let (_active_sk, _agent_sk, alice_doc) = alice_identity();
         let resolver = document_backed_resolver(&alice_doc, None);
         let transport: Box<dyn ContextTransportProvider> = Box::new(CapturingTransport::new(sent));
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
-        crate::context::test_supervisor(crypto, transport, event_log, resolver)
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
+            Box::new(
+                scp_runtime_core::context::providers::event_log::MerkleEventLogProvider::new(),
+            );
+        crate::test_supervisor(crypto, transport, event_log, resolver)
     }
 
     /// Reads Bob's actor-minted `AccessKey` from Alice's context actor via the
@@ -569,7 +576,7 @@ mod live_supervisor_send {
         ctx_id: &str,
     ) -> scp_protocol::crypto::access_keys::AccessKey {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = crate::context::actor::QueriesCommand::GetAllAccessKeys {
+        let cmd = scp_runtime_core::context::actor::QueriesCommand::GetAllAccessKeys {
             context_id: ctx_id.to_owned(),
             reply: tx,
         };
@@ -626,8 +633,11 @@ mod live_supervisor_send {
                 }
             })
         };
-        let (bob_sup, bob) =
-            crate::crypto::mls::two_party_test_support::bob_supervisor(BOB_DID, resolver);
+        let (bob_sup, bob) = scp_runtime_core::crypto::mls::two_party_test_support::bob_supervisor(
+            BOB_DID,
+            resolver,
+            crate::domain_handlers(),
+        );
 
         // Reserve Bob's real KeyPackage from his own store. The store loads
         // Bob's identity wrapping keypair first, and the KP publishes its public
@@ -635,7 +645,7 @@ mod live_supervisor_send {
         let (reservation_id, bob_kp_bytes) = bob_sup
             .reserve_key_package(
                 DID::from(BOB_DID),
-                &crate::context::actor::CommandSigner::local_ed25519(bob_active_key),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(bob_active_key),
             )
             .await
             .expect("bob reserves a real KeyPackage from his own store");
@@ -697,7 +707,7 @@ mod live_supervisor_send {
         // for opening Alice's sender-key distributions; then seed his owned
         // actor state directly from the join constructor.
         let bob_wrapping = bob_sup
-            .load_wrapping_key(&DID::from(BOB_DID))
+            .load_wrapping_key_for_test(&DID::from(BOB_DID))
             .await
             .expect("bob's wrapping key is loaded");
         drop(bob_sup);
@@ -720,7 +730,7 @@ mod live_supervisor_send {
                 } => {
                     // ADR-049 PR-6: process returns (key, epoch) without
                     // installing; install unchecked (trusted bootstrap path).
-                    let (key, _epoch) = crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                    let (key, _epoch) = scp_runtime_core::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
 &bob_wrapping, &bob_actor.context_id, &sender_did, &payload)
                         .await
                         .expect("bob processes Alice's sender key");
@@ -789,8 +799,9 @@ mod live_supervisor_send {
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
         // is Alice's matching (#agent or #active) key. `MessageSigner` pairs the
         // two so the stamped persona cannot disagree with the key that signs.
-        let command_signer =
-            crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
+        let command_signer = scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+            signing_key.clone(),
+        );
         let signer = match signing_key_id {
             SigningKeyId::Active => MessageSigner::Active(&command_signer),
             SigningKeyId::Agent => MessageSigner::Agent(&command_signer),

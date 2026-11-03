@@ -12,9 +12,9 @@
 use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{ContextError, ContextParams};
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::DurableProviders;
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::supervisor::DurableProviders;
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 /// Derives a deterministic signing key from a DID string for example use.
 pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
@@ -37,16 +37,14 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
 /// Returns the custody's error when the import or the public-key read fails.
 pub async fn command_signer_for(
     did: &DID,
-) -> Result<scp_runtime::context::actor::CommandSigner, scp_platform::error::PlatformError> {
+) -> Result<scp_runtime_core::context::actor::CommandSigner, scp_platform::error::PlatformError> {
     use scp_platform::traits::KeyCustody;
     let custody = std::sync::Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let seed = zeroize::Zeroizing::new(signing_key_for(did).to_bytes());
     let handle = custody.import_ed25519_signing_key(&seed).await?;
     let signer =
         scp_platform::CustodySigner::new(custody, handle, scp_crypto::SigAlg::Ed25519).await?;
-    Ok(scp_runtime::context::actor::CommandSigner::from_custody(
-        signer,
-    ))
+    Ok(scp_runtime_core::context::actor::CommandSigner::from_custody(signer))
 }
 
 /// Convenience constructor: real `NodeMlsFactory` bound to a DID.
@@ -67,11 +65,11 @@ pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
 /// durable `Storage` (`SQLCipher`). An
 /// [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter)
 /// under a fresh random key wraps it, so the context persistence goes through
-/// the production [`ProtocolRepository::new`](scp_runtime::store::ProtocolRepository::new)
+/// the production [`ProtocolRepository::new`](scp_runtime_core::store::ProtocolRepository::new)
 /// and its `EncryptedStorage` bound, the same constructor a host calls.
 pub fn example_storage_providers() -> (
     DurableProviders,
-    Box<dyn scp_runtime::context::persistence::ContextPersistence>,
+    Box<dyn scp_runtime_core::context::persistence::ContextPersistence>,
 ) {
     use rand::RngCore as _;
     let mut key = zeroize::Zeroizing::new([0u8; 32]);
@@ -81,8 +79,8 @@ pub fn example_storage_providers() -> (
         key,
     ));
     let durable = DurableProviders::from_handle(std::sync::Arc::clone(&storage));
-    let persistence = scp_runtime::store::context::ProtocolRepositoryContextBridge::new(
-        std::sync::Arc::new(scp_runtime::store::ProtocolRepository::new(storage)),
+    let persistence = scp_runtime_core::store::context::ProtocolRepositoryContextBridge::new(
+        std::sync::Arc::new(scp_runtime_core::store::ProtocolRepository::new(storage)),
     );
     (durable, Box::new(persistence))
 }

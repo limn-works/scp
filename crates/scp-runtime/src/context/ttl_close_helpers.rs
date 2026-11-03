@@ -10,11 +10,11 @@
 //!
 //! This module hosts the TTL-domain helpers that the actor handler in
 //! [`crate::context::actor::handlers::ttl_close`] calls to implement
-//! [`TtlCloseCommand`](crate::context::actor::commands::TtlCloseCommand).
+//! [`TtlCloseCommand`](scp_runtime_core::context::actor::commands::TtlCloseCommand).
 //! Helpers operate on actor-owned
-//! [`PerContextState`](crate::context::actor::state::PerContextState)
+//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState)
 //! and capability-reduced
-//! [`ActorDeps`](crate::context::actor::deps::ActorDeps). The pre-migration
+//! [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps). The pre-migration
 //! `&Supervisor` lock-and-call bodies have been removed (Phase 2A
 //! finalization); this module is the sole home for these helpers.
 //!
@@ -33,22 +33,22 @@
 //! leaf timestamp, convergent across members by construction (§7.3.1,
 //! §9.9.3).
 
-use crate::context::shared::ttl_close::{
+use scp_did::DID;
+use scp_runtime_core::context::shared::ttl_close::{
     ExtensionLeaf, TtlExpiryOutcome, convergent_ttl_deadline, convergent_ttl_deadline_secs,
 };
-use crate::context::supervisor::handle::ConvergentDeadline;
-use scp_did::DID;
+use scp_runtime_core::context::supervisor::handle::ConvergentDeadline;
 
-use crate::context::builder::AppendMode;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::ContextEvent;
+use scp_runtime_core::context::builder::AppendMode;
 
-use crate::context::ContextHandle;
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
-use crate::context::state::{context_id_to_bytes, strip_event_payload};
-use crate::context::ttl::{self, TtlExtension, TtlTimer};
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::state::{context_id_to_bytes, strip_event_payload};
+use scp_runtime_core::context::ttl::{self, TtlExtension, TtlTimer};
 
 // ---------------------------------------------------------------------------
 // 1. handle_ttl_expiry
@@ -145,7 +145,7 @@ pub async fn handle_ttl_expiry(
         );
         cell.class_c_view().ttl_mut().timer.deadline_unix_secs = None;
         return TtlExpiryOutcome {
-            result: crate::context::ttl::TtlExpiryResult::aborted_no_deadline(),
+            result: scp_runtime_core::context::ttl::TtlExpiryResult::aborted_no_deadline(),
             persist_result: Ok(()),
         };
     };
@@ -267,12 +267,13 @@ pub async fn handle_ttl_expiry(
             terminal_result.clone(),
             expiry_deadline_secs,
         );
-        match tokio::time::timeout(crate::context::actor::HANDLER_TIMEOUT, io_fut).await {
+        match tokio::time::timeout(scp_runtime_core::context::actor::HANDLER_TIMEOUT, io_fut).await
+        {
             Ok(r) => r,
             Err(_elapsed) => {
                 tracing::warn!(
                     context_id = %context_id,
-                    budget = ?crate::context::actor::HANDLER_TIMEOUT,
+                    budget = ?scp_runtime_core::context::actor::HANDLER_TIMEOUT,
                     "TTL expiry relay/event-log I/O exceeded its transport budget; \
                      terminal Expired state already persisted fail-closed, retry \
                      will re-attempt the unfinished cleanup step"
@@ -511,7 +512,7 @@ pub async fn reset_ttl_timer(
 /// appended.
 pub async fn extend_ttl_deadline_and_record(
     cell: &mut ClassSCell,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_log: &dyn scp_runtime_core::context::builder::ContextEventLogProvider,
     context_id_bytes: &[u8; 32],
     actor_did: &str,
     additional_secs: u64,
@@ -736,15 +737,15 @@ fn persist_state_best_effort<'d, 'c>(
     // Single source of truth: the canonical best-effort persist builds the
     // snapshot, exports the crypto state with the Supervisor's floors, and
     // persists nothing when the Supervisor has dropped.
-    crate::context::snapshot::persist_state_best_effort(state, deps, context_id)
+    scp_runtime_core::context::snapshot::persist_state_best_effort(state, deps, context_id)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use crate::context::shared::ttl_close::convergent_ttl_deadline;
-    use crate::context::shared::ttl_close::convergent_ttl_deadline_secs;
-    use crate::context::supervisor::handle::ConvergentDeadline;
+    use scp_runtime_core::context::shared::ttl_close::convergent_ttl_deadline;
+    use scp_runtime_core::context::shared::ttl_close::convergent_ttl_deadline_secs;
+    use scp_runtime_core::context::supervisor::handle::ConvergentDeadline;
 
     /// Unwrap the arming-seam newtype to its `u64` for assertions.
     fn secs(d: Option<ConvergentDeadline>) -> Option<u64> {
@@ -820,13 +821,14 @@ mod tests {
     const TTL: u64 = 3_600;
 
     /// A cell for a finite-TTL context created at `CREATION`.
-    fn ttl_cell(ctx: [u8; 32]) -> crate::context::actor::class_s::ClassSCell {
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            ctx,
-            CREATION,
-            scp_did::DID::from("did:example:extension-admin"),
-        );
-        state.handle = crate::context::ContextHandle::new(
+    fn ttl_cell(ctx: [u8; 32]) -> scp_runtime_core::context::actor::class_s::ClassSCell {
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx,
+                CREATION,
+                scp_did::DID::from("did:example:extension-admin"),
+            );
+        state.handle = scp_runtime_core::context::ContextHandle::new(
             hex::encode(ctx),
             scp_protocol::context::params::ContextParams {
                 ttl: Some(std::time::Duration::from_secs(TTL)),
@@ -834,7 +836,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::context::actor::class_s::ClassSCell::new(state)
+        scp_runtime_core::context::actor::class_s::ClassSCell::new(state)
     }
 
     /// The committed governance extension still extends when the log cannot
@@ -844,10 +846,10 @@ mod tests {
     /// (spec section 17.3, "Event log write failures").
     #[tokio::test]
     async fn an_unreadable_log_fails_only_the_extension_before_its_step() {
-        use crate::context::builder::ContextEventLogProvider;
+        use scp_runtime_core::context::builder::ContextEventLogProvider;
         const ADDITIONAL: u64 = 600;
         let ctx = [0x7Au8; 32];
-        let log = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        let log = scp_runtime_core::context::providers::event_log::MerkleEventLogProvider::new();
         log.init_event_log(&ctx).await.expect("init log");
         log.release_event_log(&ctx);
 
@@ -858,7 +860,7 @@ mod tests {
             &ctx,
             "did:example:extension-admin",
             ADDITIONAL,
-            crate::context::shared::ttl_close::ExtensionLeaf::Governance {
+            scp_runtime_core::context::shared::ttl_close::ExtensionLeaf::Governance {
                 proposal_id: [1u8; 32],
                 committer_timestamp_secs: CREATION + 1,
                 consenting_members: vec!["did:example:extension-admin".to_owned()],
@@ -880,7 +882,7 @@ mod tests {
             &ctx,
             "did:example:extension-admin",
             ADDITIONAL,
-            crate::context::shared::ttl_close::ExtensionLeaf::Reset {
+            scp_runtime_core::context::shared::ttl_close::ExtensionLeaf::Reset {
                 consenting_members: vec!["did:example:extension-admin".to_owned()],
             },
         )

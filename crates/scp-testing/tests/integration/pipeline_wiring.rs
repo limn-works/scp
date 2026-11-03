@@ -42,22 +42,22 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/snapshot.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/push_routes.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/messaging.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/outlets.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/governance.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/lifecycle.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/economy.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/queries.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/standing.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/trust_recovery.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/broadcast.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/shared/ttl_close.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/restored_crypto.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/snapshot.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/push_routes.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/messaging.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/outlets.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/governance.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/lifecycle.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/economy.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/queries.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/standing.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/trust_recovery.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/broadcast.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/ttl_close.rs"),
+    include_str!("../../../../crates/scp-runtime-core/src/context/restored_crypto.rs"),
 );
 const PROVIDER_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
+    include_str!("../../../../crates/scp-runtime-core/src/crypto/mls/provider.rs");
 
 // Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
 // steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
@@ -65,7 +65,8 @@ const PROVIDER_SRC: &str =
 // `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
 // this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
 // home of the same seal/open pipeline, not a weakening.
-const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+const STATE_SRC: &str =
+    include_str!("../../../../crates/scp-runtime-core/src/context/actor/state.rs");
 
 // Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
 // bootstrap arms (Create / Import / Restore) moved to the actor-shape
@@ -75,7 +76,7 @@ const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context
 // regress the bootstrap path back to the `_legacy` `&Supervisor` helpers
 // (which no longer spawn a per-context actor).
 const SUPERVISOR_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
+    include_str!("../../../../crates/scp-runtime-core/src/context/supervisor/supervisor.rs");
 
 // SCP-006 `Identity::create` and `Identity::abandon_pending`
 // (`03-identity.md` §3.10.10; `09-security-model.md` §9.7.4.1 items 3 to 5,
@@ -94,7 +95,7 @@ const IDENTITY_UNFINISHED_SRC: &str =
 // per-chunk two-phase commit — the single `CommitBStreamSettle` fires once at
 // stream-close, outside the loop.
 const OUTLETS_INVOKE_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/outlets/invoke.rs");
+    include_str!("../../../../crates/scp-runtime-core/src/context/outlets/invoke.rs");
 
 // FFI bridge sources. PR #1606 / C4 wired all 3 of these to
 // `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
@@ -221,13 +222,14 @@ const HANDLERS_BROADCAST_SRC: &str =
 // `on_ttl_tick`, `on_governance_timeout` (the ACTOR-OWNED timer arms,
 // ADR-049 Decision-1 / finding A3). Pinned by
 // `actor_owned_timer_arms_reconcile_from_state`.
-const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
+const ACTOR_MOD_SRC: &str =
+    include_str!("../../../../crates/scp-runtime-core/src/context/actor/mod.rs");
 
 // Actor pseudonym-rotation source — owns `note_processed_commit`, which applies
 // a processed membership Commit to the registry and the rotation state (spec 09
 // §9.10.4.1). Pinned by `processed_membership_commit_reaches_rotation_and_registry`.
 const PSEUDONYM_ROTATION_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/pseudonym_rotation.rs");
+    include_str!("../../../../crates/scp-runtime-core/src/context/actor/pseudonym_rotation.rs");
 
 // Push handler source — owns `handlers::push::dispatch`, the mailbox step of
 // the PUSH-013 push routing-ID query (§10.7.1).
@@ -240,7 +242,8 @@ const PUSH_HELPERS_SRC: &str =
 // Push registrar source — owns `PushRegistrar::register`, which signs one
 // `PushRegistration` per relay and publishes it at that relay's push routing ID
 // (PUSH-014, §10.7.1). Pinned by `push_registrar_register_reaches_relay_publish`.
-const PUSH_REGISTRAR_SRC: &str = include_str!("../../../../crates/scp-runtime/src/push/mod.rs");
+const PUSH_REGISTRAR_SRC: &str =
+    include_str!("../../../../crates/scp-runtime-core/src/push/mod.rs");
 // Push publisher source — owns `TransportPushPublisher::publish`, the relay
 // PUBLISH the registrar's messages leave through (PUSH-014).
 const PUSH_PUBLISHER_SRC: &str =
@@ -298,7 +301,7 @@ const FFI_TRUST_STORE_SRC: &str =
 // `_on` bodies.
 const FFI_CHALLENGE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/challenge.rs");
 const LEDGER_SRC: &str = include_str!(
-    "../../../../crates/scp-runtime/src/context/supervisor/challenger_ledger_actor.rs"
+    "../../../../crates/scp-runtime-core/src/context/supervisor/challenger_ledger_actor.rs"
 );
 const FFI_CONTEXT_PARAMS_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/context_params.rs");
@@ -1161,7 +1164,7 @@ const LIFECYCLE_HELPERS_SRC: &str =
 // ADR-070: `normalize_relay_urls`, the `FirstStateRollback` guard and the
 // first-state writes read and write only core state, so they live in core.
 const LIFECYCLE_CORE_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/shared/lifecycle.rs");
+    include_str!("../../../../crates/scp-runtime-core/src/context/shared/lifecycle.rs");
 
 #[test]
 fn relay_set_writes_store_canonical_relay_urls() {
@@ -2740,7 +2743,7 @@ fn join_and_add_share_the_add_then_distribute_step() {
 #[test]
 fn export_crypto_state_persists_pending_distributions() {
     const ACTOR_STATE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+        include_str!("../../../../crates/scp-runtime-core/src/context/actor/state.rs");
     assert!(
         fn_body_contains(
             ACTOR_STATE_SRC,
@@ -4688,7 +4691,7 @@ fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
         "the dropped guard must drain before the lock and undo under it"
     );
     let handle_src =
-        include_str!("../../../../crates/scp-runtime/src/context/supervisor/handle.rs");
+        include_str!("../../../../crates/scp-runtime-core/src/context/supervisor/handle.rs");
     let body = extract_fn_body(handle_src, "spawn_under_bootstrap_spawn_lock")
         .expect("spawn_under_bootstrap_spawn_lock not found");
     let tracked = body
@@ -5079,7 +5082,7 @@ fn context_event_channel_enabled_on_every_bridge() {
     // `Supervisor::subscribe_events` (the former
     // `ContextManager::with_event_channel` accessor is gone).
     let supervisor_src =
-        include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
+        include_str!("../../../../crates/scp-runtime-core/src/context/supervisor/supervisor.rs");
     assert!(
         supervisor_src.contains("fn subscribe_events"),
         "Supervisor must expose subscribe_events (otherwise no Rust caller can subscribe)"
@@ -8226,7 +8229,7 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // Bound the seal-task function body: from its `fn` to the next item
     // (`record_streaming_saga_a_event`, which immediately follows it).
     let fn_start = OUTLETS_INVOKE_SRC
-        .find("pub(crate) async fn run_streaming_saga_seal_task")
+        .find("pub async fn run_streaming_saga_seal_task")
         .expect("run_streaming_saga_seal_task must exist in invoke.rs");
     let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
     let fn_len = after_fn
@@ -9567,7 +9570,22 @@ fn handle_paths_to_the_bootstrap_lock(facts: &[syn_scan::FnFacts]) -> Vec<String
 /// retryable `ActorBusy`, or hands the work to a task that takes the lock.
 #[test]
 fn no_actor_turn_waits_on_the_bootstrap_spawn_lock() {
-    let files = syn_scan::production_files(&crates_dir().join("scp-runtime"));
+    // ADR-070: the Supervisor lives in scp-runtime-core and the domains in
+    // their own crates, so the scan reads every `scp-runtime*` crate.
+    let mut runtime_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(crates_dir())
+        .expect("read the crates directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scp-runtime"))
+        })
+        .collect();
+    runtime_dirs.sort();
+    let files: Vec<_> = runtime_dirs
+        .iter()
+        .flat_map(|dir| syn_scan::production_files(dir))
+        .collect();
     let facts = syn_scan::Collector::scan(&files);
     let handle_fns = facts
         .iter()

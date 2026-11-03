@@ -24,7 +24,7 @@
 //!
 //! 1. [`export_context_blocks`] — read-only state borrow; captures the
 //!    snapshot and event-log blocks the actor signs into a
-//!    [`ContextExport`](crate::context::export_import::ContextExport).
+//!    [`ContextExport`](scp_runtime_core::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
 //! 3. [`drain_and_deliver_sender_keys`] — publish queued sender-key
@@ -43,7 +43,7 @@
 //!    [`join_context`].
 //!
 //! Bootstrap (build fresh state, then register through
-//! [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)):
+//! [`SupervisorHandle`](scp_runtime_core::context::supervisor::handle::SupervisorHandle)):
 //!
 //! - [`create_context`] — full create body; builds and registers a fresh `PerContextState`.
 //! - [`SpawnedContext`] — the gauge refresh and TTL timer a bootstrap runs after it releases `bootstrap_spawn_lock`.
@@ -61,7 +61,7 @@
 //! # Supervisor-iterating sweep entry points
 //!
 //! These iterate the actor registry
-//! ([`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids),
+//! ([`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids),
 //! NOT a legacy `contexts` `DashMap`) and dispatch one typed sweep
 //! command per actor through the per-context mailbox. They live in this
 //! module:
@@ -73,7 +73,7 @@
 
 #![allow(clippy::significant_drop_tightening)]
 
-use crate::context::shared::lifecycle::{
+use scp_runtime_core::context::shared::lifecycle::{
     DistributionScope, FirstStateRollback, SpawnedContext, TtlArming,
     add_member_and_queue_distribution, normalize_relay_urls, persist_first_state,
 };
@@ -88,17 +88,17 @@ use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipStat
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 
-use crate::context::ContextHandle;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::DistributionReport;
-use crate::context::actor::state::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::DistributionReport;
+use scp_runtime_core::context::actor::state::{
     ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
 };
-use crate::context::state::{
+use scp_runtime_core::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
 };
-use crate::context::ttl::{self, CloseResult, TtlTimer};
+use scp_runtime_core::context::ttl::{self, CloseResult, TtlTimer};
 use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
 use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
@@ -156,7 +156,7 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 ///
 /// The actor lifecycle handler signs the returned blocks in the same turn
 /// through
-/// [`create_signed_export`](crate::context::export_import::create_signed_export).
+/// [`create_signed_export`](scp_runtime_core::context::export_import::create_signed_export).
 ///
 /// # Errors
 ///
@@ -174,13 +174,13 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 pub fn export_context_blocks(
     state: &PerContextState,
     deps: &ActorDeps,
-) -> Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError> {
+) -> Result<(scp_runtime_core::context::state::ContextSnapshot, Vec<u8>), ContextError> {
     let context_id = state.handle.context_id();
     // ADR-056: resolve to the canonical digest (matches `state.context_id` and
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
-    let snapshot = crate::context::snapshot::build_snapshot_from_state(state);
+    let snapshot = scp_runtime_core::context::snapshot::build_snapshot_from_state(state);
 
     let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
 
@@ -212,7 +212,7 @@ pub fn export_context_blocks(
 // regain await points under ADR-049 Decision 7 (async-provider-trait conversion).
 #[allow(clippy::too_many_lines, clippy::unused_async)]
 pub async fn leave_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     caller_did: &DID,
@@ -243,7 +243,7 @@ pub async fn leave_context(
             let state = view.rest_mut();
 
             // PR #1606 C6: refuse if a commit fault marker is set.
-            crate::context::shared::governance::check_commit_fault(state)?;
+            scp_runtime_core::context::shared::governance::check_commit_fault(state)?;
 
             // Authorization: self-removal always allowed; otherwise MemberRemove
             // required.
@@ -346,7 +346,7 @@ pub async fn leave_context(
             // §9.10.4.1: another member's leave triggers a rotation under
             // `on_membership_change`; the local member's own leave discards its
             // grace state. Persisted with the removal.
-            crate::context::actor::pseudonym_rotation::note_member_removed(
+            scp_runtime_core::context::actor::pseudonym_rotation::note_member_removed(
                 state,
                 deps.crypto.local_did(),
                 member_did.as_ref(),
@@ -432,7 +432,7 @@ pub async fn leave_context(
     // ADR-051 (§7.3.1, §9.9.3).
     deps.event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             member_did.as_ref(),
@@ -479,7 +479,7 @@ pub async fn leave_context(
 /// The publish pass runs either way: a failed publish stays queued and is
 /// reported by event (§9.16.9).
 pub(in crate::context) async fn rotate_sender_key_and_distribute(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) {
@@ -497,13 +497,15 @@ pub(in crate::context) async fn rotate_sender_key_and_distribute(
         })
         .await;
     let failure = match persisted {
-        Ok(epoch) => crate::context::shared::messaging::mirror_forward_local_sender_epoch(
-            deps,
-            &state::context_id_to_bytes(context_id),
-            epoch,
-        )
-        .err()
-        .map(|e| (e, None)),
+        Ok(epoch) => {
+            scp_runtime_core::context::shared::messaging::mirror_forward_local_sender_epoch(
+                deps,
+                &state::context_id_to_bytes(context_id),
+                epoch,
+            )
+            .err()
+            .map(|e| (e, None))
+        }
         Err(e) => Some((e, preimage)),
     };
     if let Some((error, preimage)) = failure {
@@ -542,7 +544,7 @@ pub(in crate::context) async fn rotate_sender_key_and_distribute(
 /// governance timer calls it each tick; it does nothing when no rotation is
 /// owed or the context is a broadcast one.
 pub(in crate::context) async fn retry_pending_sender_key_rotation(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) {
@@ -572,12 +574,12 @@ pub(in crate::context) async fn retry_pending_sender_key_rotation(
 /// reports the turn mutated and the run loop persists it.
 pub(super) async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
-    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+    view: &mut scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     context_id: &str,
     scope: DistributionScope,
 ) -> DistributionReport {
-    use crate::context::actor::state::DistributionFault;
     use scp_protocol::envelope::outer::BlobTtl;
+    use scp_runtime_core::context::actor::state::DistributionFault;
 
     let mut report = DistributionReport::default();
     let routing_id = scp_protocol::context::context_routing_id(context_id);
@@ -665,7 +667,7 @@ pub(super) async fn drain_and_deliver_sender_keys(
 ///
 /// See [`close_context_with_key`].
 pub async fn close_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
@@ -686,12 +688,12 @@ async fn final_close_checkpoint(
     deps: &ActorDeps,
     context_id: &str,
     initiator_did: &DID,
-    signer: &crate::context::actor::signer::CommandSigner,
+    signer: &scp_runtime_core::context::actor::signer::CommandSigner,
 ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
     // Takes the cell's two scalars, not `&ClassSCell`: the cell is not
     // `Sync`, and a reference to it held across the sign's await would make
     // the close future `!Send`.
-    match crate::context::shared::queries::build_checkpoint(
+    match scp_runtime_core::context::shared::queries::build_checkpoint(
         context_id,
         broadcast_context_is_none,
         mls_epoch,
@@ -729,11 +731,11 @@ async fn final_close_checkpoint(
 ///   `SingleAdmin` (the close must route through governance).
 /// - Errors propagated from [`ttl::close_context`].
 pub async fn close_context_with_key(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
-    signer: Option<&crate::context::actor::signer::CommandSigner>,
+    signer: Option<&scp_runtime_core::context::actor::signer::CommandSigner>,
 ) -> Result<CloseResult, ContextError> {
     let context_id = handle.context_id().to_owned();
 
@@ -865,7 +867,7 @@ pub async fn close_context_with_key(
 
         // Record the final checkpoint signed above (§9.9.3).
         if let Some(cp) = final_checkpoint {
-            let cp = crate::context::shared::queries::force_create_checkpoint_fields(
+            let cp = scp_runtime_core::context::shared::queries::force_create_checkpoint_fields(
                 &context_id,
                 &mut state.checkpoint_events_since,
                 &mut state.checkpoint_last_time_secs,
@@ -934,7 +936,7 @@ pub async fn close_context_with_key(
 ///   `EconomyTicket` is rolled back.
 #[allow(clippy::too_many_lines)]
 pub async fn join_context(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     key_package: KeyPackage,
@@ -1095,7 +1097,7 @@ pub async fn join_context(
     // downstream error path (adapter, MLS, sender-key) is forced
     // to roll back velocity + hard_rate_limit + budget, not just
     // the budget.
-    let ticket = crate::context::shared::economy::EconomyTicket {
+    let ticket = scp_runtime_core::context::shared::economy::EconomyTicket {
         actor_did: member_did.clone(),
         deducted_cost,
         velocity_token,
@@ -1132,14 +1134,15 @@ pub async fn join_context(
                 // the ticket rollback go through `&*cell` / a `class_c_view()` (no
                 // `state_mut()`); the view inside `rollback_join_economy_ticket`
                 // drops before the return.
-                let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
-                    spending_nonce_token.take(),
-                    &*cell,
-                    deps,
-                    &context_id,
-                    payment_err,
-                )
-                .await;
+                let err =
+                    scp_runtime_core::context::shared::messaging::commit_send_nonce_token_on_abort(
+                        spending_nonce_token.take(),
+                        &*cell,
+                        deps,
+                        &context_id,
+                        payment_err,
+                    )
+                    .await;
                 rollback_join_economy_ticket(cell, ticket);
                 return Err(err);
             }
@@ -1183,16 +1186,18 @@ pub async fn join_context(
             // before the existing escrow-void + ticket rollback. Nonce-commit +
             // escrow-void run through `&*cell` (shared, no mutation); the ticket
             // rollback opens a `class_c_view()` that drops before the return.
-            let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
-                spending_nonce_token.take(),
-                &*cell,
-                deps,
-                &context_id,
-                e,
-            )
-            .await;
+            let err =
+                scp_runtime_core::context::shared::messaging::commit_send_nonce_token_on_abort(
+                    spending_nonce_token.take(),
+                    &*cell,
+                    deps,
+                    &context_id,
+                    e,
+                )
+                .await;
             if let Some(a) = auth {
-                crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
+                scp_runtime_core::context::shared::economy::void_paid_action(deps, a, &context_id)
+                    .await;
             }
             rollback_join_economy_ticket(cell, ticket);
             return Err(err);
@@ -1242,7 +1247,7 @@ pub async fn join_context(
             .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
-        let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
+        let err = scp_runtime_core::context::shared::messaging::commit_send_nonce_token_on_abort(
             spending_nonce_token.take(),
             &*cell,
             deps,
@@ -1251,7 +1256,8 @@ pub async fn join_context(
         )
         .await;
         if let Some(a) = auth {
-            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
+            scp_runtime_core::context::shared::economy::void_paid_action(deps, a, &context_id)
+                .await;
         }
         rollback_join_economy_ticket(cell, ticket);
         return Err(err);
@@ -1271,7 +1277,7 @@ pub async fn join_context(
     // the join event, THEN durably persist, THEN settle the external escrow.
     // Consume the ticket — commit returns the deducted cost and marks the
     // ticket committed so the Drop guard stays quiet.
-    let deducted_cost = crate::context::shared::economy::commit_economy_ticket(ticket);
+    let deducted_cost = scp_runtime_core::context::shared::economy::commit_economy_ticket(ticket);
 
     // Append MemberJoined event to event log.
     //
@@ -1306,7 +1312,7 @@ pub async fn join_context(
     if let Err(e) = deps
         .event_log
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
+            scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             member_did.as_ref(),
@@ -1321,7 +1327,7 @@ pub async fn join_context(
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before voiding the escrow hold (mirrors the money-ordering rule
         // below). The membership / MLS state already applied is NOT reversed.
-        let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
+        let err = scp_runtime_core::context::shared::messaging::commit_send_nonce_token_on_abort(
             spending_nonce_token.take(),
             &*cell,
             deps,
@@ -1330,7 +1336,8 @@ pub async fn join_context(
         )
         .await;
         if let Some(a) = auth {
-            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
+            scp_runtime_core::context::shared::economy::void_paid_action(deps, a, &context_id)
+                .await;
         }
         return Err(err);
     }
@@ -1378,12 +1385,14 @@ pub async fn join_context(
         // shared `&PerContextState`, supplied via `&*cell`.
         if let Err(e) = t.commit(&*cell, deps, &context_id).await {
             if let Some(a) = auth {
-                crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
+                scp_runtime_core::context::shared::economy::void_paid_action(deps, a, &context_id)
+                    .await;
             }
             return Err(e);
         }
     } else {
-        crate::context::snapshot::persist_state_best_effort(&*cell, deps, &context_id).await;
+        scp_runtime_core::context::snapshot::persist_state_best_effort(&*cell, deps, &context_id)
+            .await;
     }
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
@@ -1400,7 +1409,7 @@ pub async fn join_context(
 
 /// Performs the membership state mutations for [`join_context`] (Phase 4).
 ///
-/// Takes a [`ClassCMut`](crate::context::actor::class_s::ClassCMut) view rather
+/// Takes a [`ClassCMut`](scp_runtime_core::context::actor::class_s::ClassCMut) view rather
 /// than `&mut PerContextState`: every mutation here is Class-C (participation
 /// cache, role state, membership set, access-key store, receive buffer), so it
 /// routes through the field-granular accessors with no whole-state borrow and no
@@ -1414,7 +1423,7 @@ pub async fn join_context(
 /// - Errors from `roles::system_assign_role` propagated as
 ///   [`ContextError::MembershipFailed`].
 pub fn join_context_membership(
-    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+    view: &mut scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
@@ -1525,9 +1534,9 @@ pub fn join_context_membership(
 /// is applied afterward through a short-lived `class_c_view()` — no
 /// whole-`&mut PerContextState`, no `state_mut()`.
 pub async fn capture_join_payment(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    auth: Option<crate::context::shared::economy::PaidActionAuthorization>,
+    auth: Option<scp_runtime_core::context::shared::economy::PaidActionAuthorization>,
     member_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
@@ -1549,7 +1558,7 @@ pub async fn capture_join_payment(
                 &receipt,
                 context_id,
             );
-            crate::context::shared::economy::record_payment_receipt(
+            scp_runtime_core::context::shared::economy::record_payment_receipt(
                 view.payment_receipts_mut(),
                 &receipt,
             );
@@ -1608,25 +1617,25 @@ fn record_payment_capture_failure(
     state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
 }
 
-/// Reverses a Phase-1 [`EconomyTicket`](crate::context::shared::economy::EconomyTicket)
+/// Reverses a Phase-1 [`EconomyTicket`](scp_runtime_core::context::shared::economy::EconomyTicket)
 /// for [`join_context`] through a `class_c_view()` borrow that drops before the
 /// caller's early return (so the cell is free for the subsequent `.await`s).
 ///
 /// Thin cell-holder wrapper over the shared
-/// [`crate::context::shared::economy::rollback_economy_ticket_inline_view`] (also
+/// [`scp_runtime_core::context::shared::economy::rollback_economy_ticket_inline_view`] (also
 /// driven by the send path): the velocity entry, hard-rate-limit token, and
 /// budget debit are all Class-C, so they reverse through the field-granular
 /// `GovernanceClassCMut` accessors with no whole-state borrow. Consumes the
 /// ticket so its `Drop` guard stays quiet.
 fn rollback_join_economy_ticket(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    ticket: crate::context::shared::economy::EconomyTicket,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+    ticket: scp_runtime_core::context::shared::economy::EconomyTicket,
 ) {
     // Shared with the send path: reverse the three Class-C governance fields
     // through the field-granular `GovernanceClassCMut` view. The `&mut view`
     // borrow drops before the caller's early return (so the cell is free for the
     // subsequent `.await`s).
-    crate::context::shared::economy::rollback_economy_ticket_inline_view(
+    scp_runtime_core::context::shared::economy::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
     );
@@ -1640,7 +1649,7 @@ fn rollback_join_economy_ticket(
 ///
 /// Validates parameters, builds a fresh `PerContextState`, and hands
 /// it to
-/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
+/// [`SupervisorHandle::spawn_actor_with_state`](scp_runtime_core::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
 /// which spawns an actor that OWNS the state and registers its handle
 /// in the supervisor registry (no legacy contexts `DashMap` write).
 /// Returns a [`SpawnedContext`]; the caller releases `bootstrap_spawn_lock`
@@ -1705,9 +1714,9 @@ pub(in crate::context) async fn create_context(
     // (`Supervisor::create`, `Supervisor::create_context`, the
     // `CreateContext` lifecycle command, the standing-pair recreate, and the
     // governance migration) reaches this call.
-    crate::context::params_validation::validate_params(
+    scp_runtime_core::context::params_validation::validate_params(
         &params,
-        crate::context::params_validation::ParamsOrigin::Creation,
+        scp_runtime_core::context::params_validation::ParamsOrigin::Creation,
     )?;
     let governance_engine = state::create_governance_engine(
         &params.governance,
@@ -1727,13 +1736,13 @@ pub(in crate::context) async fn create_context(
     // The creator's leaf publishes the owning identity's wrapping key (spec 09
     // §9.16.1); with none loaded the creation fails closed before any group exists.
     let wrapping_public_key = *deps.my_wrapping_key()?.public();
-    let (handle, created_owned_crypto) = crate::context::builder::create_context(
+    let (handle, created_owned_crypto) = scp_runtime_core::context::builder::create_context(
         context_id.clone(),
         params.clone(),
         deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
-        crate::context::builder::ContextCreator {
+        scp_runtime_core::context::builder::ContextCreator {
             did: creator_did.as_ref(),
             wrapping_public_key: &wrapping_public_key,
         },
@@ -1784,7 +1793,9 @@ pub(in crate::context) async fn create_context(
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
     let mode = if create_is_broadcast {
-        ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
+        ContextModeState::Broadcast(
+            Box::<scp_runtime_core::context::actor::state::BroadcastState>::default(),
+        )
     } else {
         ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
     };
@@ -1805,7 +1816,7 @@ pub(in crate::context) async fn create_context(
         members: actor_members,
         // Shared fresh-context governance bucket (create + spawn-from-Welcome
         // build the identical set — see `state::fresh_governance_state`).
-        governance: crate::context::state::fresh_governance_state(
+        governance: scp_runtime_core::context::state::fresh_governance_state(
             governance_engine,
             &params,
             initial_members,
@@ -1813,7 +1824,7 @@ pub(in crate::context) async fn create_context(
             Arc::clone(&deps.clock),
             // The creator at genesis: no governance action has run, so the live
             // registry equals the genesis declaration (GitHub #2020).
-            crate::context::state::OutletRegistrySeed::GenesisDeclaration,
+            scp_runtime_core::context::state::OutletRegistrySeed::GenesisDeclaration,
         ),
         role_state,
         receive_buffer: ReceiveBuffer::new(),
@@ -1868,7 +1879,7 @@ pub(in crate::context) async fn create_context(
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        class_s: crate::context::actor::state::ClassSState {
+        class_s: scp_runtime_core::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -1878,7 +1889,7 @@ pub(in crate::context) async fn create_context(
             // local — a foreign saga must never drive local reversal).
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
@@ -1886,7 +1897,7 @@ pub(in crate::context) async fn create_context(
             stream_reservations: HashMap::new(),
             // §9.10.4.1: the creator stamps T0 and follows the schedule from it.
             pseudonym_rotation:
-                crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                scp_runtime_core::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
                     params.pseudonym_rotation.as_ref(),
                     Some(creation_timestamp_secs),
                     creation_timestamp_secs,
@@ -2002,7 +2013,7 @@ fn generate_initial_access_key_store(
 /// Propagates the event-log provider's import failure.
 async fn hydrate_imported_event_log(
     deps: &ActorDeps,
-    _floor_guarded: &crate::context::restored_crypto::FloorGuardedCrypto,
+    _floor_guarded: &scp_runtime_core::context::restored_crypto::FloorGuardedCrypto,
     ctx_id_bytes: &[u8; 32],
     event_log_data: &[u8],
 ) -> Result<(), ContextError> {
@@ -2042,7 +2053,7 @@ async fn hydrate_imported_event_log(
 #[allow(dead_code)] // Bootstrap entry — see `create_context` rationale.
 pub(in crate::context) async fn import_context(
     deps: &ActorDeps,
-    export: crate::context::export_import::ContextExport,
+    export: scp_runtime_core::context::export_import::ContextExport,
     verifying_key: &ed25519_dalek::VerifyingKey,
     local_pseudonym: Option<[u8; 32]>,
     first_state: &FirstStateRollback,
@@ -2057,7 +2068,7 @@ pub(in crate::context) async fn import_context(
     // failure (or signer-binding mismatch) rejects with
     // `ContextError::SnapshotSignatureInvalid`, distinct from the event-log
     // Merkle failure and from the version gate.
-    crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
+    scp_runtime_core::context::export_import::validate_export_for_import(&export, verifying_key)?;
 
     // SINGLE-SOURCE TTL-DEADLINE (ADR-049 §9, E3): reject a future-dated
     // `creation_timestamp_secs` BEFORE any side effect. The create base is the
@@ -2112,7 +2123,7 @@ pub(in crate::context) async fn import_context(
     // so this Full-only gate is NOT a signature concern: it is a separate
     // import-orchestration policy check, because a *legitimately-signed* Public
     // export must still be rejected for full import.
-    if export.scope != crate::context::export_import::ExportScope::Full {
+    if export.scope != scp_runtime_core::context::export_import::ExportScope::Full {
         return Err(ContextError::InvalidState(format!(
             "cannot import a {:?}-scope export — only full-scope exports carry the \
              membership, governance, and event-log state required to reconstruct an \
@@ -2181,7 +2192,7 @@ pub(in crate::context) async fn import_context(
     // path, the Welcome-joiner precheck, the restore path, and
     // `execute_register_outlet` run the same checks, so every writer of the live
     // registry admits the same registrations (GitHub #2250).
-    crate::context::state::validate_outlet_registry_set(
+    scp_runtime_core::context::state::validate_outlet_registry_set(
         &export.snapshot.registered_outlets,
         "imported",
     )
@@ -2225,7 +2236,7 @@ pub(in crate::context) async fn import_context(
     // Crypto state is read from the SIGNED snapshot field (ADR-050: all
     // importer-restored state lives in the signed preimage), never from an
     // unsigned envelope blob. Validated by `validate_export_for_import` above.
-    let imported_crypto = crate::context::restored_crypto::build_restored_crypto(
+    let imported_crypto = scp_runtime_core::context::restored_crypto::build_restored_crypto(
         &ctx_id_bytes,
         &export.snapshot.mls_crypto_state,
         "import",
@@ -2251,7 +2262,7 @@ pub(in crate::context) async fn import_context(
     // schedule, and its local TTL close uses the deadline the imported
     // (exporter's) snapshot records (rule 9's keyless clause).
     let imported_crypto =
-        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+        scp_runtime_core::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
             imported_crypto,
             &context_id,
             export.snapshot.role_state.creator_did.as_str(),
@@ -2262,8 +2273,8 @@ pub(in crate::context) async fn import_context(
         )
         .map_err(|reason| ContextError::ImportRejected { reason })?;
     let committed_t0 = match imported_crypto.binding() {
-        crate::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
-        crate::context::restored_crypto::RestoredBinding::Keyless => None,
+        scp_runtime_core::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
+        scp_runtime_core::context::restored_crypto::RestoredBinding::Keyless => None,
     };
     // The TTL base (§5.13.3 rule 9): the committed `T0`, which the binding check
     // above proved equal to the snapshot's `creation_timestamp_secs`. A keyless
@@ -2422,7 +2433,9 @@ pub(in crate::context) async fn import_context(
         None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
     };
     let validated_message_pricing = export.snapshot.message_pricing.clone().or_else(|| {
-        crate::context::state::derive_message_pricing(export.snapshot.economic_policy.as_ref())
+        scp_runtime_core::context::state::derive_message_pricing(
+            export.snapshot.economic_policy.as_ref(),
+        )
     });
     if let Some(ref pricing) = validated_message_pricing {
         pricing.validate().map_err(|e| {
@@ -2575,7 +2588,7 @@ pub(in crate::context) async fn import_context(
             revoked_spending_ucan_cids: export.snapshot.revoked_spending_ucan_cids,
             // C3: Wipe `proposal_timestamps`.
             proposal_timestamps: HashMap::new(),
-            class_s: crate::context::state::GovernanceClassS {
+            class_s: scp_runtime_core::context::state::GovernanceClassS {
                 executed_proposals: {
                     let now = deps.clock.now_secs();
                     export
@@ -2660,7 +2673,7 @@ pub(in crate::context) async fn import_context(
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        class_s: crate::context::actor::state::ClassSState {
+        class_s: scp_runtime_core::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -2670,7 +2683,7 @@ pub(in crate::context) async fn import_context(
             // local — a foreign saga must never drive local reversal).
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
@@ -2681,7 +2694,7 @@ pub(in crate::context) async fn import_context(
             // counted from the committed `T0` (§5.13.3 rule 9), or none when the
             // import is keyless.
             pseudonym_rotation:
-                crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                scp_runtime_core::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
                     handle.params().pseudonym_rotation.as_ref(),
                     committed_t0,
                     deps.clock.now_secs(),
@@ -2773,7 +2786,7 @@ pub(in crate::context) async fn import_context(
     // recorded creation timestamp on a keyless import (see its definition).
     let import_log_entries: Vec<scp_event_log::Event> =
         rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
-    let ttl = crate::context::shared::ttl_close::convergent_ttl_deadline(
+    let ttl = scp_runtime_core::context::shared::ttl_close::convergent_ttl_deadline(
         &import_log_entries,
         ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
@@ -2798,10 +2811,10 @@ pub(in crate::context) async fn import_context(
 pub async fn load_persisted_context_state(
     deps: &ActorDeps,
     context_id: &str,
-    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
+    preloaded_snapshot: Option<scp_runtime_core::context::state::ContextSnapshot>,
 ) -> Result<
     (
-        crate::context::state::ContextSnapshot,
+        scp_runtime_core::context::state::ContextSnapshot,
         Option<scp_protocol::context::broadcast::BroadcastContext>,
     ),
     ContextError,
@@ -2869,14 +2882,14 @@ pub async fn load_persisted_context_state(
 /// only after this returns `Ok`, so a restore refused here leaves the
 /// registry's floors as they were.
 ///
-/// [`EventLogRestore::Absent`]: crate::context::builder::EventLogRestore::Absent
+/// [`EventLogRestore::Absent`]: scp_runtime_core::context::builder::EventLogRestore::Absent
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
 async fn restore_event_log_fail_closed(
     deps: &ActorDeps,
-    _binding_verified: &crate::context::restored_crypto::VerifiedRestoredCrypto,
+    _binding_verified: &scp_runtime_core::context::restored_crypto::VerifiedRestoredCrypto,
     context_id: &str,
 ) -> Result<(), ContextError> {
-    use crate::context::state::context_id_to_bytes;
+    use scp_runtime_core::context::state::context_id_to_bytes;
     let restored = deps
         .event_log
         .restore_event_log(&context_id_to_bytes(context_id))
@@ -2901,8 +2914,8 @@ async fn restore_event_log_fail_closed(
 /// registered: a spawn cancelled after it registered the actor leaves that
 /// actor owning the log.
 struct RestoredEventLogGuard {
-    event_log: Arc<dyn crate::context::builder::ContextEventLogProvider>,
-    supervisor: crate::context::supervisor::handle::SupervisorHandle,
+    event_log: Arc<dyn scp_runtime_core::context::builder::ContextEventLogProvider>,
+    supervisor: scp_runtime_core::context::supervisor::handle::SupervisorHandle,
     context_id: String,
     context_id_bytes: [u8; 32],
     armed: bool,
@@ -2941,7 +2954,7 @@ impl Drop for RestoredEventLogGuard {
 ///
 /// Loads the persisted `ContextSnapshot` and optional broadcast state,
 /// reconstructs `PerContextState`, and hands it to
-/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
+/// [`SupervisorHandle::spawn_actor_with_state`](scp_runtime_core::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
 /// which spawns an actor that OWNS the rehydrated state and registers
 /// its handle in the supervisor registry (no legacy contexts `DashMap`
 /// write). Re-spawns the TTL timer if the context carries a finite
@@ -2967,19 +2980,19 @@ pub async fn restore_context(
     deps: &ActorDeps,
     context_id: &str,
     handle: &ContextHandle,
-    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
+    preloaded_snapshot: Option<scp_runtime_core::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
     use crate::context::lifecycle_logic::{
         sanitize_cooldown_until, validate_consequence_rules_for_import,
         validate_context_params_for_import,
     };
-    use crate::context::state::derive_message_pricing;
-    use crate::context::state::{
+    use scp_protocol::context::governance::mls_integration::EpochCoordinator;
+    use scp_protocol::context::membership::ReceiveBuffer;
+    use scp_runtime_core::context::state::derive_message_pricing;
+    use scp_runtime_core::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
         restore_grace_store_from_snapshot,
     };
-    use scp_protocol::context::governance::mls_integration::EpochCoordinator;
-    use scp_protocol::context::membership::ReceiveBuffer;
     use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
     let (mut ctx_snapshot, broadcast_ctx) =
@@ -3050,7 +3063,7 @@ pub async fn restore_context(
     // none; the keypair is one per identity, owned by the supervisor, spec 09
     // §9.16.1). The actor is the SOLE crypto authority by construction.
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    let restored_crypto = crate::context::restored_crypto::build_restored_crypto(
+    let restored_crypto = scp_runtime_core::context::restored_crypto::build_restored_crypto(
         &ctx_id_bytes,
         &ctx_snapshot.mls_crypto_state,
         "restore",
@@ -3071,7 +3084,7 @@ pub async fn restore_context(
     // snapshot whose recorded creation timestamp differs from it; `None` for a
     // keyless (needs-reconnect) snapshot, which carries no group.
     let restored_crypto =
-        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+        scp_runtime_core::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
             restored_crypto,
             context_id,
             ctx_snapshot.role_state.creator_did.as_str(),
@@ -3082,8 +3095,8 @@ pub async fn restore_context(
         )
         .map_err(ContextError::PersistenceFailed)?;
     let restore_committed_t0 = match restored_crypto.binding() {
-        crate::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
-        crate::context::restored_crypto::RestoredBinding::Keyless => None,
+        scp_runtime_core::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
+        scp_runtime_core::context::restored_crypto::RestoredBinding::Keyless => None,
     };
 
     // §23.17 Invariant 2 (trusted-local self-respawn / process-restart):
@@ -3140,11 +3153,12 @@ pub async fn restore_context(
             ))
         })?
         .unwrap_or_default();
-    let restore_ttl_deadline = crate::context::shared::ttl_close::convergent_ttl_deadline(
-        &restore_log_entries,
-        restore_ttl_base_secs,
-        handle.params().ttl.map(|t| t.as_secs()),
-    );
+    let restore_ttl_deadline =
+        scp_runtime_core::context::shared::ttl_close::convergent_ttl_deadline(
+            &restore_log_entries,
+            restore_ttl_base_secs,
+            handle.params().ttl.map(|t| t.as_secs()),
+        );
 
     let last_members: HashSet<scp_did::DID> = ctx_snapshot
         .membership
@@ -3214,7 +3228,7 @@ pub async fn restore_context(
     // the five writers of the live registry — genesis, the Welcome-joiner
     // precheck, import, this path, and `execute_register_outlet` — admitting the
     // same registrations (GitHub #2250).
-    crate::context::state::validate_outlet_registry_set(
+    scp_runtime_core::context::state::validate_outlet_registry_set(
         &ctx_snapshot.registered_outlets,
         "restored",
     )
@@ -3239,7 +3253,9 @@ pub async fn restore_context(
         .collect();
     let restored_is_broadcast = broadcast_ctx.is_some();
     let mode = if restored_is_broadcast {
-        ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
+        ContextModeState::Broadcast(
+            Box::<scp_runtime_core::context::actor::state::BroadcastState>::default(),
+        )
     } else {
         ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
     };
@@ -3324,7 +3340,7 @@ pub async fn restore_context(
             // forbids. The snapshot is authoritative.
             revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
             proposal_timestamps: ctx_snapshot.proposal_timestamps,
-            class_s: crate::context::state::GovernanceClassS {
+            class_s: scp_runtime_core::context::state::GovernanceClassS {
                 executed_proposals: {
                     let now = deps.clock.now_secs();
                     ctx_snapshot
@@ -3363,7 +3379,7 @@ pub async fn restore_context(
             access_key_store: ctx_snapshot.access_key_store,
         },
         ttl: TtlState {
-            timer: crate::context::ttl::TtlTimer::with_clock(Arc::clone(&deps.clock)),
+            timer: scp_runtime_core::context::ttl::TtlTimer::with_clock(Arc::clone(&deps.clock)),
             extension: None,
         },
         sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
@@ -3390,7 +3406,7 @@ pub async fn restore_context(
         // it is reconstructable interface state, repopulated when the outlet
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        class_s: crate::context::actor::state::ClassSState {
+        class_s: scp_runtime_core::context::actor::state::ClassSState {
             saga_pending: ctx_snapshot
                 .saga_pending
                 .into_iter()
@@ -3408,7 +3424,7 @@ pub async fn restore_context(
             // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 ctx_snapshot.xctx_nonce_dedup,
-                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
             // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
@@ -3556,7 +3572,7 @@ pub async fn restore_context(
 //
 // These replaced the now-deleted legacy lifecycle sweep helpers
 // (the `lifecycle_helpers_legacy` module is gone). Each iterates
-// [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+// [`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids)
 // (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
 // and dispatches one typed sweep command per actor via the per-actor
 // mailbox.
@@ -3595,7 +3611,7 @@ pub async fn restore_context(
 /// - [`ContextError::PersistenceFailed`] if the persistence provider
 ///   is unconfigured or `list_persisted_contexts` fails.
 pub async fn restore_all_contexts(
-    supervisor: &Arc<crate::context::supervisor::Supervisor>,
+    supervisor: &Arc<scp_runtime_core::context::supervisor::Supervisor>,
 ) -> Result<Vec<String>, ContextError> {
     let Some(persistence) = supervisor.persistence_ref() else {
         return Err(ContextError::PersistenceFailed(
@@ -3625,8 +3641,10 @@ pub async fn restore_all_contexts(
             continue;
         }
 
-        let handle =
-            crate::context::ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
+        let handle = scp_runtime_core::context::ContextHandle::new(
+            ctx_id.clone(),
+            ctx_snapshot.context_params.clone(),
+        );
 
         match supervisor.restore_context(ctx_id, &handle).await {
             Ok(()) => restored.push(ctx_id.clone()),
@@ -3654,11 +3672,11 @@ pub async fn restore_all_contexts(
 ///    passed the closed-flag check registers under the same lock, so the
 ///    snapshot holds every actor that can still be spawned.
 /// 3. Send each actor
-///    [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf),
+///    [`LifecycleCommand::ShutdownSelf`](scp_runtime_core::context::actor::commands::LifecycleCommand::ShutdownSelf),
 ///    which destroys sender keys, the MLS group, and the event log in that
 ///    order (zeroize secrets before tearing down structure), then despawn the
 ///    actor whether or not the send succeeded and whether or not the actor
-///    replied within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT):
+///    replied within [`REPLY_TIMEOUT`](scp_runtime_core::context::actor::REPLY_TIMEOUT):
 ///    the despawn drops the last
 ///    mailbox sender, the actor's `run()` loop exits on the closed inbox, and
 ///    its task releases its `PerContextState`.
@@ -3672,10 +3690,10 @@ pub async fn restore_all_contexts(
 ///    reads its floors from this registry.
 ///
 /// Used by
-/// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
+/// [`Supervisor::shutdown_all_contexts`](scp_runtime_core::context::supervisor::Supervisor::shutdown_all_contexts)
 /// for process exit and test teardown. Does NOT
 /// send leave messages or notify remote peers.
-pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+pub async fn shutdown_all_contexts(supervisor: &scp_runtime_core::context::supervisor::Supervisor) {
     let context_ids = shutdown_sweep(supervisor).await;
     supervisor.await_tracked_tasks().await;
     let removed_count = reap_swept_floors(supervisor, &context_ids);
@@ -3688,10 +3706,12 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 
 /// Steps 1 to 5 of [`shutdown_all_contexts`]; returns the ids of the context
 /// actors the sweep despawned.
-async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> Vec<String> {
+async fn shutdown_sweep(
+    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
+) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
 
-    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+    use scp_runtime_core::context::actor::commands::{ContextCommand, LifecycleCommand};
 
     supervisor.close_spawn_gate();
     let context_ids = {
@@ -3703,25 +3723,29 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
             match actor
-                .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
                 .await
             {
-                Ok(()) => match crate::context::actor::bounded_reply_await(rx).await {
+                Ok(()) => match scp_runtime_core::context::actor::bounded_reply_await(rx).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!(
                         context_id = %ctx_id,
                         error = %e,
                         "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
                     ),
-                    Err(crate::context::actor::BoundedReplyError::Dropped) => tracing::warn!(
-                        context_id = %ctx_id,
-                        "shutdown: actor exited before replying to ShutdownSelf; despawning"
-                    ),
-                    Err(crate::context::actor::BoundedReplyError::Elapsed) => tracing::warn!(
-                        context_id = %ctx_id,
-                        "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
-                         despawning"
-                    ),
+                    Err(scp_runtime_core::context::actor::BoundedReplyError::Dropped) => {
+                        tracing::warn!(
+                            context_id = %ctx_id,
+                            "shutdown: actor exited before replying to ShutdownSelf; despawning"
+                        );
+                    }
+                    Err(scp_runtime_core::context::actor::BoundedReplyError::Elapsed) => {
+                        tracing::warn!(
+                            context_id = %ctx_id,
+                            "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
+                             despawning"
+                        );
+                    }
                 },
                 Err(e) => tracing::warn!(
                     context_id = %ctx_id,
@@ -3787,14 +3811,19 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
 /// tracker drain has finished, so no actor task is left to persist a snapshot
 /// that would export the absent entry as empty floors.
 fn reap_swept_floors(
-    supervisor: &crate::context::supervisor::Supervisor,
+    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
     context_ids: &[String],
 ) -> usize {
     for ctx_id in context_ids {
-        supervisor.remove_context_floors(&crate::context::state::context_id_to_bytes(ctx_id));
+        supervisor.remove_context_floors(&scp_runtime_core::context::state::context_id_to_bytes(
+            ctx_id,
+        ));
     }
     context_ids.len()
 }
+
+#[cfg(test)]
+mod spawn_rollback_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -3805,18 +3834,20 @@ mod shutdown_sweep_tests {
     use std::sync::Arc;
 
     use super::shutdown_all_contexts;
-    use crate::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
-    use crate::context::supervisor::Supervisor;
+    use scp_runtime_core::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
+    use scp_runtime_core::context::supervisor::Supervisor;
 
     fn supervisor() -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkShutdownSweep".to_owned(),
-            Arc::new(scp_clock::SystemClock),
-        ));
-        crate::context::test_supervisor(
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkShutdownSweep".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        crate::test_supervisor(
             crypto,
-            Box::new(crate::context::builder::NotConfiguredTransportProvider),
-            Box::new(crate::context::providers::MerkleEventLogProvider::new()),
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider),
+            Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new()),
             Arc::new(|_, _| None),
         )
     }
@@ -3857,18 +3888,18 @@ mod shutdown_sweep_tests {
     /// drop the registry entry.
     #[tokio::test(start_paused = true)]
     async fn floors_outlive_an_unanswering_actor_until_the_drain_ends() {
-        use crate::context::actor::commands::LifecycleCommand;
+        use scp_runtime_core::context::actor::commands::LifecycleCommand;
 
         let sup = supervisor();
         let ctx_id = "ab".repeat(32);
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
-        sup.check_and_advance_sender_epoch(&ctx_bytes, "floor-sender", 7, u64::MAX)
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch_for_test(&ctx_bytes, "floor-sender", 7, u64::MAX)
             .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
         sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
         let actor_sup = Arc::clone(&sup);
         let actor = sup
-            .spawn_tracked("unanswering actor", async move {
+            .spawn_tracked_for_test("unanswering actor", async move {
                 let mut held_replies = Vec::new();
                 while let Some(cmd) = rx.recv().await {
                     if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd
@@ -3878,7 +3909,10 @@ mod shutdown_sweep_tests {
                 }
                 // The inbox closed on the despawn: model the persist of a
                 // command the actor was still running.
-                (actor_sup.export_sender_key_epochs(&ctx_bytes), held_replies)
+                (
+                    actor_sup.export_sender_key_epochs_for_test(&ctx_bytes),
+                    held_replies,
+                )
             })
             .expect("spawn before shutdown");
 
@@ -3897,7 +3931,7 @@ mod shutdown_sweep_tests {
             "the actor's last persist read the advanced floor, not an empty export"
         );
         assert!(
-            sup.export_sender_key_epochs(&ctx_bytes).is_empty(),
+            sup.export_sender_key_epochs_for_test(&ctx_bytes).is_empty(),
             "the shutdown dropped the floor entry after the drain"
         );
     }
@@ -3945,12 +3979,13 @@ mod restore_reconcile_tests {
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::{ContextError, builder::ContextCreationError};
 
-    use crate::context::actor::state::ContextRouting;
-    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-    use crate::context::persistence::ContextPersistence;
-    use crate::context::state::ContextSnapshot;
-    use crate::context::supervisor::supervisor::Supervisor;
-    use crate::context::{ContextHandle, lifecycle_helpers};
+    use crate::context::lifecycle_helpers;
+    use scp_runtime_core::context::ContextHandle;
+    use scp_runtime_core::context::actor::state::ContextRouting;
+    use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use scp_runtime_core::context::persistence::ContextPersistence;
+    use scp_runtime_core::context::state::ContextSnapshot;
+    use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
     type PersistErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -4144,10 +4179,12 @@ mod restore_reconcile_tests {
         persistence: Box<dyn ContextPersistence>,
         key_resolver: scp_protocol::context::governance::KeyResolver,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkRestoreReconcile".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkRestoreReconcile".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
@@ -4243,7 +4280,7 @@ mod restore_reconcile_tests {
             .expect("create_context should succeed");
 
         capture.contexts.lock().unwrap().remove(ctx_id);
-        crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
+        scp_runtime_core::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect("a working store persists");
         assert!(
@@ -4254,7 +4291,7 @@ mod restore_reconcile_tests {
         capture
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let err = crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
+        let err = scp_runtime_core::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect_err("a failed snapshot write must reach the caller");
         assert!(
@@ -4265,7 +4302,7 @@ mod restore_reconcile_tests {
         capture
             .fail
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
+        scp_runtime_core::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect("the retry after the store recovers flushes");
     }
@@ -4310,17 +4347,20 @@ mod restore_reconcile_tests {
             .await
             .expect("build_actor_deps");
         let ctx_id = hex::encode([0x4Du8; 32]);
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            [0x4Du8; 32],
-            1_700_000_000,
-            owner,
-        );
-        let snapshot = crate::context::snapshot::build_snapshot_for_persist(&state, &deps, &ctx_id)
-            .expect("snapshot");
-        let guard = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx_id)
-            .expect("guard");
+        let state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                [0x4Du8; 32],
+                1_700_000_000,
+                owner,
+            );
+        let snapshot =
+            scp_runtime_core::context::snapshot::build_snapshot_for_persist(&state, &deps, &ctx_id)
+                .expect("snapshot");
+        let guard =
+            scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx_id)
+                .expect("guard");
         guard.inner.writes_idle.send_replace(false);
-        let writes = crate::context::shared::lifecycle::first_state_writes(
+        let writes = scp_runtime_core::context::shared::lifecycle::first_state_writes(
             Arc::clone(&guard.inner),
             1_700_000_000,
             Box::new(snapshot),
@@ -4346,20 +4386,22 @@ mod restore_reconcile_tests {
             .build_actor_deps_loaded(&DID("did:dht:z6MkFirstStateClaim".to_owned()))
             .await
             .expect("build_actor_deps");
-        let first = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
-            .expect("guard");
-        let second = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed");
+        let first =
+            scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
+                .expect("guard");
+        let second =
+            scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed");
         assert!(
             matches!(&second, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
             "a second guard of a claimed id is refused"
         );
         first.commit();
         drop(
-            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
+            scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
                 .expect("the id is free once the first guard commits"),
         );
         drop(
-            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
+            scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
                 .expect("an untouched guard releases its claim when dropped"),
         );
     }
@@ -4391,8 +4433,10 @@ mod restore_reconcile_tests {
                 supervisor.shutdown_all_contexts().await;
             }
             let first_state =
-                crate::context::shared::lifecycle::FirstStateRollback::new(&deps, ctx_id)
-                    .expect("guard");
+                scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(
+                    &deps, ctx_id,
+                )
+                .expect("guard");
             match lifecycle_helpers::create_context(
                 &deps,
                 ctx_id.to_owned(),
@@ -4458,11 +4502,11 @@ mod restore_reconcile_tests {
             snapshot.event_log_merkle_root = [0u8; 32];
             let creator = DID("did:dht:z6MkHarvestCreator".to_owned());
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let export = crate::context::export_import::create_export(
+            let export = scp_runtime_core::context::export_import::create_export(
                 snapshot,
                 Vec::new(),
                 creator.clone(),
-                crate::context::export_import::ExportScope::Full,
+                scp_runtime_core::context::export_import::ExportScope::Full,
                 &scp_clock::SystemClock,
                 |hash: &[u8; 32]| {
                     Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
@@ -4482,8 +4526,10 @@ mod restore_reconcile_tests {
                 supervisor.shutdown_all_contexts().await;
             }
             let first_state =
-                crate::context::shared::lifecycle::FirstStateRollback::new(&deps, ctx_id)
-                    .expect("guard");
+                scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(
+                    &deps, ctx_id,
+                )
+                .expect("guard");
             match lifecycle_helpers::import_context(
                 &deps,
                 export,
@@ -4528,9 +4574,11 @@ mod restore_reconcile_tests {
             .build_actor_deps_loaded(&creator())
             .await
             .expect("build_actor_deps");
-        let first_state =
-            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "create-dup")
-                .expect("guard");
+        let first_state = scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(
+            &deps,
+            "create-dup",
+        )
+        .expect("guard");
         lifecycle_helpers::create_context(
             &deps,
             "create-dup".to_owned(),
@@ -4562,9 +4610,11 @@ mod restore_reconcile_tests {
             rmp_serde::to_vec_named(&snapshot).expect("encode the snapshot")
         };
         let snapshot_before = stored_snapshot();
-        let second_state =
-            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "create-dup")
-                .expect("guard");
+        let second_state = scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(
+            &deps,
+            "create-dup",
+        )
+        .expect("guard");
         let second = lifecycle_helpers::create_context(
             &deps,
             "create-dup".to_owned(),
@@ -4711,10 +4761,10 @@ mod restore_reconcile_tests {
     /// An event log over `storage`, as production builds it.
     fn stored_event_log(
         storage: &Arc<InMemoryStorage>,
-    ) -> crate::context::providers::MerkleEventLogProvider {
-        crate::context::providers::MerkleEventLogProvider::with_persistence(Arc::new(
-            crate::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
-                crate::store::ProtocolRepository::new_for_testing(Arc::clone(storage)),
+    ) -> scp_runtime_core::context::providers::MerkleEventLogProvider {
+        scp_runtime_core::context::providers::MerkleEventLogProvider::with_persistence(Arc::new(
+            scp_runtime_core::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                scp_runtime_core::store::ProtocolRepository::new_for_testing(Arc::clone(storage)),
             )),
         ))
     }
@@ -4724,11 +4774,16 @@ mod restore_reconcile_tests {
     async fn deps_with_stored_event_log(
         snapshot: ContextSnapshot,
         storage: &Arc<InMemoryStorage>,
-    ) -> (Arc<Supervisor>, crate::context::actor::deps::ActorDeps) {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkRestoreReconcile".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+    ) -> (
+        Arc<Supervisor>,
+        scp_runtime_core::context::actor::deps::ActorDeps,
+    ) {
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkRestoreReconcile".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
@@ -4755,7 +4810,7 @@ mod restore_reconcile_tests {
     #[tokio::test]
     async fn a_restore_failing_after_the_load_releases_the_loaded_log() {
         let ctx_id = "restore-case-release-after-load";
-        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(ctx_id);
         let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
         snapshot.context_id = ctx_id.to_owned();
         snapshot.routing = ContextRouting::for_mode(true, [0u8; 32]);
@@ -4795,7 +4850,7 @@ mod restore_reconcile_tests {
         let reloaded = stored_event_log(&storage);
         assert_eq!(
             reloaded.restore_event_log(&ctx_bytes).await.unwrap(),
-            crate::context::builder::EventLogRestore::Loaded { entries: 1 },
+            scp_runtime_core::context::builder::EventLogRestore::Loaded { entries: 1 },
             "the release leaves the stored log"
         );
     }
@@ -4806,7 +4861,7 @@ mod restore_reconcile_tests {
     #[tokio::test]
     async fn a_restore_of_a_running_context_leaves_its_log_in_memory() {
         let ctx_id = "restore-case-running-actor";
-        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(ctx_id);
         let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
         snapshot.context_id = ctx_id.to_owned();
         let storage = Arc::new(InMemoryStorage::new());
@@ -4844,7 +4899,7 @@ mod restore_reconcile_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         supervisor.register_actor_handle_for_test(
             ctx_id,
-            crate::context::actor::ContextActorHandle::from_sender(tx),
+            scp_runtime_core::context::actor::ContextActorHandle::from_sender(tx),
         );
 
         let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
@@ -4871,12 +4926,14 @@ mod restore_reconcile_tests {
     #[tokio::test]
     async fn shutdown_keeps_the_stored_event_log() {
         let ctx_id = "shutdown-keeps-stored-log";
-        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(ctx_id);
         let storage = Arc::new(InMemoryStorage::new());
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkRestoreReconcile".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkRestoreReconcile".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
@@ -4930,7 +4987,7 @@ mod restore_reconcile_tests {
                 .restore_event_log(&ctx_bytes)
                 .await
                 .unwrap(),
-            crate::context::builder::EventLogRestore::Loaded { entries: created },
+            scp_runtime_core::context::builder::EventLogRestore::Loaded { entries: created },
             "the stored log survives shutdown"
         );
     }
@@ -4943,12 +5000,14 @@ mod restore_reconcile_tests {
     async fn a_restore_guard_keeps_a_registered_actors_log() {
         let owner = DID("did:dht:z6MkGuardKeepsLog".to_owned());
         let live = "restore-guard-registered-actor";
-        let live_bytes = crate::context::state::context_id_to_bytes(live);
+        let live_bytes = scp_runtime_core::context::state::context_id_to_bytes(live);
         let storage = Arc::new(InMemoryStorage::new());
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            owner.0.clone(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                owner.0.clone(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
@@ -4989,7 +5048,7 @@ mod restore_reconcile_tests {
         );
 
         let orphan = "restore-guard-no-actor";
-        let orphan_bytes = crate::context::state::context_id_to_bytes(orphan);
+        let orphan_bytes = scp_runtime_core::context::state::context_id_to_bytes(orphan);
         deps.event_log
             .init_event_log(&orphan_bytes)
             .await
@@ -5053,7 +5112,8 @@ mod restore_reconcile_tests {
         let ctx_id = "restore-case-over-cap-outlets";
         let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let routing = enc_snapshot.routing.clone();
-        enc_snapshot.registered_outlets = (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+        enc_snapshot.registered_outlets = (0
+            ..=scp_runtime_core::context::state::MAX_REGISTERED_OUTLETS)
             .map(|i| restorable_outlet_fixture(&format!("outlet-{i}")))
             .collect();
         let err = restore_with(enc_snapshot, routing, None, ctx_id)
@@ -5264,10 +5324,12 @@ mod restore_reconcile_tests {
 
         // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
         // that resolves the joiner's verifying key for the spending-UCAN sig.
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkJoinMoneyOrder".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkJoinMoneyOrder".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let key_resolver: scp_protocol::context::governance::KeyResolver = {
             let did = joiner_for_resolver;
             let vk = joiner_vk;
@@ -5307,7 +5369,7 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
 
         let context_id = "ctx-paid-join-money-order".to_owned();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(&context_id);
 
         // #2148 (ADR-049 birth-into-actor): no MLS group is birthed — this join
         // is rejected at the economics auto-accept guard (SCP-ECON-12030) BEFORE
@@ -5316,11 +5378,12 @@ mod restore_reconcile_tests {
         // Build per-context state with a per_join cost so a spending UCAN is
         // required and the escrow path runs.
         let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            context_id_bytes,
-            now_secs,
-            admin.clone(),
-        );
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                context_id_bytes,
+                now_secs,
+                admin.clone(),
+            );
         state
             .role_state
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
@@ -5345,7 +5408,7 @@ mod restore_reconcile_tests {
         });
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
         // Generate a real MLS KeyPackage for the joiner.
@@ -5369,7 +5432,7 @@ mod restore_reconcile_tests {
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
         let spending_ucan = signed_join_ucan(&joiner, &joiner_key);
@@ -5380,7 +5443,7 @@ mod restore_reconcile_tests {
         deps.persistence = Arc::new(FailingJoinPersistence);
 
         // `join_context` now takes the Class-S cell; wrap the owned state.
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
         let result = lifecycle_helpers::join_context(
             &mut cell,
             &deps,
@@ -5482,10 +5545,12 @@ mod restore_reconcile_tests {
     /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkFinalizeSendSeq".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkFinalizeSendSeq".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_q: &DID, _kid: scp_did::SigningKeyId| None);
 
@@ -5510,20 +5575,21 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
 
         let context_id = "ctx-finalize-send-seq".to_owned();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(&context_id);
 
         let sender = DID("did:dht:z6MkFinalizeSendSender".to_owned());
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            context_id_bytes,
-            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-            admin.clone(),
-        );
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                context_id_bytes,
+                scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                admin.clone(),
+            );
         state
             .membership
             .add_member(sender.clone(), "member".to_owned(), Vec::new());
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
         // Reserve a sequence exactly as `send_message` does, capturing it.
@@ -5539,7 +5605,7 @@ mod restore_reconcile_tests {
         // skips the post-send checkpoint path. `finalize_send` is actor-shape
         // (ADR-049 §9): wrap the state in the owning `ClassSCell` for the call,
         // then reclaim it via `into_inner` for the post-send read below.
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
@@ -5548,8 +5614,8 @@ mod restore_reconcile_tests {
             &sender,
             reserved,
             b"payload",
-            crate::context::supervisor::MessageSigner::Active(
-                &crate::context::actor::signer::CommandSigner::local_ed25519(
+            scp_runtime_core::context::supervisor::MessageSigner::Active(
+                &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
                     ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
                 ),
             ),
@@ -5653,10 +5719,12 @@ mod restore_reconcile_tests {
     async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
         use scp_protocol::context::membership::ContextEvent;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkPayConverge".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkPayConverge".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &DID, _| None);
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5688,13 +5756,14 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
 
         let context_id = "ctx-pay-converge".to_owned();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(&context_id);
         let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            context_id_bytes,
-            now_secs,
-            admin.clone(),
-        );
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                context_id_bytes,
+                now_secs,
+                admin.clone(),
+            );
         // A per-message cost so a paid action authorizes + captures.
         state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
             locked: false,
@@ -5897,16 +5966,17 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
 
         let context_id = "ctx-leave-fail-closed".to_owned();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(&context_id);
         let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Broadcast-mode state: leave skips MLS (no crypto group needed), so the
         // whole removal body runs synchronously inside `commit_class_s_keep`.
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
-            context_id_bytes,
-            now,
-            admin.clone(),
-        );
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_broadcast(
+                context_id_bytes,
+                now,
+                admin.clone(),
+            );
         // The departing member must be on the authoritative roster for
         // `remove_member` to succeed and reach the persist.
         let leaver = DID("did:dht:z6MkLeaver".to_owned());
@@ -5923,15 +5993,15 @@ mod restore_reconcile_tests {
         );
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
         // Self-removal (caller == member): always permitted, no MemberRemove cap.
         let result =
             lifecycle_helpers::leave_context(&mut cell, &deps, &handle, &leaver, &leaver).await;
@@ -5963,15 +6033,16 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
 
         let context_id = "ctx-close-fail-closed".to_owned();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(&context_id);
         let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Default test governance is SingleAdmin (the close-path model gate).
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            context_id_bytes,
-            now,
-            admin.clone(),
-        );
+        let mut state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                context_id_bytes,
+                now,
+                admin.clone(),
+            );
         // The initiator needs `ContextClose` (the `ttl::close_context` role gate).
         state.role_state.members.insert(admin.as_ref().to_owned());
         state.role_state.member_capabilities.insert(
@@ -5982,15 +6053,15 @@ mod restore_reconcile_tests {
         // `Broadcast` is observable as a retained mutation.
         state
             .handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
-            .transition_to(&crate::context::ContextState::Active)
+            .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
         let result = lifecycle_helpers::close_context(&mut cell, &deps, &handle, &admin).await;
 
         assert!(
@@ -6083,7 +6154,9 @@ mod restore_reconcile_tests {
                 ctx_id,
                 &outsider,
                 modify(Some(policy)),
-                &crate::context::actor::signer::CommandSigner::local_ed25519(outsider_key.clone()),
+                &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                    outsider_key.clone(),
+                ),
             )
             .await;
         assert!(
@@ -6102,7 +6175,9 @@ mod restore_reconcile_tests {
                     interval_secs: None,
                     on_membership_change: false,
                 })),
-                &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
+                &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                    admin_key.clone(),
+                ),
             )
             .await;
         assert!(
@@ -6118,7 +6193,9 @@ mod restore_reconcile_tests {
                 ctx_id,
                 &admin,
                 modify(Some(policy)),
-                &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
+                &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                    admin_key.clone(),
+                ),
             )
             .await
             .expect("the admin's proposal executes");
@@ -6241,7 +6318,9 @@ mod restore_reconcile_tests {
                         did: bob.clone(),
                         role: "member".to_owned(),
                     },
-                    &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
+                    &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                        admin_key.clone(),
+                    ),
                 )
                 .await
                 .expect("the admin adds bob");
@@ -6263,7 +6342,9 @@ mod restore_reconcile_tests {
                             on_membership_change: true,
                         }),
                     },
-                    &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
+                    &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                        admin_key.clone(),
+                    ),
                 )
                 .await
                 .expect("the admin sets a rotation policy");
@@ -6288,7 +6369,7 @@ mod restore_reconcile_tests {
                             did: bob.clone(),
                             reason: None,
                         },
-                        &crate::context::actor::signer::CommandSigner::local_ed25519(
+                        &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
                             admin_key.clone(),
                         ),
                     )
@@ -6309,7 +6390,7 @@ mod restore_reconcile_tests {
 mod relay_url_storage_tests {
     //! §5.12.3.1 `relay_urls` storage rule: canonical when possible.
 
-    use crate::context::shared::lifecycle::normalize_relay_urls;
+    use scp_runtime_core::context::shared::lifecycle::normalize_relay_urls;
 
     fn urls(list: &[&str]) -> Vec<String> {
         list.iter().map(|u| (*u).to_owned()).collect()
@@ -6350,18 +6431,20 @@ mod flush_sweep_tests {
 
     use std::sync::Arc;
 
-    use crate::context::actor::commands::LifecycleCommand;
-    use crate::context::actor::handle::DeliberateExit;
-    use crate::context::actor::{ContextActorHandle, ContextCommand};
-    use crate::context::shared::lifecycle::flush_all_contexts;
-    use crate::context::supervisor::Supervisor;
+    use scp_runtime_core::context::actor::commands::LifecycleCommand;
+    use scp_runtime_core::context::actor::handle::DeliberateExit;
+    use scp_runtime_core::context::actor::{ContextActorHandle, ContextCommand};
+    use scp_runtime_core::context::shared::lifecycle::flush_all_contexts;
+    use scp_runtime_core::context::supervisor::Supervisor;
 
     /// A Supervisor with a persistence provider, so the sweep runs.
     fn persisting_supervisor() -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MkFlushSweep".to_owned(),
-            Arc::new(scp_clock::SystemClock),
-        ));
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkFlushSweep".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
         let mls_storage: Arc<
             dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
         > = Arc::new(
@@ -6371,11 +6454,11 @@ mod flush_sweep_tests {
         );
         Supervisor::with_providers(
             crypto,
-            Box::new(crate::context::builder::NotConfiguredTransportProvider),
-            Box::new(crate::context::providers::MerkleEventLogProvider::new()),
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider),
+            Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new()),
             Arc::new(|_, _| None),
             Some(Box::new(
-                crate::context::providers::persistence::InMemoryPersistence::new(),
+                scp_runtime_core::context::providers::persistence::InMemoryPersistence::new(),
             )),
             None,
             None,
@@ -6438,7 +6521,10 @@ mod flush_sweep_tests {
 
         assert!(panicked.await.unwrap_err().is_panic());
         assert!(
-            matches!(result, Err(crate::context::ContextError::ActorCrashed(_))),
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::ActorCrashed(_))
+            ),
             "a panicked actor fails the sweep: {result:?}"
         );
 
@@ -6464,12 +6550,16 @@ mod flush_sweep_tests {
         let sup = persisting_supervisor();
         let did = scp_did::DID("did:dht:z6MkFlushSweep".to_owned());
         let deps = sup.build_actor_deps_loaded(&did).await.unwrap();
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            [0x5a; 32],
-            1_700_000_000,
-            did,
-        );
-        let handle = sup.spawn_actor_with_state(state, deps, None).await.unwrap();
+        let state =
+            scp_runtime_core::context::actor::state::PerContextState::new_for_test_encrypted(
+                [0x5a; 32],
+                1_700_000_000,
+                did,
+            );
+        let handle = sup
+            .spawn_actor_with_state_for_test(state, deps, None)
+            .await
+            .unwrap();
         assert_eq!(handle.exited_deliberately(), None);
 
         handle.shutdown_and_await_exit().await.unwrap();
@@ -6493,7 +6583,10 @@ mod flush_sweep_tests {
         let result = flush_all_contexts(&sup).await;
 
         assert!(
-            matches!(result, Err(crate::context::ContextError::ActorBusy(_))),
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::ActorBusy(_))
+            ),
             "a full mailbox on a running actor fails the sweep: {result:?}"
         );
         drop(rx);

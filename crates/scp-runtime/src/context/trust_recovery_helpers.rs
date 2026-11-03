@@ -5,7 +5,7 @@
 //!
 //! This module hosts the trust-recovery-domain helpers that the actor
 //! handlers in [`crate::context::actor::handlers::trust_recovery`] call
-//! to implement [`TrustRecoveryCommand`](crate::context::actor::commands::TrustRecoveryCommand).
+//! to implement [`TrustRecoveryCommand`](scp_runtime_core::context::actor::commands::TrustRecoveryCommand).
 //!
 //! # Phase 2A.1 migration
 //!
@@ -55,10 +55,10 @@ use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
 };
 
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
-use crate::context::state::{CommitOperation, context_id_to_bytes, require_active};
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::state::{CommitOperation, context_id_to_bytes, require_active};
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint
@@ -250,7 +250,7 @@ pub async fn recovery_advance_epoch(
             Ok(payload) => {
                 deps.event_log
                     .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
+                        scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::RecoveryEpochAdvanced,
                         "system:recovery",
@@ -300,7 +300,7 @@ pub async fn recovery_send_notification(
     sender_did: &str,
     payload: &[u8],
     sequence: u64,
-    signer: &crate::context::actor::signer::CommandSigner,
+    signer: &scp_runtime_core::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -328,7 +328,9 @@ pub async fn recovery_send_notification(
 
     // ADR-049 Decision 7a: signed through custody within the signing budget,
     // before any send-tracker state is touched.
-    let inner = crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer).await?;
+    let inner =
+        scp_runtime_core::envelope::inner::sign::create_inner_envelope_signed(&params, signer)
+            .await?;
 
     // Use domain-separated routing ID for relay routing, distinct from the
     // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
@@ -399,13 +401,13 @@ pub async fn recovery_send_notification(
 ///
 /// This helper is cross-context but stays actor-shape: the
 /// shared-context lookup goes through
-/// [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context), the only narrow
+/// [`SupervisorHandle::find_shared_context`](scp_runtime_core::context::supervisor::handle::SupervisorHandle::find_shared_context), the only narrow
 /// capability the actor's `deps.supervisor` exposes for cross-context
 /// membership reads. The actor making the call cannot reach the
 /// target context's actor directly (capability-reduced handle, see
 /// ADR-049 §2 / plan §`ActorDeps` and `SupervisorHandle`). Once the
 /// shared context is identified, the notification dispatches through
-/// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification) which
+/// [`SupervisorHandle::dispatch_recovery_send_notification`](scp_runtime_core::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification) which
 /// routes a `RecoverySendNotification` command to the target
 /// context's actor mailbox (or falls through to the legacy lock-
 /// shaped handler if no actor is registered yet).
@@ -423,9 +425,9 @@ pub async fn recovery_notify_contact(
     recovering_did: &str,
     contact_did: &str,
     payload: &[u8],
-    signer: &crate::context::actor::signer::CommandSigner,
+    signer: &scp_runtime_core::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
-    use crate::context::actor::commands::RecoverySendNotificationPayload;
+    use scp_runtime_core::context::actor::commands::RecoverySendNotificationPayload;
 
     let shared_context_id = deps
         .supervisor
@@ -476,5 +478,5 @@ fn persist_state_best_effort<'d, 'c>(
     // Single source of truth: the canonical best-effort persist builds the
     // snapshot, exports the crypto state with the Supervisor's floors, and
     // persists nothing when the Supervisor has dropped.
-    crate::context::snapshot::persist_state_best_effort(state, deps, context_id)
+    scp_runtime_core::context::snapshot::persist_state_best_effort(state, deps, context_id)
 }

@@ -1,8 +1,8 @@
 //! Integration test for the ADR-049 commit-12a fields-only contract.
 //!
-//! Commit 12a extends [`scp_runtime::context::actor::state::PerContextState`],
-//! [`scp_runtime::context::actor::state::ContextCryptoState`], and
-//! [`scp_runtime::context::actor::state::BroadcastState`] with the legacy
+//! Commit 12a extends [`scp_runtime_core::context::actor::state::PerContextState`],
+//! [`scp_runtime_core::context::actor::state::ContextCryptoState`], and
+//! [`scp_runtime_core::context::actor::state::BroadcastState`] with the legacy
 //! field set so 12b+ handler migrations are mechanical. This test
 //! witnesses the structural contract by:
 //!
@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use scp_did::DID;
-use scp_runtime::context::actor::{
+use scp_runtime_core::context::actor::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState,
     ContextLifecycleState, ContextModeState, PendingBroadcastKeyRotation, PerContextState,
     RecvSequenceTracker, WelcomeProcessing,

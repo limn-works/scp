@@ -5,7 +5,7 @@
 // helpers wired here have no in-tree caller until the supervisor's
 // `dispatch_query` shim is deleted in Phase 2A finalization; until then
 // the live FFI / test path still flows through
-// [`crate::context::queries_helpers_legacy`] via the supervisor
+// [`scp_runtime_core::context::queries_helpers_legacy`] via the supervisor
 // passthroughs.
 #![allow(clippy::significant_drop_tightening, dead_code)]
 
@@ -15,8 +15,8 @@
 //! # Purpose
 //!
 //! This module hosts query-domain helpers that operate on actor-owned
-//! [`PerContextState`](crate::context::actor::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) and
+//! capability-reduced [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps).
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
@@ -94,10 +94,10 @@ use scp_protocol::context::{ContextError, ContextParams};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::context::actor::class_s::ClassCMut;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
-use crate::context::state::{self, CommitFaultMarker, PendingCommit};
+use scp_runtime_core::context::actor::class_s::ClassCMut;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::state::{self, CommitFaultMarker, PendingCommit};
 
 // ===========================================================================
 // Per-context read queries (actor-shape)
@@ -138,17 +138,19 @@ pub fn local_pseudonym(state: &PerContextState) -> Result<[u8; 32], ContextError
 pub(super) fn local_routing_ids(
     state: &PerContextState,
     now_secs: u64,
-) -> Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
+) -> Result<scp_runtime_core::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
     let current = local_pseudonym(state)?;
     let rotation = &state.class_s.pseudonym_rotation;
     let policy = state.handle.params().pseudonym_rotation;
-    Ok(crate::context::actor::pseudonym_rotation::LocalRoutingIds {
-        current,
-        query_only: rotation.live_query_only(now_secs),
-        pseudonym_epoch: rotation.epoch(),
-        next_pseudonym_epoch: rotation.next_epoch(policy.as_ref(), now_secs),
-        announce_pending: rotation.announce_pending(),
-    })
+    Ok(
+        scp_runtime_core::context::actor::pseudonym_rotation::LocalRoutingIds {
+            current,
+            query_only: rotation.live_query_only(now_secs),
+            pseudonym_epoch: rotation.epoch(),
+            next_pseudonym_epoch: rotation.next_epoch(policy.as_ref(), now_secs),
+            announce_pending: rotation.announce_pending(),
+        },
+    )
 }
 
 /// Returns the broadcast key and epoch for an author in a broadcast
@@ -253,7 +255,7 @@ pub fn context_params(state: &PerContextState) -> ContextParams {
 /// # Errors
 ///
 /// [`ContextError::InvalidState`] on a Welcome joiner that has not yet
-/// received the live list (see [`crate::context::state::Replicated`]).
+/// received the live list (see [`scp_runtime_core::context::state::Replicated`]).
 pub fn capability_requirements(
     state: &PerContextState,
 ) -> Result<scp_protocol::trust::CapabilityRequirements, scp_protocol::context::ContextError> {
@@ -829,6 +831,9 @@ pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) 
 // Relocated from `queries_helpers_legacy` in Phase 2A finalization.
 
 #[cfg(test)]
+mod routing_id_tests;
+
+#[cfg(test)]
 mod equivocation_dedup_tests {
     //! Focused unit coverage for the `record_equivocation_if_fresh` dedup
     //! gate (§9.9.3 replay defense). The per-sender `(count, root)` set is the
@@ -849,9 +854,9 @@ mod equivocation_dedup_tests {
     use scp_did::DID;
 
     use super::record_equivocation_if_fresh;
-    use crate::context::actor::deps::ActorDeps;
-    use crate::context::actor::state::PerContextState;
-    use crate::context::supervisor::supervisor::Supervisor;
+    use scp_runtime_core::context::actor::deps::ActorDeps;
+    use scp_runtime_core::context::actor::state::PerContextState;
+    use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
     /// Event-log provider that counts `append_event` calls so the test can
     /// assert the dedup gate appends NOTHING to the durable Merkle log —
@@ -863,7 +868,7 @@ mod equivocation_dedup_tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for CountingEventLog {
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
@@ -906,13 +911,15 @@ mod equivocation_dedup_tests {
     async fn deps_with_counting_log(appends: Arc<AtomicUsize>) -> (ActorDeps, PerContextState) {
         use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestEquivDedup".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MktestEquivDedup".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
             Box::new(CountingEventLog { appends });
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
@@ -1144,15 +1151,15 @@ mod checkpoint_signer_tests {
 
     use scp_did::DID;
 
-    use crate::context::actor::signer::CommandSigner;
-    use crate::context::shared::queries::build_checkpoint;
+    use scp_runtime_core::context::actor::signer::CommandSigner;
+    use scp_runtime_core::context::shared::queries::build_checkpoint;
 
     /// Event-log provider with a fixed Merkle root and an empty entry list,
     /// so the checkpoint fields are known in advance.
     struct FixedRootEventLog;
 
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for FixedRootEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for FixedRootEventLog {
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -1205,7 +1212,7 @@ mod checkpoint_signer_tests {
     struct FailingEventLog;
 
     #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for FailingEventLog {
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for FailingEventLog {
         async fn init_event_log(
             &self,
             _id: &[u8; 32],

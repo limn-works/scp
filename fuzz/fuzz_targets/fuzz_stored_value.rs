@@ -3,7 +3,7 @@
 
 //! StoredValue deserialization fuzz target (Tier 2 — covers #1653).
 //!
-//! Target: `scp_runtime::store::StoredValue<T>` deserialization path used
+//! Target: `scp_runtime_core::store::StoredValue<T>` deserialization path used
 //! by `ProtocolRepository::deserialize`. Every value persisted by
 //! `ProtocolRepository` is wrapped in a `StoredValue` envelope; corrupt or
 //! adversarial bytes at this boundary could cause a panic or unsound upgrade
@@ -36,7 +36,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use rmpv::Value;
-use scp_runtime::store::{CURRENT_STORE_VERSION, StoredValue};
+use scp_runtime_core::store::{CURRENT_STORE_VERSION, StoredValue};
 
 fuzz_target!(|data: &[u8]| {
     // Path 1: deserialize as StoredValue<Value> — exercises the version

@@ -24,10 +24,10 @@
 //! The outlet executor is a non-`Send` generic `FnOnce` closure (FFI
 //! bridges supply GIL-bound / JS-bound closures) that cannot cross the
 //! actor mailbox. The economy bookkeeping, by contrast, is `Send` and
-//! mutates owned [`PerContextState`](crate::context::actor::state::PerContextState). The split therefore runs:
+//! mutates owned [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState). The split therefore runs:
 //!
 //! - **Phase 1 (reserve)** — [`reserve_outlet_economy`] runs INSIDE the
-//!   actor handler ([`OutletsCommand::ReserveOutletEconomy`](crate::context::actor::commands::OutletsCommand::ReserveOutletEconomy)) on
+//!   actor handler ([`OutletsCommand::ReserveOutletEconomy`](scp_runtime_core::context::actor::commands::OutletsCommand::ReserveOutletEconomy)) on
 //!   `&mut PerContextState`. It consumes the hard rate limit, records the
 //!   velocity entry, runs the economy pre-check, deducts budget,
 //!   authorizes the payment escrow, and returns a `Send`
@@ -40,7 +40,7 @@
 //!   commands.
 //! - **Phase 3 (settle)** — on executor success
 //!   [`settle_outlet_economy_capture`] runs inside the actor
-//!   ([`OutletsCommand::SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)) to perform post-invocation
+//!   ([`OutletsCommand::SettleOutletEconomy`](scp_runtime_core::context::actor::commands::OutletsCommand::SettleOutletEconomy)) to perform post-invocation
 //!   bookkeeping + consequence enforcement + payment capture; on
 //!   executor failure [`rollback_outlet_economy`] voids the escrow and
 //!   reverses budget / velocity / rate-limit.
@@ -51,8 +51,8 @@
 //! off-lock-executor invariant the legacy lock-split protected, expressed
 //! in the actor model.
 
-use crate::context::outlets::invoke::InvocationCaveatBinding;
-use crate::context::shared::outlets::{
+use scp_runtime_core::context::outlets::invoke::InvocationCaveatBinding;
+use scp_runtime_core::context::shared::outlets::{
     OutletEconomyReservation, OutletEconomyTicket, OutletSettleOutcome, OutletSettleRequest,
     SCP_OUTLET_6089_MARKER, StreamEconomyReservation, authorize_and_capture_stream_billed,
     invocation_error_to_context, rollback_outlet_economy,
@@ -68,9 +68,9 @@ use scp_protocol::economy::types::{Amount, PaymentAdapterRef};
 use scp_protocol::trust::CaveatKind;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
-use crate::context::ContextHandle;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::outlets::invoke::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::outlets::invoke::{
     self, InvocationError, OutletEconomyContext, economy_pre_check,
     post_outlet_invocation_bookkeeping,
 };
@@ -85,10 +85,10 @@ use scp_runtime_types::economy::adapter::PaymentReceipt;
 /// Returns `true` if a token was consumed and `false` when the sender is
 /// over budget. Unknown-context pass-through remains in the supervisor
 /// shim fallback; once a command reaches this helper, the context actor
-/// already owns the target [`PerContextState`](crate::context::actor::state::PerContextState).
+/// already owns the target [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState).
 #[must_use]
 pub fn try_consume_hard_rate_limit(
-    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     did: &DID,
     now_secs: u64,
 ) -> bool {
@@ -105,7 +105,10 @@ pub fn try_consume_hard_rate_limit(
 ///
 /// Unknown-context no-op behavior remains in the supervisor shim
 /// fallback; the actor path only runs after mailbox lookup succeeds.
-pub fn refund_hard_rate_limit(mut view: crate::context::actor::class_s::ClassCMut<'_>, did: &DID) {
+pub fn refund_hard_rate_limit(
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
+    did: &DID,
+) {
     view.governance_class_c_mut()
         .hard_rate_limit_mut()
         .refund(did);
@@ -126,7 +129,7 @@ fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amoun
 }
 
 /// Reverse a cross-context saga's caller-side Prepare-A reservation from its
-/// durable [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord) (spec §6.2.4 "Reservation release on
+/// durable [`CallerReservationRecord`](scp_runtime_core::context::supervisor::saga_prepared_state::CallerReservationRecord) (spec §6.2.4 "Reservation release on
 /// every terminal path"), used EXCLUSIVELY by the crash-recovery abort path
 /// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
 /// (The LIVE `Abort { Some }` and Commit-A paths reverse via the carrier
@@ -163,9 +166,9 @@ fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amoun
 /// reversal); the caller folds that into its Class-S fail-closed persist
 /// decision exactly as it does for a carrier rollback.
 pub async fn reverse_caller_reservation_record(
-    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
-    record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    record: &scp_runtime_core::context::supervisor::saga_prepared_state::CallerReservationRecord,
 ) -> bool {
     // External escrow void is always safe (and required to avoid a leak): the
     // payment hold authorized at Prepare-A is real and external to any actor
@@ -256,7 +259,7 @@ pub async fn reverse_caller_reservation_record(
 /// - **Streaming path** (`reserve_outlet_stream_economy` /
 ///   `reserve_stream_grant_escrow`): the `ContextError` is reverse-mapped by
 ///   [`reserve_error_to_open_rejection`], which reads `current_state` **typed**
-///   into [`OpenStreamRejection::ContextNotActive`](crate::context::outlets::dispatch::OpenStreamRejection::ContextNotActive); the stream-open FFI seam
+///   into [`OpenStreamRejection::ContextNotActive`](scp_runtime_core::context::outlets::dispatch::OpenStreamRejection::ContextNotActive); the stream-open FFI seam
 ///   (`open_rejection_to_err`) then emits only `error_code()` + `slug()` — also
 ///   state-free.
 ///
@@ -326,7 +329,7 @@ fn ensure_context_active(handle: &ContextHandle) -> Result<(), ContextError> {
 /// same-context slice (cross-context target threading is a later slice).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_outlet_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -559,7 +562,7 @@ pub async fn reserve_outlet_economy(
                         )
                     })?;
                     if let Err(err) =
-                        crate::context::shared::economy::validate_spending_ucan_or_error(
+                        scp_runtime_core::context::shared::economy::validate_spending_ucan_or_error(
                             spending,
                             invoker_did,
                             context_id,
@@ -839,16 +842,16 @@ pub async fn reserve_outlet_economy(
 /// - [`ContextError::PermissionDenied`] — the invoker is not a member of the
 ///   context (no per-sender stream state).
 /// - An escrow-overflow / insufficient-funds [`ContextError`] — reusing the
-///   [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+///   [`OpenStreamRejection`](scp_runtime_core::context::outlets::dispatch::OpenStreamRejection)
 ///   `EscrowOverflow` / `InsufficientFunds` variants routed through
-///   [`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error)
+///   [`OpenStreamRejection::to_open_error`](scp_runtime_core::context::outlets::dispatch::OpenStreamRejection::to_open_error)
 ///   — `cost × count` overflowed, or the effective remaining budget is below
 ///   the reservation.
 /// - [`ContextError::PersistenceFailed`] — the fail-closed escrow-debit persist
 ///   did not land (budget + velocity + sequence reversed by the compensation).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_outlet_stream_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -857,7 +860,7 @@ pub async fn reserve_outlet_stream_economy(
     max_per_action: Option<Amount>,
     now_secs: u64,
 ) -> Result<StreamEconomyReservation, ContextError> {
-    use crate::context::outlets::dispatch::OpenStreamRejection;
+    use scp_runtime_core::context::outlets::dispatch::OpenStreamRejection;
 
     // --- Shared prelude (mirrors reserve_outlet_economy ~588-626): handle +
     // role-state snapshot, hard-rate consume, velocity record, economic-policy
@@ -1050,7 +1053,7 @@ pub async fn reserve_outlet_stream_economy(
 /// exactly that check-and-DEBIT against the invoker's
 /// [`MemberBudgetTracker`](scp_protocol::economy::budget::MemberBudgetTracker),
 /// returning the reserved hold the FFI bridge threads into
-/// [`apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+/// [`apply_credit_grant`](scp_runtime_core::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
 /// as `reserved_top_up`.
 ///
 /// It DELIBERATELY runs NO hard-rate / velocity / membership gate — those are
@@ -1072,7 +1075,7 @@ pub async fn reserve_outlet_stream_economy(
 ///
 /// The debit is paired ATOMICALLY (same fail-closed commit) with a bump of the
 /// durable crash-recovery record's
-/// [`reserved_escrow`](crate::context::outlets::invoke::StreamReservationRecord::reserved_escrow)
+/// [`reserved_escrow`](scp_runtime_core::context::outlets::invoke::StreamReservationRecord::reserved_escrow)
 /// keyed by `request_id`. Without this, a hard crash AFTER a grant would leave
 /// [`reconcile_stream_reservations`] refunding only the OPEN-time hold (the
 /// record still carries the open value) while the grant top-up — durably
@@ -1084,7 +1087,7 @@ pub async fn reserve_outlet_stream_economy(
 /// one (escrow-only: empty `ucan_cid`, zero counter) so the top-up is still
 /// crash-covered.
 ///
-/// [`commit_class_s_compensating`](crate::context::actor::class_s::ClassSCell::commit_class_s_compensating)
+/// [`commit_class_s_compensating`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_compensating)
 /// (NOT the keep variant) is the correct combinator: on persist failure it
 /// SNAPSHOT-RESTORES the Class-S record bump AND runs the Class-C compensation
 /// to reverse the budget debit — both undone together, so a failed grant leaves
@@ -1097,7 +1100,7 @@ pub async fn reserve_outlet_stream_economy(
 /// Propagates [`ContextError`] for `EscrowOverflow` (arithmetic) and
 /// `InsufficientFunds` (balance), plus any fail-closed persist failure.
 pub async fn reserve_stream_grant_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
@@ -1105,7 +1108,7 @@ pub async fn reserve_stream_grant_escrow(
     cost_per_chunk: Amount,
     grant: u32,
 ) -> Result<Amount, ContextError> {
-    use crate::context::outlets::dispatch::OpenStreamRejection;
+    use scp_runtime_core::context::outlets::dispatch::OpenStreamRejection;
 
     // #2196 — fail-closed context-lifecycle gate. FIRST predicate, before the
     // zero-cost early return and before any budget debit / durable record bump:
@@ -1172,16 +1175,16 @@ pub async fn reserve_stream_grant_escrow(
                 .class_s
                 .stream_reservations
                 .entry(record_key.clone())
-                .or_insert_with(
-                    || crate::context::outlets::invoke::StreamReservationRecord {
+                .or_insert_with(|| {
+                    scp_runtime_core::context::outlets::invoke::StreamReservationRecord {
                         invoker_did: member_owned.clone(),
                         ucan_cid: String::new(),
                         cost_per_chunk,
                         amount_cumulative_reserved: 0,
                         reserved_escrow: Amount::new(0),
                         generation,
-                    },
-                );
+                    }
+                });
             record.reserved_escrow = record.reserved_escrow.saturating_add(reserved);
             // `value` = the reserved hold returned to the caller; `external` =
             // the same hold the persist-failure compensation reverses on the
@@ -1211,7 +1214,7 @@ pub async fn reserve_stream_grant_escrow(
 /// [`reconcile_stream_reservations`] double-refund the reversed hold. Both
 /// operations are saturating (`reverse_spend` / `saturating_sub`), so a
 /// double-reverse (a Drop-guard racing an explicit reverse) is a safe no-op.
-/// Run under [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep):
+/// Run under [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep):
 /// a reverse must never un-reverse, so KEEP-on-persist-failure (the run loop
 /// retries the durable write) is the correct direction.
 ///
@@ -1220,7 +1223,7 @@ pub async fn reserve_stream_grant_escrow(
 /// [`ContextError::PersistenceFailed`] when the fail-closed persist does not
 /// land (the credit is KEEP'd in memory — the run loop retries).
 pub async fn reverse_stream_grant_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
@@ -1310,7 +1313,7 @@ pub enum StreamSettleOutcome {
 /// no owned Class-S state — H8 "service rendered is billed", matching the
 /// no-actor fallback), but SKIPS the cumulative-counter release and the budget
 /// refund. The unspent escrow and counter of the original (crash-restored)
-/// reservation are instead reconciled by the durable [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+/// reservation are instead reconciled by the durable [`StreamReservationRecord`](scp_runtime_core::context::outlets::invoke::StreamReservationRecord)
 /// and its restore sweep ([`reconcile_stream_reservations`]), which owns THIS
 /// context's own state. `generation` is a Class-C structural field read through
 /// the cell `Deref`.
@@ -1319,11 +1322,11 @@ pub enum StreamSettleOutcome {
 /// HIGH-1 cumulative-counter reserve back to the owned §7.3.8 `AmountCumulative`
 /// counter, and (2) REFUND the unspent escrow to the invoker's budget tracker —
 /// both under ONE fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep)
 /// so the two durable bookkeeping mutations land atomically; then (3) capture
 /// the §19.15.5 `PaymentReceipt` for the EXACT billed amount off-persist,
 /// against the LIVE per-context economic policy (falling back to the open-time
-/// [`EconomicPolicySnapshot`](crate::context::outlets::invoke::EconomicPolicySnapshot)
+/// [`EconomicPolicySnapshot`](scp_runtime_core::context::outlets::invoke::EconomicPolicySnapshot)
 /// only when the live policy is absent — H8 "service rendered is billed").
 ///
 /// Capture runs INDEPENDENTLY of the release/refund persist: a persist failure
@@ -1390,9 +1393,9 @@ pub enum StreamSettleOutcome {
               recording — splitting it would scatter the fixed ordering the doc-comment pins"
 )]
 pub async fn settle_outlet_stream(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    settlement: crate::context::outlets::invoke::StreamSettlement,
+    settlement: scp_runtime_core::context::outlets::invoke::StreamSettlement,
     generation: u64,
     // SCP-OUT-046 CRITICAL — the cross-context streaming-saga witness key. `Some`
     // ⇒ this settle reads `xctx_committed_stream_outputs[saga_id].settled` FIRST
@@ -1417,7 +1420,7 @@ pub async fn settle_outlet_stream(
     // audit/receipt-provenance figure, kept here only to assert the money-
     // conservation invariant below. (Record detection uses `has_record` —
     // whether an entry actually exists — NOT `reserved > 0`.)
-    let crate::context::outlets::invoke::StreamSettlement {
+    let scp_runtime_core::context::outlets::invoke::StreamSettlement {
         context_id,
         invoker_did,
         reserved,
@@ -1592,7 +1595,7 @@ pub async fn settle_outlet_stream(
     // cost_per_chunk` (saturating). A degenerate `billed × cost` overflow FAILS
     // CLOSED — releases nothing, leaving the counter conservatively over-charged
     // (never under-charged). Mirrors
-    // [`CounterReserveSettlement::unspent_release_amount`](crate::context::outlets::dispatch::CounterReserveSettlement::unspent_release_amount).
+    // [`CounterReserveSettlement::unspent_release_amount`](scp_runtime_core::context::outlets::dispatch::CounterReserveSettlement::unspent_release_amount).
     let unspent_release = u64::from(billed_count)
         .checked_mul(cost_per_chunk.value())
         .map_or(0, |billed| {
@@ -1770,7 +1773,7 @@ pub async fn settle_outlet_stream(
                 error: err.to_string(),
                 cost: Some(billed_amount.value()),
             };
-            crate::context::state::emit_event_into(
+            scp_runtime_core::context::state::emit_event_into(
                 cell.class_c_view().receive_buffer_mut(),
                 event,
                 &context_id,
@@ -1785,7 +1788,7 @@ pub async fn settle_outlet_stream(
 /// per-context actor on owned state.
 ///
 /// Drains `ClassSState.stream_reservations` under ONE fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep).
 /// For each unresolved record it REFUNDS the full `reserved_escrow` to the
 /// invoker's `MemberBudgetTracker` (`reverse_spend`, saturating) and RELEASES the
 /// full `amount_cumulative_reserved` back to the §7.3.8 `AmountCumulative` counter
@@ -1815,7 +1818,7 @@ pub async fn settle_outlet_stream(
 /// the durable write; a restart before it lands re-runs the sweep from the
 /// restored record — idempotent).
 pub(in crate::context) async fn reconcile_stream_reservations(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<usize, ContextError> {
@@ -1866,7 +1869,7 @@ pub(in crate::context) async fn reconcile_stream_reservations(
 /// — infallible / SATURATING at `0`, so a double-refund (a Drop-guard reversal
 /// after an explicit settlement already returned the hold) is a safe no-op —
 /// under a fail-closed
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep),
 /// so the returned budget survives a coalesce-window crash the same way the
 /// original debit does.
 ///
@@ -1875,7 +1878,7 @@ pub(in crate::context) async fn reconcile_stream_reservations(
 /// [`ContextError::PersistenceFailed`] when the fail-closed persist does not land
 /// (the credit is KEEP'd in memory — the run loop retries the durable write).
 pub async fn reverse_stream_escrow(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
@@ -1925,12 +1928,12 @@ pub async fn reverse_stream_escrow(
 /// Propagates [`ContextError::PermissionDenied`] when payment capture
 /// fails after a successful execution.
 pub async fn settle_outlet_economy_capture(
-    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    mut view: scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
     ticket: OutletEconomyTicket,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    downward_auth_sink: &mut Option<scp_runtime_core::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -1988,7 +1991,7 @@ pub async fn settle_outlet_economy_capture(
         .governance
         .enforce_triggered_consequences(
             &mut split,
-            &crate::context::shared::governance::EnforceConsequencesCtx {
+            &scp_runtime_core::context::shared::governance::EnforceConsequencesCtx {
                 context_id,
                 member_did: invoker_did,
                 now,
@@ -2053,7 +2056,7 @@ pub async fn settle_outlet_economy_capture(
 // ---------------------------------------------------------------------------
 
 /// Single Phase-3 settle entry point for the actor
-/// [`SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)
+/// [`SettleOutletEconomy`](scp_runtime_core::context::actor::commands::OutletsCommand::SettleOutletEconomy)
 /// handler. Dispatches the request to
 /// [`settle_outlet_economy_capture`] (success) or [`rollback_outlet_economy`]
 /// (failure) on owned state and assembles the [`OutletSettleOutcome`].
@@ -2063,7 +2066,7 @@ pub async fn settle_outlet_economy_capture(
 /// Propagates the capture path's [`ContextError`] on payment-capture
 /// failure. The rollback path is infallible.
 pub async fn settle_outlet_economy(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -2119,7 +2122,7 @@ pub async fn settle_outlet_economy(
             // carrier (vs. a `bool`) makes a populated-but-undischarged obligation a
             // Drop-guard PANIC in debug/CI.
             let mut downward_auth_obligation: Option<
-                crate::context::actor::class_s::ClassSCommitToken,
+                scp_runtime_core::context::actor::class_s::ClassSCommitToken,
             > = None;
             let capture_result = settle_outlet_economy_capture(
                 cell.class_c_view(),
@@ -2171,13 +2174,13 @@ pub async fn settle_outlet_economy(
 // ---------------------------------------------------------------------------
 
 /// Atomically consumes every counter-bearing §7.3.8 caveat for one invocation
-/// against the owned Class-S [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters)
+/// against the owned Class-S [`CaveatCounters`](scp_runtime_core::trust::caveat_counters::CaveatCounters)
 /// record keyed by `ucan_cid`.
 ///
 /// **All-or-nothing.** The consume is applied to a *clone* of the record and
 /// written back ONLY if every counter-bearing kind admits — so a rejection on
 /// the second/third kind never leaves the first kind's increment stranded in
-/// the map. On any [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// the map. On any [`CounterExhausted`](scp_runtime_core::trust::caveat_counters::CounterExhausted)
 /// the map is left unchanged and a mapped [`ContextError`] is returned BEFORE
 /// the caller persists (nothing consumed).
 ///
@@ -2189,7 +2192,10 @@ pub async fn settle_outlet_economy(
 /// `amount_max_cumulative` = `try_consume(AmountCumulative, action_cost, cap)`;
 /// `rate_window` = `try_consume(RateWindow, 0, max, window_secs)`.
 fn consume_caveat_counters(
-    counters: &mut std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+    counters: &mut std::collections::HashMap<
+        String,
+        scp_runtime_core::trust::caveat_counters::CaveatCounters,
+    >,
     ucan_cid: &str,
     caveats: &InvocationCaveats,
     action_cost: Amount,
@@ -2230,7 +2236,7 @@ fn consume_caveat_counters(
     Ok(())
 }
 
-/// Maps a [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// Maps a [`CounterExhausted`](scp_runtime_core::trust::caveat_counters::CounterExhausted)
 /// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
 /// [`ContextError`], naming the caveat kind that fired (slug) and the owning
 /// UCAN CID.
@@ -2245,7 +2251,7 @@ fn consume_caveat_counters(
 /// oracle-collapse target.
 fn counter_exhausted_to_context(
     ucan_cid: &str,
-    err: &crate::trust::caveat_counters::CounterExhausted,
+    err: &scp_runtime_core::trust::caveat_counters::CounterExhausted,
 ) -> ContextError {
     use scp_protocol::context::outlets::error_codes::{
         SLUG_AUTHORIZATION_CUMULATIVE_EXCEEDED, SLUG_AUTHORIZATION_DENIED,
@@ -2294,9 +2300,12 @@ fn check_invocation_error_to_context(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod stream_settlement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::actor::state::PerContextState;
+    use scp_runtime_core::context::actor::state::PerContextState;
 
     fn test_did() -> DID {
         DID::from("did:test:outlets-rate-limit")
@@ -2312,7 +2321,7 @@ mod tests {
         let state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
         // The helpers take the field-granular `ClassCMut`; wrap the test state in
         // a `ClassSCell` to construct the view.
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
 
         assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
@@ -2321,7 +2330,7 @@ mod tests {
     fn refund_hard_rate_limit_restores_actor_owned_bucket() {
         let did = test_did();
         let state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
 
         for _ in 0..10 {
             assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
@@ -2397,12 +2406,12 @@ mod tests {
             ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
         };
 
-        use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::deps::ActorDeps;
-        use crate::context::actor::state::PerContextState;
-        use crate::context::builder::ContextEventLogProvider;
-        use crate::context::providers::MerkleEventLogProvider;
         use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
+        use scp_runtime_core::context::actor::class_s::ClassSCell;
+        use scp_runtime_core::context::actor::deps::ActorDeps;
+        use scp_runtime_core::context::actor::state::PerContextState;
+        use scp_runtime_core::context::builder::ContextEventLogProvider;
+        use scp_runtime_core::context::providers::MerkleEventLogProvider;
         use scp_runtime_types::economy::adapter::PaymentMetadata;
         use scp_runtime_types::economy::adapter::{
             AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError,
@@ -2525,9 +2534,9 @@ mod tests {
 
         /// An escrow-bearing ticket whose capture will run (escrow + policy set),
         /// carrying a budget deduction. Consumed by the capture path.
-        fn escrow_ticket() -> crate::context::shared::outlets::OutletEconomyTicket {
+        fn escrow_ticket() -> scp_runtime_core::context::shared::outlets::OutletEconomyTicket {
             let invoker = DID(INVOKER.to_owned());
-            crate::context::shared::outlets::OutletEconomyTicket::new_for_test_with_escrow(
+            scp_runtime_core::context::shared::outlets::OutletEconomyTicket::new_for_test_with_escrow(
                 invoker.clone(),
                 PreparedAction {
                     envelope: ActionEnvelope {
@@ -2549,15 +2558,17 @@ mod tests {
         }
 
         async fn build_deps() -> ActorDeps {
-            use crate::context::supervisor::supervisor::Supervisor;
             use scp_platform::in_memory::InMemoryStorage;
+            use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-                ADMIN.to_owned(),
-                std::sync::Arc::new(scp_clock::SystemClock),
-            ));
-            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let crypto = Arc::new(
+                scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                    ADMIN.to_owned(),
+                    std::sync::Arc::new(scp_clock::SystemClock),
+                ),
+            );
+            let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+                Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
             let event_log: Box<dyn ContextEventLogProvider> =
                 Box::new(MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
@@ -2585,7 +2596,7 @@ mod tests {
                 mls_storage,
                 crate::domain_handlers(),
             );
-            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+            scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
                 .await
@@ -2637,10 +2648,11 @@ mod tests {
             let mut cell = ClassSCell::new(seed_state());
             let ctx_str = hex::encode([CTX_BYTE; 32]);
 
-            let request = crate::context::shared::outlets::OutletSettleRequest::Capture {
-                generation: cell.generation,
-                ticket: escrow_ticket(),
-            };
+            let request =
+                scp_runtime_core::context::shared::outlets::OutletSettleRequest::Capture {
+                    generation: cell.generation,
+                    ticket: escrow_ticket(),
+                };
             let result = super::super::settle_outlet_economy(
                 &mut cell,
                 &deps,
@@ -2656,7 +2668,7 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(crate::context::ContextError::PersistenceFailed(_))
+                    Err(scp_protocol::context::ContextError::PersistenceFailed(_))
                 ),
                 "a outlet-settle whose capture fails AFTER a consequence suspension must \
                  still persist the suspension fail-closed; a failing persist surfaces \
@@ -2679,11 +2691,11 @@ mod tests {
     /// `outlet_settle_fail_closed` module can reference it via `super::`.
     struct FailOutletPersistence;
     #[async_trait::async_trait]
-    impl crate::context::persistence::ContextPersistence for FailOutletPersistence {
+    impl scp_runtime_core::context::persistence::ContextPersistence for FailOutletPersistence {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
@@ -2691,7 +2703,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::state::ContextSnapshot>,
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -2734,14 +2746,14 @@ mod tests {
         use scp_protocol::economy::types::Amount;
         use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
 
-        use crate::context::ContextError;
-        use crate::context::ContextState;
-        use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::deps::ActorDeps;
-        use crate::context::actor::state::PerContextState;
-        use crate::context::outlets::invoke::InvocationCaveatBinding;
-        use crate::context::outlets::invoke::InvocationError;
-        use crate::trust::caveat_counters::CaveatCounters;
+        use scp_protocol::context::ContextError;
+        use scp_protocol::context::ContextState;
+        use scp_runtime_core::context::actor::class_s::ClassSCell;
+        use scp_runtime_core::context::actor::deps::ActorDeps;
+        use scp_runtime_core::context::actor::state::PerContextState;
+        use scp_runtime_core::context::outlets::invoke::InvocationCaveatBinding;
+        use scp_runtime_core::context::outlets::invoke::InvocationError;
+        use scp_runtime_core::trust::caveat_counters::CaveatCounters;
 
         /// SCP-OUT-031 PR-2a root-cause proof: the runtime → `ContextError`
         /// seam (`invocation_error_to_context`) NO LONGER flattens outlet
@@ -2751,7 +2763,7 @@ mod tests {
         fn invocation_error_to_context_yields_typed_outlet_never_permission_denied() {
             use scp_protocol::context::outlets::errors::OutletErrorClass;
 
-            let timeout = crate::context::shared::outlets::invocation_error_to_context(
+            let timeout = scp_runtime_core::context::shared::outlets::invocation_error_to_context(
                 InvocationError::Timeout { timeout_ms: 100 },
             );
             match timeout {
@@ -2779,7 +2791,9 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        crate::context::shared::outlets::invocation_error_to_context(err),
+                        scp_runtime_core::context::shared::outlets::invocation_error_to_context(
+                            err
+                        ),
                         ContextError::Outlet(_)
                     ),
                     "outlet errors must not flatten to PermissionDenied(String)"
@@ -2791,19 +2805,20 @@ mod tests {
         /// detail intact; `ContextNotActive` stays a typed outlet error.
         #[test]
         fn invocation_error_to_context_keeps_supervisor_shut_down() {
-            match crate::context::shared::outlets::invocation_error_to_context(
-                crate::context::outlets::invoke::OutletOpenError::SupervisorShutDown {
+            match scp_runtime_core::context::shared::outlets::invocation_error_to_context(
+                scp_runtime_core::context::outlets::invoke::OutletOpenError::SupervisorShutDown {
                     message: "open refused".into(),
                 },
             ) {
                 ContextError::SupervisorShutDown(m) => assert_eq!(m, "open refused"),
                 other => panic!("expected ContextError::SupervisorShutDown, got {other:?}"),
             }
-            let not_active = crate::context::shared::outlets::invocation_error_to_context(
-                InvocationError::ContextNotActive {
-                    current_state: "Closing".into(),
-                },
-            );
+            let not_active =
+                scp_runtime_core::context::shared::outlets::invocation_error_to_context(
+                    InvocationError::ContextNotActive {
+                        current_state: "Closing".into(),
+                    },
+                );
             assert!(
                 matches!(not_active, ContextError::Outlet(_)),
                 "got {not_active:?}"
@@ -2815,19 +2830,20 @@ mod tests {
         /// exercised indirectly through Display-string assertions).
         #[test]
         fn reserve_error_reverse_map_arms() {
-            use crate::context::outlets::dispatch::OpenStreamRejection;
-            use crate::context::outlets::invoke::OutletStreamOpenError;
             use scp_protocol::context::outlets::error_codes;
             use scp_protocol::context::outlets::errors::OutletErrorSurface;
+            use scp_runtime_core::context::outlets::dispatch::OpenStreamRejection;
+            use scp_runtime_core::context::outlets::invoke::OutletStreamOpenError;
 
             // Economic reserve rejections cross the mailbox as the typed
             // `Outlet(surface)` and are routed by the surface's structured slug.
-            let escrow = crate::context::shared::outlets::reserve_error_to_open_rejection(
-                &ContextError::Outlet(Box::new(OutletErrorSurface::from_class(
-                    error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
-                    None,
-                ))),
-            );
+            let escrow =
+                scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
+                    &ContextError::Outlet(Box::new(OutletErrorSurface::from_class(
+                        error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
+                        None,
+                    ))),
+                );
             assert!(
                 matches!(
                     escrow,
@@ -2836,7 +2852,7 @@ mod tests {
                 "{escrow:?}"
             );
 
-            let funds = crate::context::shared::outlets::reserve_error_to_open_rejection(
+            let funds = scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
                 &ContextError::Outlet(Box::new(OutletErrorSurface::from_class(
                     error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
                     None,
@@ -2851,11 +2867,12 @@ mod tests {
             );
 
             // The typed context-not-active carrier keeps `current_state`.
-            let not_active = crate::context::shared::outlets::reserve_error_to_open_rejection(
-                &ContextError::OutletContextNotActive {
-                    current_state: ContextState::Closing,
-                },
-            );
+            let not_active =
+                scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
+                    &ContextError::OutletContextNotActive {
+                        current_state: ContextState::Closing,
+                    },
+                );
             match not_active {
                 OutletStreamOpenError::Rejected(OpenStreamRejection::ContextNotActive {
                     current_state,
@@ -2869,7 +2886,7 @@ mod tests {
             }
 
             // Hard-rate-limit → transport admission slug.
-            let rl = crate::context::shared::outlets::reserve_error_to_open_rejection(
+            let rl = scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
                 &ContextError::RateLimited {
                     resource: "outlet_call".to_owned(),
                     message: "bucket empty".to_owned(),
@@ -2887,7 +2904,7 @@ mod tests {
             );
 
             // Any other error is genuinely transient → retryable transport slug.
-            let other = crate::context::shared::outlets::reserve_error_to_open_rejection(
+            let other = scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
                 &ContextError::PersistenceFailed("disk".to_owned()),
             );
             assert!(
@@ -2902,7 +2919,7 @@ mod tests {
 
             // A shutdown refusal keeps the Supervisor's shutdown arm and its
             // message, not the retryable transport slug.
-            let shut = crate::context::shared::outlets::reserve_error_to_open_rejection(
+            let shut = scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(
                 &ContextError::SupervisorShutDown("reserve refused".to_owned()),
             );
             assert!(
@@ -3126,7 +3143,7 @@ mod tests {
         /// escrow hold + cumulative counter reserve).
         #[test]
         fn stream_reservations_survive_class_s_snapshot_round_trip() {
-            use crate::context::outlets::invoke::StreamReservationRecord;
+            use scp_runtime_core::context::outlets::invoke::StreamReservationRecord;
 
             let expected = StreamReservationRecord {
                 invoker_did: scp_did::DID::from("did:key:snap-invoker"),
@@ -3157,11 +3174,11 @@ mod tests {
         /// happy path for the counter consume's fail-closed persist.
         struct OkPersistence;
         #[async_trait::async_trait]
-        impl crate::context::persistence::ContextPersistence for OkPersistence {
+        impl scp_runtime_core::context::persistence::ContextPersistence for OkPersistence {
             async fn persist_context(
                 &self,
                 _: &str,
-                _: &crate::context::state::ContextSnapshot,
+                _: &scp_runtime_core::context::state::ContextSnapshot,
             ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
@@ -3169,7 +3186,7 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<
-                Option<crate::context::state::ContextSnapshot>,
+                Option<scp_runtime_core::context::state::ContextSnapshot>,
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Ok(None)
@@ -3188,19 +3205,21 @@ mod tests {
         }
 
         async fn build_deps(
-            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+            persistence: Box<dyn scp_runtime_core::context::persistence::ContextPersistence>,
         ) -> ActorDeps {
-            use crate::context::supervisor::supervisor::Supervisor;
             use scp_platform::in_memory::InMemoryStorage;
+            use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-                INVOKER.to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ));
-            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-                Box::new(crate::context::builder::NotConfiguredTransportProvider);
-            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let crypto = Arc::new(
+                scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                    INVOKER.to_owned(),
+                    Arc::new(scp_clock::SystemClock),
+                ),
+            );
+            let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+                Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
+                Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
                 Arc::new(|_, _| None);
             let mls_storage: Arc<
@@ -3226,7 +3245,7 @@ mod tests {
                 mls_storage,
                 crate::domain_handlers(),
             );
-            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+            scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
@@ -3331,7 +3350,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_over_an_unreadable_log_returns_velocity_and_rate_tokens() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_key());
+            let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_key());
             deps.event_log
                 .init_event_log(&ctx_bytes)
                 .await
@@ -3745,19 +3764,21 @@ mod tests {
         /// outlet-economy wiring reference, whose paid happy path also configures
         /// no adapter and asserts `payment_receipt.is_none()`.
         async fn build_deps_paid(
-            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+            persistence: Box<dyn scp_runtime_core::context::persistence::ContextPersistence>,
         ) -> ActorDeps {
-            use crate::context::supervisor::supervisor::Supervisor;
             use scp_platform::in_memory::InMemoryStorage;
+            use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-                INVOKER.to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ));
-            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-                Box::new(crate::context::builder::NotConfiguredTransportProvider);
-            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let crypto = Arc::new(
+                scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                    INVOKER.to_owned(),
+                    Arc::new(scp_clock::SystemClock),
+                ),
+            );
+            let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+                Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
+                Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new());
             let key_resolver = mock_key_resolver();
             let mls_storage: Arc<
                 dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
@@ -3779,7 +3800,7 @@ mod tests {
                 mls_storage,
                 crate::domain_handlers(),
             );
-            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+            scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
@@ -4096,11 +4117,11 @@ mod tests {
         use scp_did::DID;
         use scp_protocol::economy::types::{Amount, EconomicPolicy};
 
-        use crate::context::ContextError;
-        use crate::context::ContextState;
-        use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::deps::ActorDeps;
-        use crate::context::actor::state::PerContextState;
+        use scp_protocol::context::ContextError;
+        use scp_protocol::context::ContextState;
+        use scp_runtime_core::context::actor::class_s::ClassSCell;
+        use scp_runtime_core::context::actor::deps::ActorDeps;
+        use scp_runtime_core::context::actor::state::PerContextState;
 
         const INVOKER: &str = "did:dht:z6MkStreamInvoker";
         const CTX_BYTE: u8 = 0x57;
@@ -4117,11 +4138,11 @@ mod tests {
         /// Persistence double whose `persist_context` always SUCCEEDS.
         struct OkPersistence;
         #[async_trait::async_trait]
-        impl crate::context::persistence::ContextPersistence for OkPersistence {
+        impl scp_runtime_core::context::persistence::ContextPersistence for OkPersistence {
             async fn persist_context(
                 &self,
                 _: &str,
-                _: &crate::context::state::ContextSnapshot,
+                _: &scp_runtime_core::context::state::ContextSnapshot,
             ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
@@ -4129,7 +4150,7 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<
-                Option<crate::context::state::ContextSnapshot>,
+                Option<scp_runtime_core::context::state::ContextSnapshot>,
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Ok(None)
@@ -4151,11 +4172,11 @@ mod tests {
         /// fail-closed escrow-debit compensation path.
         struct FailPersistence;
         #[async_trait::async_trait]
-        impl crate::context::persistence::ContextPersistence for FailPersistence {
+        impl scp_runtime_core::context::persistence::ContextPersistence for FailPersistence {
             async fn persist_context(
                 &self,
                 _: &str,
-                _: &crate::context::state::ContextSnapshot,
+                _: &scp_runtime_core::context::state::ContextSnapshot,
             ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Err("induced persist failure".into())
             }
@@ -4163,7 +4184,7 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<
-                Option<crate::context::state::ContextSnapshot>,
+                Option<scp_runtime_core::context::state::ContextSnapshot>,
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Ok(None)
@@ -4182,19 +4203,21 @@ mod tests {
         }
 
         async fn build_deps(
-            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+            persistence: Box<dyn scp_runtime_core::context::persistence::ContextPersistence>,
         ) -> ActorDeps {
-            use crate::context::supervisor::supervisor::Supervisor;
             use scp_platform::in_memory::InMemoryStorage;
+            use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
-            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-                INVOKER.to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ));
-            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-                Box::new(crate::context::builder::NotConfiguredTransportProvider);
-            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let crypto = Arc::new(
+                scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                    INVOKER.to_owned(),
+                    Arc::new(scp_clock::SystemClock),
+                ),
+            );
+            let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+                Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
+                Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
                 Arc::new(|_, _| None);
             let mls_storage: Arc<
@@ -4217,7 +4240,7 @@ mod tests {
                 mls_storage,
                 crate::domain_handlers(),
             );
-            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
+            scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps_loaded(&invoker())
                 .await
@@ -4267,8 +4290,10 @@ mod tests {
             cost: u64,
             count: u32,
             max_per_action: Option<u64>,
-        ) -> Result<crate::context::shared::outlets::StreamEconomyReservation, ContextError>
-        {
+        ) -> Result<
+            scp_runtime_core::context::shared::outlets::StreamEconomyReservation,
+            ContextError,
+        > {
             super::super::reserve_outlet_stream_economy(
                 cell,
                 deps,
@@ -4534,7 +4559,7 @@ mod tests {
         fn seed_open_record(state: &mut PerContextState, open_hold: u64) {
             state.class_s.stream_reservations.insert(
                 hex::encode(GRANT_REQ),
-                crate::context::outlets::invoke::StreamReservationRecord {
+                scp_runtime_core::context::outlets::invoke::StreamReservationRecord {
                     invoker_did: invoker(),
                     ucan_cid: String::new(),
                     cost_per_chunk: Amount::new(10),
@@ -4996,8 +5021,9 @@ mod tests {
                 "the reserve emits the canonical 6089 membership marker: {msg}"
             );
 
-            let crate::context::outlets::invoke::OutletStreamOpenError::Rejected(rejection) =
-                crate::context::shared::outlets::reserve_error_to_open_rejection(&err)
+            let scp_runtime_core::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                rejection,
+            ) = scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection(&err)
             else {
                 panic!("a membership denial is an open rejection, not a shutdown refusal");
             };

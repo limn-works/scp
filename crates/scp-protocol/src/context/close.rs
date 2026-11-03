@@ -13,7 +13,7 @@
 //! dispatched close by [`MemoryScope`] were DELETED in #2199 (they were 100%
 //! dead after #2148 moved crypto disposal onto the context actor). The truthful
 //! key-destruction attestation is now built inline at the actor finalize seam
-//! (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the observed
+//! (`scp_runtime_core::context::shared::ttl_close::finalize_close`) from the observed
 //! disposal outcome. The pure-data close types here are retained.
 //!
 //! # Close Sequencing
@@ -473,7 +473,7 @@ pub enum CloseEvent {
 // then 100% dead (every constructor lived only in `mod tests`), so they and
 // their orchestrator-only plumbing types were removed. The TRUTHFUL
 // attestation is now built inline at the actor finalize seam
-// (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the OBSERVED
+// (`scp_runtime_core::context::shared::ttl_close::finalize_close`) from the OBSERVED
 // `DisposalOutcome`.
 //
 // The SPECCED close-orchestration data types below/above — `ContextCloseReason`,

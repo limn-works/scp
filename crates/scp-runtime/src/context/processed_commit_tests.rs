@@ -36,17 +36,17 @@ use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextError, ContextState};
 use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, SenderKey};
 
-use crate::context::ContextHandle;
-use crate::context::actor::class_s::ClassSCell;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::pseudonym_rotation::PseudonymRotationState;
-use crate::context::actor::state::PerContextState;
-use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::governance_helpers::execute_reset_member;
-use crate::context::persistence::ContextPersistence;
-use crate::context::shared::governance::CommitMeta;
-use crate::context::state::{ContextSnapshot, context_id_to_bytes};
-use crate::context::supervisor::supervisor::Supervisor;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::pseudonym_rotation::PseudonymRotationState;
+use scp_runtime_core::context::actor::state::PerContextState;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::persistence::ContextPersistence;
+use scp_runtime_core::context::shared::governance::CommitMeta;
+use scp_runtime_core::context::state::{ContextSnapshot, context_id_to_bytes};
+use scp_runtime_core::context::supervisor::supervisor::Supervisor;
 
 const ALICE: &str = "did:dht:z6MkAliceProcessedCommitAliceProcessedCo1";
 const BOB: &str = "did:dht:z6MkBobProcessedCommitBobProcessedCommitB1";
@@ -215,7 +215,7 @@ struct Member {
 
 async fn member_deps(
     did: &str,
-    crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+    crypto: Arc<scp_runtime_core::crypto::mls::provider::NodeMlsFactory>,
 ) -> (ActorDeps, Arc<Supervisor>, Arc<Store>, Arc<Sent>) {
     let store = Arc::new(Store::default());
     let sent = Arc::new(Sent::default());
@@ -230,7 +230,7 @@ async fn member_deps(
         crypto,
         Box::new(RecordingTransport(Arc::clone(&sent))),
         Box::new(OkEventLog),
-        crate::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
         Some(Box::new(SharedStore(Arc::clone(&store)))),
         None,
         None,
@@ -331,15 +331,15 @@ async fn deliver(
     member: &mut Member,
     ctx: &str,
     blob: Vec<u8>,
-) -> Result<crate::context::actor::commands::DeliverOutcome, ContextError> {
+) -> Result<scp_runtime_core::context::actor::commands::DeliverOutcome, ContextError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _outcome = crate::context::actor::handlers::messaging::dispatch(
         &mut member.cell,
         &member.deps,
-        crate::context::actor::commands::MessagingCommand::DeliverIncoming {
+        scp_runtime_core::context::actor::commands::MessagingCommand::DeliverIncoming {
             context_id: ctx.to_owned(),
             envelope_bytes: blob,
-            mode: crate::context::actor::commands::DeliveryMode::Live,
+            mode: scp_runtime_core::context::actor::commands::DeliveryMode::Live,
             reply: tx,
         },
     )
@@ -365,14 +365,19 @@ fn is_commit(bytes: &[u8]) -> bool {
 /// the raw receive path before his cell was built, so nothing persisted it and
 /// Bob's rotation state starts with nothing pending.
 async fn trio(ctx: &str) -> (Member, Member) {
-    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+    let scp_runtime_core::crypto::mls::two_party_test_support::TwoPartyPair {
         alice_provider,
         mut alice_state,
         bob_provider,
         mut bob_state,
         ctx_bytes,
         ..
-    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    } = scp_runtime_core::crypto::mls::two_party_test_support::stand_up_two_party(
+        ctx,
+        ALICE,
+        BOB,
+        crate::domain_handlers(),
+    );
     let (alice_deps, alice_sup, alice_store, alice_sent) = member_deps(ALICE, alice_provider).await;
     let (bob_deps, bob_sup, bob_store, bob_sent) = member_deps(BOB, bob_provider).await;
 
@@ -392,7 +397,7 @@ async fn trio(ctx: &str) -> (Member, Member) {
     .expect("Bob merges the add");
     assert!(matches!(
         dispatched,
-        crate::context::shared::messaging::Dispatched::Commit { .. }
+        scp_runtime_core::context::shared::messaging::Dispatched::Commit { .. }
     ));
 
     activate(&mut alice_state, &[ALICE, BOB, CAROL]);
@@ -477,10 +482,10 @@ async fn seed_bob_for_carol(bob: &mut Member, ctx: &str, sender_key_ctx: &str) {
         .await
         .expect("seed Bob's state for Carol");
     bob.sup
-        .check_and_advance_sender_epoch(&ctx_bytes, CAROL, 1, MAX_EPOCH_ADVANCE)
+        .check_and_advance_sender_epoch_for_test(&ctx_bytes, CAROL, 1, MAX_EPOCH_ADVANCE)
         .expect("seed Carol's sender-epoch floor");
     bob.sup
-        .check_and_advance_recv_sequence(
+        .check_and_advance_recv_sequence_for_test(
             &ctx_bytes,
             CAROL,
             ReceiveFloor {
@@ -580,18 +585,20 @@ async fn a_received_remove_commit_changes_only_the_trigger_and_the_registry_reco
     );
     assert!(
         bob.sup
-            .export_sender_key_epochs(&ctx_bytes)
+            .export_sender_key_epochs_for_test(&ctx_bytes)
             .contains(&(CAROL.to_owned(), 1)),
         "sender-epoch floor kept"
     );
     assert!(
-        bob.sup.export_recv_sequence_floors(&ctx_bytes).contains(&(
-            CAROL.to_owned(),
-            ReceiveFloor {
-                epoch: 1,
-                sequence: 4
-            }
-        )),
+        bob.sup
+            .export_recv_sequence_floors_for_test(&ctx_bytes)
+            .contains(&(
+                CAROL.to_owned(),
+                ReceiveFloor {
+                    epoch: 1,
+                    sequence: 4
+                }
+            )),
         "receive floor kept"
     );
 }

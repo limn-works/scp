@@ -50,7 +50,7 @@ use scp_protocol::envelope::inner::verify_inner_signature;
 use scp_protocol::envelope::InnerEnvelopeParams;
 
 use ed25519_dalek::SigningKey;
-use scp_runtime::envelope::inner::sign::create_inner_envelope_raw;
+use scp_runtime_core::envelope::inner::sign::create_inner_envelope_raw;
 
 // Fixed signing key for all fuzz runs (deterministic, non-secret).
 const FUZZ_SEED: [u8; 32] = [

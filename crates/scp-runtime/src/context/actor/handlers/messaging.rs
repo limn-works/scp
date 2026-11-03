@@ -40,15 +40,15 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::ContextHandle;
-use crate::context::actor::commands::MessagingCommand;
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::commands::MessagingCommand;
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
 use scp_runtime_types::context::actor::sequence::SequenceReservation;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`MessagingCommand`] against actor-owned state and deps.
 ///
@@ -62,8 +62,8 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 // One arm per `MessagingCommand` variant — a flat match-dispatcher, not a
 // complex body (mirrors the `#[allow]` on `handlers::lifecycle::dispatch`).
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn dispatch(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn dispatch(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
@@ -314,7 +314,7 @@ pub(crate) async fn dispatch(
 ///
 /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) READ-ONLY inner-envelope inspection: the
 /// actor twin of the deleted provider `open` inspection twin. Drives ONLY
-/// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+/// [`ContextCryptoState::open`](scp_runtime_core::context::actor::state::ContextCryptoState::open)
 /// on the actor's OWNED crypto state and returns the raw decrypted
 /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) so the harness
 /// can read the wire-level `message_type` / `sequence` (§9.9.2 heartbeat AC2/AC3).
@@ -346,14 +346,14 @@ pub(crate) async fn dispatch(
 /// ahead of the production receive path for a message you also intend to deliver.
 #[cfg(feature = "testing")]
 fn handle_inspect_incoming_inner(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
 ) -> Outcome<()> {
     use scp_protocol::context::builder::OpenResult;
 
-    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+    let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(context_id);
 
     let mut view = cell.class_c_view();
     // A `None` crypto state is a context with no MLS group (a broadcast context,
@@ -404,7 +404,7 @@ fn handle_inspect_incoming_inner(
 ///
 /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 ANSWER half reached by
 /// `context_id`: drives the actor-owned
-/// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request)
+/// [`ContextCryptoState::handle_sender_key_request`](scp_runtime_core::context::actor::state::ContextCryptoState::handle_sender_key_request)
 /// and returns the ephemeral-sealed `SenderKeyResponse` bytes straight back to
 /// the caller (the full-stack harness, which drives the requester side with its
 /// own custody — actor-loop request INITIATION is deferred #2049). Mirrors
@@ -416,14 +416,14 @@ fn handle_inspect_incoming_inner(
 /// nothing and reports `err`).
 #[cfg(feature = "testing")]
 async fn handle_handle_sender_key_request(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     request_bytes: &[u8],
     requester_public_key: &[u8; 32],
     reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
 ) -> Outcome<()> {
-    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+    let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(context_id);
     let local_did = deps.crypto.local_did().to_owned();
     let now_secs = deps.clock.now_secs();
     // No per-context sender-key block list is resident on the actor (the
@@ -485,7 +485,7 @@ async fn handle_handle_sender_key_request(
 /// install MUST land on the actor.
 #[cfg(feature = "testing")]
 async fn handle_land_sender_key_response(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &str,
@@ -493,7 +493,7 @@ async fn handle_land_sender_key_response(
     epoch: u64,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+    let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(context_id);
 
     // GATE first (FAIL-CLOSED, no cell borrow) — the Class-M registry enforces
     // epoch monotonicity + the poisoning ceiling and advances the authoritative
@@ -540,7 +540,7 @@ async fn handle_land_sender_key_response(
 /// match so the dispatcher stays a flat one-line-per-arm router.
 #[cfg(feature = "testing")]
 fn handle_seed_peer_pseudonym(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     member_did: scp_did::DID,
     pseudonym: [u8; 32],
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -589,7 +589,7 @@ fn handle_seed_peer_pseudonym(
 /// map). Rejects an inactive context so a mis-targeted test fails loudly.
 #[cfg(feature = "testing")]
 fn handle_test_insert_member(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     member_did: &scp_did::DID,
     role: &str,
@@ -604,7 +604,7 @@ fn handle_test_insert_member(
     // write, so nothing was mutated (`err`, mutated:false). Split OUT of the
     // closure below so this clean reject is distinguishable from a post-mutation
     // failure.
-    if let Err(e) = crate::context::state::require_active(&cell.handle) {
+    if let Err(e) = scp_runtime_core::context::state::require_active(&cell.handle) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -652,14 +652,14 @@ fn handle_test_insert_member(
 /// bypasses the capability ceiling (matching the fixture): the ceiling is
 /// downward-auth Class-S with no structural-view `&mut`, so this seam reaches
 /// `role_state.member_capabilities` through the whole-state
-/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// [`commit_class_s_keep`](scp_runtime_core::context::actor::class_s::ClassSCell::commit_class_s_keep)
 /// combinator (fail-closed persist; the grant is KEPT in memory even if the
 /// durable write fails, and the run loop retries it). Rejects an inactive
 /// context (pre-mutation gate → clean `err`, `mutated:false`) and an
 /// unrecognized capability stem.
 #[cfg(feature = "outlet-capability-test-grant")]
 async fn handle_test_grant_member_capability(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &scp_did::DID,
@@ -668,7 +668,7 @@ async fn handle_test_grant_member_capability(
 ) -> Outcome<()> {
     use scp_protocol::context::roles::Capability;
 
-    if let Err(e) = crate::context::state::require_active(&cell.handle) {
+    if let Err(e) = scp_runtime_core::context::state::require_active(&cell.handle) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -718,17 +718,17 @@ async fn handle_test_grant_member_capability(
 /// harness recovered through the REAL §9.17 pull round trip, not one minted
 /// locally. Rejects an inactive context so a mis-targeted test fails loudly.
 /// Routes the store through the non-persisting `class_c_view` (the run loop
-/// persists on `mutated`), mirroring [`generate_context_access_key`](crate::context::shared::queries::generate_context_access_key).
+/// persists on `mutated`), mirroring [`generate_context_access_key`](scp_runtime_core::context::shared::queries::generate_context_access_key).
 #[cfg(feature = "testing")]
 fn handle_test_install_access_key(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     key: scp_protocol::crypto::access_keys::AccessKey,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let result = (|| {
-        crate::context::state::require_active(&cell.handle)?;
+        scp_runtime_core::context::state::require_active(&cell.handle)?;
         cell.class_c_view()
             .access_mut()
             .access_key_store
@@ -763,7 +763,7 @@ fn handle_test_install_access_key(
 /// stays correct.
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_message(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
@@ -865,12 +865,12 @@ async fn handle_send_message(
 /// budget. Precedent: `handlers::broadcast::handle_broadcast_*` wraps
 /// sync helpers the same way.
 async fn handle_deliver_incoming(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     envelope_bytes: &[u8],
-    mode: crate::context::actor::commands::DeliveryMode,
-    reply: crate::context::actor::commands::DeliverIncomingReply,
+    mode: scp_runtime_core::context::actor::commands::DeliveryMode,
+    reply: scp_runtime_core::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
     // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation populated when the
     // receive cascade performs a downward-auth mutation (a `suspended_capabilities`
@@ -881,14 +881,16 @@ async fn handle_deliver_incoming(
     // crash would silently re-grant the member's removed authority). The token
     // carrier (vs. the prior `bool`) makes a populated-but-undischarged obligation a
     // Drop-guard PANIC in debug/CI, so a missed discharge cannot slip through.
-    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
-        None;
+    let mut downward_auth_obligation: Option<
+        scp_runtime_core::context::actor::class_s::ClassSCommitToken,
+    > = None;
     // Spec 09 §9.10.4.1: a Commit another member committed, with its
     // membership changes counted by DID. `deliver_incoming` fills it; the
     // registry deletion and rotation trigger it owes are Class-S, so they are
     // applied below through a fail-closed commit once the view drops.
-    let mut processed_commit: Option<crate::context::actor::pseudonym_rotation::ProcessedCommit> =
-        None;
+    let mut processed_commit: Option<
+        scp_runtime_core::context::actor::pseudonym_rotation::ProcessedCommit,
+    > = None;
     // Coalesced Class-C mutation (the run loop persists on `mutated`); the receive
     // cascade reaches its Class-C fields through the non-persisting `class_c_view`
     // (sequence/reorder/receive buffers, membership[read], role[read], routing,
@@ -943,18 +945,18 @@ async fn handle_deliver_incoming(
     // nothing and does not advance its MLS send ratchet: the answer stays
     // queued until a full reconnection sends `SendQueuedSenderKeys`.
     match mode {
-        crate::context::actor::commands::DeliveryMode::Live => {
+        scp_runtime_core::context::actor::commands::DeliveryMode::Live => {
             deps.domains
                 .lifecycle
                 .drain_and_deliver_sender_keys(
                     deps,
                     &mut cell.class_c_view(),
                     context_id,
-                    crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+                    scp_runtime_core::context::shared::lifecycle::DistributionScope::NeverAttempted,
                 )
                 .await;
         }
-        crate::context::actor::commands::DeliveryMode::PullOnly => {}
+        scp_runtime_core::context::actor::commands::DeliveryMode::PullOnly => {}
     }
 
     // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
@@ -968,7 +970,7 @@ async fn handle_deliver_incoming(
     // no delivery error can be lost.
     let reply_result = if let Some(commit) = processed_commit.take() {
         cell.commit_class_s_keep(deps, context_id, |mut v| {
-            crate::context::actor::pseudonym_rotation::note_processed_commit(
+            scp_runtime_core::context::actor::pseudonym_rotation::note_processed_commit(
                 v.rest_mut(),
                 deps.crypto.local_did(),
                 &commit,
@@ -1014,17 +1016,19 @@ async fn handle_deliver_incoming(
 ///
 /// MLS-encrypts and sends every queued sender-key distribution, a failed one
 /// included, through `drain_and_deliver_sender_keys`. The reply carries the
-/// pass's [`DistributionReport`](crate::context::actor::state::DistributionReport):
+/// pass's [`DistributionReport`](scp_runtime_core::context::actor::state::DistributionReport):
 /// a distribution that stays queued or was dropped is a fault in the report,
 /// never an error (spec 09 §9.16.9). The reply is `TransportTimeout` only when
 /// the pass exceeds its budget; the pass removes an entry only after its
 /// publish succeeds and reports each fault when it records it, so a timeout
 /// loses neither a queued distribution nor a report.
 async fn handle_send_queued_sender_keys(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    reply: oneshot::Sender<Result<crate::context::actor::state::DistributionReport, ContextError>>,
+    reply: oneshot::Sender<
+        Result<scp_runtime_core::context::actor::state::DistributionReport, ContextError>,
+    >,
 ) -> Outcome<()> {
     let result = {
         let mut view = cell.class_c_view();
@@ -1032,7 +1036,7 @@ async fn handle_send_queued_sender_keys(
             deps,
             &mut view,
             context_id,
-            crate::context::shared::lifecycle::DistributionScope::All,
+            scp_runtime_core::context::shared::lifecycle::DistributionScope::All,
         );
         match tokio::time::timeout(HANDLER_TIMEOUT, drain).await {
             Ok(report) => Ok(report),
@@ -1055,9 +1059,9 @@ async fn handle_send_queued_sender_keys(
 /// events on the reply channel; never propagates `ContextNotRegistered`
 /// because the actor IS the registration.
 async fn handle_drain_events(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
-    reply: crate::context::actor::commands::DrainEventsReply,
+    reply: scp_runtime_core::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
     // receive buffer through the non-persisting `class_c_view`.
@@ -1088,9 +1092,9 @@ async fn handle_drain_events(
 /// it so catch-up does not destroy buffered application traffic
 /// (messages, membership changes) that arrived during the sync.
 async fn handle_drain_equivocation_alerts(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
-    reply: crate::context::actor::commands::DrainEventsReply,
+    reply: scp_runtime_core::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
     // equivocation alerts through the non-persisting `class_c_view`.
@@ -1114,7 +1118,7 @@ async fn handle_drain_equivocation_alerts(
 
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`] (actor-shape).
 async fn handle_send_pseudonym_announcement(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -1162,7 +1166,7 @@ struct RotateRequest<'a> {
     new_epoch: u64,
     new_routing_id: [u8; 32],
     sender_did: &'a scp_did::DID,
-    signer: &'a crate::context::actor::signer::CommandSigner,
+    signer: &'a scp_runtime_core::context::actor::signer::CommandSigner,
 }
 
 /// Handle [`MessagingCommand::RotatePseudonym`] (actor-shape).
@@ -1176,7 +1180,7 @@ struct RotateRequest<'a> {
 /// can stop the helper part-way; a rejection or a restored persist failure
 /// changed nothing and reports no mutation.
 async fn handle_rotate_pseudonym(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     request: RotateRequest<'_>,
@@ -1225,7 +1229,7 @@ async fn handle_rotate_pseudonym(
 /// Handle [`MessagingCommand::ReportDegradedMode`] (actor-shape).
 ///
 /// Synchronous pure-emit handler: delegates to the actor-shape
-/// [`crate::context::shared::queries::report_degraded_mode`](crate::context::shared::queries::report_degraded_mode)
+/// [`scp_runtime_core::context::shared::queries::report_degraded_mode`](scp_runtime_core::context::shared::queries::report_degraded_mode)
 /// which writes a `DegradedMode` event into `state.receive_buffer` (and
 /// the optional broadcast channel on `deps.event_tx`) only when the
 /// supplied `compat` is the `DegradedMode` variant. All other
@@ -1235,7 +1239,7 @@ async fn handle_rotate_pseudonym(
 /// [`Outcome::ok_mutated`] because the receive buffer may have grown by
 /// one event.
 fn handle_report_degraded_mode(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     compat: scp_protocol::envelope::VersionCompatibility,
@@ -1246,7 +1250,7 @@ fn handle_report_degraded_mode(
     // `DegradedMode` event lands in the receive buffer via the non-persisting
     // `class_c_view`. `report_degraded_mode` is field-narrowed to the single
     // `&mut ReceiveBuffer` it mutates.
-    crate::context::shared::queries::report_degraded_mode(
+    scp_runtime_core::context::shared::queries::report_degraded_mode(
         cell.class_c_view().receive_buffer_mut(),
         deps,
         context_id,
@@ -1261,9 +1265,9 @@ fn handle_report_degraded_mode(
 ///
 /// Forces a signed consistency checkpoint from the current event-log
 /// state via
-/// [`force_create_checkpoint_view`](crate::context::shared::queries::force_create_checkpoint_view),
+/// [`force_create_checkpoint_view`](scp_runtime_core::context::shared::queries::force_create_checkpoint_view),
 /// which reaches the three Class-C checkpoint fields through a
-/// non-persisting [`class_c_view`](crate::context::actor::class_s::ClassSCell::class_c_view)
+/// non-persisting [`class_c_view`](scp_runtime_core::context::actor::class_s::ClassSCell::class_c_view)
 /// (the run loop coalesce-persists), then broadcasts it to peers via
 /// [`send_checkpoint`](crate::context::messaging_helpers::send_checkpoint)
 /// (best-effort — a transport failure is logged but does not fail the
@@ -1282,12 +1286,12 @@ fn handle_report_degraded_mode(
 /// because the checkpoint ring and counters changed, and on the timeout arm
 /// because the broadcast seal may already have advanced the MLS generation.
 async fn handle_build_local_checkpoint(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_did::DID,
     signer: &CommandSigner,
-    reply: crate::context::actor::commands::BuildLocalCheckpointReply,
+    reply: scp_runtime_core::context::actor::commands::BuildLocalCheckpointReply,
 ) -> Outcome<()> {
     // Build, sign and retain the checkpoint, then broadcast it best-effort.
     let turn = async {
@@ -1299,7 +1303,7 @@ async fn handle_build_local_checkpoint(
             let mut view = cell.class_c_view();
             let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
             let mls_epoch = view.epoch_mut().mls_epoch;
-            crate::context::shared::queries::force_create_checkpoint_view(
+            scp_runtime_core::context::shared::queries::force_create_checkpoint_view(
                 &mut view,
                 context_id,
                 broadcast_context_is_none,
@@ -1370,11 +1374,11 @@ async fn handle_build_local_checkpoint(
 /// separately) / `Ahead` / `Consistent` / `Divergent`
 /// classification and any `MemberNotFound` / `CryptoFailed` error.
 fn handle_compare_remote_checkpoint(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
-    reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
+    reply: scp_runtime_core::context::actor::commands::CompareRemoteCheckpointReply,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation (the run loop persists on `mutated`); the
     // equivocation dedup set + receive-buffer emit land through the non-persisting
@@ -1426,7 +1430,7 @@ fn handle_compare_remote_checkpoint(
     reason = "&mut ClassSCell held across await must be Send; &PerContextState is !Send (ADR-049 Decision 7)"
 )]
 async fn handle_send_heartbeat(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_did::DID,
@@ -1499,31 +1503,33 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
     }
 }
 
-/// The messaging domain's [`MessagingDomain`](crate::context::domains::MessagingDomain)
+/// The messaging domain's [`MessagingDomain`](scp_runtime_core::context::domains::MessagingDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Messaging;
 
 #[async_trait::async_trait]
-impl crate::context::domains::MessagingDomain for Messaging {
+impl scp_runtime_core::context::domains::MessagingDomain for Messaging {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::MessagingCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::MessagingCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn decrypt_and_dispatch(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
-        crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        crypto_state: Option<&mut scp_runtime_core::context::actor::state::ContextCryptoState>,
         context_id: &str,
         context_id_bytes: &[u8; 32],
         encrypted_blob: &[u8],
         denied: &std::collections::HashSet<String>,
-    ) -> Result<crate::context::shared::messaging::Dispatched, scp_protocol::context::ContextError>
-    {
+    ) -> Result<
+        scp_runtime_core::context::shared::messaging::Dispatched,
+        scp_protocol::context::ContextError,
+    > {
         crate::context::messaging_helpers::decrypt_and_dispatch(
             deps,
             crypto_state,
@@ -1537,9 +1543,9 @@ impl crate::context::domains::MessagingDomain for Messaging {
 
     async fn finalize_send(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        send: crate::context::domains::FinalizeSendRequest<'_>,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        send: scp_runtime_core::context::domains::FinalizeSendRequest<'_>,
     ) -> Result<(), scp_protocol::context::ContextError> {
         crate::context::messaging_helpers::finalize_send(
             cell,

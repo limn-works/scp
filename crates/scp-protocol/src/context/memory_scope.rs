@@ -13,7 +13,7 @@
 //!
 //! Key-destruction ATTESTATION ([`KeyDestructionAttestation`]) is a pure-data
 //! record defined here; it is BUILT at the actor finalize seam
-//! (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the observed
+//! (`scp_runtime_core::context::shared::ttl_close::finalize_close`) from the observed
 //! disposal outcome. The former runtime-side `KeyDestructionOrchestrator` was
 //! deleted in #2199 (dead after #2148 moved crypto disposal onto the actor).
 //!
@@ -402,7 +402,7 @@ pub struct EphemeralContextMetadata {
 // dead orchestrators that were its only producers/consumers. The TRUTHFUL
 // `KeyDestructionAttestation` is now built inline from the OBSERVED
 // `DisposalOutcome` at the actor finalize seam
-// (`scp_runtime::context::ttl_close_helpers::finalize_close`);
+// (`scp_runtime_core::context::shared::ttl_close::finalize_close`);
 // `RelayDeletionRequest` (retained below) remains the standalone relay-deletion
 // protocol type.
 
@@ -577,7 +577,7 @@ mod tests {
     // Note: the runtime-side `KeyDestructionOrchestrator` and its tests were
     // DELETED in #2199 (dead after #2148 moved crypto disposal onto the context
     // actor). The truthful attestation is now built + tested at the actor
-    // finalize seam (`scp_runtime::context::ttl_close_helpers::finalize_close`).
+    // finalize seam (`scp_runtime_core::context::shared::ttl_close::finalize_close`).
 
     // -----------------------------------------------------------------------
     // KeyDestructionLevel tests

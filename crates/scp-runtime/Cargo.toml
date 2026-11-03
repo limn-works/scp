@@ -11,54 +11,25 @@ keywords = ["protocol", "context", "governance", "encryption"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-# Enables non-standard did:key:{hex} DID format acceptance. Only for
-# integration tests that run outside `#[cfg(test)]`. Production builds
-# must never enable this feature. See issue #128.
-#
-# Carries `scp-dht/testing` so a consumer who enables `scp-runtime/testing` gets
-# `InMemoryDhtClient`, exactly as `scp-identity`, `scp-node`, `scp-ffi`,
-# `scp-ffi-napi`, and `scp-ffi-uniffi` carry that edge in their own `testing`
-# lists (ADR-062, capability injection, §Decision 1; story SCP-CAPINJECT-001, the
-# DHT capability-injection slice in `.docs/prds/adr062-capability-injection.json`,
-# requires the edge of every consumer). `scp-dht` is a normal dependency and
-# survives publication, so the edge makes `examples/identity.rs` compile for a
-# consumer of the published crate under `--features testing`. The
-# `[dev-dependencies]` edge on `scp-dht` below activates the same feature for this
-# crate's own `cargo test -p scp-runtime`. `scp-dht/testing` appears in no
-# default or non-testing list, and no shipped artifact resolves
-# `scp-runtime/testing`, so `scripts/check-shipped-feature-graph.sh` keeps
-# proving `InMemoryDhtClient` absent from every shipped feature graph.
-testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
-# Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
-# without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
-# requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
-# in scp-ffi. See issue #695.
-allow_unencrypted_storage = []
-# Gates `RestoredContexts::for_test` — the test-only minter for the
-# restore-then-replay ordering witness, used by the saga-FSM / crash-recovery
-# integration suites that drive replay in isolation. Deliberately NOT implied by
-# `testing`: a `testing`-gated minter would leak into every bridge test
-# build via `scp-ffi/testing → dep:scp-testing →
-# scp-core/testing → scp-runtime/testing`, re-opening the forge. This feature is
-# enabled ONLY by the `required-features` of the `actor_saga_coordinator` /
-# `actor_saga_crash_recovery` test targets, so no production or FFI build can
-# reach the witness back-door.
-saga-witness-test-mint = []
-# Gates `Supervisor::test_grant_member_capability` — the test-only seam that
-# grants a §7.2.2 Tier-2 capability (e.g. `OutletCallAll`) directly into a
-# member's `role_state.member_capabilities`, bypassing the governance role-
-# assignment round-trip. This is an AUTHORITY-ESCALATION primitive, so it is
-# deliberately NOT implied by `testing`: a `testing`-gated grant would leak into
-# every bridge test build via `scp-ffi/testing → dep:scp-testing →
-# scp-core/testing → scp-runtime/testing`, compiling a capability-escalation
-# back-door into test-harness builds. Enabled ONLY by the
-# `required-features` / explicit `--features` of the outlet-stream live-flow test
-# that needs to authorize a member invoker, so no production or FFI build can
-# reach it. Follows the `saga-witness-test-mint` precedent above.
-outlet-capability-test-grant = []
+# Turns on `testing` in every runtime crate and in the scp dependencies the
+# tests use. Only test builds enable it; see `scp-runtime-core`'s manifest for
+# why no shipped artifact resolves it.
+testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-runtime-core/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
+# Forwards to `scp-runtime-core/allow_unencrypted_storage`, which gates
+# `ProtocolRepository::new_for_testing()`.
+allow_unencrypted_storage = ["scp-runtime-core/allow_unencrypted_storage"]
+# Forwards to `scp-runtime-core/saga-witness-test-mint` (`RestoredContexts::for_test`,
+# `CrossContextSagaSeal::for_test`). Deliberately NOT implied by `testing`; no
+# crate's non-dev dependency enables it.
+saga-witness-test-mint = ["scp-runtime-core/saga-witness-test-mint"]
+# Forwards to `scp-runtime-core/outlet-capability-test-grant`
+# (`Supervisor::test_grant_member_capability`), an authority-escalation test
+# seam. Deliberately NOT implied by `testing`.
+outlet-capability-test-grant = ["scp-runtime-core/outlet-capability-test-grant"]
 
 [dependencies]
 scp-runtime-types = { path = "../scp-runtime-types", version = "=0.1.0-beta.2" }
+scp-runtime-core = { path = "../scp-runtime-core", version = "=0.1.0-beta.2" }
 openmls = { workspace = true }
 openmls_traits = { workspace = true }
 openmls_basic_credential = { workspace = true }
@@ -193,6 +164,62 @@ required-features = ["testing"]
 
 [[test]]
 name = "context_config_create"
+required-features = ["testing"]
+
+[[test]]
+name = "supervisor_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "supervisor_open_outlet_stream_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "supervisor_streaming_saga_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "spawn_from_welcome_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "push_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "class_s_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "actor_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "actor_state_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "outlet_invoke_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "stream_counter_adapter_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "supervisor_floors_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "supervisor_handle_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "mls_provider_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "identity_recovery_tests"
 required-features = ["testing"]
 
 # The examples declare no `required-features`, and this crate carries no dev-dependency

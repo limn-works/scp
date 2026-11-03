@@ -4,14 +4,14 @@
 //! A `PushRegistration` lists the routing IDs at which a blob for this device
 //! arrives on one relay. [`push_routes`] reads one context's share of that list
 //! from the actor-owned state, and
-//! [`Supervisor::push_routing_ids`](crate::context::supervisor::Supervisor::push_routing_ids)
+//! [`Supervisor::push_routing_ids`](scp_runtime_core::context::supervisor::Supervisor::push_routing_ids)
 //! fans the read across every known context and groups the answers by canonical
 //! relay URL (`09-security-model.md` §9.18.2).
 
-use crate::context::push_routes::ContextWakeTarget;
 use scp_protocol::context::{ContextState, broadcast_routing_id, context_routing_id};
+use scp_runtime_core::context::push_routes::ContextWakeTarget;
 
-use crate::context::actor::state::PerContextState;
+use scp_runtime_core::context::actor::state::PerContextState;
 
 /// Returns the push-wake pull target of the context `state` holds, or `None`
 /// unless the context is `Active`, because only an `Active` context accepts
@@ -51,11 +51,11 @@ mod tests {
     };
 
     use super::wake_target;
-    use crate::context::ContextHandle;
-    use crate::context::actor::state::{ContextRouting, PerContextState};
-    use crate::context::push_routes::ContextPushRoutes;
-    use crate::context::push_routes::ContextWakeTarget;
-    use crate::context::push_routes::push_routes;
+    use scp_runtime_core::context::ContextHandle;
+    use scp_runtime_core::context::actor::state::{ContextRouting, PerContextState};
+    use scp_runtime_core::context::push_routes::ContextPushRoutes;
+    use scp_runtime_core::context::push_routes::ContextWakeTarget;
+    use scp_runtime_core::context::push_routes::push_routes;
 
     const RELAY: &str = "wss://relay.example/scp/v1";
 

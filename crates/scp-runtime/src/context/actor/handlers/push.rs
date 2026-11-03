@@ -1,25 +1,25 @@
 //! Push handlers: see
-//! [`PushCommand`](crate::context::actor::commands::PushCommand) and
+//! [`PushCommand`](scp_runtime_core::context::actor::commands::PushCommand) and
 //! `10-infrastructure-and-self-hosting.md` §10.7.1.
 //!
 //! Read-only by construction: [`dispatch`] borrows the actor-owned state
 //! shared, returns `Outcome { mutated: false }`, and answers each arm from
 //! the matching helper in [`crate::context::push_helpers`].
 
-use crate::context::actor::commands::PushCommand;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 use crate::context::push_helpers;
+use scp_runtime_core::context::actor::commands::PushCommand;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::state::PerContextState;
 
 /// Actor-shape dispatch for a [`PushCommand`].
 ///
 /// Synchronous: every arm is a pure read of `state`, so the actor's
 /// `dispatch_state` calls it with a shared borrow of the cell's state and no
 /// future holds the non-`Sync` cell.
-pub(crate) fn dispatch(state: &PerContextState, cmd: PushCommand) -> Outcome<()> {
+pub fn dispatch(state: &PerContextState, cmd: PushCommand) -> Outcome<()> {
     match cmd {
         PushCommand::Routes { reply } => {
-            let _ = reply.send(crate::context::push_routes::push_routes(state));
+            let _ = reply.send(scp_runtime_core::context::push_routes::push_routes(state));
             Outcome::ok(())
         }
         PushCommand::WakeTarget { reply } => {
@@ -29,16 +29,16 @@ pub(crate) fn dispatch(state: &PerContextState, cmd: PushCommand) -> Outcome<()>
     }
 }
 
-/// The push domain's [`PushDomain`](crate::context::domains::PushDomain)
+/// The push domain's [`PushDomain`](scp_runtime_core::context::domains::PushDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Push;
 
-impl crate::context::domains::PushDomain for Push {
+impl scp_runtime_core::context::domains::PushDomain for Push {
     fn dispatch(
         &self,
-        state: &crate::context::actor::state::PerContextState,
-        cmd: crate::context::actor::commands::PushCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        state: &scp_runtime_core::context::actor::state::PerContextState,
+        cmd: scp_runtime_core::context::actor::commands::PushCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(state, cmd)
     }
 }

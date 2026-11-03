@@ -1,0 +1,2145 @@
+//! Two-phase commit context creation with ordered rollback.
+//!
+//! Implements the `create_context` flow defined in ADR-008 (`.docs/adrs/phase-2.md`):
+//!
+//! - **Phase 1 -- Validate:** Checks all preconditions with zero side effects.
+//! - **Phase 2 -- Execute:** Steps through context creation, recording each
+//!   completed step in a [`CreationReceipt`]. On failure at any step, all
+//!   previously completed steps are rolled back in reverse order.
+//!
+//! External dependencies (transport, event log) are injected via traits
+//! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
+//! layer is the concrete [`NodeMlsFactory`]
+//! — the old `ContextCryptoProvider` trait was deleted in ADR-049 §15;
+//! the builder names the concrete type directly.
+
+use super::ContextHandle;
+use crate::context::params_validation::{self, ParamsOrigin};
+use crate::crypto::mls::provider::NodeMlsFactory;
+use scp_protocol::context::{
+    CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
+};
+
+pub use scp_protocol::context::builder::{
+    AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
+    MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope, ReceiveFloor, RemoveMemberOutput,
+    try_strip_management_prefix,
+};
+
+/// Provides transport operations needed during context creation.
+///
+/// Implementors handle relay connectivity checks and context publication /
+/// deletion.
+///
+/// # Async discipline (ADR-049 Decision 7)
+///
+/// This is a partial-async trait. The transport-I/O methods (`publish_context`,
+/// `delete_published`, `send_message`, `send_to_routing_id`,
+/// `publish_key_package`) are `async` and `.await` the underlying async
+/// transport adapter directly — the `block_in_place` sync→async bridge in
+/// `scp-transport`'s `RelayTransportProvider` is deleted. The `is_connected`
+/// method stays **sync**: it reads an `AtomicBool` and touches no async I/O.
+/// This is the ADR's explicit `is_connected`-stays-sync carve-out.
+///
+/// Held as `Arc<dyn ContextTransportProvider>` inside `ActorDeps` (moved into
+/// `tokio::spawn`), so the async futures must be **Send** — plain
+/// `#[async_trait]`, not `?Send`.
+#[async_trait::async_trait]
+pub trait ContextTransportProvider: Send + Sync {
+    /// Returns the provider's connection flag.
+    ///
+    /// Each implementor states what sets its flag. `RelayTransportProvider` in
+    /// `scp-transport` sets it at construction and changes it only through its
+    /// `mark_*` methods, which no adapter path calls, so a `true` result does
+    /// not mean a relay is reachable now. No production caller reads this
+    /// method to decide whether a send can succeed; a send reports its own
+    /// failure.
+    fn is_connected(&self) -> bool;
+
+    /// Publishes the context announcement to connected relays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if publication fails.
+    async fn publish_context(
+        &self,
+        context_id: &[u8; 32],
+        params: &ContextParams,
+    ) -> Result<(), ContextCreationError>;
+
+    /// Best-effort deletion of any published blobs for the context (rollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if deletion fails. Callers may
+    /// ignore this error during rollback (best-effort).
+    async fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    // -- Messaging operations (SCP-020) ------------------------------------
+
+    /// Sends an encrypted message via transport, asking the relay to store it
+    /// for `ttl`.
+    ///
+    /// The caller builds `ttl` with the
+    /// [`BlobTtl`](scp_protocol::envelope::outer::BlobTtl) constructor for the
+    /// kind of message it sends or, for a Commit retry, from the first attempt
+    /// ([`BlobTtl::republish_commit`](scp_protocol::envelope::outer::BlobTtl::republish_commit))
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type" and
+    /// "Republish rule"). An implementation frames it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if sending fails.
+    async fn send_message(
+        &self,
+        context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+        ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError>;
+
+    /// Sends a payload to a specific routing ID (e.g., personal invitation routing ID).
+    ///
+    /// Used for Welcome delivery (spec §5.12.3). The `ttl` is seconds.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if sending fails.
+    async fn send_to_routing_id(
+        &self,
+        _routing_id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: u32,
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "send_to_routing_id not supported".into(),
+        ))
+    }
+
+    /// Publishes a public `KeyPackage`'s TLS-serialized bytes so other members
+    /// can fetch it for offline member addition (§9.16.1). The
+    /// `KeyPackageStoreActor` calls this for each pooled KP not yet published.
+    ///
+    /// `owner_did` is the DID that owns the `KeyPackage`. The relay routing id
+    /// is the canonical `derive_key_package_routing_id(owner_did)` (spec
+    /// §5.12.3) so a peer can fetch this identity's published `KeyPackage`s with
+    /// the SAME id the canonical fetcher computes from the owner's DID. The id
+    /// MUST be per-DID: a relay-URL-only id collides every identity onto one
+    /// bucket and makes published KPs unfetchable by the canonical path.
+    ///
+    /// There is no `relay_url` parameter: routing is fully determined by
+    /// `owner_did`, and the relay the bytes land on is the adapter's OWN
+    /// connection (the production impl publishes through its single configured
+    /// adapter). Each `KeyPackage` is therefore published exactly once, not
+    /// fanned out per relay URL — a `relay_url` argument would be silently
+    /// discarded and imply a fan-out that does not happen.
+    ///
+    /// Publication is idempotent at the relay: the same `kp_bytes` published
+    /// twice resolves to the same content-addressed blob, so a re-publish
+    /// (e.g. after an actor respawn) is harmless.
+    ///
+    /// Default: not supported (returns error). Production transports override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if publication fails.
+    async fn publish_key_package(
+        &self,
+        _owner_did: &str,
+        _kp_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "publish_key_package not supported".into(),
+        ))
+    }
+}
+
+/// What [`ContextEventLogProvider::restore_event_log`] found in storage.
+///
+/// Spec 17 §17.3 "Merkle event log entries": restore starts an empty log only
+/// when storage holds no log for the context. A failed load is never this
+/// value; it is an `Err` that fails the restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLogRestore {
+    /// Storage held a log for the context, and its `entries` entries were
+    /// replayed into memory.
+    Loaded {
+        /// Number of entries replayed.
+        entries: usize,
+    },
+    /// Storage holds no log for the context, or the provider keeps no
+    /// storage; the context starts with an empty log.
+    Absent,
+}
+
+/// Where an event log append sits relative to the irreversible step of the
+/// operation that makes it (spec section 17.3, "Event log write failures").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendMode {
+    /// The append comes before any side effect of its operation. It stores
+    /// the entry before memory takes it and returns an error when storing
+    /// fails, and the operation then fails with nothing done.
+    FailClosed,
+    /// The append comes after an irreversible step of its operation (a sent
+    /// message, an advanced MLS epoch, a committed governance decision). It
+    /// records the entry in memory first, stores it best-effort, and succeeds
+    /// when storing fails, because failing the operation cannot undo the
+    /// step. A failed store marks the stored log diverged, so the next write
+    /// replaces it.
+    AfterSideEffect,
+}
+
+/// Provides event log operations needed during context creation.
+///
+/// Implementors initialise the Merkle event log and append events.
+///
+/// # Async discipline (ADR-049 Decision 7)
+///
+/// This is a partial-async trait. The persistence-touching methods
+/// (`init_event_log`, `append_event`, `destroy_event_log`, the `append_*`
+/// helpers, `import_event_log_data`, `restore_event_log`,
+/// `prune_before_checkpoint`) are `async` and `.await` the async
+/// [`EventLogPersistence`](crate::context::providers::event_log::EventLogPersistence)
+/// backend directly. The pure in-memory read methods (`event_log_entries`,
+/// `event_log_merkle_root`, `export_event_log_data`, `prove_event_inclusion`,
+/// `prove_event_consistency`, `rebuild_event_log_for_proof`) stay **sync**:
+/// they touch no async I/O and are read directly by sync FFI-boundary
+/// supervisor probes (`Supervisor::event_log_entries` / `participation_record`),
+/// so forcing them async would add `block_on` at that boundary — the Decision-7
+/// anti-goal. This mirrors the ADR's `is_connected`-stays-sync carve-out.
+///
+/// Held as `Arc<dyn ContextEventLogProvider>` inside `ActorDeps` (moved into
+/// `tokio::spawn`), so the async futures must be **Send** — plain
+/// `#[async_trait]`, not `?Send`.
+#[async_trait::async_trait]
+pub trait ContextEventLogProvider: Send + Sync {
+    /// Initialises an empty event log for the given context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if initialisation fails.
+    async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    /// Appends a typed event to the context's event log.
+    ///
+    /// `actor_did` is the DID of the actor who produced this event (the sender
+    /// for messages, the proposer for governance, the joiner for membership
+    /// events). Pass an empty string when the actor is unknown or not
+    /// applicable (e.g., system-initiated events).
+    ///
+    /// `event_type` is the closed-taxonomy [`scp_event_log::EventType`] variant
+    /// for this event. `payload` is the structured event payload included in
+    /// the Merkle leaf preimage. Parameterized events carry positional
+    /// `MessagePack` bytes built via [`scp_event_log::payload::encode_payload`];
+    /// non-parameterized events carry an empty [`scp_event_log::EventPayload`].
+    ///
+    /// `timestamp_secs` is the **committer-assigned** leaf timestamp in seconds
+    /// since the Unix epoch. For a commit-ordered event it is the `created_at`
+    /// of the signed SCP envelope carrying the commit, copied by every member
+    /// so that all honest members hash the identical leaf preimage (§7.3.1,
+    /// §9.9.3). For timer-triggered events (TTL/close, governance-freeze expiry,
+    /// deferred economic-policy application) it is the pre-computed convergent
+    /// deadline already held in context state — never a per-member local clock
+    /// reading, which would diverge and break the equal-count/equal-root test.
+    ///
+    /// The append fails closed ([`AppendMode::FailClosed`]): it stores the
+    /// entry before the in-memory log takes it, so the in-memory log is never
+    /// ahead of the stored log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if the context has no log, the event
+    /// is malformed, or storing it fails. The in-memory log is then unchanged.
+    async fn append_event(
+        &self,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError>;
+
+    /// Appends a typed event after an irreversible step of its operation
+    /// ([`AppendMode::AfterSideEffect`]): the in-memory log takes the entry
+    /// first, storing it is best-effort, and a failed store still returns
+    /// `Ok` and marks the stored log diverged. Parameters as
+    /// [`Self::append_event`].
+    ///
+    /// The default delegates to [`Self::append_event`], which is correct for
+    /// a provider that keeps no separate stored log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if the context has no log or the event
+    /// is malformed. A storage failure is not an error here.
+    async fn append_event_after_side_effect(
+        &self,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
+            .await
+    }
+
+    /// Appends a typed event in the given [`AppendMode`]: dispatches to
+    /// [`Self::append_event`] or [`Self::append_event_after_side_effect`].
+    ///
+    /// # Errors
+    ///
+    /// As the method `mode` selects.
+    async fn append_event_in(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        match mode {
+            AppendMode::FailClosed => {
+                self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
+                    .await
+            }
+            AppendMode::AfterSideEffect => {
+                self.append_event_after_side_effect(
+                    context_id,
+                    event_type,
+                    actor_did,
+                    payload,
+                    timestamp_secs,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Destroys the event log for the given context, in memory and in
+    /// storage (creation rollback). The in-memory log and the write gate are
+    /// removed even when deleting the stored log fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if deleting the stored log fails.
+    /// Creation rollback reports it as `RollbackFailed` (spec section 17.3,
+    /// "Event log write failures").
+    async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    /// Releases the context's in-memory log and write gate without touching
+    /// storage, so the next restore loads the stored log (shutdown, and a
+    /// restore that fails before its actor spawns).
+    ///
+    /// The default does nothing: a provider that keeps no per-context memory
+    /// has nothing to release.
+    fn release_event_log(&self, context_id: &[u8; 32]) {
+        let _ = context_id;
+    }
+
+    // -- Membership/messaging event logging (SCP-020) ----------------------
+
+    /// Appends a named event to the context's event log.
+    ///
+    /// This variant returns [`ContextError`] for use in membership and
+    /// messaging operations (as opposed to creation-time operations).
+    ///
+    /// `actor_did` is the DID of the actor who produced this event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the append fails.
+    async fn append_context_event(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        self.append_event_in(
+            mode,
+            context_id,
+            event_type,
+            actor_did,
+            scp_event_log::EventPayload::default(),
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Appends a typed event with a structured payload.
+    ///
+    /// Like [`append_context_event`](Self::append_context_event) but accepts
+    /// a structured [`scp_event_log::EventPayload`] included in the Merkle leaf
+    /// preimage (parameterized events).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the append fails.
+    async fn append_context_event_with_payload(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        self.append_event_in(
+            mode,
+            context_id,
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Appends an [`OutletInvokedEvent`] after enforcing the FULL §5.4.5:566
+    /// manifest-derived `chunks_billed` wire-invariant.
+    ///
+    /// Unlike the raw [`append_event`](Self::append_event) boundary — which
+    /// holds only the opaque event and can enforce nothing stronger than the
+    /// event-local `chunks_billed <= stream_chunk_count` backstop — this entry
+    /// point re-derives the manifest root + billable count from the
+    /// caller-supplied retained chunk sequence and rejects the event at
+    /// log-insert time if the recorded aggregates diverge. On success it
+    /// serializes the event and delegates to `append_event`, which re-runs the
+    /// durable event-local backstop. This is the verified-append boundary for
+    /// the cross-context receiver-side recording (SCP-OUT-036 AC7; §5.4.5:566) —
+    /// the path that retains the payload set to re-derive the manifest over its
+    /// independently-reassembled chunk sequence. The same-context streaming pump
+    /// does NOT route through here: it
+    /// does not retain the chunk sequence and persists via `append_event`,
+    /// enforcing same-context integrity inline
+    /// (`AuditAnomaly::ChunksBilledSelfMismatch`) plus the event-local backstop.
+    ///
+    /// [`OutletInvokedEvent`]:
+    ///     scp_protocol::context::outlets::lifecycle::OutletInvokedEvent
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the manifest
+    /// verification rejects the event (the wire-layer `ChunksBilledMismatch`),
+    /// when the event cannot be serialized, or when the underlying append
+    /// fails (e.g. no log initialized for the context).
+    async fn append_outlet_invoked_verified(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        chunks: &[scp_protocol::context::outlets::stream::OutletStreamChunk],
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
+        // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
+        scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_manifest(
+            event, chunks,
+        )
+        .map_err(|err| {
+            let log_err =
+                scp_runtime_types::context::outlets::stream::chunks_billed_error_to_event_log_error(
+                    err,
+                );
+            ContextCreationError::EventLogFailed(log_err.to_string())
+        })?;
+        // (2) Serialize and append through the standard boundary, which
+        // re-runs the durable event-local `<=` backstop.
+        let data = serde_json::to_vec(event).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!(
+                "failed to serialize OutletInvokedEvent: {e}"
+            ))
+        })?;
+        self.append_event_in(
+            mode,
+            context_id,
+            scp_event_log::EventType::OutletInvoked,
+            actor_did,
+            scp_event_log::EventPayload { data },
+            timestamp_secs,
+        )
+        .await
+    }
+
+    /// Appends a `MemberJoined` / `MemberLeft` leaf carrying a subject-bearing
+    /// [`MembershipChangePayload`](scp_event_log::payload::MembershipChangePayload).
+    ///
+    /// `change.subject_did` is the *affected member* (joined/left) — NOT the
+    /// governance actor (`actor_did`), which on admin-driven membership changes
+    /// is the executing admin. `change.role_name` is the role the member holds
+    /// at the membership change. The leaf is convergent (ADR-011 amendment); the
+    /// participation record (§7.3.2) attributes the join/leave interval to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    async fn append_membership_change_leaf(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        change: &scp_event_log::payload::MembershipChangePayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload = scp_event_log::payload::encode_payload(change)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            mode,
+            context_id,
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+    }
+
+    /// Appends a `RoleAssigned` leaf carrying a subject-bearing
+    /// [`RoleAssignedPayload`](scp_event_log::payload::RoleAssignedPayload).
+    ///
+    /// `subject_did` is the *affected member* whose role changed — NOT the
+    /// governance actor (`actor_did`). `role` is the newly-assigned role. The
+    /// leaf is convergent (ADR-011 amendment); the participation record (§7.3.2)
+    /// attributes the role transition (`role_progression_count`) to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    async fn append_role_assigned_leaf(
+        &self,
+        mode: AppendMode,
+        context_id: &[u8; 32],
+        actor_did: &str,
+        subject_did: &str,
+        role: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+                subject_did: subject_did.to_owned(),
+                role: role.to_owned(),
+            })
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            mode,
+            context_id,
+            scp_event_log::EventType::RoleAssigned,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+    }
+
+    // -- Entry reading (symmetric with append) --------------------------------
+
+    /// Returns the event log entries for a context.
+    ///
+    /// Completes the read side of the event log interface: `append_event`
+    /// writes, `event_log_entries` reads. Without this method, callers holding
+    /// a `Box<dyn ContextEventLogProvider>` can write but not read.
+    ///
+    /// Returns `Ok(None)` only if no log exists for the context: it was
+    /// never created, or it was destroyed.
+    ///
+    /// Required, with no default: callers read an `Err` as a failure and never
+    /// as an empty log (spec section 17.3, "Event log write failures"), so a
+    /// provider that cannot read would fail every restore, expiry and
+    /// governance path that reads its log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] when the stored log cannot be
+    /// read, and [`ContextError::ContextNotRegistered`] when the log was
+    /// released ([`Self::release_event_log`]) and not loaded again: storage
+    /// still holds it, so it is not loaded rather than absent.
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError>;
+
+    // -- Export/import for context state portability (#363) -------------------
+
+    /// Exports the event log entries for a context as serialized bytes
+    /// (MessagePack-encoded `Vec<scp_event_log::Event>`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the context has no event
+    /// log or serialization fails.
+    fn export_event_log_data(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log export not supported by this provider".into(),
+        ))
+    }
+
+    /// Imports serialized event log entries into this provider, replacing
+    /// any existing log for the context. The implementation must verify
+    /// Merkle chain integrity before accepting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
+    /// the Merkle chain is broken.
+    async fn import_event_log_data(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
+        let _ = (context_id, data);
+        Err(ContextError::EventLogFailed(
+            "event log import not supported by this provider".into(),
+        ))
+    }
+
+    /// Returns the Merkle root hash of the event log for a context.
+    ///
+    /// Returns all zeros if the log is empty. Returns an error if no log
+    /// exists for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the provider does not
+    /// support Merkle root computation.
+    fn event_log_merkle_root(&self, context_id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "merkle root not supported by this provider".into(),
+        ))
+    }
+
+    /// Returns the entry count and the Merkle root of a context's event log,
+    /// both read from one state of the log.
+    ///
+    /// An implementation reads the two values under one acquisition of its
+    /// log state, so an append that lands concurrently is either counted and
+    /// hashed or neither. Calling [`Self::event_log_entries`] and then
+    /// [`Self::event_log_merkle_root`] gives no such guarantee.
+    ///
+    /// An existing log with no entries reports a count of 0 and the
+    /// empty-tree root, `SHA-256("")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, or if this provider does not support the summary.
+    fn event_log_summary(&self, context_id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log summary not supported by this provider".into(),
+        ))
+    }
+
+    // -- Persistence for process restart recovery (#636) --------------------
+
+    /// Restores the event log for a context from persistent storage.
+    ///
+    /// Called during [`crate::context::supervisor::Supervisor::restore_context`] to reload event log
+    /// entries that were persisted before the process restarted.
+    ///
+    /// Returns [`EventLogRestore::Absent`] only when storage holds no log for
+    /// the context. The default, for a provider that keeps no storage,
+    /// initialises an empty log and returns `Absent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if loading the stored log fails or the
+    /// stored data is corrupt (e.g., broken Merkle chain). The in-memory log
+    /// and the stored log are unchanged on error.
+    async fn restore_event_log(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<EventLogRestore, ContextCreationError> {
+        self.init_event_log(context_id).await?;
+        Ok(EventLogRestore::Absent)
+    }
+
+    /// Prunes event log entries before a checkpoint boundary based on a
+    /// [`PruningPolicy`](scp_protocol::context::governance::PruningPolicy).
+    ///
+    /// Called after creating a governance checkpoint (#1474). The default
+    /// removes nothing and returns `Ok(None)`: a provider that keeps no log
+    /// entries has none to prune.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries removed, or `None` if no log exists for the
+    /// context or the provider keeps no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the prune fails; the
+    /// in-memory log is then unchanged, and the checkpoint fails (spec
+    /// section 17.3, "Event log write failures").
+    async fn prune_before_checkpoint(
+        &self,
+        _context_id: &[u8; 32],
+        _checkpoint_event_count: u64,
+        _policy: &scp_protocol::context::governance::PruningPolicy,
+    ) -> Result<Option<usize>, ContextError> {
+        Ok(None)
+    }
+
+    // -- Merkle proofs (ADR-011) ---------------------------------------------
+
+    /// Returns an RFC 6962 inclusion proof for the event at `leaf_index`.
+    ///
+    /// The default implementation reads the context's events via
+    /// [`event_log_entries`](Self::event_log_entries), replays them through the
+    /// canonical [`scp_event_log`] substrate to reconstruct the Merkle tree
+    /// (the same leaf preimage the provider committed to), and constructs the
+    /// proof against that tree. This is the single proof seam: there is no
+    /// second tree to keep in sync with the provider's log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, the leaf index is out of bounds, the log is empty, or the
+    /// replayed events fail hash-chain verification.
+    fn prove_event_inclusion(
+        &self,
+        context_id: &[u8; 32],
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        scp_event_log::proof::prove_inclusion(&log, leaf_index)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Returns an RFC 6962 consistency proof between the tree at `old_size`
+    /// and the current tree size.
+    ///
+    /// Reconstructs the Merkle tree the same way as
+    /// [`prove_event_inclusion`](Self::prove_event_inclusion).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, `old_size` is 0, `old_size` exceeds the current size, the log
+    /// is empty, or the replayed events fail hash-chain verification.
+    fn prove_event_consistency(
+        &self,
+        context_id: &[u8; 32],
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        let current_size = scp_event_log::tree::event_count(&log);
+        scp_event_log::proof::prove_consistency(&log, old_size, current_size)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Reconstructs the canonical [`scp_event_log::EventLog`] for a context by
+    /// replaying its events through the substrate.
+    ///
+    /// Shared by the proof methods. Returns an error if no log exists for the
+    /// context or the replayed events break the hash chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] on a missing log or a broken
+    /// chain.
+    fn rebuild_event_log_for_proof(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_event_log::EventLog, ContextError> {
+        let entries = self.event_log_entries(context_id)?.ok_or_else(|| {
+            ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        let mut log = scp_event_log::EventLog::new(hex::encode(context_id));
+        for event in &entries {
+            scp_event_log::tree::append_unsigned_event(&mut log, event).map_err(|e| {
+                ContextError::EventLogFailed(format!(
+                    "event log chain broken at sequence {}: {e}",
+                    event.sequence
+                ))
+            })?;
+        }
+        Ok(log)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LocalTransportProvider -- production no-op transport for single-user apps
+// ---------------------------------------------------------------------------
+
+/// No-op [`ContextTransportProvider`] for single-user or local-only applications.
+///
+/// All operations succeed immediately with no side effects. Use this when
+/// there is no relay to connect to — for example, in a single-user desktop
+/// app where all contexts are local.
+///
+/// Unlike the test-only `MockTransportProvider`, this type is available in
+/// production builds and carries no failure-injection machinery.
+pub struct LocalTransportProvider;
+
+#[async_trait::async_trait]
+impl ContextTransportProvider for LocalTransportProvider {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    async fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NotConfiguredTransportProvider -- returns errors for unconfigured transport
+// ---------------------------------------------------------------------------
+
+/// [`ContextTransportProvider`] that returns descriptive errors for all operations.
+///
+/// Use this at the FFI bridge layer when no relay transport has been configured.
+/// Unlike [`LocalTransportProvider`] (which silently succeeds), this provider
+/// makes it explicit that transport is not configured — all publish/send/delete
+/// calls return errors, and `is_connected()` returns `false`.
+///
+/// This prevents silent data loss where callers believe messages were sent
+/// successfully when no relay is actually reachable.
+pub struct NotConfiguredTransportProvider;
+
+#[async_trait::async_trait]
+impl ContextTransportProvider for NotConfiguredTransportProvider {
+    fn is_connected(&self) -> bool {
+        false
+    }
+
+    async fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before publishing contexts"
+                .to_owned(),
+        ))
+    }
+
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before deleting published contexts"
+                .to_owned(),
+        ))
+    }
+
+    async fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before sending messages"
+                .to_owned(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opaque resource handles -- represent ownership for rollback tracking
+// ---------------------------------------------------------------------------
+
+// #2148 (ADR-049 birth-into-actor): the `MlsGroupHandle` / `SenderKeyHandle`
+// rollback-evidence types were DELETED. Crypto is no longer provider-resident
+// during creation — `create_context` births the group + sender key as OWNED
+// material (`create_mls_group_with_context` → `OwnedMlsCryptoState`) and hands
+// it back to the caller, which seeds the spawning actor directly. There is no
+// provider-side crypto to roll back. On a post-birth creation failure the owned
+// material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
+// F6) — a bare drop zeroizes the group's in-memory OpenMLS storage values and
+// the Ed25519 signer (OpenMLS `SignatureKeyPair` holds its private key in
+// `SecretVLBytes`). `destroy_group` releases the same material; on this rollback
+// branch the owner drops immediately after, so the explicit dispose is
+// equivalent to that drop. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// Only the event log retains a provider-resident rollback handle.
+
+/// Opaque handle representing ownership of a created event log.
+///
+/// The actual event log state lives inside the [`ContextEventLogProvider`];
+/// this handle tracks that the provider holds event log state for this context.
+#[derive(Debug)]
+pub struct EventLogHandle {
+    _private: (),
+}
+
+impl EventLogHandle {
+    /// Creates a new handle (builder-internal only).
+    const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreationReceipt -- tracks completed steps for ordered rollback
+// ---------------------------------------------------------------------------
+
+/// Tracks which creation steps have completed so that rollback can reverse
+/// them in order.
+///
+/// Each field corresponds to a creation step. On failure at any subsequent
+/// step, [`rollback`](CreationReceipt::rollback) destroys resources in
+/// reverse order.
+///
+/// See ADR-008 section "Two-phase commit steps" for the step ordering.
+///
+/// ## Design note: `Option<Handle>` vs `bool`
+///
+/// #2148 (ADR-049 birth-into-actor): crypto (MLS group + sender key) is no
+/// longer provider-resident during creation, so the receipt tracks only the
+/// two resources that DO leave recoverable state outside the returned owned
+/// crypto material: the event log (`Option<EventLogHandle>`, provider-resident)
+/// and transport publication (`bool` — no recoverable local state, rollback
+/// issues a best-effort DELETE to remote relays). A post-birth creation failure
+/// disposes the `OwnedMlsCryptoState` on the rollback branch (`dispose_secrets`,
+/// which eagerly frees the group via `destroy_group` — the signer and the
+/// `SenderKey` zeroize on drop), so there is nothing
+/// crypto-shaped left for the receipt to roll back.
+#[derive(Debug, Default)]
+pub struct CreationReceipt {
+    /// Handle to the event log initialised during step 4.
+    /// `None` if the event log step has not completed.
+    pub event_log: Option<EventLogHandle>,
+    /// Whether the context was published to transport (step 5).
+    pub published: bool,
+}
+
+impl CreationReceipt {
+    /// Rolls back all completed steps in reverse order and returns the error
+    /// creation fails with: `cause` itself, or
+    /// [`ContextCreationError::RollbackFailed`] carrying `cause` and the
+    /// event-log destroy error when destroying the event log failed (spec
+    /// section 17.3, "Event log write failures"). A failed destroy is reported,
+    /// never dropped, because the stored log it leaves names a context that
+    /// was never created.
+    ///
+    /// The relay delete stays best-effort: relays are untrusted, and an
+    /// orphaned blob is encrypted with destroyed keys. Every step runs even
+    /// when an earlier one fails.
+    ///
+    /// #2148 (ADR-049 birth-into-actor): the crypto (MLS group / sender key)
+    /// rollback arms are GONE — crypto is never provider-resident during
+    /// creation. A post-birth failure disposes the owned material on the caller's
+    /// rollback branch (`dispose_secrets` eagerly frees the group via
+    /// `destroy_group` — the signer and the `SenderKey` zeroize on drop). On
+    /// this branch the owner drops immediately after, so the dispose is
+    /// equivalent to that drop. Only the event
+    /// log + publication are reversed here.
+    pub async fn rollback(
+        &self,
+        context_id: &[u8; 32],
+        transport: &dyn ContextTransportProvider,
+        event_log: &dyn ContextEventLogProvider,
+        cause: ContextCreationError,
+    ) -> ContextCreationError {
+        // Reverse order: published -> event_log
+        if self.published
+            && let Err(e) = transport.delete_published(context_id).await
+        {
+            // Best-effort: relays are untrusted, orphaned blobs are encrypted
+            // with destroyed keys.
+            tracing::warn!(
+                context_id = %hex::encode(context_id),
+                error = %e,
+                "creation rollback could not delete the published context from the relay"
+            );
+        }
+        if self.event_log.is_some()
+            && let Err(rollback) = event_log.destroy_event_log(context_id).await
+        {
+            // Logged here as well: a bridge that reports the cause's own
+            // code surfaces only the cause.
+            tracing::error!(
+                context_id = %hex::encode(context_id),
+                cause = %cause,
+                error = %rollback,
+                "creation rollback could not destroy the event log"
+            );
+            return ContextCreationError::RollbackFailed {
+                cause: Box::new(cause),
+                rollback: Box::new(rollback),
+            };
+        }
+        cause
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Phase 1 validation: runs [`params_validation::validate_params`], the one
+/// validator of every check that reads only `ContextParams`, with
+/// [`ParamsOrigin::Creation`] so the template check runs. It is a pure
+/// function with no side effects. `lifecycle_helpers::create_context` calls
+/// the same validator before it builds governance state; this call makes the
+/// rules hold for every in-crate caller of [`create_context`], test code
+/// included.
+///
+/// # Errors
+///
+/// The [`ContextCreationError`] that `From<ParamsRejection>` maps the first
+/// refusal to:
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::CeilingRequired`] with
+///   [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+///   for an empty ceiling (construction.md M2), or wrapping
+///   [`ContextError::VersionIncompatible`] when the SDK does not satisfy
+///   `min_protocol_version`;
+/// - [`ContextCreationError::InvalidCeilingCategory`] for a ceiling entry
+///   that breaks the §5.3.1.1 grammar;
+/// - [`ContextCreationError::InvalidPseudonymRotationPolicy`] for a
+///   `pseudonym_rotation` that fails §9.10.4.1;
+/// - [`ContextCreationError::InvalidSybilPolicy`] for a `sybil_policy` that
+///   fails §9.3.1;
+/// - [`ContextCreationError::TemplateValidationFailed`] for a
+///   `projection_policy` on an encrypted context (§18.11.2.1) or params that
+///   differ from their template;
+/// - [`ContextCreationError::CreationFailed`] for the governance model,
+///   consequence rules, economic-policy metrics, genesis outlets, and the
+///   Broadcast memory scope (§5.11).
+///
+/// [`ParamsRejection`]: params_validation::ParamsRejection
+fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
+    params_validation::validate_params(params, ParamsOrigin::Creation)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Context creation (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Resolves the context's string ID to the 32-byte value that keys its MLS
+/// group, broadcast/sender keys, and event log at creation.
+///
+/// Delegates to the canonical [`super::state::context_id_to_bytes`]
+/// (ADR-056): a real 64-hex context id (as `generate_context_id` produces)
+/// resolves to its raw digest, so the MLS group, sender key, and event log
+/// created here are keyed under the SAME bytes that `PerContextState.context_id`
+/// holds (`context_id_to_bytes` of the same id). A synthetic /
+/// non-context string hashes exactly as before. Without this alignment,
+/// creation would key crypto under `SHA-256(id)` while live state keys under
+/// the digest — every subsequent send/receive for a real context would miss
+/// the group.
+fn context_id_bytes(context_id: &str) -> [u8; 32] {
+    super::state::context_id_to_bytes(context_id)
+}
+
+/// The identity creating a context: its DID and the wrapping public key its
+/// leaf publishes as the `0xFF01` extension (spec 09 §9.16.1).
+#[derive(Clone, Copy)]
+pub struct ContextCreator<'a> {
+    /// The creator's DID.
+    pub did: &'a str,
+    /// The creator identity's 65-byte wrapping public key.
+    pub wrapping_public_key: &'a [u8; 65],
+}
+
+/// Executes the two-phase context creation flow.
+///
+/// Crate-private: no other crate can create a context through this function.
+/// Phase 1 rejects an empty ceiling (construction.md M2) for every caller.
+///
+/// **Phase 1 (validate):** Checks params and identity with zero side effects.
+/// Returns early on any validation failure. Transport connectivity is NOT
+/// checked — context creation is a local operation.
+///
+/// **Phase 2 (execute):** Steps through creation, recording progress in a
+/// [`CreationReceipt`]. On failure at any step, all previously completed
+/// steps are rolled back in reverse order via
+/// [`CreationReceipt::rollback`].
+///
+/// # Arguments
+///
+/// * `context_id` -- Unique string identifier for the new context.
+/// * `params` -- Full context configuration.
+/// * `crypto` -- Provider for MLS and sender key operations.
+/// * `transport` -- Provider for relay connectivity and publication.
+/// * `event_log_provider` -- Provider for event log initialisation and append.
+///
+/// # Returns
+///
+/// On success, a [`ContextHandle`] in the `Active` state together with the
+/// owned per-context crypto material: `Some(OwnedMlsCryptoState)` for
+/// Encrypted mode (the freshly-born MLS group + local sender key, for the
+/// caller to seed onto the spawning actor) or `None` for Broadcast mode
+/// (whose broadcast key lives on the actor's `BroadcastState`, not here).
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError`] if any validation or execution step
+/// fails. After an error, no MLS group state, sender key material, or event
+/// log state persists (atomic from the caller's perspective).
+///
+/// See ADR-008 acceptance criterion 2.
+// ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
+// store. The async event-log provider calls (`init_event_log`, `append_event`,
+// `append_membership_change_leaf`) and the async `receipt.rollback` regain real
+// await points under ADR-049 Decision 7 (async-provider-trait conversion), so
+// this fn genuinely awaits (no longer `unused_async`). `too_many_lines` is
+// allowed: it is a single cohesive multi-phase creation orchestrator (validate →
+// crypto → sender key → event log → publish → activate → creation leaves) whose
+// per-phase rollback-and-return blocks each gained `.await` continuation lines;
+// splitting the sequential phases across helpers would reduce, not improve,
+// readability.
+#[allow(clippy::too_many_lines)]
+pub async fn create_context(
+    context_id: String,
+    params: ContextParams,
+    crypto: &NodeMlsFactory,
+    transport: &dyn ContextTransportProvider,
+    event_log_provider: &dyn ContextEventLogProvider,
+    creator: ContextCreator<'_>,
+    creation_timestamp_secs: u64,
+) -> Result<
+    (
+        ContextHandle,
+        Option<crate::crypto::mls::provider::OwnedMlsCryptoState>,
+    ),
+    ContextCreationError,
+> {
+    // ------------------------------------------------------------------
+    // Phase 1 -- Validate (no side effects)
+    // ------------------------------------------------------------------
+    let ContextCreator {
+        did: creator_did,
+        wrapping_public_key,
+    } = creator;
+
+    // 1. Validate ContextParams (including template validation).
+    validate_params(&params)?;
+
+    // 2. Validate the creator's identity and signing key accessibility.
+    crypto.validate_creator_identity()?;
+
+    // 3. Transport connectivity is NOT checked here. Context creation is a
+    //    local operation (MLS group init, sender key generation, event log
+    //    bootstrap). Publishing to a relay is a separate step (step 5) that
+    //    will surface its own error if the transport is unavailable.
+
+    // ------------------------------------------------------------------
+    // Phase 2 -- Execute (with ordered rollback)
+    // ------------------------------------------------------------------
+
+    let id_bytes = context_id_bytes(&context_id);
+    let mut receipt = CreationReceipt::default();
+
+    // Step 1: Create the handle in `Creating` state. `context_id` is cloned so
+    // it remains available to build the `scp_context_params` extension below.
+    let handle = ContextHandle::new(context_id.clone(), params.clone());
+
+    // Step 2: Birth the per-context crypto as OWNED material.
+    //
+    // #2148 (ADR-049 birth-into-actor): the MLS group + local sender key are
+    // no longer installed into a provider map. The Encrypted path mints them
+    // via `create_mls_group_with_context` (owned-return) and hands the
+    // `OwnedMlsCryptoState` back to the caller
+    // (`lifecycle_helpers::create_context`), which seeds it onto the spawning
+    // actor's `PerContextState`. The local sender key is minted INSIDE this
+    // owned birth (no separate rotate step). A birth failure returns `Err`
+    // with nothing installed to roll back. Broadcast contexts have no MLS
+    // group and no provider-resident broadcast key: the actor's
+    // `BroadcastState` (seeded by `Supervisor::init_broadcast_context` in
+    // `lifecycle_helpers::create_context`) is the authoritative broadcast-key
+    // home — so nothing crypto-shaped is born here.
+    let owned_crypto = match params.mode {
+        ContextMode::Encrypted => {
+            // Bind the context parameters into the MLS `group_context` via the
+            // `scp_context_params` (`0xFF02`) extension so every joiner reads
+            // the same creator-committed parameters, folded into the key
+            // schedule (spec §5.13.3, finding FFI-02). A root context has no
+            // parents. Built before the side-effect-free owned birth so a
+            // canonical-encoding failure aborts with nothing to roll back.
+            let context_extension =
+                ScpContextExtension::for_root(scp_protocol::context::ScpContextGenesis {
+                    context_id,
+                    creator_did: scp_did::DID::from(creator_did.to_owned()),
+                    creation_timestamp_secs,
+                    mode: params.mode,
+                    governance: &params.governance,
+                    ceiling_policy: params.ceiling_policy,
+                    ceiling: &CapabilityCeiling::new(params.ceiling.clone()),
+                })
+                .map_err(|e| {
+                    ContextCreationError::CryptoFailed(format!(
+                        "building scp_context_params extension: {e}"
+                    ))
+                })?;
+            // Owned birth. On `Err` the `?` drops nothing — no group / sender
+            // key was installed into any provider map.
+            Some(crypto.create_mls_group_with_context(&context_extension, wrapping_public_key)?)
+        }
+        ContextMode::Broadcast => None,
+    };
+
+    // Step 4: Initialise event log.
+    if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
+        // Dispose the born-but-never-seeded crypto's OpenMLS group
+        // (`destroy_group`) before `owned` drops on this rollback. A bare drop
+        // already wipes the in-memory group storage and zeroizes the signer, so
+        // this explicit dispose is equivalent to that drop. `SenderKey`
+        // zeroizes on its own drop.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
+    }
+    receipt.event_log = Some(EventLogHandle::new());
+
+    // Step 5: Publish to transport (best-effort).
+    //
+    // Context creation is a local operation — the context is fully
+    // functional even without relay publication.  If publish fails
+    // (e.g., transport not configured, relay unreachable), we log a
+    // warning and continue.  The context won't be discoverable via
+    // relay until a subsequent publish or sync, but all local state
+    // (MLS group, sender key, event log) remains valid.
+    match transport.publish_context(&id_bytes, &params).await {
+        Ok(()) => {
+            receipt.published = true;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "context created locally but publish failed — \
+                 context is not discoverable via relay"
+            );
+        }
+    }
+
+    // Step 6: Transition state to Active.
+    if let Err(e) = handle.transition_to(&ContextState::Active) {
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e.into())
+            .await);
+    }
+
+    // Step 7: Append ContextCreated event.
+    if let Err(e) = event_log_provider
+        .append_event(
+            &id_bytes,
+            scp_event_log::EventType::ContextCreated,
+            creator_did,
+            scp_event_log::EventPayload::default(),
+            // Creator-assigned creation time, copied by every member (§7.3.1,
+            // §9.9.3) — not each member's local `now()`.
+            creation_timestamp_secs,
+        )
+        .await
+    {
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
+        // The handle is Active but `owned_crypto` is still live (returned to the
+        // caller on success at step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        // Even though the handle is Active, we must roll back everything.
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
+    }
+
+    // Step 8: Append the founder's `MemberJoined` leaf.
+    //
+    // The creation flow emits only `ContextCreated` for the creator; without a
+    // `MemberJoined` leaf the membership-interval participation model has no
+    // join event to open the founder's interval, so the founder's
+    // `participation_duration_secs` computes as 0 even after they participate.
+    // Append a subject-bearing join leaf for the founder (actor == subject ==
+    // creator) at the SAME creator-assigned creation timestamp as
+    // `ContextCreated`, so it is convergent-by-construction (not each member's
+    // local `now()`; §7.3.1, §9.9.3). The creator's initial role is `admin`,
+    // mirroring the supervisor's creator membership in
+    // `lifecycle_helpers::create_context`. Rolls back the whole creation on
+    // failure, exactly like the `ContextCreated` append above.
+    if let Err(e) = event_log_provider
+        .append_membership_change_leaf(
+            crate::context::builder::AppendMode::FailClosed,
+            &id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            creator_did,
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: creator_did.to_owned(),
+                role_name: "admin".to_owned(),
+            },
+            creation_timestamp_secs,
+        )
+        .await
+    {
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
+        // `owned_crypto` is still live (returned to the caller on success at
+        // step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e.into())
+            .await);
+    }
+
+    // Step 8.5: Append one `OutletRegistered` leaf per genesis-declared outlet
+    // (§5.1/§5.12 "declared at creation"; GitHub #2020). The creator is the
+    // authoritative event-log writer, so these leaves are appended HERE — the
+    // same append boundary that just wrote `ContextCreated`/`MemberJoined` —
+    // reusing the exact `EventType::OutletRegistered` leaf that
+    // `governance_helpers::execute_register_outlet` emits for the runtime
+    // governance-registration path, so genesis-seeded and governance-registered
+    // outlets are UNIFORM authenticated log leaves (§5.4: "silent outlet
+    // modification is not possible — any change is visible to all context
+    // members"). The corresponding live-registry seed happens in
+    // `state::fresh_governance_state`, which seeds from `params.outlets` for THIS
+    // creator alone (`OutletRegistrySeed::GenesisDeclaration`) — see
+    // `OutletRegistrySeed::AwaitingLeafReplication` for what a Welcome-joiner
+    // installs instead, and for the replication code that does not exist yet.
+    // `actor_did` is the creator (the genesis declarant), and every leaf carries
+    // the convergent creator-assigned `creation_timestamp_secs` (§7.3.1,
+    // §9.9.3). A failure rolls back the whole creation, exactly like the leaves
+    // above.
+    //
+    // NOTE (uniformity finding, GitHub #2020 requirement 3): neither this genesis
+    // path NOR `execute_register_outlet` verifies an `OutletRegistration`'s
+    // §5.4.1 operator signature today — `verify_outlet_registration_signature`
+    // exists but has no production caller. The two paths are therefore uniform
+    // (both unverified); this genesis path introduces no bypass. Wiring signature
+    // verification into BOTH paths is a separate, pre-existing gap.
+    //
+    // Each leaf carries the `OutletRegisteredEvent` for its own outlet, encoded
+    // by `scp_event_log::payload::encode_payload` — the same payload
+    // `execute_register_outlet` writes on the governance path. A leaf carrying
+    // `EventPayload::default()` would name no outlet, so a member reading the log
+    // could count registrations and never learn which outlets they registered
+    // (GitHub #2250).
+    let genesis_outlet_leaves: Result<(), ContextCreationError> = async {
+        for outlet in &params.outlets {
+            let event = scp_protocol::context::outlets::OutletRegisteredEvent {
+                outlet_id: outlet.outlet_id.clone(),
+                name: outlet.name.clone(),
+                description: outlet.description.clone(),
+                implementation_hash: outlet.implementation_hash,
+                operator_did: outlet.operator_did.clone(),
+                registrant_did: scp_did::DID(creator_did.to_owned()),
+                test_vector_count: outlet.test_vectors.len(),
+            };
+            let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
+                ContextCreationError::CreationFailed(format!(
+                    "failed to encode the OutletRegistered payload for genesis outlet {:?}: {e}",
+                    outlet.outlet_id,
+                ))
+            })?;
+            event_log_provider
+                .append_event(
+                    &id_bytes,
+                    scp_event_log::EventType::OutletRegistered,
+                    creator_did,
+                    payload,
+                    creation_timestamp_secs,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = genesis_outlet_leaves {
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
+        // `owned_crypto` is still live (returned to the caller on success at
+        // step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
+    }
+
+    // Step 9: Return the handle plus the owned crypto material (Encrypted
+    // mode) for the caller to seed onto the spawning actor. Broadcast contexts
+    // return `None` — their broadcast key lives on the actor's `BroadcastState`.
+    Ok((handle, owned_crypto))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::significant_drop_tightening,
+    dead_code,
+    reason = "ADR-049 §15: scaffolding for tests ignored pending MlsBackend injection"
+)]
+mod tests {
+    use super::*;
+    use scp_protocol::context::{ContextParams, MemoryScope};
+
+    /// Test DID for the real [`NodeMlsFactory`].
+    ///
+    /// The prior `MockCryptoProvider` fail-injection scaffold was deleted
+    /// along with the `ContextCryptoProvider` trait in ADR-049 §15.
+    /// Success-path tests bind a real provider; fail-injection tests are
+    /// `#[ignore]`d pending `MlsBackend` injection.
+    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    /// Default params with a non-empty ceiling, which every create requires
+    /// (construction.md M2).
+    fn ceilinged_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                scp_protocol::context::roles::Capability::MessagesRead,
+                scp_protocol::context::roles::Capability::MessagesWrite,
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    #[test]
+    fn validate_params_rejects_an_empty_ceiling() {
+        let params = ContextParams::default();
+        assert!(
+            params.ceiling.is_empty(),
+            "test precondition: default ceiling is empty"
+        );
+        let err = validate_params(&params).expect_err("an empty ceiling must be rejected");
+        assert!(
+            matches!(
+                err,
+                ContextCreationError::StateTransition(ContextError::CeilingRequired(
+                    scp_protocol::context::CeilingDeclaration::Empty
+                ))
+            ),
+            "expected CeilingRequired(Empty), got {err:?}"
+        );
+        assert!(
+            validate_params(&ceilinged_params()).is_ok(),
+            "a non-empty ceiling must be accepted"
+        );
+    }
+
+    /// Phase 1 validation refuses a sybil policy whose device-attestation max
+    /// age is one second above the §9.3.1 one-year maximum, with the typed
+    /// `InvalidSybilPolicy`. The same params at the maximum pass, so the max
+    /// age alone decides the refusal.
+    #[test]
+    fn validate_params_rejects_invalid_policy() {
+        use scp_protocol::trust::sybil::{
+            ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS, SybilPolicyError,
+        };
+        let with_max_age = |max_age: u64| ContextParams {
+            sybil_policy: Some(ContextSybilPolicy {
+                device_attestation_max_age_secs: max_age,
+                ..ContextSybilPolicy::casual()
+            }),
+            ..ceilinged_params()
+        };
+        let err = validate_params(&with_max_age(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1))
+            .expect_err("a max age above the maximum must be refused");
+        assert!(
+            matches!(
+                err,
+                ContextCreationError::InvalidSybilPolicy(
+                    SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
+                )
+            ),
+            "expected InvalidSybilPolicy(DeviceAttestationMaxAgeTooLarge), got {err:?}"
+        );
+        assert!(
+            validate_params(&with_max_age(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS)).is_ok(),
+            "a max age at the maximum must be accepted"
+        );
+    }
+
+    struct TestTransport;
+    #[async_trait::async_trait]
+    impl ContextTransportProvider for TestTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn publish_context(
+            &self,
+            _: &[u8; 32],
+            _: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+    }
+
+    struct TestEventLog;
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn validate_params_full_scope_permitted() {
+        // Pure data test — no crypto provider needed.
+        let params = ContextParams {
+            memory_scope: MemoryScope::Full,
+            ..ceilinged_params()
+        };
+        assert!(validate_params(&params).is_ok());
+    }
+
+    /// ADR-056 (Model A) / §6.2.4:276 conformance: a context whose
+    /// id is a real 64-hex string (the shape `generate_context_id` produces:
+    /// `hex(32 random bytes)`) keys its creation crypto under the **decoded
+    /// digest**, NOT under `SHA-256(id)`. This is the load-bearing fix: the
+    /// §6.2.4 cross-context outlet saga compares the wire `target_context_id`
+    /// (the raw digest) against `state.context_id`, and `state.context_id` is
+    /// set by `context_id_to_bytes` of the same id — so the MLS group,
+    /// sender key, and event log created here MUST live under that identical
+    /// digest, or every real-context message/saga would address the wrong
+    /// group.
+    #[tokio::test]
+    async fn create_context_keys_crypto_under_decoded_digest_not_sha256() {
+        use crate::context::state::context_id_to_bytes;
+
+        // A canonical id: the lowercase-hex of a known 32-byte digest, exactly
+        // the form `generate_context_id` (scp-ffi-common) emits.
+        let digest: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // Boundary assertion: the canonical resolver (the single chokepoint the
+        // historical call sites route through) DECODES a 64-hex id to its
+        // digest and does NOT re-hash it. `SHA-256(id)` (the pre-ADR-056
+        // keying) is a DIFFERENT value — pinning the double-hash fix.
+        assert_eq!(
+            context_id_to_bytes(&id),
+            digest,
+            "a real 64-hex id must resolve to its decoded digest"
+        );
+        let sha256_of_id = scp_protocol::context::context_id_bytes(&id);
+        assert_ne!(
+            sha256_of_id, digest,
+            "test precondition: SHA-256(hex(digest)) must differ from the digest, \
+             else the test could not distinguish decode from hash"
+        );
+
+        // Drive real creation crypto. A real MLS provider + no-op transport /
+        // event log isolates the keying behavior under test.
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let (handle, owned_crypto) = create_context(
+            id.clone(),
+            ceilinged_params(),
+            &crypto,
+            &TestTransport,
+            &TestEventLog,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            1_700_000_000,
+        )
+        .await
+        .expect("create_context should succeed for a canonical 64-hex id");
+        assert_eq!(handle.context_id(), id, "handle carries the canonical id");
+
+        // #2148 (ADR-049 birth-into-actor): crypto is born as OWNED material
+        // and returned (never installed into a provider map — the provider's
+        // `contexts` map and `context_crypto_present` residency probe are
+        // DELETED). The keying-under-decoded-digest property that this test
+        // originally proved via provider residency is now proved directly by
+        // `context_id_to_bytes(&id) == digest` above (the SINGLE keying
+        // chokepoint every seed / send / receive routes through): the actor's
+        // `PerContextState.context_id` is set from exactly that resolver, and
+        // the owned crypto seeded here carries no separate key. An Encrypted
+        // create MUST yield owned crypto material.
+        assert!(
+            owned_crypto.is_some(),
+            "an Encrypted create must return born-owned MLS crypto material"
+        );
+    }
+
+    /// The creation flow must emit a founder `MemberJoined` leaf so the
+    /// membership-interval participation model can attribute a join time to the
+    /// creator. Without it the founder's `participation_duration_secs` computes
+    /// as 0 even after they participate (no `MemberJoined` to open the
+    /// interval). Here the founder creates a context at t=1000 and participates
+    /// at t=1300; the participation record must report the 300s span (the
+    /// interval, still open, runs to the latest event), not 0.
+    #[tokio::test]
+    async fn founder_membership_leaf_yields_nonzero_participation_duration() {
+        use crate::context::providers::MerkleEventLogProvider;
+        use scp_protocol::trust::participation::compute_participation_record;
+
+        const CREATION_TS: u64 = 1_000;
+        const SEND_TS: u64 = 1_300;
+
+        // A real 64-hex context id (the shape `generate_context_id` emits).
+        let id = hex::encode([0x2au8; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let provider = MerkleEventLogProvider::new();
+
+        create_context(
+            id.clone(),
+            ceilinged_params(),
+            &crypto,
+            &TestTransport,
+            &provider,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            CREATION_TS,
+        )
+        .await
+        .expect("create_context should succeed");
+
+        // The founder participates after creation; a later subject event extends
+        // the still-open membership interval to `SEND_TS`.
+        provider
+            .append_event(
+                &id_bytes,
+                scp_event_log::EventType::MessageSent,
+                TEST_DID,
+                scp_event_log::EventPayload::default(),
+                SEND_TS,
+            )
+            .await
+            .expect("append founder MessageSent");
+
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+
+        // Load-bearing fix: the creation stream carries the founder's
+        // `MemberJoined` leaf (actor == subject == creator) at the convergent
+        // creation timestamp, projecting the creator as the affected subject.
+        let founder_join = entries
+            .iter()
+            .find(|e| {
+                e.event_type == scp_event_log::EventType::MemberJoined
+                    && e.actor_did.0.as_str() == TEST_DID
+            })
+            .expect("founder MemberJoined leaf must be emitted on create");
+        assert_eq!(
+            founder_join.timestamp, CREATION_TS,
+            "founder join must carry the convergent creation timestamp"
+        );
+        assert_eq!(
+            scp_event_log::payload::project_payload(
+                &founder_join.event_type,
+                &founder_join.payload
+            )
+            .subject_did
+            .as_deref(),
+            Some(TEST_DID),
+            "founder join leaf must project the creator as the affected subject"
+        );
+
+        let record = compute_participation_record(&entries, TEST_DID, &id, [0u8; 32], 2_000, &[])
+            .expect("participation record computes");
+
+        assert_eq!(
+            record.participation_duration_seconds,
+            SEND_TS - CREATION_TS,
+            "founder duration must span the join (creation) to the latest event"
+        );
+        assert!(
+            record.participation_duration_seconds > 0,
+            "a founder who participated must have non-zero participation duration"
+        );
+    }
+
+    /// Builds a registrable [`OutletRegistration`] fixture for genesis-outlet
+    /// tests (GitHub #2020).
+    ///
+    /// The schemas declare two properties each because
+    /// `state::validate_genesis_outlets` runs the §6.2/§9.2.1 specificity floor
+    /// (`MIN_SCHEMA_FIELDS == 2`) over every genesis declaration, so a fixture
+    /// with property-free schemas would be refused at creation.
+    fn outlet_fixture(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegistration {
+        use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
+            name: outlet_id.to_owned(),
+            description: "genesis outlet fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [7u8; 32],
+            test_vectors: vec![],
+            message_catalog: Vec::new(),
+            operator_did: TEST_DID.into(),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Creates an encrypted context at `creation_ts` and returns its owned
+    /// crypto (or the creation error) with its event log.
+    async fn create_at(
+        seed: u8,
+        creation_ts: u64,
+    ) -> (
+        Result<Option<crate::crypto::mls::provider::OwnedMlsCryptoState>, ContextCreationError>,
+        crate::context::providers::MerkleEventLogProvider,
+        [u8; 32],
+    ) {
+        let id = hex::encode([seed; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let provider = crate::context::providers::MerkleEventLogProvider::new();
+        let result = create_context(
+            id,
+            ceilinged_params(),
+            &crypto,
+            &TestTransport,
+            &provider,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            creation_ts,
+        )
+        .await
+        .map(|(_, owned)| owned);
+        (result, provider, id_bytes)
+    }
+
+    /// Spec 05 §5.13.3 "Creation timestamp": the creator's `0xFF02` extension
+    /// commits `creation_timestamp_secs` equal to the `timestamp` of its
+    /// `ContextCreated` leaf.
+    #[tokio::test]
+    async fn the_created_group_commits_the_context_created_leaf_timestamp() {
+        const CREATION_TS: u64 = 1_700_000_123;
+        let (result, provider, id_bytes) = create_at(0x3c, CREATION_TS).await;
+        let owned = result
+            .expect("create_context succeeds")
+            .expect("an encrypted context births an MLS group");
+        let committed = owned
+            .mls_group
+            .group_context_extension()
+            .expect("the extension reads")
+            .expect("the group carries the 0xFF02 extension")
+            .creation_timestamp_secs;
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+        let created = entries
+            .iter()
+            .find(|e| e.event_type == scp_event_log::EventType::ContextCreated)
+            .expect("the log holds the ContextCreated leaf");
+        assert_eq!(committed, created.timestamp);
+        assert_eq!(committed, CREATION_TS);
+    }
+
+    /// Spec 05 §5.13.3 "Serialization": creation refuses a creation timestamp
+    /// above 2^53 − 1 and births no event log.
+    #[tokio::test]
+    async fn creation_refuses_a_creation_timestamp_above_two_to_the_53_minus_one() {
+        let (result, provider, id_bytes) =
+            create_at(0x3d, scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1).await;
+        let Err(ContextCreationError::CryptoFailed(reason)) = result else {
+            panic!("expected a CryptoFailed refusal");
+        };
+        assert!(reason.contains("exceeds 2^53 - 1"), "{reason}");
+        assert!(
+            provider
+                .event_log_entries(&id_bytes)
+                .expect("entries readable")
+                .is_none(),
+            "a refused creation leaves no event log"
+        );
+    }
+
+    /// §5.1/§5.12 (GitHub #2020): outlets declared in `ContextParams.outlets` at
+    /// genesis are INSTALLED — the creator's authoritative event log carries one
+    /// `OutletRegistered` leaf per genesis outlet (the same leaf
+    /// `execute_register_outlet` emits for the runtime governance path), attributed
+    /// to the creator at the convergent creation timestamp. Before the fix the
+    /// genesis path dropped `params.outlets` entirely, so NO leaves were emitted.
+    #[tokio::test]
+    async fn genesis_outlets_emit_outlet_registered_leaves_on_create() {
+        use crate::context::providers::MerkleEventLogProvider;
+
+        const CREATION_TS: u64 = 1_000;
+        let id = hex::encode([0x3bu8; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let provider = MerkleEventLogProvider::new();
+
+        let params = ContextParams {
+            outlets: vec![outlet_fixture("alpha"), outlet_fixture("beta")],
+            ..ceilinged_params()
+        };
+
+        create_context(
+            id.clone(),
+            params,
+            &crypto,
+            &TestTransport,
+            &provider,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            CREATION_TS,
+        )
+        .await
+        .expect("create_context should succeed with genesis outlets");
+
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+
+        let outlet_leaves: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::OutletRegistered)
+            .collect();
+        assert_eq!(
+            outlet_leaves.len(),
+            2,
+            "one OutletRegistered leaf per genesis outlet must be emitted on create"
+        );
+        for leaf in &outlet_leaves {
+            assert_eq!(
+                leaf.actor_did.0.as_str(),
+                TEST_DID,
+                "genesis outlet leaf is attributed to the creator (the genesis declarant)"
+            );
+            assert_eq!(
+                leaf.timestamp, CREATION_TS,
+                "genesis outlet leaf carries the convergent creation timestamp"
+            );
+        }
+
+        // The leaves name WHICH outlets they registered. A leaf carrying
+        // `EventPayload::default()` passes every assertion above — two contexts
+        // with disjoint 2-outlet declarations would produce indistinguishable
+        // logs — so decode the payload and read the identities back out
+        // (GitHub #2250).
+        let mut registered: Vec<String> = outlet_leaves
+            .iter()
+            .map(|leaf| {
+                let event: scp_protocol::context::outlets::OutletRegisteredEvent =
+                    scp_event_log::payload::decode_payload(&leaf.payload)
+                        .expect("each OutletRegistered leaf carries a decodable payload");
+                assert_eq!(
+                    event.operator_did.0.as_str(),
+                    TEST_DID,
+                    "the leaf carries the declared operator DID"
+                );
+                assert_eq!(
+                    event.registrant_did.0.as_str(),
+                    TEST_DID,
+                    "the creator is the registrant of a genesis outlet"
+                );
+                assert_eq!(
+                    event.implementation_hash, [7u8; 32],
+                    "the leaf carries the declared implementation hash"
+                );
+                event.outlet_id
+            })
+            .collect();
+        registered.sort();
+        assert_eq!(
+            registered,
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            "the leaves name the two declared outlets, so a reader learns which \
+             outlets the genesis declaration registered"
+        );
+    }
+
+    /// A genesis declaration carrying the FFI bridges' fabricated name-only
+    /// outlet — operator DID `did:key:placeholder`, two property-free schemas,
+    /// an all-zero implementation hash — is refused at creation, because the
+    /// creator installs `params.outlets` into the live authorization registry
+    /// and `registry::register_outlet` would refuse the same registration
+    /// (GitHub #2250).
+    #[test]
+    fn validate_params_rejects_a_genesis_outlet_registry_would_refuse() {
+        use scp_protocol::context::outlets::OutletSchema;
+
+        let mut degenerate = outlet_fixture("weather");
+        degenerate.schema = OutletSchema {
+            input_schema: serde_json::Value::Object(serde_json::Map::default()),
+            output_schema: serde_json::Value::Object(serde_json::Map::default()),
+            aggregate_schema: None,
+        };
+        let params = ContextParams {
+            outlets: vec![degenerate],
+            ..ceilinged_params()
+        };
+        let err = validate_params(&params)
+            .expect_err("property-free schemas fail the §6.2/§9.2.1 specificity floor");
+        let message = err.to_string();
+        assert!(
+            message.contains("weather"),
+            "the refusal names the outlet it refused, got {message}"
+        );
+
+        // A structurally valid pair of schemas that declares fewer than two
+        // properties on both sides fails the specificity floor.
+        let mut under_floor = outlet_fixture("weather");
+        under_floor.schema.input_schema = serde_json::json!({"type": "object"});
+        under_floor.schema.output_schema = serde_json::json!({"type": "object"});
+        let params = ContextParams {
+            outlets: vec![under_floor],
+            ..ceilinged_params()
+        };
+        assert!(
+            validate_params(&params).is_err(),
+            "schemas under the §6.2/§9.2.1 specificity floor must be refused at creation"
+        );
+
+        // The operator DID is checked too, on a declaration whose schemas pass.
+        let mut bad_operator = outlet_fixture("weather");
+        bad_operator.operator_did = "not-a-did".into();
+        let params = ContextParams {
+            outlets: vec![bad_operator],
+            ..ceilinged_params()
+        };
+        assert!(
+            validate_params(&params).is_err(),
+            "an operator DID that is not a DID must be refused at creation"
+        );
+    }
+
+    /// Two genesis outlets sharing one `outlet_id` are refused. `OutletRegistry`
+    /// is keyed by `outlet_id` and `GovernanceState::registered_outlets` is a
+    /// `Vec`, so a duplicate would install two entries under one id, and a later
+    /// removal would delete one and leave the other answering invocations the
+    /// context revoked (GitHub #2250).
+    #[test]
+    fn validate_params_rejects_duplicate_genesis_outlet_ids() {
+        let params = ContextParams {
+            outlets: vec![outlet_fixture("alpha"), outlet_fixture("alpha")],
+            ..ceilinged_params()
+        };
+        let err = validate_params(&params).expect_err("a duplicate outlet id must be refused");
+        assert!(
+            err.to_string().contains("more than once"),
+            "the refusal names the duplication, got {err}"
+        );
+    }
+
+    /// The genesis path enforces the SAME `MAX_REGISTERED_OUTLETS` bound as the
+    /// runtime governance-registration path (`execute_register_outlet`): a
+    /// `params.outlets` set larger than the cap is rejected at creation, so genesis
+    /// cannot bypass the per-context registry limit (GitHub #2020).
+    #[test]
+    fn validate_params_rejects_genesis_outlets_over_the_cap() {
+        let params = ContextParams {
+            outlets: (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+                .map(|i| outlet_fixture(&format!("outlet-{i}")))
+                .collect(),
+            ..ceilinged_params()
+        };
+        assert!(
+            params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS,
+            "fixture must exceed the cap"
+        );
+        assert!(
+            validate_params(&params).is_err(),
+            "a genesis outlet set exceeding MAX_REGISTERED_OUTLETS must be rejected at creation"
+        );
+    }
+
+    /// A genesis outlet set at exactly the cap is accepted (boundary check).
+    #[test]
+    fn validate_params_accepts_genesis_outlets_at_the_cap() {
+        let params = ContextParams {
+            outlets: (0..crate::context::state::MAX_REGISTERED_OUTLETS)
+                .map(|i| outlet_fixture(&format!("outlet-{i}")))
+                .collect(),
+            ..ceilinged_params()
+        };
+        assert!(
+            validate_params(&params).is_ok(),
+            "a genesis outlet set at exactly MAX_REGISTERED_OUTLETS must be accepted"
+        );
+    }
+
+    /// Event log whose destroy fails.
+    struct DestroyFailingEventLog;
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for DestroyFailingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Err(ContextCreationError::EventLogFailed(
+                "fixture: destroy deliberately fails".to_owned(),
+            ))
+        }
+    }
+
+    /// A rollback whose event-log destroy fails returns `RollbackFailed`
+    /// carrying the creation's cause and the destroy error; one whose destroy
+    /// succeeds returns the cause itself (spec section 17.3, "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn a_rollback_whose_destroy_fails_reports_both_errors() {
+        let receipt = CreationReceipt {
+            event_log: Some(EventLogHandle::new()),
+            published: true,
+        };
+        let cause = || ContextCreationError::TransportFailed("fixture: publish failed".to_owned());
+        let err = receipt
+            .rollback(
+                &[0x41; 32],
+                &TestTransport,
+                &DestroyFailingEventLog,
+                cause(),
+            )
+            .await;
+        match err {
+            ContextCreationError::RollbackFailed { cause, rollback } => {
+                assert!(
+                    matches!(*cause, ContextCreationError::TransportFailed(_)),
+                    "the cause survives: {cause:?}"
+                );
+                assert!(
+                    matches!(*rollback, ContextCreationError::EventLogFailed(_)),
+                    "the destroy error is reported: {rollback:?}"
+                );
+            }
+            other => panic!("a failed destroy must report RollbackFailed, got {other:?}"),
+        }
+        let err = receipt
+            .rollback(&[0x41; 32], &TestTransport, &TestEventLog, cause())
+            .await;
+        assert!(
+            matches!(err, ContextCreationError::TransportFailed(_)),
+            "a clean rollback returns the cause, got {err:?}"
+        );
+    }
+}

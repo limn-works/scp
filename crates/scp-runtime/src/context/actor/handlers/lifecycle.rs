@@ -16,7 +16,7 @@
 //! Bootstrap variants (`CreateContext`, `ImportContext`, `RestoreContext`)
 //! construct fresh `PerContextState` and cannot be routed against a
 //! per-context actor that does not yet exist. They are handled by
-//! [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
+//! [`Supervisor::dispatch_lifecycle_direct`](scp_runtime_core::context::supervisor::supervisor::Supervisor)
 //! which delegates to the actor-shape bootstrap helpers in
 //! `crate::context::lifecycle_helpers`. If a bootstrap variant
 //! reaches this actor-shape dispatch (because an actor is already
@@ -36,14 +36,16 @@
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::ContextHandle;
-use crate::context::actor::commands::{CloseContextReply, ExportContextReply, LifecycleCommand};
-use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
-use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
-use crate::context::actor::state::PerContextState;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::actor::commands::{
+    CloseContextReply, ExportContextReply, LifecycleCommand,
+};
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::state::PerContextState;
 
-use crate::context::actor::handle::HANDLER_TIMEOUT;
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
 // ---------------------------------------------------------------------------
 // Actor-shape dispatch (used from `dispatch_state`)
@@ -55,7 +57,7 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 /// Bootstrap commands (`CreateContext`, `RestoreContext`,
 /// `ImportContext`) do NOT take `&mut state` — they construct fresh
 /// state. They reach
-/// [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
+/// [`Supervisor::dispatch_lifecycle_direct`](scp_runtime_core::context::supervisor::supervisor::Supervisor)
 /// via the supervisor's lifecycle dispatch and never enter this actor
 /// path; if one does reach the actor (re-create attempt against an
 /// already-registered context), the handler surfaces
@@ -69,8 +71,8 @@ use crate::context::actor::handle::HANDLER_TIMEOUT;
 /// `RevokeContextAccessKey`, `RestoreContextAccessKey`) call the
 /// actor-shape helpers in [`crate::context::queries_helpers`] (Phase
 /// 2A.10) directly on `&mut state` — no supervisor shim involved.
-pub(crate) async fn dispatch(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+pub async fn dispatch(
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -79,7 +81,7 @@ pub(crate) async fn dispatch(
 
 #[allow(clippy::too_many_lines)]
 async fn dispatch_actor_inner(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -241,7 +243,7 @@ async fn dispatch_actor_inner(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_join_context_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -286,7 +288,7 @@ async fn handle_join_context_actor(
 }
 
 async fn handle_leave_context_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     _params: scp_protocol::context::params::ContextParams,
@@ -342,7 +344,7 @@ async fn handle_leave_context_actor(
 }
 
 async fn handle_close_context_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     _params: scp_protocol::context::params::ContextParams,
@@ -394,20 +396,20 @@ async fn handle_close_context_actor(
 /// actor turn (ADR-049 Decision 7a) and replies with the signed export.
 /// Export is read-only, so the outcome never marks the state mutated.
 async fn handle_export_context_actor(
-    blocks: Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError>,
+    blocks: Result<(scp_runtime_core::context::state::ContextSnapshot, Vec<u8>), ContextError>,
     deps: &ActorDeps,
     context_id: String,
     exporter_did: scp_did::DID,
-    signer: crate::context::actor::signer::CommandSigner,
+    signer: scp_runtime_core::context::actor::signer::CommandSigner,
     reply: ExportContextReply,
 ) -> Outcome<()> {
     let export_fut = async {
         let (snapshot, event_log_data) = blocks?;
-        crate::context::export_import::create_signed_export(
+        scp_runtime_core::context::export_import::create_signed_export(
             snapshot,
             event_log_data,
             exporter_did,
-            crate::context::export_import::ExportScope::Full,
+            scp_runtime_core::context::export_import::ExportScope::Full,
             deps.clock.now_secs(),
             &signer,
         )
@@ -432,7 +434,7 @@ async fn handle_export_context_actor(
 // ---------------------------------------------------------------------------
 
 fn handle_generate_context_access_key_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
@@ -442,7 +444,7 @@ fn handle_generate_context_access_key_actor(
     // role/membership reads + access-key-store write through the non-persisting
     // `class_c_view()`. The field-narrowed helper takes the `ClassCMut` view, so
     // no whole-state `state_mut()` is taken.
-    let result = crate::context::shared::queries::generate_context_access_key(
+    let result = scp_runtime_core::context::shared::queries::generate_context_access_key(
         &mut cell.class_c_view(),
         context_id,
         member_did,
@@ -457,14 +459,14 @@ fn handle_generate_context_access_key_actor(
 }
 
 fn handle_revoke_context_access_key_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
-    let result = crate::context::shared::queries::revoke_context_access_key(
+    let result = scp_runtime_core::context::shared::queries::revoke_context_access_key(
         &mut cell.class_c_view(),
         context_id,
         member_did,
@@ -479,14 +481,14 @@ fn handle_revoke_context_access_key_actor(
 }
 
 fn handle_restore_context_access_key_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
-    let result = crate::context::shared::queries::restore_context_access_key(
+    let result = scp_runtime_core::context::shared::queries::restore_context_access_key(
         &mut cell.class_c_view(),
         context_id,
         member_did,
@@ -555,10 +557,10 @@ fn handle_flush_snapshot_actor<'d>(
     deps: &'d ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> impl std::future::Future<Output = Outcome<()>> + Send + use<'d> {
-    use crate::context::state::context_id_to_bytes;
+    use scp_runtime_core::context::state::context_id_to_bytes;
 
     let context_id = state.handle.context_id().to_owned();
-    let mut snapshot = crate::context::manager_methods::snapshot_context(state);
+    let mut snapshot = scp_runtime_core::context::manager_methods::snapshot_context(state);
     // Export MLS crypto state alongside the context snapshot (#645).
     // On export failure, mark snapshot needs_reconnect=true and persist
     // an empty crypto blob (AC3 bug 2 — same contract as
@@ -605,11 +607,12 @@ fn handle_flush_snapshot_actor<'d>(
     };
     match state.export_crypto_state(sender_epochs, recv_floors) {
         Ok(crypto_state) => {
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+            snapshot.mls_crypto_state =
+                scp_runtime_core::context::state::MlsCryptoState(crypto_state);
         }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
+            snapshot.mls_crypto_state = scp_runtime_core::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -675,11 +678,11 @@ fn handle_flush_snapshot_actor<'d>(
 // precise-capture `+ use<>` bound excludes the input lifetimes, so the `&state`
 // borrow ends before the returned `async move`.
 fn handle_shutdown_self_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> impl std::future::Future<Output = Outcome<()>> + Send + use<> {
-    use crate::context::state::context_id_to_bytes;
+    use scp_runtime_core::context::state::context_id_to_bytes;
 
     let context_id = cell.handle.context_id().to_owned();
     let ctx_id_bytes = context_id_to_bytes(&context_id);
@@ -755,18 +758,20 @@ fn handle_report_buffer_len_actor(
 ///
 /// Clears the actor-owned `EpochState.needs_reconnect` flag (spec
 /// §23.11) via
-/// [`clear_needs_reconnect`](crate::context::shared::queries::clear_needs_reconnect).
+/// [`clear_needs_reconnect`](scp_runtime_core::context::shared::queries::clear_needs_reconnect).
 /// Called by the reconnection driver after the six-phase protocol
 /// completes for a context. Synchronous; always replies `Ok(())`.
 fn handle_clear_needs_reconnect_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Field-narrowed Class-C mutation: clear `needs_reconnect` through the
     // non-persisting `class_c_view().epoch_mut()` (coalesced persist via the run
     // loop's `mutated` flag), not a whole-state `state_mut()`.
-    crate::context::shared::queries::clear_needs_reconnect(cell.class_c_view().epoch_mut());
+    scp_runtime_core::context::shared::queries::clear_needs_reconnect(
+        cell.class_c_view().epoch_mut(),
+    );
     tracing::debug!(
         context_id,
         "cleared needs_reconnect after reconnection (§23.11)"
@@ -779,7 +784,7 @@ fn handle_clear_needs_reconnect_actor(
 ///
 /// Issues an MLS Update proposal + self-Commit for post-compromise
 /// security (§9.12 step 2) via
-/// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch),
+/// [`PerContextState::advance_epoch`](scp_runtime_core::context::actor::state::PerContextState::advance_epoch),
 /// which preserves the `scp_wrapping_key` leaf extension (§9.16.1) and
 /// advances the group epoch locally, then publishes the Commit through the
 /// Commit broadcast and retry queue (spec 23 §23.3 Phase 5, ADR-049). Replies
@@ -787,7 +792,7 @@ fn handle_clear_needs_reconnect_actor(
 /// Commit queued fail-closed and replies `TransportFailed`, so the
 /// reconnection driver's Phase 5 fails the context.
 async fn handle_issue_mls_update_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
+    cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -854,7 +859,7 @@ async fn handle_issue_mls_update_actor(
             deps,
             context_id,
             commit,
-            &crate::context::state::CommitOperation::ReconnectMlsUpdate,
+            &scp_runtime_core::context::state::CommitOperation::ReconnectMlsUpdate,
         )
         .await
     {
@@ -879,37 +884,38 @@ async fn handle_issue_mls_update_actor(
     Outcome::ok_mutated(())
 }
 
-/// The lifecycle domain's [`LifecycleDomain`](crate::context::domains::LifecycleDomain)
+/// The lifecycle domain's [`LifecycleDomain`](scp_runtime_core::context::domains::LifecycleDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Lifecycle;
 
 #[async_trait::async_trait]
-impl crate::context::domains::LifecycleDomain for Lifecycle {
+impl scp_runtime_core::context::domains::LifecycleDomain for Lifecycle {
     async fn dispatch(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        cmd: crate::context::actor::commands::LifecycleCommand,
-    ) -> crate::context::actor::outcome::Outcome<()> {
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        cmd: scp_runtime_core::context::actor::commands::LifecycleCommand,
+    ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         dispatch(cell, deps, cmd).await
     }
 
     async fn close_context(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
-        handle: &crate::context::ContextHandle,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        handle: &scp_runtime_core::context::ContextHandle,
         initiator_did: &scp_did::DID,
-    ) -> Result<crate::context::ttl::CloseResult, scp_protocol::context::ContextError> {
+    ) -> Result<scp_runtime_core::context::ttl::CloseResult, scp_protocol::context::ContextError>
+    {
         crate::context::lifecycle_helpers::close_context(cell, deps, handle, initiator_did).await
     }
 
     async fn create_context(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
-        create: crate::context::domains::CreateContextRequest<'_>,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        create: scp_runtime_core::context::domains::CreateContextRequest<'_>,
     ) -> Result<
-        crate::context::shared::lifecycle::SpawnedContext,
+        scp_runtime_core::context::shared::lifecycle::SpawnedContext,
         scp_protocol::context::builder::ContextCreationError,
     > {
         Box::pin(crate::context::lifecycle_helpers::create_context(
@@ -926,11 +932,11 @@ impl crate::context::domains::LifecycleDomain for Lifecycle {
 
     async fn drain_and_deliver_sender_keys(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
-        view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        view: &mut scp_runtime_core::context::actor::class_s::ClassCMut<'_>,
         context_id: &str,
-        scope: crate::context::shared::lifecycle::DistributionScope,
-    ) -> crate::context::actor::state::DistributionReport {
+        scope: scp_runtime_core::context::shared::lifecycle::DistributionScope,
+    ) -> scp_runtime_core::context::actor::state::DistributionReport {
         crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
             deps, view, context_id, scope,
         )
@@ -939,13 +945,13 @@ impl crate::context::domains::LifecycleDomain for Lifecycle {
 
     async fn import_context_from_export(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
-        export: crate::context::export_import::ContextExport,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+        export: scp_runtime_core::context::export_import::ContextExport,
         verifying_key: &ed25519_dalek::VerifyingKey,
         local_pseudonym: Option<[u8; 32]>,
-        first_state: &crate::context::shared::lifecycle::FirstStateRollback,
+        first_state: &scp_runtime_core::context::shared::lifecycle::FirstStateRollback,
     ) -> Result<
-        crate::context::shared::lifecycle::SpawnedContext,
+        scp_runtime_core::context::shared::lifecycle::SpawnedContext,
         scp_protocol::context::ContextError,
     > {
         Box::pin(crate::context::lifecycle_helpers::import_context(
@@ -960,17 +966,17 @@ impl crate::context::domains::LifecycleDomain for Lifecycle {
 
     async fn restore_all_contexts(
         &self,
-        supervisor: &std::sync::Arc<crate::context::supervisor::Supervisor>,
+        supervisor: &std::sync::Arc<scp_runtime_core::context::supervisor::Supervisor>,
     ) -> Result<Vec<String>, scp_protocol::context::ContextError> {
         crate::context::lifecycle_helpers::restore_all_contexts(supervisor).await
     }
 
     async fn restore_context(
         &self,
-        deps: &crate::context::actor::deps::ActorDeps,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
-        handle: &crate::context::ContextHandle,
-        preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
+        handle: &scp_runtime_core::context::ContextHandle,
+        preloaded_snapshot: Option<scp_runtime_core::context::state::ContextSnapshot>,
     ) -> Result<(), scp_protocol::context::ContextError> {
         Box::pin(crate::context::lifecycle_helpers::restore_context(
             deps,
@@ -983,8 +989,8 @@ impl crate::context::domains::LifecycleDomain for Lifecycle {
 
     async fn retry_pending_sender_key_rotation(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
     ) {
         crate::context::lifecycle_helpers::retry_pending_sender_key_rotation(
@@ -995,15 +1001,18 @@ impl crate::context::domains::LifecycleDomain for Lifecycle {
 
     async fn rotate_sender_key_and_distribute(
         &self,
-        cell: &mut crate::context::actor::class_s::ClassSCell,
-        deps: &crate::context::actor::deps::ActorDeps,
+        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
+        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
         context_id: &str,
     ) {
         crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
             .await;
     }
 
-    async fn shutdown_all_contexts(&self, supervisor: &crate::context::supervisor::Supervisor) {
+    async fn shutdown_all_contexts(
+        &self,
+        supervisor: &scp_runtime_core::context::supervisor::Supervisor,
+    ) {
         crate::context::lifecycle_helpers::shutdown_all_contexts(supervisor).await;
     }
 }

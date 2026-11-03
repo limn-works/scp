@@ -24,7 +24,7 @@ use scp_protocol::envelope::validation::{
     TimestampValidator, validate_received_envelope,
 };
 
-use scp_runtime::envelope::inner::sign::create_inner_envelope;
+use scp_runtime_core::envelope::inner::sign::create_inner_envelope;
 
 /// Helper: creates a signed inner envelope with the given timestamp and
 /// sequence. The signature is valid — these tests exercise the validation
