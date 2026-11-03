@@ -2890,13 +2890,13 @@ impl Supervisor {
     /// #     key_resolver: scp_protocol::context::governance::KeyResolver,
     /// #     durable: DurableProviders,
     /// #     wrapping_custody: scp_runtime::context::supervisor::WrappingCustodySource,
+    /// #     domains: scp_runtime::context::domains::DomainHandlers,
     /// # ) {
     /// let _ = Supervisor::with_providers_and_journal(
     ///     crypto, transport, event_log, key_resolver,
     ///     None, // E0308: expected `Box<dyn ContextPersistence>`
-    ///     None, None, None, durable, wrapping_custody,
-    ///     scp_runtime::domain_handlers(),
-    /// , crate::domain_handlers());
+    ///     None, None, None, durable, wrapping_custody, domains,
+    /// );
     /// # }
     /// ```
     #[must_use]
@@ -3934,7 +3934,7 @@ impl Supervisor {
     /// Takes `self: &Arc<Self>` so the returned
     /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
     /// wraps a cloned `Arc` of the same supervisor instance — not a
-    /// fresh `Supervisor::for_query_shim(crate::domain_handlers())`. Without this the handle
+    /// fresh `Supervisor::for_query_shim`. Without this the handle
     /// would point at a dangling second supervisor and
     /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
     /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
