@@ -267,7 +267,7 @@ How a new identity learns its first nodes, and how a reader reaches an identity 
 
 **Independent sources are distinct operators.** A rule that counts independent sources counts distinct `binding.operator` identifiers among proven node keys, and never entries, URLs or node keys (`09-security-model.md` §9.7.4.2 definitions, R11). Two nodes one operator runs are one operator and satisfy no floor of two. Each node is still one witness, named by its `NodeId` (`09-security-model.md` §9.7.4.3).
 
-**A listed node validates the public records it stores**, which makes it a validating node under `09-security-model.md` §9.10.12, and MUST answer a QUERY carrying a `proof_nonce` with a node proof under its node key, which R11 reads.
+**A listed node validates the public records it stores**, which makes it a validating node under `09-security-model.md` §9.10.12, and MUST answer a QUERY carrying a `proof_nonce` with a node proof under its node key, which R11 reads. Its operator installs the listed binding through the node's configuration, after the node signed its `possession_sig` through a local operator command (`09-security-model.md` §9.6.3, "How a node gets its key and its binding").
 
 **The list carries two roles, and neither decides a verdict**: the source of the fallback set, and a relying party's default recognized set, both of which `09-security-model.md` §9.7.4.2's definitions define. The rules that read it are the first-contact floor of R11 and the SDK's default witness set, which `09-security-model.md` §9.7.4.3 draws from it.
 
