@@ -15,7 +15,7 @@ permissions:
   actions: read
 
 env:
-  CARGO_TERM_COLOR: never
+  CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -56,9 +56,13 @@ jobs:
       - name: Compile the group's commands
         run: |
           pip install -q pyyaml
-          python3 scripts/ws-exp-writer.py "${{ matrix.group }}" "$RUNNER_TEMP/main-warm.yml" > "$RUNNER_TEMP/w.sh"
+          python3 scripts/ws-exp-writer.py "${{ matrix.group }}" "$RUNNER_TEMP/main-warm.yml" "$RUNNER_TEMP/wsteps"
           start=$(date +%s)
-          bash "$RUNNER_TEMP/w.sh" 2>&1 | command grep -vE '^\s+(Compiling|Checking|Fresh)' | tail -200
+          for f in "$RUNNER_TEMP"/wsteps/*.sh; do
+            echo "::group::$f"; cat "$f"
+            CARGO_TERM_COLOR=never bash "$f" 2>&1 | command grep -vE '^\s+(Compiling|Checking|Fresh)' | tail -100
+            echo "::endgroup::"
+          done
           echo "WRITER group=${{ matrix.group }} compile_seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Pack
         run: |

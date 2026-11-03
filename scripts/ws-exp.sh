@@ -34,7 +34,7 @@ run_reader() {
   while IFS= read -r c; do
     [[ -z $c ]] && continue
     echo "+ $c"
-    bash -c "$c" >"$log.1" 2>&1 || rc=1
+    CARGO_TERM_COLOR=never bash -c "$c" >"$log.1" 2>&1 || rc=1
     cat "$log.1" >>"$log"
   done < <(reader_cmds "$r")
   end=$(date +%s.%N)
