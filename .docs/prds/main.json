@@ -14555,22 +14555,32 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-relay-client/src/protocol.rs",
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/quic/listener.rs",
         "crates/scp-transport/src/udp/listener.rs",
         "crates/scp-transport/src/webtransport/session.rs",
-        "crates/scp-node/src/lib.rs"
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/native/node_proof.rs",
+        "crates/scp-protocol/src/node/own_key.rs",
+        "crates/scp-node/src/node_key.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/main.rs",
+        "crates/scp-ffi/common/src/error_codes.rs"
       ],
-      "description": "A resolver proves that a listed node served its QUERY response by sending a fresh 32-byte `proof_nonce` on the QUERY; a node that holds the node key its `NodeBinding` binds answers with a 200-byte `node_proof` on the `query_complete` EVENT, signed under `SCP-NODE-PROOF-V1:` over its `NodeId`, the nonce, the routing id, the digest of the bytes served and `observed_at` (`09-security-model.md` §9.7.4.2 definitions, §9.10.12; ADR-004 operation 4 and the EVENT row). R11's first-contact floor counts only proven sources, so SCP-367's adversarial fixture and SCP-368's node client need both fields. The `NodeProof` type, its preimage and its verification are SCP-364's; this story adds the wire fields and the signing node. A node with no bound node key answers without `node_proof`, never with a placeholder key. How a node comes to hold its node key and its `NodeBinding` (generated or imported, binding supplied how) is not yet stated by any spec section, so the criteria for holding the key and signing wait on that spec text. Node backend execution plan code PR C4b.",
+      "description": "A resolver proves that a listed node served its QUERY response by sending a fresh 32-byte `proof_nonce` on the QUERY; a node that holds the node key its `NodeBinding` binds answers with a 200-byte `node_proof` on the `query_complete` EVENT, signed under `SCP-NODE-PROOF-V1:` over its `NodeId`, the nonce, the routing id, the digest of the bytes served and `observed_at` (`09-security-model.md` §9.7.4.2 definitions, §9.10.12; ADR-004 operation 4 and the EVENT row). R11's first-contact floor counts only proven sources, so SCP-367's adversarial fixture and SCP-368's node client need both fields. The `NodeProof` type, its preimage and its verification are SCP-364's; this story adds the wire fields and the signing node. A node with no bound node key answers without `node_proof`, never with a placeholder key. The node draws its node key into the storage its SCP instance hands it, signs its binding's `possession_sig` only through a local operator command, and takes the finished `NodeBinding` from its configuration (`09-security-model.md` §9.6.3 \"How a node gets its key and its binding\"). Node backend execution plan code PR C4b.",
       "acceptanceCriteria": [
         "`ClientMessage::Query` carries `proof_nonce: Option<[u8; 32]>`, encoded as a 32-byte MessagePack `bin` under the key `proof_nonce` and omitted when absent; a `bin` of another width is refused: a round-trip test against ADR-004's QUERY row",
         "`RelayMessage::Event` carries `node_proof: Option<[u8; NODE_PROOF_LEN]>` (200 bytes), encoded as a `bin` under the key `node_proof` and omitted when absent; a `bin` of another width is refused: a round-trip test against ADR-004's EVENT row",
         "Every transport that answers QUERY and holds no bound node key (native WebSocket server, QUIC listener, UDP listener, WebTransport session) answers a QUERY carrying `proof_nonce` with a `query_complete` EVENT that has no `node_proof`: a test at the native server (`09-security-model.md` §9.10.12)",
-        "`scp-node` holds its node key and its `NodeBinding` in the storage handle it inherits from its SCP instance, and signs nothing when either is absent (`09-security-model.md` §9.6.3, §9.7.1; `10-infrastructure-and-self-hosting.md` §10.4)",
-        "A node holding its node key and binding answers a QUERY carrying `proof_nonce` with a `NodeProof` whose `node_id` is the binding's `NodeId`, whose `value_digest` covers the blobs in the order sent, including a page of zero blobs, and that verifies under the binding's `node_key`: a test over the wire (`09-security-model.md` §9.7.4.2 definitions)",
+        "`scp-node` draws its node key on its first start into the storage handle it inherits from its SCP instance and reads that same key on every later start, with no separate store, and the key's secret is wiped when it drops: a test that a binding signed against the storage of a stopped node installs on its restart (`09-security-model.md` §9.6.3 step 1; `10-infrastructure-and-self-hosting.md` §10.4)",
+        "A stored value that is not a node key, or an envelope newer than the binary reads, fails with a typed `NodeKeyStoreError` (`NodeError::NodeKey` at start) and is never replaced by a fresh key: a test",
+        "`scp-node sign-binding` is a local command over the node's storage directory that signs `possession_sig` over P for the operator, canonical URL and key-state head it is given, with the node's own `node_key` in P, and prints `node_key`, `url_hash` and `possession_sig`: a test that runs the binary twice on one storage directory (`09-security-model.md` §9.6.3 step 2)",
+        "No wire message makes a node sign P: every `ClientMessage` variant, enumerated by a match with no wildcard, goes to a bound server, and no frame it answers with carries a signature over P; a transport holds only a `BoundNodeKey`, which cannot sign P (a `compile_fail` doctest)",
+        "The operator installs the binding through `NodeConfig.node_binding` and `HostSiteConfig.node_binding` (the binary reads `SCP_NODE_BINDING`, the binding's canonical JSON, with `SCP_NODE_URL`); the node refuses to start with a typed `NodeError::NodeBinding` for a binding of another key, a `possession_sig` that fails under its key, or a `url_hash` that is not the configured URL's, and `--relay-only` exits 1 on either variable: tests (`09-security-model.md` §9.6.3 step 4)",
+        "A node holding its node key and binding answers a QUERY carrying `proof_nonce` with a `NodeProof` whose `node_id` is the binding's `NodeId`, whose `value_digest` covers the blobs in the order sent, including a page of zero blobs, and that verifies under the binding's `node_key`, signed through one function every transport (native WebSocket, QUIC, UDP, WebTransport) calls: a test over the wire on each transport and on a started `scp-node` (`09-security-model.md` §9.7.4.2 definitions)",
         "A proof checked against a nonce other than the one the QUERY sent fails verification: a test",
         "A node with no binding answers a QUERY carrying `proof_nonce` without `node_proof`: a test over the wire",
         "No `unwrap()` or `expect()` in library code",
@@ -14579,7 +14589,7 @@
       "actionItems": [
         "Add `proof_nonce` to QUERY and `node_proof` to the EVENT, with a round-trip test each.",
         "Answer without `node_proof` on every keyless transport.",
-        "Hold the node key and binding in the node's inherited storage, once a spec section states how a node obtains them.",
+        "Draw and keep the node key in the node's inherited storage, add the local `sign-binding` command, and install the configured binding with its startup checks.",
         "Sign a `NodeProof` on `query_complete` when the QUERY carries a nonce."
       ],
       "blockedBy": [
