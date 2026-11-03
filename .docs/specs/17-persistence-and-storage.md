@@ -82,6 +82,7 @@ All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy se
 ```
 _meta/schema_version
 scp/identity
+scp/node-key
 
 identity/{did}/key_event_log
 identity/{did}/service_record
@@ -151,6 +152,8 @@ mls/{context_id}/...
 ```
 
 **Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` for the node's own identity. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
+
+**Node key.** The `scp/node-key` key holds a `StoredValue` of the 32-byte P-256 scalar of the node's own node key (`09-security-model.md` §9.6.3, "How a node gets its key and its binding"; `10-infrastructure-and-self-hosting.md` §10.4). It is a top-level singleton, because a node holds one node key and the key names no DID or context. It is written and read only through the `ProtocolRepository` node-key methods (section 17.4), in the instance storage the node's SCP instance hands it. The node writes it once, on the first start that finds no key, and never overwrites it, because the key never rotates and a new key would orphan the binding the operator installed for the old one. A reader refuses a value that does not decode or whose scalar is not a P-256 private key, and never replaces it with a fresh key. The serialized buffer is zeroized after the write and after the read. A command that only signs with the key, such as the node's local `sign-binding`, reads it and refuses when none is stored; only the node's start draws one.
 
 **Push relay ledger.** Each `push_relay/{sha256_hex(relay_url)}/{sha256_hex(token)}` key holds a `StoredValue<PushRelayRecord>` (canonical relay URL, push platform, device token): a relay that may hold a push registration of that token (§10.7.1). The push registrar writes the record before its first publish to the relay and deletes it only when the relay accepts a `PushDeregistration` of the token or answers `4061` or `4063`, so a registration whose OK was lost, or a restart, still leaves a record, and the registrar deregisters every recorded relay that hosts no context of this device. Both key components are SHA-256 hex, so neither the URL nor the token appears in a key. A record that does not decode fails the whole ledger load, because skipping it would leave its relay never deregistered. The token is a secret, so the serialized buffer is zeroized after the write.
 
@@ -404,6 +407,10 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_adapter_credentials(&self, did: &DID, adapter_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError>;
 
+    // --- Node key (09-security-model.md §9.6.3) ---
+    pub async fn store_node_key(&self, key: &NodeSigningKey) -> Result<(), StoreError>;
+    pub async fn load_node_key(&self) -> Result<Option<NodeSigningKey>, StoreError>;
+
     // --- TLS certificates (§18.6.3) ---
     pub async fn store_tls_certificate(&self, certificate_chain_pem: &str, private_key_pem: &str) -> Result<(), StoreError>;
     pub async fn load_tls_certificate(&self) -> Result<Option<(String, Zeroizing<String>)>, StoreError>;
@@ -427,6 +434,7 @@ scp-core/src/store/
     identity.rs     # Key-event logs, service records, private state, TOFU, resolved-log cache
     nonce.rs        # UCAN nonce tracking, pruning
     tls.rs          # TLS certificate chain + private key (§18.6.3)
+    node_key.rs     # The node's own node key (09-security-model.md §9.6.3)
     outlets.rs        # Outlet registration, sessions
     transport.rs    # Relay scores, key packages
     economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials
