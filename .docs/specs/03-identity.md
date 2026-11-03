@@ -1570,7 +1570,11 @@ pub struct ResolutionOutcome {
 /// The key state a resolution accepted: the state replaying the validated
 /// chain derived, and the instant of the resolution. Only the verdict
 /// classifier constructs it, on `Confirmed` or `Adopted`, so every
-/// verification decision that reads key state reads one a resolution accepted.
+/// verification decision a party makes on key state reads one a resolution
+/// accepted. A validating store's admission and selection
+/// (`09-security-model.md` §9.10.12) read the chains the store retains under
+/// `09-security-model.md` §9.7.4.2 R9 instead, as `RetainedChain` below.
+/// Store admission is availability only and grants no trust.
 pub struct ResolvedState { /* the validated chain, the replayed state, the identifier, the head's digest and sequence, and the resolution instant; private */ }
 
 impl ResolvedState {
@@ -1597,6 +1601,33 @@ impl ResolvedState {
     /// false where `now` precedes the resolution instant, because a clock
     /// stepped backward would otherwise extend that bound.
     pub fn is_fresh(&self, now: SystemTime) -> bool;
+}
+
+/// One chain a validating store retains under `09-security-model.md`
+/// §9.7.4.2 R9, accepted or suffix, with the key state replaying it derives.
+/// Only `AcceptedChainHolder`, the holder of a store's retained set,
+/// constructs it, from that set, so a store's admission and selection
+/// (`09-security-model.md` §9.10.12) read a chain the store holds and never a
+/// chain a caller hands in. It carries no verdict and no resolution instant:
+/// a store admits a record for availability, and no party's trust decision
+/// reads a `RetainedChain`. A verifier of a log-anchored or current-key
+/// signature (`09-security-model.md` §9.7.1) takes a `ResolvedState` or a
+/// `RetainedChain` and applies the same identity check and the same refusal
+/// of a head off the chain to either.
+pub struct RetainedChain { /* the validated chain, the replayed state, the identifier; private */ }
+
+impl RetainedChain {
+    /// The identifier the retained chain's inception recomputes to.
+    pub fn identifier(&self) -> &Identifier;
+    /// The preimage digest of the retained chain's head event.
+    pub fn head_digest(&self) -> [u8; 32];
+    /// The key state at the retained chain's head.
+    pub fn key_state(&self) -> &KeyState;
+    /// The key state at the retained chain's event whose
+    /// `09-security-model.md` §9.5.1 preimage digest is `digest`, read as
+    /// `ResolvedState::key_state_at` reads it. `NotOnChain` where no event of
+    /// the retained chain has that digest.
+    pub fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain>;
 }
 
 /// The commitment the latest reveal-authorized event fixed, or the
