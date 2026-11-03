@@ -2,7 +2,7 @@
 # Cases for the clippy scope in scripts/hooks/pre-commit.
 #
 # THE CRITERION: the hook lints the workspace members that hold a path the commit changes,
-# plus every member that depends on one of them, and lints the whole workspace when a
+# and no member that only depends on one of them, and lints the whole workspace when a
 # changed path is one the full-run lists of `scripts/pre-commit-clippy-scope.py` name.
 # That script's module docstring states the rule in full.
 #
@@ -78,7 +78,8 @@ new_repo() {
     done
     for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml \
         crates/scp-relay/src/main.rs crates/scp-relay/data.json \
-        crates/scp-relay/src/extra.rs crates/scp-protocol/src/lib.rs fuzz/src/lib.rs docs/notes.md; do
+        crates/scp-relay/src/extra.rs crates/scp-protocol/src/lib.rs crates/scp-runtime/src/lib.rs \
+        fuzz/src/lib.rs docs/notes.md; do
         mkdir -p "$(dirname "$f")"
         echo "// $f" > "$f"
     done
@@ -95,12 +96,6 @@ edit() {
 
 ALL_FEATURES="scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing"
 TAIL="--all-targets -- -D warnings"
-# Every member whose library or tests compile against scp-protocol's library, read off the
-# recorded graph by hand: scp-clock, scp-crypto, scp-did, scp-dht, scp-event-log, and
-# scp-ffi-napi-test-stubs are the six members scp-protocol does not reach.
-PROTOCOL_MEMBERS="scp-client scp-client-wasm scp-core scp-ffi scp-ffi-common scp-ffi-napi scp-ffi-uniffi scp-identity scp-mcp scp-media scp-mls scp-node scp-platform scp-protocol scp-relay scp-relay-client scp-relay-mock scp-runtime scp-testing scp-transport"
-PROTOCOL_ARGS=""
-for m in $PROTOCOL_MEMBERS; do PROTOCOL_ARGS="$PROTOCOL_ARGS -p $m"; done
 
 # assert_clippy <name> <want: the exact `cargo clippy` line, or "none"> [protocol: yes|no]
 # Also requires that the toolchain check ran. With `protocol` yes (the default), both
@@ -142,13 +137,32 @@ g commit -q -m "leaf change" >/dev/null
 assert_clippy "a change in leaf crate scp-relay lints scp-relay only" \
     "cargo clippy -p scp-relay $TAIL"
 
-# Case 2: scp-protocol, which most members depend on.
+# Case 2: scp-protocol, which twenty members depend on. None of them is linted, and no
+# testing feature is passed, because each feature names a package outside the selection.
 new_repo "$WORK/protocol"
 edit crates/scp-protocol/src/lib.rs
 : > "$LOG"
 g commit -q -m "protocol change" >/dev/null
-assert_clippy "a change in scp-protocol lints scp-protocol and every member depending on it" \
-    "cargo clippy${PROTOCOL_ARGS} --features $ALL_FEATURES $TAIL"
+assert_clippy "a change in scp-protocol lints scp-protocol and none of its dependents" \
+    "cargo clippy -p scp-protocol $TAIL"
+
+# Case 2b: scp-runtime, whose testing feature the hook passes. scp-core, scp-transport,
+# scp-node and the bridges depend on it and are not linted.
+new_repo "$WORK/runtime"
+edit crates/scp-runtime/src/lib.rs
+: > "$LOG"
+g commit -q -m "runtime change" >/dev/null
+assert_clippy "a change in scp-runtime lints scp-runtime with its testing feature only" \
+    "cargo clippy -p scp-runtime --features scp-runtime/testing $TAIL"
+
+# Case 2c: two members in one commit select both, in name order.
+new_repo "$WORK/two-members"
+edit crates/scp-runtime/src/lib.rs
+edit crates/scp-protocol/src/lib.rs
+: > "$LOG"
+g commit -q -m "protocol and runtime change" >/dev/null
+assert_clippy "a commit changing scp-protocol and scp-runtime lints exactly those two" \
+    "cargo clippy -p scp-protocol -p scp-runtime --features scp-runtime/testing $TAIL"
 
 # Case 3: the root manifest beside a leaf change.
 new_repo "$WORK/manifest"
@@ -311,6 +325,66 @@ git merge -q --no-ff --no-commit main >/dev/null 2>&1
 g commit -q -m "merge main into feature" >/dev/null
 assert_clippy "a merge selects from the files that differ from the merged-in head" \
     "cargo clippy -p scp-relay $TAIL"
+
+# assert_fmt <name> <want: the exact `cargo fmt` line, or "none">
+assert_fmt() {
+    local name="$1" want="$2" got
+    got="$(command grep '^cargo fmt' "$LOG" 2>/dev/null || true)"
+    [ -z "$got" ] && got=none
+    if [[ "$got" == "$want" ]]; then
+        echo "  ok    ${name}"
+        PASSED=$((PASSED + 1))
+    else
+        echo "  FAIL  ${name}"
+        echo "          want: ${want}"
+        echo "          got:  ${got}"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# Cases 10-13: the format step formats the members holding a staged path, plus the members
+# holding a tracked `.rs` file the working tree modified, since `git add -u` stages those.
+new_repo "$WORK/fmt-runtime"
+edit crates/scp-runtime/src/lib.rs
+: > "$LOG"
+g commit -q -m "runtime change" >/dev/null
+assert_fmt "a change in scp-runtime formats scp-runtime only" "cargo fmt -p scp-runtime"
+
+new_repo "$WORK/fmt-unstaged"
+edit crates/scp-runtime/src/lib.rs
+echo "// unstaged edit" >> crates/scp-protocol/src/lib.rs
+: > "$LOG"
+g commit -q -m "runtime change, protocol edit left unstaged" >/dev/null
+assert_fmt "an unstaged edit to a tracked .rs file adds its member to the format step" \
+    "cargo fmt -p scp-protocol -p scp-runtime"
+
+new_repo "$WORK/fmt-root"
+edit Cargo.toml
+edit crates/scp-relay/src/main.rs
+: > "$LOG"
+g commit -q -m "manifest change" >/dev/null
+assert_fmt "a root Cargo.toml change formats every member" "cargo fmt --all"
+
+new_repo "$WORK/fmt-metadata-fails"
+edit crates/scp-relay/src/main.rs
+: > "$LOG"
+SCOPE_TEST_METADATA_FAILS=1 g commit -q -m "metadata fails" >/dev/null 2>&1 || true
+assert_fmt "a format step that cannot read the member graph formats every member" "cargo fmt --all"
+
+# Case 14: the protocol checks run beside clippy, and a failing one still rejects the commit.
+new_repo "$WORK/protocol-deps-fails"
+printf '#!/usr/bin/env bash\necho "check-protocol-deps.sh" >> "%s"\nexit 1\n' "$LOG" \
+    > scripts/check-protocol-deps.sh
+git -c commit.gpgsign=false commit -q --no-verify -am "failing protocol-deps stub"
+edit crates/scp-relay/src/main.rs
+: > "$LOG"
+if g commit -q -m "relay change" >/dev/null 2>&1; then
+    echo "  FAIL  a failing check-protocol-deps.sh rejects the commit (the commit succeeded)"
+    FAILED=$((FAILED + 1))
+else
+    echo "  ok    a failing check-protocol-deps.sh rejects the commit"
+    PASSED=$((PASSED + 1))
+fi
 
 # Case 9: cargo metadata fails, so the hook cannot read the member graph and must fail.
 new_repo "$WORK/metadata-fails"
