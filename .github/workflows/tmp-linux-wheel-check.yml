@@ -123,8 +123,8 @@ jobs:
         run: |
           ls -l wheels
           uname -m
-          python3 --version
-          python3 -m venv "$RUNNER_TEMP/venv"
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --no-index --find-links wheels scp-python
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/venv/bin/python" -I -c "import scp_sdk, scp_sdk._scp_core as core; print(scp_sdk.__file__); print(core.__file__)"
