@@ -4363,43 +4363,11 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          # Google withdrew `tools`, the obsolete Android SDK Tools package,
-          # from the SDK repository, and `tools platform-tools` is this
-          # action's default package list. sdkmanager prints `Warning: Failed
-          # to find package 'tools'` and exits 1, so the action throws before
-          # it appends the command-line-tools bin directory to PATH, and the
-          # job stops at this step. Naming the list drops the withdrawn
-          # package and leaves the rest of the default. The two Kotlin jobs,
-          # the Android build job in build-matrix.yml, and the Maven publish
-          # job in release.yml each carry this input for the same reason.
-          # First observed 2026-09-15 in the `Kotlin / test` job of workflow
-          # run 34915608875.
-          #
-          # This step also carried `continue-on-error: true`, which pull
-          # request #1352, the deployId return-value change, added so that
-          # the action could fail while the sdkmanager the runner image
-          # preinstalls served the steps below. The image stopped putting
-          # that copy on PATH, so in workflow run 34915608875 the swallowed
-          # failure reappeared three steps later as exit 127 against the
-          # `sdkmanager "platforms;android-35"` step, which had run correct
-          # code. A failed setup ends the job either way, so removing the key
-          # turns no passing job red, and the job now stops at the step that
-          # failed. The Android build job in build-matrix.yml and the Maven
-          # publish job in release.yml stop there already.
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35"
+          packages: platforms;android-35
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: true
@@ -4764,43 +4732,11 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          # Google withdrew `tools`, the obsolete Android SDK Tools package,
-          # from the SDK repository, and `tools platform-tools` is this
-          # action's default package list. sdkmanager prints `Warning: Failed
-          # to find package 'tools'` and exits 1, so the action throws before
-          # it appends the command-line-tools bin directory to PATH, and the
-          # job stops at this step. Naming the list drops the withdrawn
-          # package and leaves the rest of the default. The two Kotlin jobs,
-          # the Android build job in build-matrix.yml, and the Maven publish
-          # job in release.yml each carry this input for the same reason.
-          # First observed 2026-09-15 in the `Kotlin / test` job of workflow
-          # run 34915608875.
-          #
-          # This step also carried `continue-on-error: true`, which pull
-          # request #1352, the deployId return-value change, added so that
-          # the action could fail while the sdkmanager the runner image
-          # preinstalls served the steps below. The image stopped putting
-          # that copy on PATH, so in workflow run 34915608875 the swallowed
-          # failure reappeared three steps later as exit 127 against the
-          # `sdkmanager "platforms;android-35"` step, which had run correct
-          # code. A failed setup ends the job either way, so removing the key
-          # turns no passing job red, and the job now stops at the step that
-          # failed. The Android build job in build-matrix.yml and the Maven
-          # publish job in release.yml stop there already.
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35"
+          packages: platforms;android-35
       # The artifact root is the workspace (see the upload in uniffi-cdylib-linux), so `.`
       # restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to the
       # paths the producer wrote them at. A missing artifact fails this step.
@@ -4945,21 +4881,19 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      # The emulator, its system image and adb come from the same step: the instrumented
+      # run below starts the emulator itself rather than through an action that runs
+      # `sdkmanager --install` for each of them on every run.
+      - uses: ./.github/actions/android-sdk
         with:
-          # kotlin-test's copy of this input states why `tools` must not be requested.
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35" "ndk;27.2.12479018"
+          packages: >-
+            platforms;android-35
+            ndk;27.2.12479018
+            platform-tools
+            emulator
+            system-images;android-${{ matrix.api-level }};default;x86_64
       - name: Point cargo at the NDK linker
         run: |
           # The same linker build-matrix.yml's Android job names for this triple.
@@ -5023,32 +4957,65 @@ jobs:
         with:
           cache-read-only: true
       # The emulator cold-boots: `-no-snapshot` neither loads nor saves a snapshot, and
-      # `force-avd-creation` builds a fresh AVD. The runner treats
+      # `avdmanager create avd --force` builds a fresh AVD. This step treats
       # `getprop sys.boot_completed` == 1 as ready and then sends
-      # `adb shell input keyevent 82`, failing the step on any error. On a cold boot
+      # `adb shell input keyevent 82`, failing on any error. On a cold boot
       # ActivityManagerService sets that property only after SystemServer has published
-      # its services, `input` among them, so the property implies the readiness the
-      # runner assumes. A restored snapshot carries the property's saved value of 1 with
+      # its services, `input` among them, so the property implies the readiness this
+      # step assumes. A restored snapshot carries the property's saved value of 1 with
       # it, so the property no longer says whether the restored framework is serving: one
       # run loaded snapshot 'default_boot', read 1 two seconds later, and keyevent 82 threw
       # `No service published for: input`. Do not reintroduce an AVD snapshot cache here.
-      # The runner runs each `script` line in its own shell, so the directory comes from
-      # `working-directory`. An AOSP emulator's KeyMint runs in software, so
+      # An AOSP emulator's KeyMint runs in software, so
       # `expectSoftwareKeyInfo=true` makes custodyMatchesKeyInfo also assert that KeyInfo
       # reported a non-secure level: a comparison that only ever saw "hardware" would pass
       # against an adapter that always reports "hardware".
+      #
+      # This step does what reactivecircus/android-emulator-runner did with this job's
+      # inputs (two cores, port 5554, a 600-second boot budget, animations off), less that
+      # action's `sdkmanager --install` of the emulator, the system image, a platform,
+      # platform-tools and build-tools on every run, which unpacked whatever it downloaded:
+      # job 125594057792 printed `Error reading Zip content from a SeekableByteChannel`
+      # for the emulator package and ran no test. The android-sdk step above installs
+      # each of them from a checked archive.
       - name: Run the instrumented tests
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api-level }}
-          arch: x86_64
-          target: default
-          force-avd-creation: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
-          disable-animations: true
-          working-directory: bindings/kotlin
-          script: |
-            ./gradlew :scp-kt-android:connectedDebugAndroidTest -Pscp.uniffi.prebuiltBindings=true -Pandroid.testInstrumentationRunnerArguments.expectSoftwareKeyInfo=true
+        working-directory: bindings/kotlin
+        env:
+          SYSTEM_IMAGE: system-images;android-${{ matrix.api-level }};default;x86_64
+        run: |
+          set -euo pipefail
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd --force -n test --package "$SYSTEM_IMAGE"
+          printf 'hw.cpu.ncore=2\n' >> "$ANDROID_AVD_HOME/test.avd/config.ini"
+          log="$RUNNER_TEMP/emulator.log"
+          emulator -port 5554 -avd test -no-window -gpu swiftshader_indirect -noaudio \
+            -no-boot-anim -camera-back none -no-snapshot > "$log" 2>&1 &
+          emulator_pid=$!
+          trap 'adb -s emulator-5554 emu kill || kill "$emulator_pid" 2>/dev/null || true' EXIT
+          booted=""
+          for _ in $(seq 300); do
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+              cat "$log"
+              echo "::error::the emulator exited before it booted; its log is above"
+              exit 1
+            fi
+            if [ "$(adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
+              booted=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$booted" ]; then
+            cat "$log"
+            echo "::error::the emulator did not set sys.boot_completed within 600 seconds"
+            exit 1
+          fi
+          adb -s emulator-5554 shell input keyevent 82
+          adb -s emulator-5554 shell settings put global window_animation_scale 0.0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0.0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0.0
+          ./gradlew :scp-kt-android:connectedDebugAndroidTest -Pscp.uniffi.prebuiltBindings=true -Pandroid.testInstrumentationRunnerArguments.expectSoftwareKeyInfo=true
       # `BUILD SUCCESSFUL` proves nothing about what ran. This step fails unless every
       # expected test ran on this leg, none was skipped, and none failed.
       - name: Check the instrumented test results

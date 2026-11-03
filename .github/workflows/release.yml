@@ -824,15 +824,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # The package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why. The AAR publish
+      # compiles against android-35.
+      - name: Install the Android platform
+        uses: ./.github/actions/android-sdk
         with:
-          # Google withdrew `tools`, the obsolete Android SDK Tools package,
-          # from the SDK repository, and `tools platform-tools` is this
-          # action's default package list, so the action exits 1 and never
-          # puts sdkmanager on PATH. The two Kotlin jobs in ci.yml carry the
-          # same input and state the failure in full.
-          packages: platform-tools
+          packages: platforms;android-35
 
       - name: Download Kotlin AAR artifacts
         uses: actions/download-artifact@v4

@@ -394,6 +394,20 @@ nothing:
                fails on each tracked path rust-test reads, found by scanning
                `crates/**/*.rs` for include and workspace_root literals, that
                the `rust` output does not select and no always-on step mirrors.
+  verified-download
+               sdkmanager unpacks the archive it downloads with no check that
+               reaches the job: job 118835960956 died on `Error on ZipFile
+               unknown archive` unpacking the NDK, and job 125594057792 printed
+               `Error reading Zip content from a SeekableByteChannel` for the
+               emulator package that reactivecircus/android-emulator-runner
+               installs on every run, then ran no test. Both reruns passed. The
+               check fails on any workflow or local-action step that uses an
+               action in UNVERIFIED_DOWNLOAD_ACTIONS, installs a package with
+               sdkmanager, or fetches with curl or wget and runs no digest
+               command; .github/actions/android-sdk is the checked path. It
+               also feeds that action's installer a truncated archive and
+               fails unless the download is retried a bounded number of times
+               and then fails naming the package.
   group-partition
                CI runs `--group docs` on every pull request and `--group rest`
                only under the `code` output, so a check missing from GROUPS
@@ -11490,6 +11504,272 @@ def load_inputs() -> Inputs:
     return Inputs(workflow=workflow, jobs=workflow["jobs"], documents=documents)
 
 
+ANDROID_SDK_ACTION = "./.github/actions/android-sdk"
+ANDROID_SDK_INSTALLER = REPO / ".github/actions/android-sdk/install.py"
+# CRITERION for verified-download: a step that fetches an archive from outside the
+# repository and unpacks or runs it checks that archive (against a pinned digest where
+# the publisher gives one, else by a complete read) before anything uses it. The lists
+# below are INDICATORS of a fetch, not the criterion:
+#   UNVERIFIED_DOWNLOAD_ACTIONS  actions whose source downloads an archive and unpacks
+#                                it with no check (setup-android: the command-line
+#                                tools zip and every `packages` entry through
+#                                sdkmanager; android-emulator-runner: sdkmanager
+#                                installs of the emulator, a system image, a platform,
+#                                platform-tools and build-tools on every run).
+#   sdkmanager with a package    sdkmanager unpacks what it downloaded: jobs
+#                                118835960956 (NDK) and 125594057792 (emulator) died
+#                                on corrupt archives.
+#   curl, wget                   a raw fetch; the step must also run a digest command
+#                                in DIGEST_COMMANDS on what it fetched.
+UNVERIFIED_DOWNLOAD_ACTIONS = (
+    "android-actions/setup-android@",
+    "reactivecircus/android-emulator-runner@",
+)
+FETCH_COMMANDS = {"curl", "wget"}
+DIGEST_COMMANDS = {"sha1sum", "sha256sum", "sha512sum", "shasum", "b2sum"}
+# sdkmanager flags that install nothing.
+SDKMANAGER_READ_ONLY_FLAGS = {
+    "--list",
+    "--list_installed",
+    "--licenses",
+    "--version",
+    "--help",
+}
+
+
+def sdkmanager_installs(arguments: list[str]) -> bool:
+    """True when an sdkmanager command line names a package or `--install`/`--update`."""
+    flags = {
+        argument.split("=", 1)[0] for argument in arguments if argument.startswith("-")
+    }
+    if flags & SDKMANAGER_READ_ONLY_FLAGS:
+        return False
+    return bool(flags & {"--install", "--update"}) or any(
+        not argument.startswith("-") for argument in arguments
+    )
+
+
+def script_commands(script: str) -> list[tuple[str, list[str]]]:
+    """Every (command word, arguments) in a `run:` script, up to the first separator.
+
+    A line shlex cannot split is read as one command per indicator word found on it, so
+    an unparseable line hides no fetch.
+    """
+    found = []
+    for line in logical_lines(script):
+        words = command_words(line)
+        if words is None:
+            words = [
+                (word, line.split())
+                for word in sorted(FETCH_COMMANDS | DIGEST_COMMANDS | {"sdkmanager"})
+                if re.search(rf"(?<![\w/.-]){word}\b", line)
+            ]
+        for word, rest in words:
+            arguments = []
+            for token in rest:
+                if token in SHELL_SEPARATORS:
+                    break
+                arguments.append(token)
+            found.append((posixpath.basename(word), arguments))
+    return found
+
+
+def unverified_download_gaps(where: str, steps: object) -> list[str]:
+    """Return each step under `where` that fetches an archive and checks nothing."""
+    gaps = []
+    for index, step in enumerate(steps if isinstance(steps, list) else []):
+        if not isinstance(step, dict):
+            continue
+        label = f"{where} step {index} ({step.get('name') or step_uses(step) or 'run'})"
+        uses = step_uses(step)
+        if uses.startswith(UNVERIFIED_DOWNLOAD_ACTIONS):
+            gaps.append(
+                f"{label} uses {uses}, which unpacks archives it downloads without a "
+                f"check; install Android SDK packages through {ANDROID_SDK_ACTION}"
+            )
+        commands = script_commands(str(step.get("run") or ""))
+        if any(
+            word == "sdkmanager" and sdkmanager_installs(rest)
+            for word, rest in commands
+        ):
+            gaps.append(
+                f"{label} installs a package with sdkmanager, which unpacks what it "
+                f"downloads without a check; pin it in {ANDROID_SDK_INSTALLER.relative_to(REPO)} "
+                f"and install it through {ANDROID_SDK_ACTION}"
+            )
+        fetches = sorted({word for word, _ in commands if word in FETCH_COMMANDS})
+        if fetches and not any(word in DIGEST_COMMANDS for word, _ in commands):
+            gaps.append(
+                f"{label} fetches with {', '.join(fetches)} and runs none of "
+                f"{sorted(DIGEST_COMMANDS)} on what it fetched"
+            )
+    return gaps
+
+
+def download_step_lists(documents: list[tuple[Path, dict]]) -> list[tuple[str, object]]:
+    """Every workflow job's steps and every local composite action's steps."""
+    found = []
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            found.append((f"{path.name}:{job_id}", job.get("steps")))
+    for action in sorted((REPO / ".github/actions").glob("*/action.y*ml")):
+        doc = yaml.safe_load(action.read_text()) or {}
+        found.append(
+            (str(action.relative_to(REPO)), (doc.get("runs") or {}).get("steps"))
+        )
+    return found
+
+
+def load_android_sdk_installer():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "android_sdk_install", ANDROID_SDK_INSTALLER
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_installer_rejects_a_corrupt_archive() -> None:
+    """Feed install.py's download a truncated archive and a whole one over file://."""
+    import contextlib
+    import hashlib
+    import io
+    import zipfile
+
+    installer = load_android_sdk_installer()
+    # The installer prints a `::warning::` per mismatched attempt; `quiet` keeps it out of
+    # the log so the planted mismatches raise no annotation on the run.
+    quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("pkg/source.properties", "Pkg.Revision=1\n")
+            archive.writestr("pkg/blob", os.urandom(4096))
+        whole = payload.getvalue()
+        sha1 = hashlib.sha1(whole).hexdigest()
+        good = root / "good.zip"
+        good.write_bytes(whole)
+        truncated = root / "truncated.zip"
+        truncated.write_bytes(whole[: len(whole) // 2])
+        fetched = []
+        real_fetch = installer.fetch_once
+
+        def counting_fetch(url, destination):
+            fetched.append(url)
+            return real_fetch(url, destination)
+
+        installer.fetch_once = counting_fetch
+        try:
+            with quiet():
+                installer.download_verified(
+                    "planted;truncated",
+                    truncated.as_uri(),
+                    len(whole),
+                    sha1,
+                    root / "out-truncated.zip",
+                    attempts=3,
+                    backoff=0,
+                )
+            error = ""
+        except installer.InstallError as raised:
+            error = str(raised)
+        check(
+            "install.py fails on a truncated archive, naming the package and URL",
+            "planted;truncated" in error and truncated.as_uri() in error,
+            f"got {error!r}",
+        )
+        check(
+            "install.py retries a mismatched archive a bounded number of times",
+            len(fetched) == 3 and not (root / "out-truncated.zip").exists(),
+            f"fetched {len(fetched)} times; a mismatched archive must be refetched up to "
+            f"`attempts` times and never left on disk",
+        )
+        try:
+            with quiet():
+                installer.download_verified(
+                    "planted;whole",
+                    good.as_uri(),
+                    len(whole),
+                    sha1,
+                    root / "out-whole.zip",
+                    attempts=3,
+                    backoff=0,
+                )
+            error = ""
+        except installer.InstallError as raised:
+            error = str(raised)
+        check(
+            "install.py accepts an archive whose size and sha1 match its pin",
+            not error and (root / "out-whole.zip").read_bytes() == whole,
+            f"got {error!r}",
+        )
+        installer.fetch_once = real_fetch
+
+
+def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
+    gaps = [
+        gap
+        for where, steps in download_step_lists(documents)
+        for gap in unverified_download_gaps(where, steps)
+    ]
+    check(
+        "no workflow or local action step unpacks an archive it downloaded unchecked",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Planted cases, each of which must be reported, and controls that must not be.
+    planted = {
+        "setup-android": [{"uses": "android-actions/setup-android@v3"}],
+        "emulator-runner": [{"uses": "reactivecircus/android-emulator-runner@v2"}],
+        "sdkmanager": [{"run": 'sdkmanager "ndk;27.2.12479018"'}],
+        "sdkmanager --install": [
+            {"run": "yes | sdkmanager --install emulator --channel=0"}
+        ],
+        "curl": [
+            {"run": "curl -fsSLo a.zip https://example.invalid/a.zip\nunzip a.zip"}
+        ],
+        "wget in a substitution": [
+            {"run": 'out="$(wget -qO- https://example.invalid/a.tgz | tar xz)"'}
+        ],
+    }
+    for name, steps in planted.items():
+        check(
+            f"verified-download reports a planted {name} step",
+            bool(unverified_download_gaps("planted", steps)),
+            f"{steps} went unreported",
+        )
+    controls = {
+        "the android-sdk action": [
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}}
+        ],
+        "sdkmanager --list_installed": [{"run": "sdkmanager --list_installed"}],
+        "curl with sha256sum -c": [
+            {
+                "run": "curl -fsSLo a.zip https://example.invalid/a.zip\n"
+                'echo "$SUM  a.zip" | sha256sum -c -'
+            }
+        ],
+    }
+    for name, steps in controls.items():
+        check(
+            f"verified-download does not report {name}",
+            not unverified_download_gaps("control", steps),
+            f"{unverified_download_gaps('control', steps)}",
+        )
+    check_installer_rejects_a_corrupt_archive()
+
+
+def run_verified_download(inputs: Inputs) -> None:
+    print(
+        "verified-download — every archive a CI step downloads is checked before it is "
+        "unpacked"
+    )
+    check_verified_downloads(inputs.documents)
+
+
 def run_timeout(inputs: Inputs) -> None:
     documents = inputs.documents
     print("timeout — every job in every workflow bounds its own runtime")
@@ -12636,6 +12916,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "skip": run_skip,
     "push-skips": run_push_skips,
     "filter-key": run_filter_key,
+    "verified-download": run_verified_download,
 }
 
 # CRITERION for GROUPS: a check belongs to `docs` when a file outside the `code`
@@ -12693,6 +12974,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "skip",
         "push-skips",
         "filter-key",
+        "verified-download",
     ),
 }
 

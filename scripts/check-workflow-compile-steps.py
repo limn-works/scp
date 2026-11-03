@@ -1612,7 +1612,6 @@ PUSH_ACTIONS = (
     "actions/cache/restore@",
     "actions/cache/save@",
     "actions/upload-artifact@",
-    "android-actions/setup-android@",
     "gradle/actions/setup-gradle@",
     "oven-sh/setup-bun@",
     "taiki-e/install-action@",
@@ -1623,6 +1622,7 @@ PUSH_ACTIONS = (
     "./.github/actions/rust-toolchain",
     "./.github/actions/rust-cache",
     "./.github/actions/cargo-fetch",
+    "./.github/actions/android-sdk",
 )
 # Programs a push step may run with any arguments: shell builtins, and utilities that
 # read, hash, print, copy or delete files or install packages. None of them runs a

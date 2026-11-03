@@ -406,20 +406,11 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "ndk;27.2.12479018"
+          packages: ndk;27.2.12479018
       # The same linker and C toolchain variables kotlin-android-instrumented writes, before
       # rust-cache, which hashes every CARGO* variable into the key.
       - name: Point cargo at the NDK linker
@@ -484,20 +475,11 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35"
+          packages: platforms;android-35
       - uses: gradle/actions/setup-gradle@v4
       # Resolves every configuration of every project (the ktlint and detekt tool
       # classpaths among them), and compiles and packages what kotlin-test,
