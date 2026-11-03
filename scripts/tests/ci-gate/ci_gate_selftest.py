@@ -297,8 +297,9 @@ nothing:
                supports. When ubuntu-latest moved its default to 3.14, job
                rust-docs in docs.yml, which ran `cargo doc --workspace` with no
                pinned Python, failed on every pull request. Every step that
-               compiles pyo3 must come after an unconditional
-               `actions/setup-python` step pinned to 3.12 and run with
+               compiles pyo3 must come after an unconditional Python setup
+               step (.github/actions/toolcache-setup with `tool: python`, or
+               `actions/setup-python`) pinned to 3.12 and run with
                PYO3_PYTHON naming that interpreter: the step's `python-path`
                output, or `python3.12` off Windows. A step compiles pyo3 when
                its `run:` text runs cargo with a compiling subcommand that
@@ -402,12 +403,23 @@ nothing:
                emulator package that reactivecircus/android-emulator-runner
                installs on every run, then ran no test. Both reruns passed. The
                check fails on any workflow or local-action step that uses an
-               action in UNVERIFIED_DOWNLOAD_ACTIONS, installs a package with
-               sdkmanager, or fetches with curl or wget and runs no digest
-               command; .github/actions/android-sdk is the checked path. It
-               also feeds that action's installer a truncated archive and
+               action in UNVERIFIED_DOWNLOAD_ACTIONS (setup-android,
+               android-emulator-runner, setup-bun, setup-nasm), uses
+               setup-python, setup-node or setup-java outside
+               .github/actions/toolcache-setup's guard.py steps, uses
+               maturin-action without the maturin pinned-tool installs or in
+               a manylinux container outside MATURIN_CONTAINER_BUILDS,
+               installs a package with sdkmanager, or fetches with curl or
+               wget and runs no digest command; .github/actions/android-sdk
+               and .github/actions/pinned-tool are the checked paths. Every
+               job that runs gradlew must validate the wrapper jar first,
+               every wrapper it runs must pin distributionSha256Sum, and
+               every build it runs must carry gradle/verification-metadata.xml
+               with verify-metadata on and no wildcard trust. It also feeds
+               the shared verified_download module a truncated archive and
                fails unless the download is retried a bounded number of times
-               and then fails naming the package.
+               and then fails naming the artifact, and runs guard.py against
+               a planted tool cache.
   group-partition
                CI runs `--group docs` on every pull request and `--group rest`
                only under the `code` output, so a check missing from GROUPS
@@ -6398,13 +6410,28 @@ def step_compiles_pyo3(job: dict, step: dict) -> bool:
     return bool(script) and script_compiles_pyo3(script, start_directory(job, step))
 
 
+def python_setup_version_key(step: dict) -> str | None:
+    """The input naming the Python version a setup step installs, or None for any other step.
+
+    The workflows set Python up through TOOLCACHE_ACTION with `tool: python`, which runs
+    setup-python and passes `version` through as its `python-version`.
+    """
+    uses = step_uses(step)
+    if uses.startswith(SETUP_PYTHON_ACTION):
+        return "python-version"
+    if uses == TOOLCACHE_ACTION and str((step.get("with") or {}).get("tool")) == "python":
+        return "version"
+    return None
+
+
 def pinned_setup_steps(steps: list[dict], before: int) -> dict[str, int]:
     """Return {id or '': index} of each unconditional setup-python 3.12 step before `before`."""
     found: dict[str, int] = {}
     for index, step in enumerate(steps[:before]):
-        if not step_uses(step).startswith(SETUP_PYTHON_ACTION) or step.get("if"):
+        key = python_setup_version_key(step)
+        if key is None or step.get("if"):
             continue
-        version = str((step.get("with") or {}).get("python-version") or "").strip()
+        version = str((step.get("with") or {}).get(key) or "").strip()
         if version == PINNED_PYTHON_VERSION:
             found[str(step.get("id") or "")] = index
     return found
@@ -6544,7 +6571,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
 
     def rust_docs(doc: dict) -> tuple[list[dict], int, int]:
         steps = doc["jobs"]["rust-docs"]["steps"]
-        setup = next(i for i, s in enumerate(steps) if step_uses(s).startswith(SETUP_PYTHON_ACTION))
+        setup = next(i for i, s in enumerate(steps) if python_setup_version_key(s))
         writer = next(i for i, s in enumerate(steps) if PYO3_ENV_WRITE.search(str(s.get("run") or "")))
         return steps, setup, writer
 
@@ -6563,7 +6590,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
 
     mutated = copy.deepcopy(docs)
     steps, setup, _ = rust_docs(mutated)
-    steps[setup]["with"]["python-version"] = "3.14"
+    steps[setup]["with"][python_setup_version_key(steps[setup])] = "3.14"
     reported("docs.yml rust-docs pinned to 3.14", "docs.yml", mutated,
              "no unconditional setup-python 3.12 step before it")
 
@@ -6599,7 +6626,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
     mutated = copy.deepcopy(by_name["codeql.yml"])
     mutated["jobs"]["analyze"]["steps"] = [
         step for step in mutated["jobs"]["analyze"]["steps"]
-        if not step_uses(step).startswith(SETUP_PYTHON_ACTION)
+        if not python_setup_version_key(step)
         and not PYO3_ENV_WRITE.search(str(step.get("run") or ""))
     ]
     reported("codeql.yml analyze, whose Rust leg runs build scripts, with no pin",
@@ -6624,7 +6651,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
             not_reported(f"an unpinned job running {label}", "fixture.yml", mutated)
     mutated = {"env": {"PYO3_PYTHON": "python3.12"}, "jobs": {"fixture": copy.deepcopy(fixture)}}
     mutated["jobs"]["fixture"]["steps"] += [
-        {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
+        {"uses": TOOLCACHE_ACTION, "with": {"tool": "python", "version": "3.12"}},
         {"run": "cargo build --workspace"},
     ]
     not_reported("a pinned job running a workspace build", "fixture.yml", mutated)
@@ -9456,10 +9483,16 @@ def check_push_writer_mutants(live: dict) -> None:
     bun["jobs"]["error-codes"].setdefault("steps", []).append(
         {"uses": "oven-sh/setup-bun@v2"}
     )
+    # The workflows install bun through .github/actions/pinned-tool, so no live job
+    # writes the setup-bun cache; this cache-warm stands in for one that does.
+    warm_bun = {
+        "on": {"push": {"branches": ["main"]}},
+        "jobs": {"bun": {"steps": [{"uses": "oven-sh/setup-bun@v2"}]}},
+    }
     check(
         "a setup-bun write in a push-skipped job is not reported while a push writes it",
-        not skipped_writers(bun) and not push_writer_gaps(bun),
-        f"{skipped_writers(bun)} {push_writer_gaps(bun)}",
+        not skipped_writers(bun) and not push_writer_gaps(bun, warm=warm_bun),
+        f"{skipped_writers(bun)} {push_writer_gaps(bun, warm=warm_bun)}",
     )
     for job in bun["jobs"].values():
         for step in job.get("steps") or []:
@@ -9472,9 +9505,8 @@ def check_push_writer_mutants(live: dict) -> None:
                 elif guard is None:
                     job["if"] = "github.event_name != 'push'"
     check(
-        "cache-warm.yml writes the setup-bun executable cache on every push to `main`",
-        "the setup-bun executable cache"
-        in warm_pushed_caches(yaml.safe_load(CACHE_WARM_WORKFLOW.read_text())),
+        "warm_pushed_caches reads a cache-warm job writing the setup-bun cache",
+        "the setup-bun executable cache" in warm_pushed_caches(warm_bun),
     )
     gaps = push_writer_gaps(bun, warm={"on": {"push": {"branches": ["main"]}}, "jobs": {}})
     check(
@@ -11506,24 +11538,66 @@ def load_inputs() -> Inputs:
 
 ANDROID_SDK_ACTION = "./.github/actions/android-sdk"
 ANDROID_SDK_INSTALLER = REPO / ".github/actions/android-sdk/install.py"
+PINNED_TOOL_ACTION = "./.github/actions/pinned-tool"
+PINNED_TOOL_INSTALLER = REPO / ".github/actions/pinned-tool/install.py"
+TOOLCACHE_ACTION = "./.github/actions/toolcache-setup"
+TOOLCACHE_ACTION_FILE = ".github/actions/toolcache-setup/action.yml"
+TOOLCACHE_GUARD = REPO / ".github/actions/toolcache-setup/guard.py"
+VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
 # CRITERION for verified-download: a step that fetches an archive from outside the
 # repository and unpacks or runs it checks that archive (against a pinned digest where
 # the publisher gives one, else by a complete read) before anything uses it. The lists
 # below are INDICATORS of a fetch, not the criterion:
 #   UNVERIFIED_DOWNLOAD_ACTIONS  actions whose source downloads an archive and unpacks
-#                                it with no check (setup-android: the command-line
-#                                tools zip and every `packages` entry through
-#                                sdkmanager; android-emulator-runner: sdkmanager
-#                                installs of the emulator, a system image, a platform,
-#                                platform-tools and build-tools on every run).
+#                                it with no check, each with the checked replacement
+#                                (setup-android: the command-line tools zip and every
+#                                `packages` entry through sdkmanager;
+#                                android-emulator-runner: sdkmanager installs of the
+#                                emulator, a system image, a platform, platform-tools
+#                                and build-tools on every run; setup-bun@v2
+#                                src/action.ts:182-183; setup-nasm@v1 index.js:65-76).
+#   TOOLCACHE_ACTIONS            setup-python@v5, setup-node@v4 and setup-java@v4 unpack
+#                                unchecked on a tool-cache miss (guard.py cites the
+#                                lines), so they may run only inside TOOLCACHE_ACTION,
+#                                between its guard.py `before` and `after` steps.
+#   PyO3/maturin-action          downloads maturin unchecked unless the tool cache holds
+#                                `maturin-version` (src/index.ts:550-583 at v1), so a
+#                                step must name the version pinned-tool installs, after
+#                                a pinned-tool maturin step. In a manylinux container it
+#                                downloads maturin, rustup and uv unchecked whatever the
+#                                cache holds (src/index.ts:711-725).
 #   sdkmanager with a package    sdkmanager unpacks what it downloaded: jobs
 #                                118835960956 (NDK) and 125594057792 (emulator) died
 #                                on corrupt archives.
 #   curl, wget                   a raw fetch; the step must also run a digest command
 #                                in DIGEST_COMMANDS on what it fetched.
-UNVERIFIED_DOWNLOAD_ACTIONS = (
-    "android-actions/setup-android@",
-    "reactivecircus/android-emulator-runner@",
+#   gradlew                      runs the committed wrapper jar, which downloads the
+#                                distribution distributionUrl names and every
+#                                dependency; the wrapper properties must pin
+#                                distributionSha256Sum, a validator in
+#                                GRADLE_WRAPPER_VALIDATORS must check the jar first, and
+#                                the build root must carry gradle/verification-metadata.xml.
+UNVERIFIED_DOWNLOAD_ACTIONS = {
+    "android-actions/setup-android@": f"install Android SDK packages through {ANDROID_SDK_ACTION}",
+    "reactivecircus/android-emulator-runner@": f"install Android SDK packages through {ANDROID_SDK_ACTION}",
+    "oven-sh/setup-bun@": f"install bun through {PINNED_TOOL_ACTION}",
+    "ilammy/setup-nasm@": f"install NASM through {PINNED_TOOL_ACTION}",
+}
+TOOLCACHE_ACTIONS = (
+    "actions/setup-python@",
+    "actions/setup-node@",
+    "actions/setup-java@",
+)
+MATURIN_ACTION = "PyO3/maturin-action@"
+# Jobs whose maturin-action step builds in a manylinux container, where maturin-action's
+# own script downloads maturin (src/index.ts:722, `curl -L ${url} | tar -xz`), rustup
+# (src/index.ts:711) and uv (src/index.ts:725) with no check. Checking them means running
+# the manylinux build without maturin-action. Listed so the gap stays visible; a job
+# missing from this set fails the check.
+MATURIN_CONTAINER_BUILDS = {"build-matrix.yml:python-wheels"}
+GRADLE_WRAPPER_VALIDATORS = (
+    "gradle/actions/setup-gradle@",
+    "gradle/actions/wrapper-validation@",
 )
 FETCH_COMMANDS = {"curl", "wget"}
 DIGEST_COMMANDS = {"sha1sum", "sha256sum", "sha512sum", "shasum", "b2sum"}
@@ -11535,6 +11609,8 @@ SDKMANAGER_READ_ONLY_FLAGS = {
     "--version",
     "--help",
 }
+GRADLEW = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*gradlew)(?![\w.-])")
+GRADLE_PROJECT_DIR = re.compile(r"(?<!\S)(?:-p|--project-dir)[ =]+(\S+)")
 
 
 def sdkmanager_installs(arguments: list[str]) -> bool:
@@ -11574,19 +11650,87 @@ def script_commands(script: str) -> list[tuple[str, list[str]]]:
     return found
 
 
+def runs_guard(step: object, mode: str) -> bool:
+    """Whether a step runs toolcache-setup's guard.py in `mode` (before or after)."""
+    run = str(step.get("run") or "") if isinstance(step, dict) else ""
+    return bool(re.search(rf'\$GITHUB_ACTION_PATH/guard\.py"?\s+{mode}\b', run))
+
+
+def pinned_tool_installs(step: object, tool: str) -> bool:
+    return (
+        isinstance(step, dict)
+        and step_uses(step) == PINNED_TOOL_ACTION
+        and str((step.get("with") or {}).get("tool")) == tool
+    )
+
+
+def load_module(name: str, path: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def pinned_maturin_version() -> str:
+    return load_module("pinned_tool_install", PINNED_TOOL_INSTALLER).MATURIN_VERSION
+
+
+def maturin_gaps(where: str, label: str, step: dict, earlier: list) -> list[str]:
+    """Each way a maturin-action step can reach maturin it did not check."""
+    inputs = step.get("with") or {}
+    pinned = pinned_maturin_version()
+    gaps = []
+    if str(inputs.get("maturin-version", "")) != pinned:
+        gaps.append(
+            f"{label} passes maturin-version {inputs.get('maturin-version')!r}, not "
+            f"{pinned!r}, the version {PINNED_TOOL_INSTALLER.relative_to(REPO)} puts in "
+            "the tool cache, so maturin-action downloads its own unchecked"
+        )
+    if not any(pinned_tool_installs(s, "maturin") for s in earlier):
+        gaps.append(
+            f"{label} runs with no earlier {PINNED_TOOL_ACTION} step installing maturin, "
+            "so maturin-action downloads maturin unchecked"
+        )
+    if (
+        str(inputs.get("manylinux", "off")) not in ("", "off")
+        and where not in MATURIN_CONTAINER_BUILDS
+    ):
+        gaps.append(
+            f"{label} builds in a manylinux container, where maturin-action downloads "
+            "maturin, rustup and uv unchecked"
+        )
+    return gaps
+
+
 def unverified_download_gaps(where: str, steps: object) -> list[str]:
     """Return each step under `where` that fetches an archive and checks nothing."""
     gaps = []
-    for index, step in enumerate(steps if isinstance(steps, list) else []):
+    steps = steps if isinstance(steps, list) else []
+    for index, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
         label = f"{where} step {index} ({step.get('name') or step_uses(step) or 'run'})"
         uses = step_uses(step)
-        if uses.startswith(UNVERIFIED_DOWNLOAD_ACTIONS):
+        for prefix, remedy in UNVERIFIED_DOWNLOAD_ACTIONS.items():
+            if uses.startswith(prefix):
+                gaps.append(
+                    f"{label} uses {uses}, which unpacks archives it downloads without "
+                    f"a check; {remedy}"
+                )
+        if uses.startswith(TOOLCACHE_ACTIONS) and not (
+            where == TOOLCACHE_ACTION_FILE
+            and any(runs_guard(s, "before") for s in steps[:index])
+            and any(runs_guard(s, "after") for s in steps[index + 1 :])
+        ):
             gaps.append(
-                f"{label} uses {uses}, which unpacks archives it downloads without a "
-                f"check; install Android SDK packages through {ANDROID_SDK_ACTION}"
+                f"{label} uses {uses}, which downloads and unpacks an unchecked archive "
+                f"when the tool cache lacks the version; use {TOOLCACHE_ACTION}"
             )
+        if uses.startswith(MATURIN_ACTION):
+            gaps += maturin_gaps(where, label, step, steps[:index])
         commands = script_commands(str(step.get("run") or ""))
         if any(
             word == "sdkmanager" and sdkmanager_installs(rest)
@@ -11620,28 +11764,155 @@ def download_step_lists(documents: list[tuple[Path, dict]]) -> list[tuple[str, o
     return found
 
 
-def load_android_sdk_installer():
-    import importlib.util
+class GradleRun(NamedTuple):
+    wrapper_dir: str
+    build_root: str
 
-    spec = importlib.util.spec_from_file_location(
-        "android_sdk_install", ANDROID_SDK_INSTALLER
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+
+def gradle_runs(job: dict, step: dict) -> list[GradleRun]:
+    """Each gradlew a step runs: the wrapper's directory and the build it runs.
+
+    Both are repository-relative: the step's working directory (else the job's) joined
+    with the gradlew path, and with `-p`/`--project-dir` where the line passes one.
+    """
+    default = ((job.get("defaults") or {}).get("run") or {}).get("working-directory")
+    cwd = str(step.get("working-directory") or default or ".")
+    found = []
+    for line in logical_lines(str(step.get("run") or "")):
+        for match in GRADLEW.finditer(line):
+            wrapper = posixpath.normpath(
+                posixpath.join(cwd, posixpath.dirname(match.group(1)))
+            )
+            project = GRADLE_PROJECT_DIR.search(line[match.end() :])
+            root = (
+                posixpath.normpath(posixpath.join(cwd, project.group(1).strip("\"'")))
+                if project
+                else posixpath.normpath(cwd)
+            )
+            found.append(GradleRun(wrapper, root))
+    return found
+
+
+def wrapper_validation_gaps(where: str, job: dict) -> list[str]:
+    """A job that runs gradlew must validate the wrapper jar before the first run."""
+    steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+    for index, step in enumerate(steps):
+        if not gradle_runs(job, step):
+            continue
+        validated = any(
+            step_uses(s).startswith(GRADLE_WRAPPER_VALIDATORS)
+            and str((s.get("with") or {}).get("validate-wrappers", "true")).lower()
+            != "false"
+            for s in steps[:index]
+        )
+        if not validated:
+            return [
+                f"{where} step {index} runs gradlew with no earlier step using one of "
+                f"{list(GRADLE_WRAPPER_VALIDATORS)} (setup-gradle with validate-wrappers "
+                "on), so an altered wrapper jar would run unchecked"
+            ]
+        return []
+    return []
+
+
+def wrapper_properties_gaps(where: str, text: str | None) -> list[str]:
+    if text is None:
+        return [f"{where} does not exist"]
+    if not re.search(r"(?m)^distributionSha256Sum=[0-9a-f]{64}\s*$", text):
+        return [
+            f"{where} has no distributionSha256Sum, so the wrapper unpacks the "
+            "distribution it downloads unchecked"
+        ]
+    return []
+
+
+def verification_metadata_gaps(where: str, text: str | None) -> list[str]:
+    """gradle/verification-metadata.xml must exist, verify metadata and trust nothing wholesale."""
+    import xml.etree.ElementTree as ET
+
+    if text is None:
+        return [
+            f"{where} does not exist, so Gradle resolves every dependency unchecked"
+        ]
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as error:
+        return [f"{where} does not parse: {error}"]
+    namespace = re.match(r"\{[^}]*\}", root.tag)
+    ns = namespace.group(0) if namespace else ""
+    gaps = []
+    verify = root.find(f"{ns}configuration/{ns}verify-metadata")
+    if verify is None or (verify.text or "").strip() != "true":
+        gaps.append(f"{where} does not set verify-metadata to true")
+    for trust in root.iter(f"{ns}trust"):
+        named = [
+            trust.get(key)
+            for key in ("group", "name", "version", "file")
+            if trust.get(key) is not None
+        ]
+        if not named or (
+            trust.get("regex") == "true"
+            and all(value in ("", ".*", ".+") for value in named)
+        ):
+            gaps.append(f"{where} trusts every artifact: {trust.attrib}")
+    if not any(True for _ in root.iter(f"{ns}sha256")):
+        gaps.append(f"{where} records no sha256 checksum")
+    return gaps
+
+
+def gradle_gaps(documents: list[tuple[Path, dict]]) -> tuple[list[str], int]:
+    """Gradle gaps across every workflow job, and how many gradlew runs were read."""
+    gaps, runs = [], set()
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            gaps += wrapper_validation_gaps(f"{path.name}:{job_id}", job)
+            for step in job.get("steps") or []:
+                if isinstance(step, dict):
+                    runs.update(gradle_runs(job, step))
+    for wrapper in sorted({run.wrapper_dir for run in runs}):
+        properties = REPO / wrapper / "gradle/wrapper/gradle-wrapper.properties"
+        gaps += wrapper_properties_gaps(
+            str(properties.relative_to(REPO)),
+            properties.read_text() if properties.is_file() else None,
+        )
+    for root in sorted({run.build_root for run in runs}):
+        metadata = REPO / root / "gradle/verification-metadata.xml"
+        gaps += verification_metadata_gaps(
+            str(metadata.relative_to(REPO)),
+            metadata.read_text() if metadata.is_file() else None,
+        )
+    return gaps, len(runs)
+
+
+def load_verified_download():
+    """The module both installers import, as they import it."""
+    if str(VERIFIED_DOWNLOAD_LIB) not in sys.path:
+        sys.path.insert(0, str(VERIFIED_DOWNLOAD_LIB))
+    import verified_download
+
+    return verified_download
 
 
 def check_installer_rejects_a_corrupt_archive() -> None:
-    """Feed install.py's download a truncated archive and a whole one over file://."""
+    """Feed the shared download a truncated archive and a whole one over file://."""
     import contextlib
     import hashlib
     import io
     import xml.etree.ElementTree as ET
     import zipfile
 
-    installer = load_android_sdk_installer()
-    # The installer prints a `::warning::` per mismatched attempt; `quiet` keeps it out of
-    # the log so the planted mismatches raise no annotation on the run.
+    installer = load_module("android_sdk_install", ANDROID_SDK_INSTALLER)
+    pinned = load_module("pinned_tool_install", PINNED_TOOL_INSTALLER)
+    downloads = load_verified_download()
+    check(
+        "both installers download through verified_download.download_verified",
+        installer.download_verified is downloads.download_verified
+        and pinned.download_verified is downloads.download_verified,
+        f"android-sdk uses {installer.download_verified!r}, pinned-tool uses "
+        f"{pinned.download_verified!r}",
+    )
+    # A mismatched attempt prints a `::warning::`; `quiet` keeps it out of the log so
+    # the planted mismatches raise no annotation on the run.
     quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
@@ -11650,64 +11921,71 @@ def check_installer_rejects_a_corrupt_archive() -> None:
             archive.writestr("pkg/source.properties", "Pkg.Revision=1\n")
             archive.writestr("pkg/blob", os.urandom(4096))
         whole = payload.getvalue()
-        sha1 = hashlib.sha1(whole).hexdigest()
         good = root / "good.zip"
         good.write_bytes(whole)
         truncated = root / "truncated.zip"
         truncated.write_bytes(whole[: len(whole) // 2])
-        fetched = []
-        real_fetch = installer.fetch_once
+        real_fetch = downloads.fetch_once
+        for algorithm in ("sha1", "sha256"):
+            digest = hashlib.new(algorithm, whole).hexdigest()
+            fetched = []
 
-        def counting_fetch(url, destination):
-            fetched.append(url)
-            return real_fetch(url, destination)
+            def counting_fetch(url, destination, algorithm, fetched=fetched):
+                fetched.append(url)
+                return real_fetch(url, destination, algorithm)
 
-        installer.fetch_once = counting_fetch
-        try:
-            with quiet():
-                installer.download_verified(
-                    "planted;truncated",
-                    truncated.as_uri(),
-                    len(whole),
-                    sha1,
-                    root / "out-truncated.zip",
-                    attempts=3,
-                    backoff=0,
-                )
-            error = ""
-        except installer.InstallError as raised:
-            error = str(raised)
-        check(
-            "install.py fails on a truncated archive, naming the package and URL",
-            "planted;truncated" in error and truncated.as_uri() in error,
-            f"got {error!r}",
-        )
-        check(
-            "install.py retries a mismatched archive a bounded number of times",
-            len(fetched) == 3 and not (root / "out-truncated.zip").exists(),
-            f"fetched {len(fetched)} times; a mismatched archive must be refetched up to "
-            f"`attempts` times and never left on disk",
-        )
-        try:
-            with quiet():
-                installer.download_verified(
-                    "planted;whole",
-                    good.as_uri(),
-                    len(whole),
-                    sha1,
-                    root / "out-whole.zip",
-                    attempts=3,
-                    backoff=0,
-                )
-            error = ""
-        except installer.InstallError as raised:
-            error = str(raised)
-        check(
-            "install.py accepts an archive whose size and sha1 match its pin",
-            not error and (root / "out-whole.zip").read_bytes() == whole,
-            f"got {error!r}",
-        )
-        installer.fetch_once = real_fetch
+            downloads.fetch_once = counting_fetch
+            try:
+                with quiet():
+                    downloads.download_verified(
+                        "planted;truncated",
+                        truncated.as_uri(),
+                        len(whole),
+                        digest,
+                        root / "out-truncated.zip",
+                        algorithm,
+                        attempts=3,
+                        backoff=0,
+                    )
+                error = ""
+            except downloads.InstallError as raised:
+                error = str(raised)
+            check(
+                f"verified_download fails on a truncated archive ({algorithm}), naming "
+                "the artifact and URL",
+                "planted;truncated" in error and truncated.as_uri() in error,
+                f"got {error!r}",
+            )
+            check(
+                f"verified_download retries a mismatched archive ({algorithm}) a "
+                "bounded number of times",
+                len(fetched) == 3 and not (root / "out-truncated.zip").exists(),
+                f"fetched {len(fetched)} times; a mismatched archive must be refetched "
+                "up to `attempts` times and never left on disk",
+            )
+            try:
+                with quiet():
+                    downloads.download_verified(
+                        "planted;whole",
+                        good.as_uri(),
+                        len(whole),
+                        digest,
+                        root / "out-whole.zip",
+                        algorithm,
+                        attempts=3,
+                        backoff=0,
+                    )
+                error = ""
+            except downloads.InstallError as raised:
+                error = str(raised)
+            check(
+                f"verified_download accepts an archive whose size and {algorithm} "
+                "match its pin",
+                not error and (root / "out-whole.zip").read_bytes() == whole,
+                f"got {error!r}",
+            )
+            (root / "out-whole.zip").unlink(missing_ok=True)
+        downloads.fetch_once = real_fetch
     # sdkmanager lists the NDK and the emulator only by the package.xml install.py writes
     # for a pin with a display name; the file must name the package path and revision.
     wrong = []
@@ -11729,6 +12007,87 @@ def check_installer_rejects_a_corrupt_archive() -> None:
         not wrong,
         "; ".join(wrong),
     )
+    # Every pinned-tool pin names an https URL and a whole SHA-256, and every archive
+    # and wheel a python-versions package installs from is pinned.
+    malformed = [
+        f"{key}: {archive.url}"
+        for key, archive in [
+            *pinned.PINS.items(),
+            *(("wheel", w) for w in pinned.WHEELS),
+        ]
+        if not archive.url.startswith("https://")
+        or not re.fullmatch(r"[0-9a-f]{64}", archive.sha256)
+        or archive.size <= 0
+    ]
+    check(
+        "every pinned-tool pin names an https URL, a size and a SHA-256",
+        not malformed,
+        "; ".join(malformed),
+    )
+    with tempfile.TemporaryDirectory() as scratch:
+        environment = dict(
+            os.environ,
+            RUNNER_OS="Plan9",
+            RUNNER_ARCH="X64",
+            RUNNER_TEMP=scratch,
+            RUNNER_TOOL_CACHE=scratch,
+            GITHUB_PATH=str(Path(scratch, "path")),
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", str(PINNED_TOOL_INSTALLER), "bun"],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+    check(
+        "pinned-tool fails, naming the tool, on a runner it has no pin for",
+        result.returncode != 0 and "no pin" in result.stdout and "bun" in result.stdout,
+        f"exit {result.returncode}: {result.stdout.strip()!r}",
+    )
+
+
+def check_toolcache_guard() -> None:
+    """guard.py must refuse a version the cache lacks and an install the action added."""
+    with tempfile.TemporaryDirectory() as scratch:
+        cache = Path(scratch, "cache")
+        (cache / "Python/3.12.7").mkdir(parents=True)
+        (cache / "Python/3.12.7/x64.complete").write_text("")
+        environment = dict(
+            os.environ,
+            RUNNER_TOOL_CACHE=str(cache),
+            RUNNER_ARCH="X64",
+            RUNNER_TEMP=scratch,
+        )
+
+        def guard(*arguments: str) -> int:
+            return subprocess.run(
+                [sys.executable, "-I", str(TOOLCACHE_GUARD), *arguments],
+                env=environment,
+                capture_output=True,
+            ).returncode
+
+        check(
+            "guard.py admits a version the tool cache holds",
+            guard("before", "python", "3.12") == 0,
+        )
+        check(
+            "guard.py refuses a version the tool cache lacks",
+            guard("before", "python", "3.12\n3.10") != 0,
+        )
+        check(
+            "guard.py refuses a version that only shares a prefix",
+            guard("before", "python", "3.1") != 0,
+        )
+        check(
+            "guard.py passes when the action added nothing",
+            guard("after", "python") == 0,
+        )
+        (cache / "Python/3.13.0").mkdir()
+        (cache / "Python/3.13.0/x64.complete").write_text("")
+        check(
+            "guard.py fails when the setup action added an install",
+            guard("after", "python") != 0,
+        )
 
 
 def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
@@ -11742,10 +12101,38 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         not gaps,
         "; ".join(gaps),
     )
+    gradle, runs = gradle_gaps(documents)
+    check(
+        "every gradlew run validates the wrapper jar, pins the distribution digest, and "
+        "verifies dependencies",
+        runs > 0 and not gradle,
+        "; ".join(gradle) or "no gradlew run found",
+    )
     # Planted cases, each of which must be reported, and controls that must not be.
+    pinned_maturin = {"uses": PINNED_TOOL_ACTION, "with": {"tool": "maturin"}}
+    maturin = {
+        "uses": "PyO3/maturin-action@v1",
+        "with": {"maturin-version": pinned_maturin_version()},
+    }
     planted = {
         "setup-android": [{"uses": "android-actions/setup-android@v3"}],
         "emulator-runner": [{"uses": "reactivecircus/android-emulator-runner@v2"}],
+        "setup-bun": [{"uses": "oven-sh/setup-bun@v2"}],
+        "setup-nasm": [{"uses": "ilammy/setup-nasm@v1"}],
+        "setup-python in a workflow": [
+            {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}}
+        ],
+        "setup-node in a workflow": [{"uses": "actions/setup-node@v4"}],
+        "setup-java in a workflow": [{"uses": "actions/setup-java@v4"}],
+        "maturin-action without pinned-tool": [maturin],
+        "maturin-action without maturin-version": [
+            pinned_maturin,
+            {"uses": "PyO3/maturin-action@v1"},
+        ],
+        "maturin-action in a manylinux container": [
+            pinned_maturin,
+            {**maturin, "with": {**maturin["with"], "manylinux": "2_28"}},
+        ],
         "sdkmanager": [{"run": 'sdkmanager "ndk;27.2.12479018"'}],
         "sdkmanager --install": [
             {"run": "yes | sdkmanager --install emulator --channel=0"}
@@ -11763,6 +12150,21 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             bool(unverified_download_gaps("planted", steps)),
             f"{steps} went unreported",
         )
+    guarded = [
+        {"run": '"$py" -I "$GITHUB_ACTION_PATH/guard.py" before "$T" "$V"'},
+        {"uses": "actions/setup-python@v5"},
+        {"run": '"$py" -I "$GITHUB_ACTION_PATH/guard.py" after "$T"'},
+    ]
+    check(
+        "verified-download reports setup-python outside toolcache-setup, guarded or not",
+        bool(unverified_download_gaps("planted", guarded)),
+        f"{guarded} went unreported",
+    )
+    check(
+        "verified-download reports setup-python in toolcache-setup without its after step",
+        bool(unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded[:2])),
+        f"{guarded[:2]} went unreported",
+    )
     controls = {
         "the android-sdk action": [
             {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}}
@@ -11774,6 +12176,10 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
                 'echo "$SUM  a.zip" | sha256sum -c -'
             }
         ],
+        "maturin-action after pinned-tool at the pinned version": [
+            pinned_maturin,
+            maturin,
+        ],
     }
     for name, steps in controls.items():
         check(
@@ -11781,7 +12187,89 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             not unverified_download_gaps("control", steps),
             f"{unverified_download_gaps('control', steps)}",
         )
+    check(
+        "verified-download does not report setup-python between guard.py's steps in "
+        "toolcache-setup",
+        not unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded),
+        f"{unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded)}",
+    )
+    gradle_job = {
+        "defaults": {"run": {"working-directory": "bindings/kotlin"}},
+        "steps": [{"uses": "actions/checkout@v5"}, {"run": "./gradlew :scp-kt:jar"}],
+    }
+    check(
+        "verified-download reports a planted gradlew job with no wrapper validation",
+        bool(wrapper_validation_gaps("planted", gradle_job)),
+    )
+    disabled = copy.deepcopy(gradle_job)
+    disabled["steps"].insert(
+        1,
+        {
+            "uses": "gradle/actions/setup-gradle@v4",
+            "with": {"validate-wrappers": False},
+        },
+    )
+    check(
+        "verified-download reports a planted gradlew job whose setup-gradle skips "
+        "wrapper validation",
+        bool(wrapper_validation_gaps("planted", disabled)),
+    )
+    validated = copy.deepcopy(gradle_job)
+    validated["steps"].insert(1, {"uses": "gradle/actions/wrapper-validation@v4"})
+    check(
+        "verified-download does not report a gradlew job after wrapper-validation",
+        not wrapper_validation_gaps("control", validated),
+    )
+    check(
+        "gradle_runs reads the build a `-p` names relative to the working directory",
+        gradle_runs({}, {"run": "bindings/kotlin/gradlew -p some/runner \\\n  build"})
+        == [GradleRun("bindings/kotlin", "some/runner")],
+        f"{gradle_runs({}, {'run': 'bindings/kotlin/gradlew -p some/runner build'})}",
+    )
+    check(
+        "verified-download reports planted wrapper properties without "
+        "distributionSha256Sum",
+        bool(
+            wrapper_properties_gaps(
+                "planted",
+                "distributionUrl=https\\://services.gradle.org/distributions/"
+                "gradle-8.14.4-bin.zip\n",
+            )
+        ),
+    )
+    metadata = (
+        '<verification-metadata xmlns="https://schema.gradle.org/dependency-'
+        'verification"><configuration><verify-metadata>{}</verify-metadata>'
+        "<trusted-artifacts>{}</trusted-artifacts></configuration><components>"
+        '<component group="g" name="n" version="1"><artifact name="n-1.jar">'
+        '<sha256 value="{}" origin="Generated by Gradle"/></artifact></component>'
+        "</components></verification-metadata>"
+    )
+    planted_metadata = {
+        "missing": None,
+        "with verify-metadata off": metadata.format("false", "", "0" * 64),
+        "trusting every group": metadata.format(
+            "true", '<trust group=".*" regex="true"/>', "0" * 64
+        ),
+        "trusting every file": metadata.format(
+            "true", '<trust file=".*" regex="true"/>', "0" * 64
+        ),
+    }
+    for name, text in planted_metadata.items():
+        check(
+            f"verified-download reports planted verification metadata {name}",
+            bool(verification_metadata_gaps("planted", text)),
+        )
+    verifying = metadata.format(
+        "true", '<trust file=".*-sources[.]jar" regex="true"/>', "0" * 64
+    )
+    check(
+        "verified-download does not report verification metadata that verifies",
+        not verification_metadata_gaps("control", verifying),
+        f"{verification_metadata_gaps('control', verifying)}",
+    )
     check_installer_rejects_a_corrupt_archive()
+    check_toolcache_guard()
 
 
 def run_verified_download(inputs: Inputs) -> None:

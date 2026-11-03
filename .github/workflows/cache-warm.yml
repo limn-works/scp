@@ -66,9 +66,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -136,9 +137,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -164,9 +166,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -204,9 +207,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -232,10 +236,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+      - uses: ./.github/actions/pinned-tool
         with:
-          node-version: "22"
+          tool: bun
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: node
+          version: "22"
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -282,9 +289,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -309,9 +317,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -339,9 +348,15 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      # No runner image caches CPython 3.10; pinned-tool installs the package
+      # actions/setup-python would download, after checking its digest.
+      - uses: ./.github/actions/pinned-tool
         with:
-          python-version: |
+          tool: python3.10
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: |
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
@@ -471,10 +486,10 @@ jobs:
         run: |
           cargo build -p scp-ffi-uniffi --features testing
           ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
-      - uses: actions/setup-java@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
+          tool: java
+          version: "17"
       # Each package comes from an archive checked against a pinned digest before it is
       # unpacked; .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
@@ -505,9 +520,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -562,9 +578,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -613,9 +630,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache

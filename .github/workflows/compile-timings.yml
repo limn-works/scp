@@ -92,9 +92,10 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Report the compiler this job resolved
         run: |
           rustc --version
@@ -213,9 +214,10 @@ jobs:
       - uses: actions/checkout@v5
       # PyO3's build script runs a Python interpreter to learn the ABI it compiles
       # against, and crates/scp-ffi/build.rs asks `python3.12` for its LIBDIR.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Report the compiler and machine this job resolved
         run: |
           rustc --version

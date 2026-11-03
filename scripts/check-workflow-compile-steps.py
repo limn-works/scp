@@ -1605,15 +1605,12 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
 # select jobs, or build an image.
 PUSH_ACTIONS = (
     "actions/checkout@",
-    "actions/setup-python@",
-    "actions/setup-node@",
-    "actions/setup-java@",
     "actions/cache@",
     "actions/cache/restore@",
     "actions/cache/save@",
     "actions/upload-artifact@",
     "gradle/actions/setup-gradle@",
-    "oven-sh/setup-bun@",
+    "gradle/actions/wrapper-validation@",
     "taiki-e/install-action@",
     "dorny/paths-filter@",
     "docker/setup-buildx-action@",
@@ -1623,6 +1620,8 @@ PUSH_ACTIONS = (
     "./.github/actions/rust-cache",
     "./.github/actions/cargo-fetch",
     "./.github/actions/android-sdk",
+    "./.github/actions/toolcache-setup",
+    "./.github/actions/pinned-tool",
 )
 # Programs a push step may run with any arguments: shell builtins, and utilities that
 # read, hash, print, copy or delete files or install packages. None of them runs a

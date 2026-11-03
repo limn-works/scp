@@ -77,9 +77,10 @@ jobs:
       # Python, which moves with the image.
       - name: Setup Python 3.12
         id: python
-        uses: actions/setup-python@v5
+        uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
 
       - name: Point PyO3 at Python 3.12
         shell: bash
@@ -208,11 +209,19 @@ jobs:
 
       # The macOS and Windows legs build on the runner, so each interpreter `-i`
       # names below must exist there; the Linux legs build inside the manylinux
-      # container, which carries its own python3.10-python3.13.
-      - name: Setup Python 3.10-3.13
-        uses: actions/setup-python@v5
+      # container, which carries its own python3.10-python3.13. No runner image
+      # caches CPython 3.10; pinned-tool installs the package actions/setup-python
+      # would download, after checking its digest.
+      - name: Install Python 3.10
+        uses: ./.github/actions/pinned-tool
         with:
-          python-version: |
+          tool: python3.10
+
+      - name: Setup Python 3.10-3.13
+        uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: |
             3.10
             3.11
             3.12
@@ -220,7 +229,18 @@ jobs:
 
       - name: Setup NASM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: nasm
+
+      # maturin-action uses a maturin already in the tool cache at `maturin-version`
+      # (src/index.ts:568-576) and downloads one unchecked otherwise; pinned-tool puts
+      # the checked binary there. Inside the manylinux container of the Linux legs
+      # maturin-action fetches its own copy regardless (src/index.ts:722).
+      - name: Install maturin
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: maturin
 
       # The Linux legs build inside a manylinux container. maturin-action passes every
       # `CARGO_*` variable into it, CARGO_NET_OFFLINE=true among them, but no file of the
@@ -242,6 +262,7 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:
+          maturin-version: "1.16.0"
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           before-script-linux: ${{ matrix.before-script }}
@@ -272,10 +293,16 @@ jobs:
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      - name: Install maturin
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: maturin
+
       # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: "1.16.0"
           command: sdist
           args: >-
             --out dist
@@ -485,11 +512,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
+      # this job has no setup-gradle, whose `validate-wrappers` does the same check.
+      - name: Validate the Gradle wrapper jar
+        uses: gradle/actions/wrapper-validation@v4
+
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: ./.github/actions/toolcache-setup
         with:
-          distribution: temurin
-          java-version: "17"
+          tool: java
+          version: "17"
 
       # Each package comes from an archive checked against a pinned digest before it is
       # unpacked; .github/actions/android-sdk/install.py states why. The AAR build

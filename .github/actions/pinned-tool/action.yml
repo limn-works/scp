@@ -1,0 +1,20 @@
+name: Install a pinned tool from a checked archive
+description: >-
+  Downloads bun, NASM or maturin at the version install.py pins, refuses an archive whose
+  size or SHA-256 differs from the pin (retrying a bounded number of times), and adds the
+  tool to PATH. Check `verified-download` in scripts/tests/ci-gate/ci_gate_selftest.py
+  fails a workflow that installs these tools through an action that unpacks unchecked.
+inputs:
+  tool:
+    description: One of the tools install.py pins (bun, nasm, maturin).
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PINNED_TOOL: ${{ inputs.tool }}
+      run: |
+        # Windows runners have no `python3`; Linux and macOS runners have the image's.
+        if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+        "$py" -I "$GITHUB_ACTION_PATH/install.py" "$PINNED_TOOL"

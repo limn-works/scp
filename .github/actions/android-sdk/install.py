@@ -39,19 +39,18 @@ A package not in PINS fails the step: pin it here from the manifest above, with 
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
-import urllib.request
 from pathlib import Path
 from typing import NamedTuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from verified_download import InstallError, download_verified
+
 BASE_URL = "https://dl.google.com/android/repository/"
-ATTEMPTS = 4
 
 
 class Pin(NamedTuple):
@@ -109,10 +108,6 @@ PINS: dict[str, Pin] = {
 }
 
 
-class InstallError(Exception):
-    pass
-
-
 def revision_key(text: str) -> tuple[int, ...]:
     """`35.0.0` and `35` name one revision; sdkmanager prints whichever it read."""
     parts = [int(part) for part in text.strip().split(".")]
@@ -130,54 +125,6 @@ def properties_revision(directory: Path) -> str | None:
         if key.strip() == "Pkg.Revision":
             return value.strip()
     return None
-
-
-def fetch_once(url: str, destination: Path) -> tuple[int, str]:
-    """Write url to destination; return its size and SHA-1."""
-    digest, size = hashlib.sha1(), 0
-    with (
-        urllib.request.urlopen(url, timeout=120) as response,
-        destination.open("wb") as out,
-    ):
-        while chunk := response.read(1 << 20):
-            digest.update(chunk)
-            size += len(chunk)
-            out.write(chunk)
-    return size, digest.hexdigest()
-
-
-def download_verified(
-    package: str,
-    url: str,
-    size: int,
-    sha1: str,
-    destination: Path,
-    attempts: int = ATTEMPTS,
-    backoff: float = 10.0,
-) -> None:
-    """Download url until its size and SHA-1 match, or raise naming the package."""
-    for attempt in range(1, attempts + 1):
-        try:
-            got_size, got_sha1 = fetch_once(url, destination)
-            if got_size == size and got_sha1 == sha1:
-                print(f"{package}: {url} matches size {size} and sha1 {sha1}")
-                return
-            problem = (
-                f"got {got_size} bytes with sha1 {got_sha1}, "
-                f"want {size} bytes with sha1 {sha1}"
-            )
-        except OSError as error:
-            problem = f"download failed: {error}"
-        destination.unlink(missing_ok=True)
-        print(
-            f"::warning::{package}: attempt {attempt} of {attempts}: {url}: {problem}"
-        )
-        if attempt < attempts:
-            time.sleep(backoff * attempt)
-    raise InstallError(
-        f"{package}: no download of {url} matched its pinned digest in "
-        f"{attempts} attempts; the last one {problem}"
-    )
 
 
 def unpack(package: str, pin: Pin, archive: Path, target: Path, root: Path) -> None:
@@ -278,7 +225,7 @@ def main(packages: list[str]) -> int:
                 continue
             archive = Path(downloads) / Path(pin.archive).name
             download_verified(
-                package, BASE_URL + pin.archive, pin.size, pin.sha1, archive
+                package, BASE_URL + pin.archive, pin.size, pin.sha1, archive, "sha1"
             )
             unpack(package, pin, archive, target, root)
             archive.unlink()

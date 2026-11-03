@@ -1,0 +1,55 @@
+name: Set up Python, Node or Java from the runner's tool cache
+description: >-
+  Runs actions/setup-python, setup-node or setup-java only when the runner image's tool
+  cache already holds the requested version, and fails when the action downloaded
+  anything; guard.py states why. Check `verified-download` in
+  scripts/tests/ci-gate/ci_gate_selftest.py fails a workflow that calls those actions
+  directly.
+inputs:
+  tool:
+    description: python, node or java.
+    required: true
+  version:
+    description: >-
+      The version (python and node also take several, one per line), as the upstream
+      action's python-version, node-version or java-version input takes it.
+    required: true
+  registry-url:
+    description: setup-node's registry-url; node only.
+    required: false
+    default: ""
+outputs:
+  python-path:
+    description: setup-python's python-path output; python only.
+    value: ${{ steps.python.outputs.python-path }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TOOLCACHE_TOOL: ${{ inputs.tool }}
+        TOOLCACHE_VERSION: ${{ inputs.version }}
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+        "$py" -I "$GITHUB_ACTION_PATH/guard.py" before "$TOOLCACHE_TOOL" "$TOOLCACHE_VERSION"
+    - if: inputs.tool == 'python'
+      id: python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.version }}
+    - if: inputs.tool == 'node'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.version }}
+        registry-url: ${{ inputs.registry-url }}
+    - if: inputs.tool == 'java'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.version }}
+    - shell: bash
+      env:
+        TOOLCACHE_TOOL: ${{ inputs.tool }}
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+        "$py" -I "$GITHUB_ACTION_PATH/guard.py" after "$TOOLCACHE_TOOL"

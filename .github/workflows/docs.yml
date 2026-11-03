@@ -167,10 +167,11 @@ jobs:
       # interpreter PYO3_PYTHON names and fails when its version is newer than the
       # newest one pyo3 supports. Without the pin it reads the runner image's default
       # `python3`, which moved to 3.14 past pyo3 0.24's 3.13 ceiling.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         id: python
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Point PyO3 at Python 3.12
         run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
       - name: Generate rustdoc
@@ -204,9 +205,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Install doc dependencies
         run: pip install sphinx furo sphinx-autodoc-typehints
       - name: Generate docs
@@ -233,7 +235,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Install dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -256,10 +260,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
+      # this job has no setup-gradle, whose `validate-wrappers` does the same check.
+      - uses: gradle/actions/wrapper-validation@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: temurin
-          java-version: "17"
+          tool: java
+          version: "17"
       - name: Generate Dokka
         working-directory: bindings/kotlin
         run: ./gradlew :scp-kt:dokkaHtml

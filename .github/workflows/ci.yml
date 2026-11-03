@@ -776,9 +776,10 @@ jobs:
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
       # with `tomllib` under python3.12, and fails when that interpreter is absent
       # or cannot import it.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
@@ -804,9 +805,10 @@ jobs:
       # The wheel entry comes from scripts/check-shipped-feature-graph.sh
       # --print-wheel-entries, which reads `[tool.maturin]` with `tomllib` under
       # python3.12 and fails when that interpreter is absent or cannot import it.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: openssl-src reaches the PyPI wheel's configuration and no other shipped configuration
         run: bash scripts/check-vendored-openssl-scope.sh
 
@@ -828,13 +830,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # The packages the gate's requirements file pins: mypy, and the packages
       # whose types mypy resolves for the sites and guide blocks.
       - run: pip install -r scripts/examples-typecheck/requirements.txt
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -912,9 +917,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Run bridge-symmetry CI check
@@ -931,9 +937,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Pin pytest and tree-sitter-rust to compatible version ranges so a
       # breaking upstream release cannot silently break CI (round-6 MINOR-3).
       # Other tree-sitter grammars remain unpinned to match the convention
@@ -957,9 +964,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-protocol-sync.py
 
@@ -972,9 +980,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # ruff pinned for reproducible CI — an unpinned `pip install ruff`
       # silently tracks upstream and a new release (e.g. 0.16.x restyling
       # Markdown code blocks) can red the lint gate repo-wide with no local
@@ -997,9 +1006,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: python3.12 scripts/check-construction-pattern.py
 
   protocol-deps:
@@ -1031,9 +1041,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: bash scripts/check-no-bridge-globals.sh
 
   fallback-registry:
@@ -1081,9 +1092,10 @@ jobs:
       - uses: actions/checkout@v5
       # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
       # library has held since 3.11, and it fails when no interpreter on PATH imports it.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: bash scripts/check-toolchain-wiring.sh
       # `crates/scp-testing/tests/integration/pipeline_wiring.rs` test
       # `agents_md_enforcement_sections_present` fails when AGENTS.md loses either
@@ -1115,9 +1127,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
       # The install step every Rust job runs (`.github/actions/rust-toolchain`) against a
@@ -1213,9 +1226,10 @@ jobs:
       # origin/main when no base ref arrives, which is the merge-queue case.
       - name: Fetch the base branch the cross-layer gate diffs against
         run: git fetch origin ${{ github.base_ref || 'main' }} --depth=1
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # The same pins the sdk-coverage and pyi-generated jobs carry, for the
       # same reason: a breaking upstream release cannot red a required check
       # without a deliberate bump.
@@ -1227,7 +1241,9 @@ jobs:
       # TypeScript compiler that `bun install` puts under
       # bindings/typescript/node_modules.
       - run: pip install -r scripts/examples-typecheck/requirements.txt
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -1284,9 +1300,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: python3.12 scripts/check-no-mutable-module-globals.py
 
   no-mutable-globals-ts:
@@ -1327,9 +1344,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: pip install tree-sitter tree-sitter-rust
       # Self-test MUST run first: it proves the scanner catches every
       # known bypass pattern before we trust it on the real tree.
@@ -1355,9 +1373,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Self-test MUST run first: it plants a dead citation and asserts the scanner
       # reports it, so a green real scan means the scanner read the tree rather than
       # that it can no longer fail.
@@ -1381,9 +1400,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # The generator cross-checks every key and signature through `cryptography` when it
       # imports, so CI installs it to run the stronger check.
       - name: Install generator dependencies
@@ -1409,9 +1429,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Self-test MUST run first: it plants each of the eight failure conditions and
       # asserts the checker reports it, so a green real scan means the checker read the
       # tree rather than that it can no longer fail.
@@ -1521,9 +1542,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-bridge-instance-lifecycle.py
 
@@ -1562,9 +1584,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          node-version: "22"
+          tool: node
+          version: "22"
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -1670,9 +1693,10 @@ jobs:
       - name: Require jq
         if: matrix.leg == 'examples'
         run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -1932,9 +1956,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -2003,9 +2028,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -2115,9 +2141,10 @@ jobs:
         group: ["transport-local", "transport-network", "transport-push", "transport-blob", "node-relay", "platform-testing", "sqlite-without-memory-management"]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       # One rust-cache step per entry, each key literal: six legs share one
       # entry, which a `${{ matrix.group }}` key cannot name.
@@ -2400,9 +2427,10 @@ jobs:
         leg: ["transport-local", "transport-network", "platform"]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -2475,9 +2503,10 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -2557,7 +2586,9 @@ jobs:
           # and `--no-tests=fail` could never fire.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
             -E 'test(node_start_with_unregistered_operator_did_returns_ident_1063)'
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Shipped addon refuses identityCreateWithCustody with SCP-IDENT-1100
         run: |
           # `identityCreateWithCustody` takes JS callbacks, which no Rust test
@@ -2635,9 +2666,10 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -2922,9 +2954,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       # Restores the build-mode artifacts rust-test writes to the `workspace-debug`
       # group, and writes nothing.
@@ -2961,9 +2994,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       # Restores the check-mode artifacts rust-clippy's `workspace` leg writes to the
       # `workspace-check` group, and writes nothing.
@@ -3423,9 +3457,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Installed before the key is computed, because the maturin version is one of
       # the key's inputs.
       - name: Create virtualenv and install maturin
@@ -3766,9 +3801,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Installed before the key is computed, because the maturin version is one of
       # the key's inputs.
       - name: Create virtualenv and install maturin
@@ -3850,9 +3886,10 @@ jobs:
         working-directory: bindings/python
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # ruff pinned for reproducible CI (see the pyi-generated job above for
       # rationale). Bump deliberately in its own PR.
       - run: pip install ruff==0.15.4
@@ -3901,9 +3938,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -4015,9 +4053,15 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      # No runner image caches CPython 3.10; pinned-tool installs the package
+      # actions/setup-python would download, after checking its digest.
+      - uses: ./.github/actions/pinned-tool
         with:
-          python-version: |
+          tool: python3.10
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: |
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
@@ -4101,7 +4145,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Download NAPI native addon
         uses: actions/download-artifact@v4
         with:
@@ -4224,7 +4270,9 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -4298,7 +4346,9 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -4359,10 +4409,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
+          tool: java
+          version: "17"
       # Each package comes from an archive checked against a pinned digest before it is
       # unpacked; .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
@@ -4728,10 +4778,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
+          tool: java
+          version: "17"
       # Each package comes from an archive checked against a pinned digest before it is
       # unpacked; .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
@@ -4877,10 +4927,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
+          tool: java
+          version: "17"
       # Each package comes from an archive checked against a pinned digest before it is
       # unpacked; .github/actions/android-sdk/install.py states why.
       # The emulator, its system image and adb come from the same step: the instrumented
@@ -5208,10 +5258,13 @@ jobs:
             echo "ERROR: Unresolved issue placeholder in bridge_parity docs. File the GitHub issues and substitute real #NNNN refs before merging." >&2
             exit 1
           fi
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
-      - uses: oven-sh/setup-bun@v2
+          tool: python
+          version: "3.12"
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -5357,13 +5410,14 @@ jobs:
       GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
-      - uses: actions/setup-java@v4
+          tool: python
+          version: "3.12"
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
+          tool: java
+          version: "17"
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: true
@@ -5477,9 +5531,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # The Swift toolchain is the one the runner image ships; see job swift-build-test.
       - name: Print Swift toolchain version
         run: swift --version
@@ -5574,9 +5629,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - run: pip install 'pyyaml>=6,<7'
       - run: bash scripts/tests/ci-gate/run-tests.sh --group docs
 
@@ -5588,9 +5644,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
       # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
@@ -5714,9 +5771,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
       # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
