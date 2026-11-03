@@ -1,0 +1,12 @@
+name: Temporary vendored-OpenSSL check
+on:
+  pull_request:
+permissions:
+  contents: read
+env:
+  RUSTUP_AUTO_INSTALL: "0"
+jobs:
+  build-matrix:
+    uses: ./.github/workflows/build-matrix.yml
+    with:
+      scp-core-version: 0.0.0-check
