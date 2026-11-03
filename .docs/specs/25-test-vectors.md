@@ -1511,35 +1511,11 @@ key_positions_hash with the resolved position in place of the contested one:
 
 ### Vector 81: withdrawn
 
-Withdrawn 2026-11-02. Vector 81 fixed the bytes of the `ReseatGroupInfo` answer and its seal. ADR-069 decision 8 replaces the external re-seat that the answer served with a re-seat request that members execute (`05-contexts.md` §5.12.3.4, §5.12.3.5), so no answer and no seal remain to test. The number is not reused.
+Withdrawn 2026-11-02. Vector 81 fixed the bytes of the `ReseatGroupInfo` answer and its seal. ADR-069 decision 8 replaces the external re-seat that the answer served with a re-seat request that members submit and execute (`05-contexts.md` §5.9.1.1, kind `0x06`), so no answer and no seal remain to test. The number is not reused.
 
-### Vector 82: the `ReseatRequest` (§5.12.3.5)
+### Vector 82: withdrawn
 
-Fixture: Vector 80's identity asks to re-seat in `context-alpha`, anchored at `anchor_seq` 11 and `head_seq` 12, and signs with its `#active` key, here the §25.2 secondary key. `request_nonce` is the first 16 bytes of SHA-256("SCP test vector re-seat request nonce"), `anchor_digest` and `head_digest` are fixture digests, and `key_package` is 96 fixed bytes.
-
-```
-request_nonce:    0x460274c83c92609d6b356df85b83dbb3
-anchor_digest:    0x74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979
-head_digest:      0x1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046
-key_package:      0xdaa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1c
-key_package_hash: 0x4a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
-
-Signature preimage, 227 bytes:
-  "SCP-RESEAT-REQUEST-V1:" || BE32(13) || "context-alpha" || BE32(56) || identifier
-  || request_nonce || BE64(11) || anchor_digest || BE64(12) || head_digest || key_package_hash
-  0x5343502d5245534541542d524551554553542d56313a0000000d636f6e746578742d616c706861000000387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a71460274c83c92609d6b356df85b83dbb3000000000000000b74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979000000000000000c1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c2820464a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
-request_digest = SHA-256(preimage): 0xdb620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-signature (secondary key, RFC 6979): 0x58024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf8
-
-Request: a nine-item MessagePack array (0x99), 325 bytes
-item headers in order: ad d938 c410 0b c420 0c c420 c460 c440
-  0x99ad636f6e746578742d616c706861d9387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a71c410460274c83c92609d6b356df85b83dbb30bc42074ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba667259790cc4201382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046c460daa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1cc44058024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf8
-
-HPKE info: 0x7363702d7265736561742d726571756573742d76310000000d636f6e746578742d616c706861
-HPKE aad:  0x7363702d7265736561742d726571756573742d6161642d76310000000d636f6e746578742d616c706861
-```
-
-Two encodings are rejected. A ten-item array (0x9a) with `epoch` 41 appended, 326 bytes, fails to decode; its last 67 bytes are `c44058024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf829`. A request whose `signature` item is the 65-byte bin `c44158024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf800` is rejected.
+Withdrawn 2026-11-02. Vector 82 fixed the preimage and the bytes of a re-seat request that the member being re-seated signed itself. ADR-069 decision 8 replaces it with kind `0x06` of `05-contexts.md` §5.9.1.1, which a current member signs under its leaf with the `SCP-REQUEST-V1:` preimage every sealed item uses, so the withdrawn preimage has no use. The number is not reused.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 

@@ -3741,9 +3741,9 @@ def emit_participation_seed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.23 Vectors 80 and 82: key positions and the re-seat request
+# §25.23 Vector 80: key positions
 # (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
-# `05-contexts.md` §5.13.3 "Key positions", §5.12.3.5;
+# `05-contexts.md` §5.13.3 "Key positions";
 # `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6).
 #
 # The two branch events of the Contested position are §25.29's Vector 53
@@ -3752,8 +3752,6 @@ def emit_participation_seed() -> None:
 # ---------------------------------------------------------------------------
 
 KEY_EVENT_FRAME_VERSION = 0x02
-RESEAT_CONTEXT_ID = "context-alpha"
-RESEAT_REQUEST_DOMAIN = "SCP-RESEAT-REQUEST-V1:"
 KEY_POSITION_NAMES = ("contested", "linear", "unheld", "displaced")
 
 
@@ -3860,31 +3858,7 @@ def fixture_digest(label: str) -> bytes:
     return sha256(f"SCP test vector {label}".encode())
 
 
-def fixture_bytes(label: str, length: int) -> bytes:
-    out = b""
-    counter = 0
-    while len(out) < length:
-        out += sha256(f"SCP test vector {label} {counter}".encode())
-        counter += 1
-    return out[:length]
-
-
-def mp_header(item: bytes) -> bytes:
-    """The MessagePack header of one encoded item: a fixint or nil is its own
-    header; a fixstr has one byte; str8 and bin8 two; bin16 three; a uint8 one."""
-    first = item[0]
-    if first < 0x80 or first == 0xC0:
-        return item[:1]
-    if 0xA0 <= first <= 0xBF or first == 0xCC:
-        return item[:1]
-    if first in (0xD9, 0xC4):
-        return item[:2]
-    if first in (0xDA, 0xC5):
-        return item[:3]
-    raise AssertionError(f"no header rule for 0x{first:02x}")
-
-
-def emit_key_positions_and_reseat() -> None:
+def emit_key_positions() -> None:
     section("§25.23 Vectors 80 and 82 key positions and the re-seat request")
     identifier = INCEPTION_IDENTIFIER
     identifier_text = scp_text_form(identifier)
@@ -4032,66 +4006,6 @@ def emit_key_positions_and_reseat() -> None:
     emit_hex(
         "vector_80.key_positions_hash_resolved",
         key_positions_hash(3, [resolved, linear, unheld, displaced]),
-    )
-
-    # --- Vector 82: the re-seat request, signed by Vector 41's #active key. ---
-    request_nonce = fixture_digest("re-seat request nonce")[:16]
-    anchor_digest = fixture_digest("re-seat anchor")
-    head_digest = fixture_digest("re-seat head")
-    key_package = fixture_bytes("re-seat key package", 96)
-    key_package_hash = sha256(key_package)
-    assert len(RESEAT_REQUEST_DOMAIN) == 22
-    request_preimage = canonical_preimage(
-        RESEAT_REQUEST_DOMAIN,
-        var_field(RESEAT_CONTEXT_ID),
-        var_field(identifier_text),
-        fixed_field(request_nonce),
-        u64(11),
-        fixed_field(anchor_digest),
-        u64(12),
-        fixed_field(head_digest),
-        fixed_field(key_package_hash),
-    )
-    request_digest = sha256(request_preimage)
-    request_signature = sign_group(REF_KEY_2, request_digest, "vector_82")
-    request_items = [
-        mp_str(RESEAT_CONTEXT_ID),
-        mp_str(identifier_text),
-        mp_bin(request_nonce),
-        mp_uint(11),
-        mp_bin(anchor_digest),
-        mp_uint(12),
-        mp_bin(head_digest),
-        mp_bin(key_package),
-        mp_bin(request_signature),
-    ]
-    request = mp_array(request_items)
-    assert request[0] == 0x99
-    emit("vector_82.context_id", RESEAT_CONTEXT_ID)
-    emit("vector_82.identifier", identifier_text)
-    emit_hex("vector_82.request_nonce", request_nonce)
-    emit_hex("vector_82.anchor_digest", anchor_digest)
-    emit_hex("vector_82.head_digest", head_digest)
-    emit_hex("vector_82.key_package", key_package)
-    emit_hex("vector_82.key_package_hash", key_package_hash)
-    emit("vector_82.preimage_len", len(request_preimage))
-    emit_hex("vector_82.preimage", request_preimage)
-    emit_hex("vector_82.request_digest", request_digest)
-    emit_hex("vector_82.signature", request_signature)
-    emit(
-        "vector_82.item_headers",
-        " ".join(hexs(mp_header(item)) for item in request_items),
-    )
-    emit("vector_82.request_len", len(request))
-    emit_hex("vector_82.request", request)
-    ten_items = b"\x9a" + request[1:] + mp_uint(41)
-    emit("vector_82.rejected_ten_items_len", len(ten_items))
-    emit_hex("vector_82.rejected_ten_items_tail", ten_items[-(2 + 64 + 1) :])
-    long_signature = mp_bin(request_signature + b"\x00")
-    emit_hex("vector_82.rejected_65_byte_signature_item", long_signature)
-    emit_hex("vector_82.info", b"scp-reseat-request-v1" + var_field(RESEAT_CONTEXT_ID))
-    emit_hex(
-        "vector_82.aad", b"scp-reseat-request-aad-v1" + var_field(RESEAT_CONTEXT_ID)
     )
 
 
@@ -4436,7 +4350,7 @@ def main() -> int:
     emit_challenge_vectors()
     emit_participation_seed()
     emit_push_signing_bytes()
-    emit_key_positions_and_reseat()
+    emit_key_positions()
     emit_custody_probe()
     emit_device_attestation()
     emit_context_operator()
