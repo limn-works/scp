@@ -229,6 +229,9 @@ impl fmt::Debug for PublicRecords {
 ///   with `4042`, a blob whose `blob_id` names a retained record with
 ///   `4040`, and every other blob goes to the TTL path.
 ///
+/// A TTL outside `MIN_BLOB_TTL..=MAX_BLOB_TTL` is refused with `4011` first,
+/// for a caller that built the lifetime rather than decoding it.
+///
 /// # Errors
 ///
 /// The [`PublicRecordRefusal`] whose code the `ERR` carries.
@@ -240,6 +243,9 @@ pub async fn admit_publish<S: BlobStorage>(
     lifetime: BlobLifetime,
     blob: &[u8],
 ) -> Result<StoredBlob, PublicRecordRefusal> {
+    let lifetime = lifetime
+        .check()
+        .map_err(|error| PublicRecordRefusal::new(error.code(), error.to_string()))?;
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
     let kind = classify_node_record(&routing_id, blob);
     match lifetime {
@@ -607,6 +613,43 @@ mod tests {
             refuse_retained_copy(&storage, &stored.blob_id).await,
             Ok(())
         );
+        Ok(())
+    }
+
+    /// A lifetime built in code reaches the seam undecoded: a TTL outside
+    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL` is refused with `4011` and nothing is
+    /// stored, and each bound is stored.
+    #[tokio::test]
+    async fn an_out_of_range_ttl_is_refused_with_4011_at_the_seam() -> TestResult {
+        use scp_relay_client::{MAX_BLOB_TTL, MIN_BLOB_TTL};
+
+        let storage = InMemoryBlobStorage::new();
+        for (ttl, blob) in [(0, b"zero".as_slice()), (MAX_BLOB_TTL + 1, b"long")] {
+            let result = admit_publish(
+                &PublicRecords::Refused,
+                &storage,
+                [4; 32],
+                None,
+                BlobLifetime::Ttl(ttl),
+                blob,
+            )
+            .await;
+            assert_eq!(code_of(result), Some(code::TTL_TOO_LONG), "ttl {ttl}");
+            let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
+            assert!(storage.get(&blob_id).await?.is_none(), "ttl {ttl}");
+        }
+        for ttl in [MIN_BLOB_TTL, MAX_BLOB_TTL] {
+            let stored = admit_publish(
+                &PublicRecords::Refused,
+                &storage,
+                [4; 32],
+                None,
+                BlobLifetime::Ttl(ttl),
+                &ttl.to_be_bytes(),
+            )
+            .await?;
+            assert_eq!(stored.lifetime, StoredLifetime::Ttl(ttl));
+        }
         Ok(())
     }
 

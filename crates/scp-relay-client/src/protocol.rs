@@ -118,10 +118,24 @@ impl BlobLifetime {
             (Some(true), Some(_)) => Err(LifetimeError::Both),
             (Some(false), _) => Err(LifetimeError::RetainFalse),
             (None, None) => Err(LifetimeError::Neither),
-            (None, Some(ttl)) => match check_blob_ttl(ttl) {
-                Ok(()) => Ok(Self::Ttl(ttl)),
-                Err(error) => Err(error),
-            },
+            (None, Some(ttl)) => Self::Ttl(ttl).check(),
+        }
+    }
+
+    /// This lifetime, where its TTL lies in `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+    ///
+    /// A decoded PUBLISH always passes, but a `Ttl` built in code holds any
+    /// `u32`, so every seam that stores a PUBLISH checks it.
+    ///
+    /// # Errors
+    ///
+    /// [`LifetimeError::TtlOutOfRange`] for a TTL outside the range.
+    pub const fn check(self) -> Result<Self, LifetimeError> {
+        match self {
+            Self::Ttl(ttl) if ttl < MIN_BLOB_TTL || ttl > MAX_BLOB_TTL => {
+                Err(LifetimeError::TtlOutOfRange(ttl))
+            }
+            Self::Ttl(_) | Self::Retained => Ok(self),
         }
     }
 
@@ -558,12 +572,12 @@ impl ClientMessage {
                 ..
             } => {
                 validate_ref_id(ref_id)?;
-                if let BlobLifetime::Ttl(ttl) = lifetime {
-                    check_blob_ttl(*ttl).map_err(|error| RelayProtocolError::Lifetime {
+                lifetime
+                    .check()
+                    .map_err(|error| RelayProtocolError::Lifetime {
                         ref_id: ref_id.clone(),
                         error,
                     })?;
-                }
                 validate_blob(blob)?;
             }
             Self::Subscribe { ref_id, .. }
@@ -804,14 +818,6 @@ fn validate_ref_id(ref_id: &Option<String>) -> Result<(), RelayProtocolError> {
             "ref_id must be at most {MAX_REF_ID_LEN} bytes, got {}",
             id.len()
         )));
-    }
-    Ok(())
-}
-
-/// Checks a `blob_ttl` against `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
-const fn check_blob_ttl(ttl: u32) -> Result<(), LifetimeError> {
-    if ttl < MIN_BLOB_TTL || ttl > MAX_BLOB_TTL {
-        return Err(LifetimeError::TtlOutOfRange(ttl));
     }
     Ok(())
 }
