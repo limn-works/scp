@@ -100,11 +100,18 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
+      # The feature list is the one job rust-clippy's `workspace` leg in ci.yml lints
+      # every pull request with, under `-- -D warnings`. With the same list, a
+      # `#[cfg(feature = ...)]` test or helper is live here exactly when it is live
+      # there, so a helper whose only callers are feature-gated cannot pass every
+      # pull request and then fail `dead_code` here, at tag time. Check
+      # `release-test-features` in scripts/tests/ci-gate/ci_gate_selftest.py fails
+      # when the two lists differ.
       - name: Run tests (native targets only)
         if: >-
           matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
-        run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
 
       # Builds every uploaded binary, one package per invocation, into a target
       # directory no other step writes.

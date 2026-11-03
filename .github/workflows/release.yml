@@ -113,8 +113,13 @@ jobs:
       - name: Point PyO3 at Python 3.12
         run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
 
+      # The feature list is the one job rust-clippy's `workspace` leg in ci.yml lints
+      # every pull request with, under `-- -D warnings`, so every `#[cfg(feature)]`
+      # test and helper this build compiles was linted on the pull request. Check
+      # `release-test-features` in scripts/tests/ci-gate/ci_gate_selftest.py fails
+      # when the two lists differ.
       - name: Run all workspace tests
-        run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
+        run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
 
       # Conformance test suite runs against JSON fixtures.
       # When tests/conformance/ exists, run the dedicated conformance runner.

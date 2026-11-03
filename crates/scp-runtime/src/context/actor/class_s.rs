@@ -5746,10 +5746,13 @@ impl ClassSCell
     }
 
     /// A token dropped without `commit` trips the `Drop` `debug_assert!`
-    /// (keep-direction backstop, parity with `EconomyTicket`). Gated on
+    /// (keep-direction backstop, parity with `EconomyTicket`). Ignored without
     /// `debug_assertions`: a release build compiles the assert out, so the
-    /// expected panic never fires there.
-    #[cfg(debug_assertions)]
+    /// expected panic never fires there. The body still compiles in release.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the debug_assert! this test expects is compiled out without debug_assertions"
+    )]
     #[test]
     #[should_panic(expected = "dropped without commit")]
     fn token_dropped_without_commit_panics_in_debug() {
@@ -5774,10 +5777,14 @@ impl ClassSCell
     }
 
     /// `subsume` debug-asserts the token's context against the caller's, mirroring
-    /// `commit` — a token cannot be subsumed against the wrong context. Gated on
-    /// `debug_assertions`: a release build compiles the `debug_assert_eq!` out,
-    /// so the expected panic never fires there.
-    #[cfg(debug_assertions)]
+    /// `commit` — a token cannot be subsumed against the wrong context. Ignored
+    /// without `debug_assertions`: a release build compiles the `debug_assert_eq!`
+    /// out, so the expected panic never fires there. The body still compiles in
+    /// release.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the debug_assert_eq! this test expects is compiled out without debug_assertions"
+    )]
     #[test]
     #[should_panic(expected = "subsumed against the wrong context")]
     fn subsume_wrong_context_panics_in_debug() {

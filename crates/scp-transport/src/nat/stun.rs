@@ -374,6 +374,7 @@ impl NatKeepalive {
     /// Use [`send_keepalive`](Self::send_keepalive) for a single keepalive
     /// packet, or spawn [`run_keepalive_loop`] as a background task for
     /// continuous keepalive.
+    #[must_use]
     pub const fn new(socket: UdpSocket, server: SocketAddr) -> Self {
         Self { socket, server }
     }
