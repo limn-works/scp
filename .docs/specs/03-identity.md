@@ -574,6 +574,13 @@ All identity private state event types, organized by category:
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
 
+**Context membership events (`09-security-model.md` §9.7.1, "What X's device completes"):**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `RecordContextMembership` | `context_id: ContextId, member: bool, timestamp: u64` | No (same context) | A device appends `member` true when it completes the identity's first join of the context, by creation, invitation or re-seat, and `member` false when the identity leaves the context or is removed from it. A device completes a Welcome to a re-seat-marked KeyPackage (`0xFF07`) only for a context whose latest record says `member` true |
+| `SetDeviceContextExclusion` | `device_id: String, context_id: ContextId, excluded: bool, timestamp: u64` | No (same device+context) | `excluded` true keeps the device of `device_id` (the device registry's) out of the context: the device refuses every Welcome into it, whatever KeyPackage the Welcome is for |
+
 **Recovery contact events:**
 
 | Event type | Fields | Commutative | Notes |
