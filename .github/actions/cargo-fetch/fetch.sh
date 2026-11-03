@@ -51,8 +51,9 @@
 # THE `cargo-home` OUTPUT. The step also writes the directory the packages landed in,
 # `$CARGO_HOME` or `$HOME/.cargo`, to `$GITHUB_OUTPUT`. A step that builds inside a container
 # (job python-wheels-linux in build-matrix.yml) passes `CARGO_NET_OFFLINE` in, but the
-# container sees none of the runner's files, so it mounts `<cargo-home>/registry` into the
-# container; without that mount the offline build inside it finds no package and fails.
+# container sees none of the runner's files, so it mounts `<cargo-home>/registry` and
+# `<cargo-home>/git` into the container; without both mounts the offline build inside it
+# finds no registry package or git dependency and fails.
 #
 # Usage: fetch.sh <working-directory> [toolchain]
 # Environment:

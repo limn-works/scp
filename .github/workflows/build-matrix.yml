@@ -325,6 +325,8 @@ jobs:
       # it in, and bash inside the image expands its variables. The container gets
       # every `CARGO_*` variable of the runner but CARGO_HOME (a runner path), the
       # offline switch cargo-fetch wrote to `$GITHUB_ENV` among them, and RUSTFLAGS.
+      # It mounts the registry and the git checkouts (openmls is a git dependency)
+      # cargo-fetch filled, since an offline cargo downloads neither.
       - name: Build wheel
         env:
           IMAGE: ${{ matrix.image }}
@@ -348,6 +350,7 @@ jobs:
             -v "$sysroot:/opt/rust:ro" \
             -v "$maturin:/usr/local/bin/maturin:ro" \
             -v "$CARGO_HOME_ON_RUNNER/registry:/root/.cargo/registry" \
+            -v "$CARGO_HOME_ON_RUNNER/git:/root/.cargo/git" \
             --env-file "$RUNNER_TEMP/cargo.env" \
             -e IN_CONTAINER \
             "$IMAGE" \

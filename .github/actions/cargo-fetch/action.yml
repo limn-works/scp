@@ -23,7 +23,8 @@ outputs:
   cargo-home:
     description: >-
       The cargo home the packages were downloaded into (`$CARGO_HOME`, else `$HOME/.cargo`).
-      A step that builds in a container mounts `<cargo-home>/registry` into it.
+      A step that builds in a container mounts `<cargo-home>/registry` and
+      `<cargo-home>/git` into it.
     value: ${{ steps.fetch.outputs.cargo-home }}
 runs:
   using: composite
