@@ -452,9 +452,22 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      - name: Setup NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: nasm
+
+      # `vendored-openssl` compiles OpenSSL from source into SQLCipher on every
+      # non-Apple target, so the library carries its own OpenSSL rather than needing the
+      # installing machine's libcrypto; on an Apple target SQLCipher keeps CommonCrypto.
+      # `crates/scp-platform/Cargo.toml` states why each client artifact selects it.
+      # pwsh, not bash: Git Bash puts its MSYS perl first on PATH, and openssl-src's
+      # Configure exits 2 under that perl. Under pwsh, `perl` is the runner image's
+      # Strawberry Perl, as job python-wheels relies on.
       - name: Build NAPI addon
-        shell: bash
-        run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }}
+        shell: pwsh
+        run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Stage index.node (Unix)
         if: runner.os != 'Windows'
@@ -471,6 +484,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force napi-out | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/scp_ffi_napi.dll" napi-out/index.node
+
+      # Fails when the library loads a libcrypto or libssl, or leaves an OpenSSL symbol
+      # for the loading machine to supply, and prints its dependency list either way.
+      - name: Check index.node carries its own OpenSSL
+        shell: bash
+        run: bash scripts/assert-no-dynamic-libcrypto.sh napi-out/index.node
 
       - name: Upload NAPI artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -496,20 +515,24 @@ jobs:
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      # `vendored-openssl` changes nothing on an Apple target, where SQLCipher keeps
+      # CommonCrypto; it is named so that this job builds the one configuration every
+      # uniffi client artifact ships, which `scripts/check-shipped-feature-graph.sh` and
+      # `scripts/check-vendored-openssl-scope.sh` hold.
       - name: Build for macOS (x86_64)
-        run: cargo build --release --target x86_64-apple-darwin -p scp-ffi-uniffi
+        run: cargo build --release --target x86_64-apple-darwin -p scp-ffi-uniffi --features vendored-openssl
 
       - name: Build for macOS (aarch64)
-        run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi
+        run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi --features vendored-openssl
 
       - name: Build for iOS (arm64)
-        run: cargo build --release --target aarch64-apple-ios -p scp-ffi-uniffi
+        run: cargo build --release --target aarch64-apple-ios -p scp-ffi-uniffi --features vendored-openssl
 
       - name: Build for iOS Simulator (arm64)
-        run: cargo build --release --target aarch64-apple-ios-sim -p scp-ffi-uniffi
+        run: cargo build --release --target aarch64-apple-ios-sim -p scp-ffi-uniffi --features vendored-openssl
 
       - name: Build for iOS Simulator (x86_64)
-        run: cargo build --release --target x86_64-apple-ios -p scp-ffi-uniffi
+        run: cargo build --release --target x86_64-apple-ios -p scp-ffi-uniffi --features vendored-openssl
 
       - name: Create universal macOS binary
         run: |
@@ -532,16 +555,29 @@ jobs:
       # binary alone and reuses that step's ~650 dependencies. Without both flags cargo
       # compiles the same crate graph a second time, under the dev profile, into
       # `target/debug` — six minutes on this runner, measured on run 34724307976 of the
-      # same shape in ci.yml. `cargo run` executes what it builds, and this runner is
+      # same shape in ci.yml. `--features vendored-openssl` matches that step's feature set,
+      # without which cargo recompiles scp-ffi-uniffi and overwrites the dylib it built.
+      # `cargo run` executes what it builds, and this runner is
       # arm64, so the triple it names is the host's. The library it reads is the one that
       # step built, so the bindings match the dylib the XCFramework ships.
       # `scripts/check-workflow-compile-steps.py` holds every uniffi-bindgen step to this.
       - name: Generate UniFFI Swift bindings
         run: |
-          cargo run --release --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+          cargo run --release --target aarch64-apple-darwin -p scp-ffi-uniffi --features vendored-openssl --bin uniffi-bindgen -- generate \
             --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
             --language swift \
             --out-dir bindings/swift/Sources/SCP
+
+      # Fails when the library loads a libcrypto or libssl, or leaves an OpenSSL symbol
+      # for the loading machine to supply, and prints its dependency list either way.
+      - name: Check the XCFramework libraries carry no dynamic OpenSSL
+        shell: bash
+        run: |
+          bash scripts/assert-no-dynamic-libcrypto.sh \
+            target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
+            target/universal-macos/release/libscp_ffi_uniffi.a \
+            target/aarch64-apple-ios/release/libscp_ffi_uniffi.a \
+            target/universal-ios-sim/release/libscp_ffi_uniffi.a
 
       - name: Create module map
         run: |
@@ -643,10 +679,12 @@ jobs:
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      # `vendored-openssl` compiles OpenSSL from source into each `.so`, through the NDK
+      # tools the step above names; an Android device ships no libcrypto an app may link.
       - name: Build for Android targets
         run: |
           for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
-            cargo build --release --target "$target" -p scp-ffi-uniffi
+            cargo build --release --target "$target" -p scp-ffi-uniffi --features vendored-openssl
           done
 
       # The four builds above are Android triples and this runner is x86_64 Linux, so no
@@ -664,6 +702,9 @@ jobs:
             --language kotlin \
             --out-dir bindings/kotlin/src/main/kotlin
 
+      # The check after the copies fails when a `.so` loads a libcrypto or libssl, or
+      # leaves an OpenSSL symbol for the device to supply, and prints each `.so`'s
+      # DT_NEEDED entries either way.
       - name: Stage native libraries for AAR
         run: |
           JNILIBS=bindings/kotlin/scp-kt-android/src/main/jniLibs
@@ -672,6 +713,7 @@ jobs:
           cp target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so "$JNILIBS/armeabi-v7a/"
           cp target/x86_64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86_64/"
           cp target/i686-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86/"
+          bash scripts/assert-no-dynamic-libcrypto.sh "$JNILIBS"/*/libscp_ffi_uniffi.so
 
       - name: Build Android AAR
         working-directory: bindings/kotlin
@@ -733,11 +775,30 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      - name: Setup NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: nasm
+
       # cbindgen crate will be added in a future story; for now build the
       # cdylib from scp-ffi-uniffi which already produces a C-compatible .so
+      # `vendored-openssl` compiles OpenSSL from source into SQLCipher on every
+      # non-Apple target, so the library carries its own OpenSSL rather than needing the
+      # installing machine's libcrypto; on an Apple target SQLCipher keeps CommonCrypto.
+      # `crates/scp-platform/Cargo.toml` states why each client artifact selects it.
+      # pwsh, not bash: Git Bash puts its MSYS perl first on PATH, and openssl-src's
+      # Configure exits 2 under that perl. Under pwsh, `perl` is the runner image's
+      # Strawberry Perl, as job python-wheels relies on.
       - name: Build cdylib
+        shell: pwsh
+        run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi --features vendored-openssl
+
+      # Fails when the library loads a libcrypto or libssl, or leaves an OpenSSL symbol
+      # for the loading machine to supply, and prints its dependency list either way.
+      - name: Check the C ABI library carries its own OpenSSL
         shell: bash
-        run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+        run: bash scripts/assert-no-dynamic-libcrypto.sh target/${{ matrix.target }}/release/*scp_ffi_uniffi*.${{ matrix.lib-ext }}
 
       - name: Upload C ABI artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

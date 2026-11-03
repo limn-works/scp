@@ -2,24 +2,31 @@
 # Vendored-OpenSSL scope gate. Usage: scripts/check-vendored-openssl-scope.sh [--self-test]
 #
 # CRITERION: `openssl-src`, the crate whose build script compiles OpenSSL so that
-# `openssl-sys` links it statically, is in the dependency graph of the PyPI wheel's
-# configuration with libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature on, and
-# in the graph of no other configuration this repository ships and of no package of the
-# root workspace.
+# `openssl-sys` links it statically, is in the dependency graph of each prebuilt client
+# artifact's configuration with libsqlite3-sys's `bundled-sqlcipher-vendored-openssl`
+# feature on, and in the graph of no other configuration this repository ships and of no
+# package of the root workspace. The client artifacts are the PyPI wheel, the npm addon,
+# and the uniffi libraries (the Android AAR's `.so` files, the XCFramework, the C ABI
+# library); each installs onto a machine whose OpenSSL its build never saw.
 #
-# Presence: the one entry `scripts/check-shipped-feature-graph.sh --print-wheel-entries`
-# writes reaches at least one `openssl-src` under `cargo tree --target all`, keeping build
-# edges because `openssl-src` is a build-dependency of `openssl-sys`. A second
-# `cargo tree --target all -e no-dev,features -i libsqlite3-sys --depth 1` for that entry
+# Presence: the PRESENCE set is the one entry
+# `scripts/check-shipped-feature-graph.sh --print-wheel-entries` writes, plus the
+# CLIENT_ENTRIES below. `--print-artifacts` must list each PRESENCE entry exactly once,
+# and each reaches at least one `openssl-src` under `cargo tree --target all`, keeping
+# build edges because `openssl-src` is a build-dependency of `openssl-sys`. A second
+# `cargo tree --target all -e no-dev,features -i libsqlite3-sys --depth 1` for each entry
 # has to list libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature. The edge from
 # libsqlite3-sys to openssl-sys proves nothing on its own: libsqlite3-sys declares
 # openssl-sys optional without `dep:`, so its implicit `openssl-sys` feature makes the same
 # edge while SQLCipher still links the build host's OpenSSL.
 #
-# Absence: every entry `--print-artifacts` writes except the wheel's, which that list must
-# name exactly once beside at least one other entry, and every workspace root
-# WORKSPACE_ROOTS lists except NOT_SHIPPED_ROOTS, each under `--workspace`, reach no
-# `openssl-src` under `cargo tree --target all`.
+# Absence: every entry `--print-artifacts` writes outside the PRESENCE set, of which there
+# must be at least one, and every workspace root WORKSPACE_ROOTS lists except
+# NOT_SHIPPED_ROOTS, each under `--workspace`, reach no `openssl-src` under
+# `cargo tree --target all`. That set holds the scp-node and scp-relay binaries, which
+# link the runtime image's libssl3 so that an operator patches OpenSSL by upgrading it,
+# and each bridge under its default and its `server` features, which the `rust` job of
+# `.github/workflows/build-matrix.yml` builds.
 #
 # Roots: WORKSPACE_ROOTS is the one list of this repository's Cargo workspace roots. Each
 # entry must be a directory `cargo metadata` names as its own workspace root, and every
@@ -38,9 +45,9 @@
 # No Cargo.lock in such a root's directory, tracked or not, is read, and nothing is written
 # into the tree.
 #
-# Presence resolves the union over every target triple, so it proves the wheel's
-# configuration reaches `openssl-src` on some triple, not on each triple the wheel ships
-# for.
+# Presence resolves the union over every target triple, so it proves each PRESENCE
+# configuration reaches `openssl-src` on some triple, not on each triple it ships for;
+# `scripts/assert-no-dynamic-libcrypto.sh` checks each built library for that.
 #
 # The gate fails closed: a print mode that exits non-zero, a wheel answer that is not one
 # `<file><TAB><package>|<arguments>` line, an entry whose arguments are not a feature
@@ -60,6 +67,9 @@ cd "$REPO_ROOT"
 VENDOR_CRATE="openssl-src"
 SQLCIPHER_FEATURE="bundled-sqlcipher-vendored-openssl"
 FEATURE_GRAPH_GATE="$REPO_ROOT/scripts/check-shipped-feature-graph.sh"
+# The client artifacts besides the wheel that select a bridge crate's `vendored-openssl`
+# feature, as `--print-artifacts` writes them: the npm addon, and the uniffi libraries.
+CLIENT_ENTRIES=("scp-ffi-napi|--features vendored-openssl" "scp-ffi-uniffi|--features vendored-openssl")
 # Every Cargo workspace root in this repository, as a directory relative to its root.
 WORKSPACE_ROOTS=(. scaffolds/relay scaffolds/rust-client templates/cross-context-bridge templates/personal-relay fuzz)
 # The WORKSPACE_ROOTS entries absence does not resolve. `fuzz` builds libFuzzer harnesses
@@ -122,10 +132,10 @@ wheel_line() {
   printf '%s\n' "$line"
 }
 
-# wheel_occurrences <package>|<feature arguments>: the `openssl-src` count of the wheel's
-# graph over every triple, or 0 when libsqlite3-sys's bundled-sqlcipher-vendored-openssl
-# feature is off in it. A cargo failure fails the count.
-wheel_occurrences() {
+# vendored_occurrences <package>|<feature arguments>: the `openssl-src` count of that
+# configuration's graph over every triple, or 0 when libsqlite3-sys's
+# bundled-sqlcipher-vendored-openssl feature is off in it. A cargo failure fails the count.
+vendored_occurrences() {
   local entry="$1" n features
   local -a args=()
   read -r -a args <<<"${entry#*|}"
@@ -134,7 +144,7 @@ wheel_occurrences() {
     features="$(cargo tree --locked -p "${entry%%|*}" ${args[@]+"${args[@]}"} -e no-dev,features --target all -i libsqlite3-sys --depth 1 --prefix none --format '{p}')" ||
       { echo "cargo tree -i libsqlite3-sys failed for $entry" >&2; return 1; }
     if ! printf '%s\n' "$features" | grep -xF "libsqlite3-sys feature \"$SQLCIPHER_FEATURE\"" >/dev/null; then
-      echo "$VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys's $SQLCIPHER_FEATURE feature is off, so SQLCipher links the build host's OpenSSL" >&2
+      echo "$VENDOR_CRATE is in the graph of $entry, but libsqlite3-sys's $SQLCIPHER_FEATURE feature is off, so SQLCipher links the build host's OpenSSL" >&2
       n=0
     fi
   fi
@@ -217,20 +227,25 @@ report() {
 }
 
 run_gate() {
-  local failures=0 resolved=0 wheel_seen=0 line wheel_file wheel_entry entry n root
-  local -a args=()
+  local failures=0 resolved=0 line wheel_file wheel_entry entry present n root seen
+  local -a args=() presence=()
   line="$(wheel_line)" || { echo "FAIL — no readable wheel entry"; return 1; }
   wheel_file="${line%%$'\t'*}"; wheel_entry="${line#*$'\t'}"
-  echo "--> the wheel, $wheel_entry from $wheel_file, over every triple"
-  n="$(wheel_occurrences "$wheel_entry")" || n=""
-  report "$wheel_entry" "$n" some || failures=$((failures + 1))
+  presence=("$wheel_entry" "${CLIENT_ENTRIES[@]}")
+  echo "--> the client artifacts (the wheel, $wheel_entry from $wheel_file, and CLIENT_ENTRIES), over every triple"
+  for entry in "${presence[@]}"; do
+    n="$(vendored_occurrences "$entry")" || n=""
+    report "$entry" "$n" some || failures=$((failures + 1))
+  done
 
   echo "--> every other shipped configuration, over every triple"
   line="$(bash "$FEATURE_GRAPH_GATE" --print-artifacts)" ||
     { echo "FAIL — $FEATURE_GRAPH_GATE --print-artifacts exited non-zero"; return 1; }
   while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
-    [[ "$entry" == "$wheel_entry" ]] && { wheel_seen=$((wheel_seen + 1)); continue; }
+    present=0
+    for n in "${presence[@]}"; do [[ "$entry" == "$n" ]] && present=1; done
+    [[ "$present" -eq 1 ]] && continue
     resolved=$((resolved + 1)); n=""
     if is_feature_selection "${entry#*|}"; then
       args=(); read -r -a args <<<"${entry#*|}"
@@ -238,12 +253,16 @@ run_gate() {
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
-  # The skip above must match exactly one printed entry, and at least one other entry
-  # must be resolved, so an empty or wheel-less artifact list cannot pass.
-  [[ "$wheel_seen" -eq 1 ]] ||
-    { echo "    FAIL — --print-artifacts lists the wheel entry $wheel_seen time(s), and this gate wants it once"; failures=$((failures + 1)); }
+  # Each PRESENCE entry must match exactly one printed entry, so the configuration this
+  # gate resolves is the one the feature-graph gate ships, and at least one other entry
+  # must be resolved, so an empty or presence-only artifact list cannot pass.
+  for entry in "${presence[@]}"; do
+    seen="$(printf '%s\n' "$line" | grep -cxF -- "$entry" || true)"
+    [[ "$seen" -eq 1 ]] ||
+      { echo "    FAIL — --print-artifacts lists $entry $seen time(s), and this gate wants it once"; failures=$((failures + 1)); }
+  done
   [[ "$resolved" -gt 0 ]] ||
-    { echo "    FAIL — --print-artifacts lists no shipped configuration besides the wheel"; failures=$((failures + 1)); }
+    { echo "    FAIL — --print-artifacts lists no shipped configuration besides the client artifacts"; failures=$((failures + 1)); }
 
   echo "--> every workspace root WORKSPACE_ROOTS lists, which must name every root"
   if unlisted_manifests; then echo "    ok   — every Cargo.toml git tracks is a listed root or a member of one"
@@ -264,8 +283,8 @@ run_gate() {
     echo "    FAIL — cargo fetch --locked failed, so no root resolves offline"; failures=$((failures + 1))
   fi
 
-  [[ "$failures" -eq 0 ]] && echo "PASS — $VENDOR_CRATE reaches the wheel and nothing else shipped." && return 0
-  echo "FAIL — $failures resolution(s). Select the vendored build through scp-ffi/vendored-openssl on the wheel alone."
+  [[ "$failures" -eq 0 ]] && echo "PASS — $VENDOR_CRATE reaches each client artifact and nothing else shipped." && return 0
+  echo "FAIL — $failures resolution(s). Select the vendored build through a bridge crate's vendored-openssl feature on the client artifacts alone."
   return 1
 }
 
@@ -323,7 +342,7 @@ run_fixtures() {
     'if [ -n "$FAKE_VENDOR_PATH" ]; then case "$*" in *"$FAKE_VENDOR_PATH"*) echo "openssl-src v300.5.5+3.5.5";; esac; fi' > "$dir/bin/cargo"
   chmod +x "$dir/bin/cargo"
   REAL_CARGO="$(command -v cargo)"
-  export REAL_CARGO FAKE_BIN="$dir/bin" ARGV_LOG="$dir/argv" FAKE_BROKEN="" FAKE_FAIL_ON="" FAKE_NO_FEATURE="" FAKE_VENDORS="extension-module,vendored-openssl" \
+  export REAL_CARGO FAKE_BIN="$dir/bin" ARGV_LOG="$dir/argv" FAKE_BROKEN="" FAKE_FAIL_ON="" FAKE_NO_FEATURE="" FAKE_VENDORS="extension-module,vendored-openssl vendored-openssl" \
     FAKE_NEED="" FAKE_SEEN_LOCK="" FAKE_DRIFT="" FAKE_VENDOR_PATH=""
   PATH="$dir/bin:$PATH"
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
@@ -420,7 +439,7 @@ run_fixtures() {
   wheel_entry="${wheel#*$'\t'}"
   printf '%s\n' '#!/usr/bin/env bash' 'case "$1" in' \
     "  --print-wheel-entries) if [ -n \"\${FAKE_WHEEL+x}\" ]; then printf '%s\n' \"\$FAKE_WHEEL\"; else printf '%s\n' $(printf '%q' "$wheel"); fi; exit \"\${FAKE_WHEEL_RC:-0}\" ;;" \
-    "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "$wheel_entry"); fi; exit \"\${FAKE_ARTIFACTS_RC:-0}\" ;;" \
+    "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "$wheel_entry") 'scp-ffi-napi|--features vendored-openssl' 'scp-ffi-uniffi|--features vendored-openssl'; fi; exit \"\${FAKE_ARTIFACTS_RC:-0}\" ;;" \
     'esac' > "$dir/gate.sh"
   FEATURE_GRAPH_GATE="$dir/gate.sh"
 
@@ -433,18 +452,18 @@ run_fixtures() {
   FAKE_WHEEL="$wheel --prune openssl-src" wheel_line >/dev/null 2>&1; expect "wheel_line FAILS a wheel entry carrying a resolver flag" FAIL $?
 
   : > "$ARGV_LOG"
-  same "$(wheel_occurrences "$wheel_entry")" 1; expect "wheel_occurrences counts the wheel's openssl-src" PASS $?
+  same "$(vendored_occurrences "$wheel_entry")" 1; expect "vendored_occurrences counts the wheel's openssl-src" PASS $?
   same "$(cat "$ARGV_LOG")" "$(printf '%s\n' \
     "tree --locked -p scp-ffi --features extension-module,vendored-openssl -e no-dev --target all --prefix none --format {p}" \
     "tree --locked -p scp-ffi --features extension-module,vendored-openssl -e no-dev,features --target all -i libsqlite3-sys --depth 1 --prefix none --format {p}")"
   expect "the presence calls resolve the wheel entry over every triple, with build edges and then libsqlite3-sys's enabled features" PASS $?
-  FAKE_BROKEN=1 wheel_occurrences "$wheel_entry" >/dev/null 2>&1; expect "a failing wheel graph resolution FAILS the presence count" FAIL $?
-  FAKE_FAIL_ON=libsqlite3-sys wheel_occurrences "$wheel_entry" >/dev/null 2>&1; expect "a failing libsqlite3-sys feature resolution FAILS the presence count" FAIL $?
+  FAKE_BROKEN=1 vendored_occurrences "$wheel_entry" >/dev/null 2>&1; expect "a failing wheel graph resolution FAILS the presence count" FAIL $?
+  FAKE_FAIL_ON=libsqlite3-sys vendored_occurrences "$wheel_entry" >/dev/null 2>&1; expect "a failing libsqlite3-sys feature resolution FAILS the presence count" FAIL $?
 
   scenario() { # <label> <want>
     : > "$ARGV_LOG"; out="$(run_gate 2>&1)"; expect "$1" "$2" $?
   }
-  scenario "run_gate PASSES when only the wheel reaches $VENDOR_CRATE" PASS
+  scenario "run_gate PASSES when only the client artifacts reach $VENDOR_CRATE" PASS
   # Every call the fake cargo records is a cargo tree passing --locked and --target all,
   # except the root fetch and one lock trim per staged root, in that order.
   want="fetch --locked"
@@ -473,30 +492,41 @@ run_fixtures() {
   printf '%s\n' "$out" | grep -F "templates/personal-relay/Cargo.toml is neither the manifest of a WORKSPACE_ROOTS entry nor a member of one" >/dev/null
   expect "(roots) it names that root's manifest" PASS $?
   WORKSPACE_ROOTS=("${roots_saved[@]}")
-  FAKE_VENDORS="" scenario "(presence) run_gate FAILS when the wheel reaches no $VENDOR_CRATE" FAIL
+  FAKE_VENDORS="vendored-openssl" scenario "(presence) run_gate FAILS when the wheel reaches no $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — $wheel_entry reaches 0" >/dev/null; expect "(presence) it names the wheel entry" PASS $?
+  FAKE_VENDORS="extension-module,vendored-openssl" scenario "(presence) run_gate FAILS when the client entries reach no $VENDOR_CRATE" FAIL
+  for n in "${CLIENT_ENTRIES[@]}"; do
+    printf '%s\n' "$out" | grep -F "FAIL — $n reaches 0" >/dev/null; expect "(presence) it names $n" PASS $?
+  done
+  FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|' "$wheel_entry" 'scp-ffi-napi|--features vendored-openssl')" \
+    scenario "(presence) run_gate FAILS when --print-artifacts omits a client entry" FAIL
+  printf '%s\n' "$out" | grep -F "lists scp-ffi-uniffi|--features vendored-openssl 0 time(s)" >/dev/null; expect "(presence) it names the missing client entry" PASS $?
+  FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|' "$wheel_entry" 'scp-ffi-napi|--features vendored-openssl' 'scp-ffi-uniffi|--features vendored-openssl' 'scp-ffi-uniffi|--features vendored-openssl')" \
+    scenario "(presence) run_gate FAILS when --print-artifacts lists a client entry twice" FAIL
   FAKE_NO_FEATURE=1 scenario "(presence) run_gate FAILS when libsqlite3-sys depends on openssl-sys without $SQLCIPHER_FEATURE" FAIL
   printf '%s\n' "$out" | grep -F "$SQLCIPHER_FEATURE feature is off" >/dev/null; expect "(presence) it names the missing SQLCipher feature" PASS $?
   FAKE_WHEEL="$wheel --prune openssl-src" FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|' "$wheel_entry --prune openssl-src")" \
     scenario "(presence) run_gate FAILS when the wheel entry carries a resolver flag" FAIL
-  FAKE_VENDORS="extension-module,vendored-openssl scp-node" scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
+  FAKE_VENDORS="extension-module,vendored-openssl vendored-openssl scp-node" scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| reaches 1" >/dev/null; expect "(absence) it names scp-node" PASS $?
   # The baseline scenario vendors the wheel entry, so a removed skip goes red there;
   # vendoring the scp-ffi bridge entry goes red here, so a skip widened to every scp-ffi
   # entry goes red too.
-  FAKE_VENDORS="extension-module,vendored-openssl server" scenario "(absence) run_gate FAILS when a non-wheel scp-ffi entry reaches $VENDOR_CRATE" FAIL
+  FAKE_VENDORS="extension-module,vendored-openssl vendored-openssl server" scenario "(absence) run_gate FAILS when a non-wheel scp-ffi entry reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-ffi|--no-default-features --features server reaches 1" >/dev/null; expect "(absence) it names that scp-ffi entry" PASS $?
   FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|--prune openssl-src' "$wheel_entry")" scenario "(absence) run_gate FAILS when an artifact entry carries a resolver flag" FAIL
   FAKE_FAIL_ON=scp-node scenario "(absence) run_gate FAILS when an artifact entry's cargo tree exits non-zero" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| resolved no graph" >/dev/null; expect "(absence) it names that entry" PASS $?
   FAKE_ARTIFACTS_RC=1 scenario "(absence) run_gate FAILS when --print-artifacts exits non-zero" FAIL
   FAKE_ARTIFACTS="" scenario "(absence) run_gate FAILS when --print-artifacts lists nothing" FAIL
-  printf '%s\n' "$out" | grep -F "lists the wheel entry 0 time(s)" >/dev/null; expect "(absence) it names the missing wheel entry" PASS $?
-  printf '%s\n' "$out" | grep -F "lists no shipped configuration besides the wheel" >/dev/null; expect "(absence) it names the empty list" PASS $?
-  FAKE_ARTIFACTS='scp-node|' scenario "(absence) run_gate FAILS when --print-artifacts omits the wheel entry" FAIL
-  FAKE_ARTIFACTS="$(printf '%s\n' "$wheel_entry" 'scp-node|' "$wheel_entry")" scenario "(absence) run_gate FAILS when --print-artifacts lists the wheel entry twice" FAIL
-  FAKE_ARTIFACTS="$wheel_entry" scenario "(absence) run_gate FAILS when --print-artifacts lists only the wheel entry" FAIL
-  FAKE_VENDORS="extension-module,vendored-openssl --workspace" scenario "(absence) run_gate FAILS when the root workspace reaches $VENDOR_CRATE" FAIL
+  printf '%s\n' "$out" | grep -F "lists $wheel_entry 0 time(s)" >/dev/null; expect "(absence) it names the missing wheel entry" PASS $?
+  printf '%s\n' "$out" | grep -F "lists no shipped configuration besides the client artifacts" >/dev/null; expect "(absence) it names the empty list" PASS $?
+  clients="$(printf '%s\n' "${CLIENT_ENTRIES[@]}")"
+  FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|' "$clients")" scenario "(absence) run_gate FAILS when --print-artifacts omits the wheel entry" FAIL
+  FAKE_ARTIFACTS="$(printf '%s\n' "$wheel_entry" 'scp-node|' "$wheel_entry" "$clients")" scenario "(absence) run_gate FAILS when --print-artifacts lists the wheel entry twice" FAIL
+  FAKE_ARTIFACTS="$(printf '%s\n' "$wheel_entry" "$clients")" scenario "(absence) run_gate FAILS when --print-artifacts lists only the client entries" FAIL
+  printf '%s\n' "$out" | grep -F "lists no shipped configuration besides the client artifacts" >/dev/null; expect "(absence) it names the presence-only list" PASS $?
+  FAKE_VENDORS="extension-module,vendored-openssl vendored-openssl --workspace" scenario "(absence) run_gate FAILS when the root workspace reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — the root workspace reaches 1" >/dev/null; expect "(absence) it names the root workspace" PASS $?
   FAKE_FAIL_ON=--workspace scenario "(absence) run_gate FAILS when the root workspace's cargo tree exits non-zero" FAIL
 
@@ -504,7 +534,7 @@ run_fixtures() {
   echo "   FIXTURES: $fixture_failures failed."; return 1
 }
 
-echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches the PyPI wheel's configuration and no other configuration this repository ships"
+echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches each client artifact's configuration and no other configuration this repository ships"
 ( run_fixtures ) || exit 1
 [[ "${1:-}" == "--self-test" ]] && exit 0
 run_gate

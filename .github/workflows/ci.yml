@@ -787,9 +787,10 @@ jobs:
         run: bash scripts/check-shipped-feature-graph.sh
 
   # ── Vendored-OpenSSL scope ──
-  # scripts/check-vendored-openssl-scope.sh: `openssl-src` reaches the PyPI
-  # wheel's configuration with libsqlite3-sys's
-  # `bundled-sqlcipher-vendored-openssl` feature on, and no other configuration
+  # scripts/check-vendored-openssl-scope.sh: `openssl-src` reaches each client
+  # artifact's configuration (the PyPI wheel, the npm addon, the uniffi libraries)
+  # with libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature on, and no
+  # other configuration
   # scripts/check-shipped-feature-graph.sh --print-artifacts lists and no package
   # of a shipped workspace root the script lists, each resolved under
   # `cargo tree --target all`. Its fixture harness runs first and must pass. It
@@ -812,7 +813,7 @@ jobs:
         with:
           tool: python
           version: "3.12"
-      - name: openssl-src reaches the PyPI wheel's configuration and no other shipped configuration
+      - name: openssl-src reaches each client artifact's configuration and no other shipped configuration
         run: bash scripts/check-vendored-openssl-scope.sh
 
   # ── Examples type-check ──
@@ -5722,6 +5723,11 @@ jobs:
       # Whether that script rejects an empty set is a separate question, which
       # these fixtures answer by running it against real directories.
       - run: bash scripts/tests/signing-guard/run-tests.sh
+      # Job typescript-napi, kotlin-aar, swift-xcframework and cbindgen of
+      # build-matrix.yml run scripts/assert-no-dynamic-libcrypto.sh on each library
+      # before they upload it. Its self-test plants each library format with stub
+      # listing tools and proves every rejection fires on any runner.
+      - run: bash scripts/assert-no-dynamic-libcrypto.sh --self-test
       # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
       # budget per `fuzz_time` option, because GitHub expressions carry no
       # arithmetic. scripts/tests/ci-gate reads those chains and assumes an

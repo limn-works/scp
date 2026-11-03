@@ -19,6 +19,16 @@ path = "src/bin/uniffi-bindgen.rs"
 default = ["server"]
 # Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
+# On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
+# linking the build host's libcrypto. The Android AAR's four `.so` files (job
+# `kotlin-aar` of `.github/workflows/build-matrix.yml`), the XCFramework (job
+# `swift-xcframework`) and the C ABI library (job `cbindgen`) select it: the NDK
+# sysroot holds no libcrypto and Android exposes none to an app, and no operator
+# upgrades a `libssl3` inside an APK or an application bundle. On an Apple target it
+# changes nothing, and SQLCipher keeps CommonCrypto, which takes its patches from OS
+# updates. The `vendored-openssl` comment in `crates/scp-platform/Cargo.toml` says
+# how the Apple exclusion works and which shipped artifacts leave it off.
+vendored-openssl = ["scp-platform/vendored-openssl"]
 # Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
 # nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
 # `InMemoryDeviceAttestation`/`InMemoryPreRotationCustody` (the §17.17.2 security
