@@ -829,7 +829,7 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 **blob_id computation:** For `store_streaming`, the caller provides the `blob_id` (SHA-256 of the complete blob content). The relay computes this incrementally via streaming SHA-256 as it receives the blob over the wire, before calling `store_streaming`. The storage layer does not re-hash.
 
-**Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams directly to/from S3 using the AWS SDK's `ByteStream` without buffering the full blob.
+**Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams to and from S3 through the AWS SDK's `ByteStream` and never buffers a whole blob. A streaming store holds at most one 8 MiB part in memory. A body that ends within the first part goes up as one `PutObject` of its exact length, and a longer body goes up as a multipart upload, which the store aborts on any failure so the object stays unchanged. The `content_length` hint is advisory: it sizes only the first buffer, never the request, and the stored `content_length` is the number of bytes the body yielded.
 
 ## 17.8 Platform-Specific Key Custody
 
@@ -1048,7 +1048,7 @@ Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get
 blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
 ```
 
-The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.
+The conformance suite generates 28 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, streaming get for expired blob, a retained record survives every purge, four `after` cursor cases over blobs tied at one second (the cursor's own blob, the last tied blob, below every tied blob, above every tied blob), blobs stored out of order served ascending, the admission counter round-trips (0, an interior value, `i64::MAX`), the lifetime filter applies before the limit, and an overwrite leaves no index of the replaced blob.
 
 ## 17.12 Third-Party Adapter Candidates
 
