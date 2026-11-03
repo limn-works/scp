@@ -2147,6 +2147,37 @@ SERVED_BLOB_B = b"scp-25-served-blob-bb"
 SERVED_VALUE_DIGEST = sha256(
     u32(2) + var_field(SERVED_BLOB_A) + var_field(SERVED_BLOB_B)
 )
+# Vector 44's QUERY carries every optional field, so its query digest takes
+# each present form; Vector 80's carries none, so its digest takes each
+# absent form.
+SERVED_QUERY_SINCE = COSIGN_OBSERVED_AT - 86_400
+SERVED_QUERY_AFTER_BLOB = sha256(b"scp-25-query-after-blob")
+SERVED_QUERY_LIMIT = 100
+NODE_QUERY_SEPARATOR = "SCP-NODE-QUERY-V1:"
+
+
+def node_query_preimage(
+    routing_id: bytes,
+    since: int | None,
+    after_blob: bytes | None,
+    limit: int | None,
+) -> bytes:
+    """§9.7.4.2 definitions, the query digest's preimage: `routing_id`,
+    then each optional field as one presence byte (0x00 absent, 0x01
+    present) followed, where present, by its fixed-width value."""
+
+    def optional(value: bytes | None) -> bytes:
+        return b"\x00" if value is None else b"\x01" + value
+
+    assert len(routing_id) == 32
+    assert after_blob is None or len(after_blob) == 32
+    return (
+        NODE_QUERY_SEPARATOR.encode()
+        + routing_id
+        + optional(None if since is None else u64(since))
+        + optional(after_blob)
+        + optional(None if limit is None else u32(limit))
+    )
 
 
 def emit_witness_and_node_objects() -> None:
@@ -2218,17 +2249,29 @@ def emit_witness_and_node_objects() -> None:
     # and carries no key-state position: a node key never rotates.
     routing_id = sha256(b"scp:did:" + subject)
     proof_node_id = node_id(REF_KEY_1.compressed)
+    query_preimage = node_query_preimage(
+        routing_id, SERVED_QUERY_SINCE, SERVED_QUERY_AFTER_BLOB, SERVED_QUERY_LIMIT
+    )
+    assert len(query_preimage) == 18 + 32 + 9 + 33 + 5, len(query_preimage)
+    query_digest = sha256(query_preimage)
     proof_fields = (
         fixed_field(proof_node_id)
         + fixed_field(RESOLVER_NONCE)
         + fixed_field(routing_id)
+        + fixed_field(query_digest)
         + fixed_field(SERVED_VALUE_DIGEST)
         + u64(COSIGN_OBSERVED_AT)
     )
-    assert len(proof_fields) == 136, len(proof_fields)
+    assert len(proof_fields) == 168, len(proof_fields)
     emit_hex("vector_44.node_id", proof_node_id)
     emit_hex("vector_44.nonce", RESOLVER_NONCE)
     emit_hex("vector_44.routing_id", routing_id)
+    emit("vector_44.query_since", SERVED_QUERY_SINCE)
+    emit_hex("vector_44.query_after_blob", SERVED_QUERY_AFTER_BLOB)
+    emit("vector_44.query_limit", SERVED_QUERY_LIMIT)
+    emit("vector_44.query_preimage_len", len(query_preimage))
+    emit_hex("vector_44.query_preimage", query_preimage)
+    emit_hex("vector_44.query_digest", query_digest)
     emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
     emit_hex("vector_44.value_digest", SERVED_VALUE_DIGEST)
     emit("vector_44.observed_at", COSIGN_OBSERVED_AT)
@@ -3981,16 +4024,20 @@ def emit_key_positions_and_reseat() -> None:
     response = repeated_field([frame54])
     proof_nonce = fixture_digest("confirmation proof nonce")
     routing_id = sha256(b"scp:did:" + identifier)
+    query_preimage = node_query_preimage(routing_id, None, None, None)
+    assert len(query_preimage) == 18 + 32 + 3, len(query_preimage)
+    query_digest = sha256(query_preimage)
     proof_fields = (
         fixed_field(serving_node_id)
         + fixed_field(proof_nonce)
         + fixed_field(routing_id)
+        + fixed_field(query_digest)
         + fixed_field(sha256(response))
         + u64(COSIGN_OBSERVED_AT)
     )
     proof_digest = sha256(canonical_preimage(NODE_PROOF_SEPARATOR, proof_fields))
     node_proof = proof_fields + sign_group(REF_KEY_1, proof_digest, "vector_80.proof")
-    assert len(node_proof) == 200
+    assert len(node_proof) == 232
     confirmation = (
         var_field(list_record)
         + fixed_field(serving_node_id)
@@ -4005,6 +4052,8 @@ def emit_key_positions_and_reseat() -> None:
     emit("vector_80.list_record_len", len(list_record))
     emit_hex("vector_80.list_record_sha256", sha256(list_record))
     emit_hex("vector_80.proof_nonce", proof_nonce)
+    emit_hex("vector_80.query_preimage", query_preimage)
+    emit_hex("vector_80.query_digest", query_digest)
     emit_hex("vector_80.response_value_digest", sha256(response))
     emit_hex("vector_80.node_proof", node_proof)
     emit("vector_80.confirmation_len", len(confirmation))
