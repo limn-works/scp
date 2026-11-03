@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Governance handlers — see
-//! [`GovernanceCommand`](scp_runtime_core::context::actor::commands::GovernanceCommand)
+//! [`GovernanceCommand`]
 //! and plan row 10 of the commit ladder.
 //!
 //! # Dispatch shape
@@ -14,7 +14,7 @@
 //! variant has an actor-shape handler (`handle_*_actor`) that reads
 //! and mutates `state.governance` directly through the actor-shape
 //! helpers in
-//! [`crate::helpers`](crate::helpers).
+//! [`crate::helpers`].
 //! The migration-window shim — `dispatch_from_shim` and the
 //! supervisor-shape `handle_*` helpers — has been deleted at Phase 2A
 //! finalization.
@@ -64,7 +64,7 @@ use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 ///
 /// Every variant routes through an actor-shape `handle_*_actor` helper
 /// that reads or mutates `state.governance` directly through
-/// [`crate::helpers`](crate::helpers).
+/// [`crate::helpers`].
 /// The migration-window shim — `dispatch_from_shim`, the
 /// supervisor-shape `handle_*` helpers, and the `*_legacy` bodies they
 /// delegated to — was removed at Phase 2A finalization.

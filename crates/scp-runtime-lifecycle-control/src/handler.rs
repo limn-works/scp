@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Lifecycle-control handlers — see
-//! [`LifecycleControlCommand`](scp_runtime_core::context::actor::commands::LifecycleControlCommand)
+//! [`LifecycleControlCommand`]
 //! and plan §"BridgeInstance actor integration".
 //!
 //! # Clippy allows

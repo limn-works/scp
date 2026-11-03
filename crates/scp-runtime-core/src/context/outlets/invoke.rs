@@ -5807,7 +5807,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # §7.3.8 value-caveat enforcement
 ///
-/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`](InvocationCaveatBinding)
+/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`]
 /// (`effective_caveats` + `ucan_cid`) bound to the invocation UCAN. It is
 /// threaded verbatim into `open_outlet_stream`, where it drives the §7.3.8
 /// post-input hook AND the durable cross-invocation counter reservation

@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Economy handlers — see
-//! [`EconomyCommand`](scp_runtime_core::context::actor::commands::EconomyCommand)
+//! [`EconomyCommand`]
 //! and spec §19 / plan row 10 of the commit ladder.
 //!
 //! # Phase 2A.3 — actor-shape dispatch

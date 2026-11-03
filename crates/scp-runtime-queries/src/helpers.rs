@@ -15,8 +15,8 @@
 //! # Purpose
 //!
 //! This module hosts query-domain helpers that operate on actor-owned
-//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps).
+//! [`PerContextState`] and
+//! capability-reduced [`ActorDeps`].
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
 //!

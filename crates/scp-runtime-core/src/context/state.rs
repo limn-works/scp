@@ -1504,7 +1504,7 @@ pub struct GovernanceState {
 /// # `spending_nonce_tracker` is not `Clone`
 ///
 /// [`NonceTracker`](scp_protocol::crypto::ucan::nonce::NonceTracker) holds a
-/// clock handle and is not `Clone`, so [`Self::snapshot`] / [`Self::restore`]
+/// clock handle and is not `Clone`, so `Self::snapshot` / `Self::restore`
 /// project through its `snapshot_entries` / `from_snapshot` mirror (the
 /// `restore` side needs the clock threaded as a parameter). The other three
 /// fields are `Clone` and snapshot via a plain clone.
@@ -2055,7 +2055,7 @@ pub enum OutletRegistrySeed {
     /// The creator, inside `builder::create_context`, at genesis. No governance
     /// action has run yet, so the live registry equals `params.outlets` by
     /// construction. `validate_params` has already run
-    /// [`validate_genesis_outlets`] over the declaration.
+    /// `validate_genesis_outlets` over the declaration.
     ///
     /// **The creator holds grants that a Welcome-joiner does not.** A registry
     /// entry authorizes invocation: `actor::handlers::saga::validate_input_specificity`
@@ -2201,7 +2201,7 @@ pub(crate) fn validate_genesis_outlets(
 /// The creator-side create path is
 /// `scp_runtime_lifecycle::helpers::create_context`; the join-side
 /// spawn-from-Welcome path is
-/// [`crate::context::supervisor::Supervisor::build_welcome_joiner_state`].
+/// `crate::context::supervisor::Supervisor::build_welcome_joiner_state`.
 ///
 /// Both entrypoints stand up an identical fresh governance bucket — empty
 /// proposal/ceiling/economy maps, the matrix-default hard rate limiter, a

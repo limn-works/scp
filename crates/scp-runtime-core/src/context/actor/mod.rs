@@ -326,7 +326,7 @@ impl ContextActor {
     /// [`ActorDeps`] directly (introduced by ADR-049 §15).
     ///
     /// This is the production constructor. The owned-state spawn path
-    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`]
+    /// `crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`
     /// uses it to hand drained `PerContextState` + `ActorDeps` into the
     /// actor task, making the actor their sole owner.
     ///
@@ -336,7 +336,7 @@ impl ContextActor {
     /// # Construction of auxiliary fields
     ///
     /// - `ttl_timer`, `governance_timeout`, `ttl_armed_deadline` start as
-    ///   `None`. The run loop's [`Self::reconcile_timers`] arms them from
+    ///   `None`. The run loop's `Self::reconcile_timers` arms them from
     ///   owned state at the top of every turn (TTL from
     ///   `state.ttl.timer.deadline_unix_secs`, governance while `Active`).
     /// - `last_persist_attempt_at` starts at `Instant::now()` so a fresh

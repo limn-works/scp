@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! TTL-close handlers — see
-//! [`TtlCloseCommand`](scp_runtime_core::context::actor::commands::TtlCloseCommand)
+//! [`TtlCloseCommand`]
 //! and spec §5.8.
 //!
 //! # Phase 2A — actor-shape dispatch
@@ -299,7 +299,7 @@ async fn handle_execute_ttl_close(
 ///
 /// No forced `transition_to(Closing)` on a detached handle: per the documented
 /// FFI contract the context must ALREADY be in `Closing` (a prior
-/// `close_context`), and [`scp_runtime_core::context::shared::ttl_close::finalize_close`](scp_runtime_core::context::shared::ttl_close::finalize_close) —
+/// `close_context`), and [`scp_runtime_core::context::shared::ttl_close::finalize_close`] —
 /// via [`ttl::finalize_close`](scp_runtime_core::context::ttl::finalize_close) — performs
 /// the `Closing → Closed` transition itself, returning `InvalidTransition` if
 /// the context is not in `Closing`, exactly the FFI error contract.

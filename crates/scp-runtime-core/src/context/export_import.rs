@@ -920,13 +920,13 @@ pub(crate) fn prepare_export(
 
 /// Creates a signed [`ContextExport`] (ADR-049 Decision 7a).
 ///
-/// Runs [`prepare_export`], then one
+/// Runs `prepare_export`, then one
 /// [`CommandSigner::sign_bounded_ed25519`](crate::context::actor::CommandSigner::sign_bounded_ed25519)
 /// over the canonical snapshot digest inside the exporting actor's turn.
 ///
 /// # Errors
 ///
-/// [`prepare_export`]'s errors, and the signer's: [`ContextError::Custody`]
+/// `prepare_export`'s errors, and the signer's: [`ContextError::Custody`]
 /// with the custody's kind (`TimedOut`, SCP-CRYPTO-4062, past `SIGN_TIMEOUT`),
 /// or [`ContextError::CryptoFailed`] for a signer that is not Ed25519.
 pub async fn create_signed_export(
@@ -943,12 +943,12 @@ pub async fn create_signed_export(
     Ok(export)
 }
 
-/// Test helper: [`prepare_export`] signed by a synchronous closure, so unit
+/// Test helper: `prepare_export` signed by a synchronous closure, so unit
 /// tests can build exports with fixed keys or forged signatures.
 ///
 /// # Errors
 ///
-/// [`prepare_export`]'s errors, and [`ContextError::Custody`] when `sign` fails.
+/// `prepare_export`'s errors, and [`ContextError::Custody`] when `sign` fails.
 #[cfg(any(test, feature = "testing"))]
 pub fn create_export<F, E>(
     snapshot: ContextSnapshot,

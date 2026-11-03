@@ -280,7 +280,7 @@ impl std::fmt::Debug for IdentityWrappingKey {
 ///
 /// # Errors
 ///
-/// The errors of [`IdentityWrappingKey::generate`].
+/// The errors of `IdentityWrappingKey::generate`.
 #[cfg(any(test, feature = "testing"))]
 pub async fn test_wrapping_key<C: KeyCustody + 'static>(
     custody: &Arc<C>,

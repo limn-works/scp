@@ -5,9 +5,9 @@
 //!
 //! This module hosts the economy-domain helpers that actor handlers and
 //! migrated actor-shaped helper bodies call. Provider access flows
-//! through [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps);
+//! through [`ActorDeps`];
 //! per-context policy, velocity, and checkpoint state flow through
-//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState).
+//! [`PerContextState`].
 //!
 //! # Migration status
 //!

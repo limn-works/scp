@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Push handlers: see
-//! [`PushCommand`](scp_runtime_core::context::actor::commands::PushCommand) and
+//! [`PushCommand`] and
 //! `10-infrastructure-and-self-hosting.md` §10.7.1.
 //!
 //! Read-only by construction: [`dispatch`] borrows the actor-owned state

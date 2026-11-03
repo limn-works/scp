@@ -50,7 +50,7 @@ fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
 /// of logs.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredWrappingKeyHandle {
-    /// The record version, [`RECORD_VERSION`].
+    /// The record version, `RECORD_VERSION`.
     pub v: u8,
     /// The custody handle of the private key.
     pub handle: KeyHandle,

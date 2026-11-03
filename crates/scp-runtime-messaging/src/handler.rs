@@ -1233,7 +1233,7 @@ async fn handle_rotate_pseudonym(
 /// Handle [`MessagingCommand::ReportDegradedMode`] (actor-shape).
 ///
 /// Synchronous pure-emit handler: delegates to the actor-shape
-/// [`scp_runtime_core::context::shared::queries::report_degraded_mode`](scp_runtime_core::context::shared::queries::report_degraded_mode)
+/// [`scp_runtime_core::context::shared::queries::report_degraded_mode`]
 /// which writes a `DegradedMode` event into `state.receive_buffer` (and
 /// the optional broadcast channel on `deps.event_tx`) only when the
 /// supplied `compat` is the `DegradedMode` variant. All other
