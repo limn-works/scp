@@ -359,6 +359,10 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                 since,
                 after_blob,
                 limit,
+                // This listener holds no bound node key, so it answers every
+                // QUERY without a `node_proof`: the absent state §9.10.12
+                // permits, never a proof under a placeholder key.
+                proof_nonce: _,
             } => {
                 let messages = self
                     .handle_query_inner(ref_id.clone(), *routing_id, *since, *after_blob, *limit)
@@ -593,6 +597,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             }
 
             messages.push(RelayMessage::Event {
+                node_proof: None,
                 ref_id,
                 event_type: "backfill_complete".to_string(),
             });
@@ -702,6 +707,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
 
         // Emit query_complete event.
         messages.push(RelayMessage::Event {
+            node_proof: None,
             ref_id,
             event_type: "query_complete".to_string(),
         });
@@ -1263,6 +1269,7 @@ mod tests {
         // limit = 0 should fail.
         let result = handler
             .dispatch_message_multi(&ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: [0x44; 32],
                 since: None,
@@ -1285,6 +1292,7 @@ mod tests {
         // limit > max should fail.
         let result = handler
             .dispatch_message_multi(&ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: [0x44; 32],
                 since: None,

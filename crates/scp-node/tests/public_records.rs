@@ -566,6 +566,7 @@ impl Client {
     async fn query(&mut self, routing_id: [u8; 32]) -> Vec<Vec<u8>> {
         let reference = self.reference();
         self.send(&ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some(reference.clone()),
             routing_id,
             since: None,
@@ -1081,6 +1082,7 @@ async fn after_blob_without_since_is_refused_with_4002() {
     let mut client = Client::connect(&node).await;
     client
         .send(&ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q".to_owned()),
             routing_id: [0x42; 32],
             since: None,

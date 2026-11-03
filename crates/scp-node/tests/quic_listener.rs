@@ -102,6 +102,7 @@ async fn quic_publish_then_query_roundtrips() {
 
     // QUERY the same routing id over QUIC — must see the published blob.
     let query = ClientMessage::Query {
+        proof_nonce: None,
         ref_id: Some("q-1".to_owned()),
         routing_id,
         since: None,

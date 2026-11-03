@@ -8143,6 +8143,7 @@ mod tests {
         send_node_relay(
             &mut ws,
             &scp_relay_client::ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id,
                 since: None,

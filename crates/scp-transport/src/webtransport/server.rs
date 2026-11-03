@@ -392,6 +392,7 @@ mod tests {
             session.mark_active();
             let queried = match session
                 .dispatch_message_multi(&ClientMessage::Query {
+                    proof_nonce: None,
                     ref_id: Some("q".to_owned()),
                     routing_id: rid,
                     since: None,

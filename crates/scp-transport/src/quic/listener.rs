@@ -668,6 +668,10 @@ async fn handle_stream<S: BlobStorage + 'static>(
             since,
             after_blob,
             limit,
+            // This listener holds no bound node key, so it answers every
+            // QUERY without a `node_proof`: the absent state §9.10.12
+            // permits, never a proof under a placeholder key.
+            proof_nonce: _,
         } => {
             handle_query(
                 send, ref_id, routing_id, since, after_blob, limit, &storage, &config,
@@ -1000,6 +1004,7 @@ async fn handle_subscribe<S: BlobStorage>(
 
         // Emit backfill_complete event.
         let event = RelayMessage::Event {
+            node_proof: None,
             ref_id,
             event_type: "backfill_complete".to_string(),
         };
@@ -1113,6 +1118,7 @@ async fn handle_query<S: BlobStorage>(
 
     // Emit query_complete event.
     let event = RelayMessage::Event {
+        node_proof: None,
         ref_id,
         event_type: "query_complete".to_string(),
     };
@@ -1430,6 +1436,7 @@ mod tests {
 
         // Query for it.
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-1".to_string()),
             routing_id,
             since: None,
@@ -1626,6 +1633,7 @@ mod tests {
         let connection = connect_client(addr, &certs).await;
 
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("lim-1".to_string()),
             routing_id: [6u8; 32],
             since: None,
@@ -2099,6 +2107,7 @@ mod tests {
         let queried = send_and_recv(
             &connection,
             &ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: Some("q".into()),
                 routing_id,
                 since: None,

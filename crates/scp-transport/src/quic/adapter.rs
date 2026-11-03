@@ -553,6 +553,7 @@ impl TransportAdapter for QuicAdapter {
             let connection = self.get_connection().await?;
 
             let msg = ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: routing_id_bytes,
                 since,
@@ -1506,6 +1507,7 @@ mod tests {
     fn map_subscribe_relay_message_event_kinds() {
         let expected = [0xAAu8; 32];
         let backfill = RelayMessage::Event {
+            node_proof: None,
             ref_id: None,
             event_type: "backfill_complete".to_string(),
         };
@@ -1515,6 +1517,7 @@ mod tests {
         ));
 
         let unknown = RelayMessage::Event {
+            node_proof: None,
             ref_id: None,
             event_type: "made_up_event".to_string(),
         };

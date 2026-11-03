@@ -838,6 +838,7 @@ impl NativeRelayClient {
             // When there's an active subscription, just send the QUERY.
             // Results will be delivered through the existing subscription.
             let msg = ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: *routing_id,
                 since,
@@ -1056,6 +1057,7 @@ impl NativeRelayClient {
         // Serialize and send the QUERY frame directly (NOT via send_request,
         // which would consume the terminal query_complete).
         let mut msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: *routing_id,
             since,
@@ -2298,6 +2300,7 @@ mod tests {
                     })
                     .collect();
                 out.push(RelayMessage::Event {
+                    node_proof: None,
                     ref_id: ref_id.clone(),
                     event_type: "query_complete".to_string(),
                 });
@@ -2432,6 +2435,7 @@ mod tests {
     async fn publish_raw_maps_unexpected_response() {
         let url = start_scripted_relay(|msg| match msg {
             ClientMessage::Publish { ref_id, .. } => vec![RelayMessage::Event {
+                node_proof: None,
                 ref_id: ref_id.clone(),
                 event_type: "unexpected".to_string(),
             }],

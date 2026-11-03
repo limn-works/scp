@@ -804,6 +804,10 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
             since,
             after_blob,
             limit,
+            // This listener holds no bound node key, so it answers every
+            // QUERY without a `node_proof`: the absent state §9.10.12
+            // permits, never a proof under a placeholder key.
+            proof_nonce: _,
         } => {
             handle_udp_query(
                 ref_id,
@@ -1018,6 +1022,7 @@ async fn handle_udp_query<S: BlobStorage>(
     }
 
     let event = RelayMessage::Event {
+        node_proof: None,
         ref_id,
         event_type: "query_complete".to_string(),
     };
@@ -1456,6 +1461,7 @@ mod tests {
 
         // QUERY
         let query_msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("qry-1".to_string()),
             routing_id,
             since: None,
@@ -1644,6 +1650,7 @@ mod tests {
         let client = create_dtls_client(addr).await;
 
         let query_msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("empty-q".to_string()),
             routing_id: [0x11; 32],
             since: None,
@@ -1734,6 +1741,7 @@ mod tests {
 
         // Query and verify the recipient_hint is preserved.
         let query_msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id,
             since: None,
@@ -1793,6 +1801,7 @@ mod tests {
 
         // Query should return empty.
         let query_msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id,
             since: None,
@@ -1865,6 +1874,7 @@ mod tests {
     /// The BLOBs a QUERY at `routing_id` returns, read up to `query_complete`.
     async fn query_blob_count(client: &AsyncDtlsSession, routing_id: [u8; 32]) -> usize {
         let data = rmp_serde::to_vec_named(&ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q".to_string()),
             routing_id,
             since: None,

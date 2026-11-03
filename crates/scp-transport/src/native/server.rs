@@ -1117,6 +1117,10 @@ async fn handle_client_message(
             since,
             after_blob,
             limit,
+            // This server holds no bound node key, so it answers every
+            // QUERY without a `node_proof`: the absent state §9.10.12
+            // permits, never a proof under a placeholder key.
+            proof_nonce: _,
         } => {
             handle_query(
                 ref_id.clone(),
@@ -1423,6 +1427,7 @@ async fn handle_subscribe(
 
         // Emit backfill_complete event.
         let event = RelayMessage::Event {
+            node_proof: None,
             ref_id,
             event_type: "backfill_complete".to_string(),
         };
@@ -1553,6 +1558,7 @@ async fn handle_query(
 
     // Emit query_complete event.
     let event = RelayMessage::Event {
+        node_proof: None,
         ref_id,
         event_type: "query_complete".to_string(),
     };
@@ -2113,7 +2119,10 @@ mod tests {
         }
 
         // Query.
+        // A nonce asks for a node proof; this server holds no bound node
+        // key, so it must answer without one (§9.10.12).
         let query = ClientMessage::Query {
+            proof_nonce: Some([0x5a; 32]),
             ref_id: Some("q-1".to_string()),
             routing_id,
             since: None,
@@ -2131,9 +2140,14 @@ mod tests {
 
         let event = recv_msg(&mut stream).await;
         match &event {
-            RelayMessage::Event { event_type, ref_id } => {
+            RelayMessage::Event {
+                event_type,
+                ref_id,
+                node_proof,
+            } => {
                 assert_eq!(event_type, "query_complete");
                 assert_eq!(ref_id, &Some("q-1".to_string()));
+                assert_eq!(node_proof, &None, "a keyless server sends no proof");
             }
             other => panic!("expected EVENT, got {other:?}"),
         }
@@ -2173,6 +2187,7 @@ mod tests {
 
         // Query should return no blobs.
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-1".to_string()),
             routing_id,
             since: None,
@@ -2461,6 +2476,7 @@ mod tests {
 
         // Query with limit=2.
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-lim".to_string()),
             routing_id,
             since: None,
@@ -2535,6 +2551,7 @@ mod tests {
 
         // Query should return no blobs.
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-ttl".to_string()),
             routing_id,
             since: None,
@@ -3584,6 +3601,7 @@ mod tests {
         send_msg(
             &mut sink,
             &ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: Some("q".to_string()),
                 routing_id: push_rid(),
                 since: None,
@@ -3686,6 +3704,7 @@ mod tests {
         send_msg(
             &mut sink,
             &ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: Some("q".to_string()),
                 routing_id,
                 since: None,

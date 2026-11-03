@@ -810,6 +810,7 @@ mod tests {
     #[test]
     fn relay_backfill_complete_to_event() {
         let msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: None,
             event_type: "backfill_complete".to_string(),
         };
@@ -821,6 +822,7 @@ mod tests {
     #[test]
     fn relay_query_complete_returns_none() {
         let msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: None,
             event_type: "query_complete".to_string(),
         };
@@ -897,6 +899,7 @@ mod tests {
     #[test]
     fn subscription_relay_delegates_to_relay_message_to_event() {
         let relay_msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: None,
             event_type: "backfill_complete".to_string(),
         };

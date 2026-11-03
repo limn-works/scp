@@ -26,6 +26,7 @@
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full wire format specification.
 
+use scp_protocol::node::NODE_PROOF_LEN;
 use serde::{Deserialize, Serialize};
 
 use super::error::{RelayProtocolError, code};
@@ -317,40 +318,61 @@ fn lifetime_refusal(bytes: &[u8]) -> Option<RelayProtocolError> {
 // Serde helper for Option<[u8; 32]> as MessagePack binary
 // ---------------------------------------------------------------------------
 
-/// Serde helper module for `Option<[u8; 32]>` fields that must be encoded as
-/// `MessagePack` binary (not arrays of integers).
-///
-/// Uses `serde_bytes` internally for the `Some` case and handles `None`
-/// transparently.
-mod byte_array_32_opt {
+/// Serde for an optional fixed-width byte field carried as `MessagePack` `bin`
+/// (never an array of integers) of exactly `N` bytes: 32 for a routing id,
+/// blob id or nonce, 200 for a node proof (`09-security-model.md` §9.7.4.2
+/// definitions). A width other than `N` is refused.
+mod byte_array_opt {
     use serde::de::Error;
     use serde::{Deserializer, Serializer};
 
+    /// A field of exactly `N` bytes, held inline or boxed. A 200-byte node
+    /// proof is boxed so that every `RelayMessage` does not carry it inline.
+    pub trait FixedBytes: Sized {
+        fn bytes(&self) -> &[u8];
+        fn from_vec(bytes: Vec<u8>) -> Result<Self, Vec<u8>>;
+    }
+
+    impl<const N: usize> FixedBytes for [u8; N] {
+        fn bytes(&self) -> &[u8] {
+            self
+        }
+        fn from_vec(bytes: Vec<u8>) -> Result<Self, Vec<u8>> {
+            bytes.try_into()
+        }
+    }
+
+    impl<const N: usize> FixedBytes for Box<[u8; N]> {
+        fn bytes(&self) -> &[u8] {
+            self.as_slice()
+        }
+        fn from_vec(bytes: Vec<u8>) -> Result<Self, Vec<u8>> {
+            <[u8; N]>::from_vec(bytes).map(Self::new)
+        }
+    }
+
     // serde Serialize signature requires &Option<T>.
     #[allow(clippy::ref_option)]
-    pub fn serialize<S: Serializer>(
-        value: &Option<[u8; 32]>,
+    pub fn serialize<T: FixedBytes, S: Serializer>(
+        value: &Option<T>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         match value {
-            Some(arr) => serializer.serialize_bytes(arr),
+            Some(arr) => serializer.serialize_bytes(arr.bytes()),
             None => serializer.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
+    pub fn deserialize<'de, T: FixedBytes, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<[u8; 32]>, D::Error> {
+    ) -> Result<Option<T>, D::Error> {
         let opt: Option<serde_bytes::ByteBuf> = serde::Deserialize::deserialize(deserializer)?;
-        match opt {
-            None => Ok(None),
-            Some(buf) => {
-                let bytes: [u8; 32] = buf.into_vec().try_into().map_err(|v: Vec<u8>| {
-                    D::Error::custom(format!("expected 32 bytes, got {}", v.len()))
-                })?;
-                Ok(Some(bytes))
-            }
-        }
+        opt.map(|buf| {
+            T::from_vec(buf.into_vec()).map_err(|v: Vec<u8>| {
+                D::Error::custom(format!("expected a fixed-width bin, got {} bytes", v.len()))
+            })
+        })
+        .transpose()
     }
 }
 
@@ -402,7 +424,7 @@ pub enum ClientMessage {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            with = "byte_array_32_opt"
+            with = "byte_array_opt"
         )]
         recipient_hint: Option<[u8; 32]>,
 
@@ -474,13 +496,24 @@ pub enum ClientMessage {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            with = "byte_array_32_opt"
+            with = "byte_array_opt"
         )]
         after_blob: Option<[u8; 32]>,
 
         /// Maximum number of blobs to return. Default 100, max 1000.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+
+        /// 32 bytes the resolver drew freshly for this query. A listed node
+        /// that can sign under the node key its node-list entry binds
+        /// answers it with a `node_proof` on the `query_complete` EVENT
+        /// (ADR-004 operation 4; `09-security-model.md` §9.10.12).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "byte_array_opt"
+        )]
+        proof_nonce: Option<[u8; 32]>,
     },
 
     /// Request deletion of a blob by its ID.
@@ -731,7 +764,7 @@ pub enum RelayMessage {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            with = "byte_array_32_opt"
+            with = "byte_array_opt"
         )]
         blob_id: Option<[u8; 32]>,
     },
@@ -772,7 +805,7 @@ pub enum RelayMessage {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            with = "byte_array_32_opt"
+            with = "byte_array_opt"
         )]
         recipient_hint: Option<[u8; 32]>,
 
@@ -807,6 +840,17 @@ pub enum RelayMessage {
         /// `"query_complete"`).
         #[serde(rename = "type")]
         event_type: String,
+
+        /// On `query_complete`: the 200-byte node proof of control over
+        /// this response, present where the QUERY carried a `proof_nonce`
+        /// and the node holds a bound node key (ADR-004 `EVENT`;
+        /// `09-security-model.md` §9.7.4.2 definitions, §9.10.12).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "byte_array_opt"
+        )]
+        node_proof: Option<Box<[u8; NODE_PROOF_LEN]>>,
     },
 
     /// Keepalive response echoing the client's timestamp.
@@ -1001,6 +1045,7 @@ mod tests {
     #[test]
     fn query_roundtrip() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-1".to_string()),
             routing_id: [0x44; 32],
             since: Some(1_000_000),
@@ -1016,6 +1061,7 @@ mod tests {
     #[test]
     fn query_no_optional_fields_roundtrip() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: [0x55; 32],
             since: None,
@@ -1206,6 +1252,7 @@ mod tests {
     #[test]
     fn event_roundtrip() {
         let msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: Some("sub-1".to_string()),
             event_type: "backfill_complete".to_string(),
         };
@@ -1218,6 +1265,7 @@ mod tests {
     #[test]
     fn event_query_complete_roundtrip() {
         let msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: Some("q-1".to_string()),
             event_type: "query_complete".to_string(),
         };
@@ -1602,6 +1650,7 @@ mod tests {
     #[test]
     fn validate_query_limit_too_high() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
@@ -1615,6 +1664,7 @@ mod tests {
     #[test]
     fn validate_query_limit_zero() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
@@ -1628,6 +1678,7 @@ mod tests {
     #[test]
     fn validate_query_limit_at_max() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
@@ -1640,6 +1691,7 @@ mod tests {
     #[test]
     fn validate_query_limit_none_is_valid() {
         let msg = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
@@ -1792,6 +1844,7 @@ mod tests {
             ),
             (
                 ClientMessage::Query {
+                    proof_nonce: None,
                     ref_id: None,
                     routing_id: [0; 32],
                     since: None,
@@ -1870,6 +1923,7 @@ mod tests {
             ),
             (
                 RelayMessage::Event {
+                    node_proof: None,
                     ref_id: None,
                     event_type: "test".to_string(),
                 },
@@ -2031,6 +2085,7 @@ mod tests {
     fn relay_event_wire_field_type_not_event_type() {
         // ADR-004 specifies the wire field name is "type", not "event_type".
         let msg = RelayMessage::Event {
+            node_proof: None,
             ref_id: Some("evt-1".to_string()),
             event_type: "backfill_complete".to_string(),
         };
@@ -2122,6 +2177,7 @@ mod tests {
                 routing_id: [0; 32],
             },
             ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: Some("r".into()),
                 routing_id: [0; 32],
                 since: None,
@@ -2180,9 +2236,101 @@ mod tests {
         assert_eq!(
             msg,
             RelayMessage::Event {
+                node_proof: None,
                 ref_id: Some("evt-deser".to_string()),
                 event_type: "query_complete".to_string(),
             }
         );
+    }
+
+    /// The value an encoded message carries under `key`, if any.
+    fn field(bytes: &[u8], key: &str) -> Option<rmpv::Value> {
+        let value: rmpv::Value = rmp_serde::from_slice(bytes).unwrap();
+        value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// ADR-004's QUERY row: `proof_nonce: bin32?`. Present, it rides as a
+    /// 32-byte `bin` under the key `proof_nonce` and round-trips; absent,
+    /// the key is omitted; a `bin` of any other width is refused.
+    #[test]
+    fn query_proof_nonce_is_an_optional_bin32_per_adr_004() {
+        let query = |proof_nonce| ClientMessage::Query {
+            ref_id: Some("q-nonce".to_string()),
+            routing_id: [0x11; 32],
+            since: Some(5),
+            after_blob: Some([0x22; 32]),
+            limit: Some(16),
+            proof_nonce,
+        };
+        let with = query(Some([0x5a; 32]));
+        let bytes = with.to_bytes().unwrap();
+        assert_eq!(
+            field(&bytes, "proof_nonce"),
+            Some(rmpv::Value::Binary(vec![0x5a; 32]))
+        );
+        assert_eq!(ClientMessage::from_bytes(&bytes).unwrap(), with);
+
+        let without = query(None).to_bytes().unwrap();
+        assert_eq!(field(&without, "proof_nonce"), None);
+        assert_eq!(ClientMessage::from_bytes(&without).unwrap(), query(None));
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("QUERY".into()));
+        map.insert(
+            "routing_id".to_string(),
+            rmpv::Value::Binary(vec![0x11; 32]),
+        );
+        map.insert(
+            "proof_nonce".to_string(),
+            rmpv::Value::Binary(vec![0x5a; 31]),
+        );
+        let short = rmp_serde::to_vec_named(&map).unwrap();
+        assert!(ClientMessage::from_bytes(&short).is_err());
+    }
+
+    /// ADR-004's EVENT row: `query_complete` carries `node_proof: bin200?`.
+    /// Present, it rides as a 200-byte `bin` under the key `node_proof` and
+    /// round-trips; absent, the key is omitted; a `bin` of any other width
+    /// is refused.
+    #[test]
+    fn query_complete_node_proof_is_an_optional_bin200_per_adr_004() {
+        assert_eq!(NODE_PROOF_LEN, 200);
+        let event = |node_proof| RelayMessage::Event {
+            ref_id: Some("q-nonce".to_string()),
+            event_type: "query_complete".to_string(),
+            node_proof,
+        };
+        let proof: Vec<u8> = (0..=199).collect();
+        let with = event(Some(Box::new(
+            <[u8; NODE_PROOF_LEN]>::try_from(proof.as_slice()).unwrap(),
+        )));
+        let bytes = with.to_bytes().unwrap();
+        assert_eq!(
+            field(&bytes, "node_proof"),
+            Some(rmpv::Value::Binary(proof.clone()))
+        );
+        assert_eq!(RelayMessage::from_bytes(&bytes).unwrap(), with);
+
+        let without = event(None).to_bytes().unwrap();
+        assert_eq!(field(&without, "node_proof"), None);
+        assert_eq!(RelayMessage::from_bytes(&without).unwrap(), event(None));
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("EVENT".into()));
+        map.insert(
+            "type".to_string(),
+            rmpv::Value::String("query_complete".into()),
+        );
+        map.insert(
+            "node_proof".to_string(),
+            rmpv::Value::Binary(proof[..199].to_vec()),
+        );
+        let short = rmp_serde::to_vec_named(&map).unwrap();
+        assert!(RelayMessage::from_bytes(&short).is_err());
     }
 }
