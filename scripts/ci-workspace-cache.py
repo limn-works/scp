@@ -97,12 +97,43 @@ def workspace_files(target: Path, names: set[str]) -> list[Path]:
                 for unit in entry.iterdir():
                     if is_workspace_entry(unit.name, names):
                         out.extend(walk(unit))
+                if entry.name == "deps":
+                    out.extend(sole_unhashed_outputs(prof, entry, names))
             elif entry.name == "incremental" or (
                 entry.name.startswith(".cargo-") and entry.name.endswith("lock")
             ):
                 continue
             else:
                 out.extend(walk(entry))
+    return out
+
+
+def sole_unhashed_outputs(prof: Path, deps: Path, names: set[str]) -> list[Path]:
+    """A workspace lib's cdylib or staticlib outputs in `deps`, kept only when one lib unit wrote them.
+
+    Cargo names a cdylib or staticlib in `deps` without the metadata hash
+    (`libscp_ffi.so`), so every feature set of the package writes the same path and the
+    file holds whichever unit ran last. A lib unit's fingerprint does not cover that
+    file's content. The file is packed only when the profile holds exactly one lib unit
+    of that target, whose output it must be; with two or more, it stays out and cargo
+    rebuilds the unit on restore because its output is missing.
+    """
+    lib_units: dict[str, int] = {}
+    for unit in (prof / ".fingerprint").iterdir():
+        if not is_workspace_entry(unit.name, names):
+            continue
+        for f in unit.iterdir():
+            if f.name.startswith("lib-") and f.name.endswith(".json"):
+                stem = f.name[len("lib-") : -len(".json")]
+                lib_units[stem] = lib_units.get(stem, 0) + 1
+    out: list[Path] = []
+    for f in deps.iterdir():
+        if HASH16.search(f.name) or not f.is_file() or f.suffix == ".o":
+            continue
+        stem = f.name.split(".", 1)[0]
+        stem = stem[3:] if stem.startswith("lib") and stem[3:] in lib_units else stem
+        if stem in names and lib_units.get(stem) == 1:
+            out.append(f)
     return out
 
 
