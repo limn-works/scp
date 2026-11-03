@@ -1675,8 +1675,19 @@ where
     D: DidMethod + 'static,
     S: Storage + 'static,
 {
-    let node_key = node_key::load_or_generate(protocol_repository.storage()).await?;
-    tail.node_proofs = node_key::install(node_key, node_binding)?;
+    // The node key enters the node only inside `node_proofs`. A failure
+    // returns a fresh `NodeError` built from the error alone, never `?` over a
+    // `Result` whose `Ok` arm holds the key: `?` hands its whole operand to
+    // the early return, so the key would ride the node's start result into
+    // every value read from the node (`09-security-model.md` §9.6.3 step 1
+    // keeps the key inside the node).
+    tail.node_proofs = match node_key::load_or_generate(&protocol_repository).await {
+        Ok(key) => match node_key::install(key, node_binding) {
+            Ok(proofs) => proofs,
+            Err(e) => return Err(NodeError::NodeBinding(e)),
+        },
+        Err(e) => return Err(NodeError::NodeKey(e)),
+    };
 
     // `Persisted` is the load-or-create-and-persist source. It normalizes to
     // a `Generate` source with `persist = true` (exactly as the legacy
@@ -2915,11 +2926,21 @@ mod tests {
         binding
     }
 
-    /// Runs the local `sign-binding` step against `storage` for
-    /// [`NODE_URL`] and returns the finished binding.
-    async fn signed_binding(storage: &InMemoryStorage) -> NodeBinding {
+    /// The current Unix time in seconds, the clock a node proof's
+    /// `observed_at` is checked against.
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    /// The binding an operator assembles for the node key `storage` holds,
+    /// drawing that key first as a node's first start does (§9.6.3 step 1).
+    async fn signed_binding(storage: &Arc<InMemoryStorage>) -> NodeBinding {
+        let repository = ProtocolRepository::new_for_testing(Arc::clone(storage));
+        node_key::load_or_generate(&repository).await.unwrap();
         let grant = node_key::sign_possession(
-            storage,
+            &repository,
             &scp_did::Identifier::from_bytes([0x0a; 32]),
             &NodeUrl::new(NODE_URL).unwrap(),
             &[0x0b; 32],
@@ -2953,11 +2974,11 @@ mod tests {
         .await
     }
 
-    /// Sends a QUERY carrying `proof_nonce` to `node`'s WebSocket listener and
+    /// Sends the QUERY `sent` names to `node`'s WebSocket listener and
     /// returns the `EVENT query_complete` that ends the (empty) response.
     async fn query_complete_of<S: Storage + 'static>(
         node: &crate::ApplicationNode<S>,
-        proof_nonce: [u8; 32],
+        sent: &scp_protocol::node::SentQuery,
     ) -> scp_relay_client::RelayMessage {
         use futures::{SinkExt as _, StreamExt as _};
         use scp_relay_client::{ClientMessage, RelayMessage};
@@ -2976,11 +2997,11 @@ mod tests {
         let (mut sink, mut stream) = ws.split();
         let query = ClientMessage::Query {
             ref_id: Some("proof".to_owned()),
-            routing_id: [0x3c; 32],
-            since: None,
-            after_blob: None,
-            limit: None,
-            proof_nonce: Some(proof_nonce),
+            routing_id: sent.routing_id,
+            since: sent.since,
+            after_blob: sent.after_blob,
+            limit: sent.limit,
+            proof_nonce: Some(sent.nonce),
         };
         sink.send(Message::Binary(query.to_bytes().unwrap()))
             .await
@@ -3003,7 +3024,6 @@ mod tests {
     #[tokio::test]
     async fn the_node_key_persists_across_restart_and_proves_queries() {
         use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
-        use scp_protocol::node::NodeProof;
 
         let storage = Arc::new(InMemoryStorage::new());
         let first = start_local(Arc::clone(&storage), NodeBindingSlot::Unbound)
@@ -3012,7 +3032,7 @@ mod tests {
         first.shutdown();
         assert!(
             storage
-                .retrieve(node_key::NODE_KEY_STORAGE_KEY)
+                .retrieve(scp_core::store::node_key::NODE_KEY_KEY)
                 .await
                 .unwrap()
                 .is_some(),
@@ -3023,20 +3043,34 @@ mod tests {
         let second = start_local(Arc::clone(&storage), installed(binding.clone()))
             .await
             .unwrap();
+        let sent = scp_protocol::node::SentQuery {
+            nonce: [0x5e; 32],
+            routing_id: [0x3c; 32],
+            since: Some(7),
+            after_blob: Some([0x4d; 32]),
+            limit: Some(5),
+        };
+        let before = now_secs();
         let scp_relay_client::RelayMessage::Event {
-            node_proof: Some(bytes),
+            node_proof: Some(proof),
             event_type,
             ..
-        } = query_complete_of(&second, [0x5e; 32]).await
+        } = query_complete_of(&second, &sent).await
         else {
             panic!("a bound node's query_complete carries a node proof");
         };
+        let after = now_secs();
         assert_eq!(event_type, "query_complete");
-        let proof = NodeProof::from_bytes(bytes.as_slice()).unwrap();
         let node_key = P256PublicKey::from_sec1(&binding.node_key).unwrap();
         verify_prehash_strict(&node_key, &proof.digest(), &proof.signature).unwrap();
-        assert_eq!(proof.nonce, [0x5e; 32]);
-        assert_eq!(proof.routing_id, [0x3c; 32]);
+        assert_eq!(proof.nonce, sent.nonce);
+        assert_eq!(proof.routing_id, sent.routing_id);
+        assert_eq!(
+            proof.query_digest,
+            sent.digest(),
+            "the proof binds the page the QUERY asked for"
+        );
+        assert!((before..=after).contains(&proof.observed_at));
         assert_eq!(
             proof.node_id,
             scp_kel::derive_node_id(&binding.node_key).unwrap()
@@ -3051,7 +3085,14 @@ mod tests {
         let node = start_local(Arc::new(InMemoryStorage::new()), NodeBindingSlot::Unbound)
             .await
             .unwrap();
-        let reply = query_complete_of(&node, [0x5e; 32]).await;
+        let sent = scp_protocol::node::SentQuery {
+            nonce: [0x5e; 32],
+            routing_id: [0x3c; 32],
+            since: None,
+            after_blob: None,
+            limit: None,
+        };
+        let reply = query_complete_of(&node, &sent).await;
         assert!(
             matches!(
                 reply,
@@ -3083,7 +3124,7 @@ mod tests {
     /// A binding of another node's key refuses the start.
     #[tokio::test]
     async fn a_binding_for_another_key_refuses_the_start() {
-        let other = signed_binding(&InMemoryStorage::new()).await;
+        let other = signed_binding(&Arc::new(InMemoryStorage::new())).await;
         let refusal = refusal_of(Arc::new(InMemoryStorage::new()), other).await;
         assert_eq!(
             refusal,

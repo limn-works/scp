@@ -203,12 +203,25 @@ SIGN-BINDING:
     Signs the node's possession_sig for a NodeBinding against the node's own storage
     (spec 09 section 9.6.3, step 2) and prints {node_key, possession_sig, url_hash}
     as hex JSON. Stop the node first: the command opens the storage the node holds.
-    It draws the node key when the storage holds none. No network message runs it.
+    Start the node once first: storage that holds no node key exits 1, since only
+    a start draws the key. No network message runs the command.
     --operator <ID>         The operator identifier, in its scp: text form
     --url <URL>             The node's canonical URL (ws or wss, path ending /scp/v1)
     --key-state-head <HEX>  The operator's key-state head, 64 hex characters
     --storage-path <PATH>   The node's storage directory (also SCP_STORAGE_PATH)
 ";
+
+/// The node-binding variables of [`help_text`]'s `ENVIRONMENT VARIABLES`.
+const NODE_BINDING_ENV_HELP: &str = "\
+    SCP_NODE_BINDING            The installed NodeBinding, as its canonical JSON (spec 09
+                                section 9.6.3, step 4). Set with SCP_NODE_URL or not at
+                                all. At start the node refuses a binding of another key,
+                                a possession_sig that fails under its key, or a url_hash
+                                that is not SCP_NODE_URL's, and exits 1. Unset, the node
+                                returns no node_proof. --relay-only and --ephemeral,
+                                which keep no node key, exit 1 on it, as does a value
+                                that is not UTF-8
+    SCP_NODE_URL                The node's canonical URL the binding's url_hash names";
 
 /// The usage text [`print_help`] prints.
 fn help_text() -> String {
@@ -270,13 +283,7 @@ ENVIRONMENT VARIABLES:
                                 NAT probing.
     SCP_NODE_DHT_GATEWAYS       Comma-separated DHT HTTP gateway URLs
     SCP_STORAGE_PATH            SQLite database directory (same as --storage-path)
-    SCP_NODE_BINDING            The installed NodeBinding, as its canonical JSON (spec 09
-                                section 9.6.3, step 4). Set with SCP_NODE_URL or not at
-                                all. At start the node refuses a binding of another key,
-                                a possession_sig that fails under its key, or a url_hash
-                                that is not SCP_NODE_URL's, and exits 1. Unset, the node
-                                returns no node_proof. --relay-only exits 1 on it
-    SCP_NODE_URL                The node's canonical URL the binding's url_hash names
+{node_binding}
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
@@ -314,6 +321,7 @@ ENVIRONMENT VARIABLES:
     RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
         webpush = startup::NODE_WEBPUSH_HELP,
         sign_binding = SIGN_BINDING_HELP,
+        node_binding = NODE_BINDING_ENV_HELP,
     )
 }
 
@@ -323,13 +331,64 @@ ENVIRONMENT VARIABLES:
 
 // `env_or` is provided by `scp_transport::startup::env_or`.
 
+/// The two binding variables as the environment holds them (§9.6.3 step
+/// 4): each is `None` when unset, and a value that is not UTF-8 is an error,
+/// never read as unset. Every run mode reads the variables through this one
+/// function, so no mode drops a binding the operator set.
+#[derive(Debug, PartialEq, Eq)]
+struct NodeBindingEnv {
+    binding: Option<String>,
+    url: Option<String>,
+}
+
+impl NodeBindingEnv {
+    /// Reads `SCP_NODE_BINDING` and `SCP_NODE_URL` through `var`.
+    fn read(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Self, String> {
+        let text = |name: &str| {
+            var(name)
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| format!("{name} is set but is not UTF-8"))
+                })
+                .transpose()
+        };
+        Ok(Self {
+            binding: text("SCP_NODE_BINDING")?,
+            url: text("SCP_NODE_URL")?,
+        })
+    }
+
+    /// Reads the process environment, exiting 1 when a variable is set but
+    /// cannot be read.
+    fn from_env_or_exit() -> Self {
+        Self::read(|name| env::var_os(name)).unwrap_or_else(|e| {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        })
+    }
+
+    /// The refusal a run mode that holds no persistent node key prints when
+    /// either variable is set: `mode` keeps no instance storage a binding's
+    /// key could live in, so starting without the binding would silently
+    /// drop the proofs the operator asked for.
+    fn refusal_without_a_node_key(&self, mode: &str) -> Option<String> {
+        (self.binding.is_some() || self.url.is_some()).then(|| {
+            format!(
+                "ERROR: SCP_NODE_BINDING and SCP_NODE_URL install a node binding, which \
+                 needs the node key a full node keeps in its instance storage. {mode} keeps \
+                 no node key across starts; unset both, or run a persistent full node."
+            )
+        })
+    }
+}
+
 /// The binding the operator installed through `SCP_NODE_BINDING` and
-/// `SCP_NODE_URL` (§9.6.3 step 4), exiting 1 when only one is set or either
-/// does not parse.
+/// `SCP_NODE_URL` (§9.6.3 step 4), exiting 1 when a variable is set but
+/// unreadable, when only one is set, or when either does not parse.
 fn node_binding_or_exit() -> NodeBindingSlot {
-    let binding = env::var("SCP_NODE_BINDING").ok();
-    let url = env::var("SCP_NODE_URL").ok();
-    match scp_node::node_key::binding_slot_from(binding.as_deref(), url.as_deref()) {
+    let env = NodeBindingEnv::from_env_or_exit();
+    match scp_node::node_key::binding_slot_from(env.binding.as_deref(), env.url.as_deref()) {
         Ok(slot) => slot,
         Err(e) => {
             eprintln!("ERROR: SCP_NODE_BINDING / SCP_NODE_URL: {e}");
@@ -338,16 +397,13 @@ fn node_binding_or_exit() -> NodeBindingSlot {
     }
 }
 
-/// The refusal `--relay-only` prints when the operator configured a node
-/// binding: a relay-only node opens no instance storage, so it holds no node
-/// key the binding could bind, and starting without the binding would
-/// silently drop the proofs the operator asked for.
-fn relay_only_binding_refusal(binding_set: bool, url_set: bool) -> Option<&'static str> {
-    (binding_set || url_set).then_some(
-        "ERROR: SCP_NODE_BINDING and SCP_NODE_URL install a node binding, which needs the \
-         node key a full node keeps in its instance storage. --relay-only opens no instance \
-         storage; unset both, or run a full node.",
-    )
+/// Exits 1 when the operator configured a node binding for `mode`, which
+/// holds no persistent node key ([`NodeBindingEnv::refusal_without_a_node_key`]).
+fn refuse_node_binding_or_exit(mode: &str) {
+    if let Some(error) = NodeBindingEnv::from_env_or_exit().refusal_without_a_node_key(mode) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
 /// The arguments of `scp-node sign-binding` (§9.6.3 step 2).
@@ -404,8 +460,9 @@ fn parse_sign_binding(
 }
 
 /// Runs `scp-node sign-binding`: opens the node's own storage, signs
-/// `possession_sig` with the node key it holds (drawing one when it holds
-/// none), prints the result as JSON on stdout, and exits. A local command
+/// `possession_sig` with the node key it holds, prints the result as JSON on
+/// stdout, and exits; storage that holds no key exits 1, because only a
+/// node's start draws one (§17.3 "Node key"). A local command
 /// over the storage directory is the only way the node signs a binding
 /// (§9.6.3 step 2).
 async fn run_sign_binding(args: &[String]) -> ! {
@@ -423,7 +480,7 @@ async fn run_sign_binding(args: &[String]) -> ! {
     let storage = open_sqlite_or_exit(&storage_dir, &storage_key).await;
     drop(storage_key);
     match scp_node::node_key::sign_possession(
-        &storage,
+        &scp_core::store::ProtocolRepository::new(storage),
         &parsed.operator,
         &parsed.url,
         &parsed.key_state_head,
@@ -525,13 +582,7 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
-    if let Some(error) = relay_only_binding_refusal(
-        env::var_os("SCP_NODE_BINDING").is_some(),
-        env::var_os("SCP_NODE_URL").is_some(),
-    ) {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+    refuse_node_binding_or_exit("--relay-only");
     let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
     let mut config = or_exit(startup::relay_config_from_env());
     tracing::info!(
@@ -617,7 +668,9 @@ async fn run_full_node_ephemeral() {
     use scp_platform::testing::InMemoryKeyCustody;
 
     exit_on_ignored_cloud_backend("--ephemeral", EPHEMERAL_STORE);
-    let node_binding = node_binding_or_exit();
+    // An ephemeral node draws a fresh node key in memory on every start, so
+    // no binding the operator signed can name it.
+    refuse_node_binding_or_exit("--ephemeral");
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -676,7 +729,7 @@ async fn run_full_node_ephemeral() {
         // Ephemeral mode offers no push: an enabled relay needs a durable
         // registration store.
         PushSlot::Disabled,
-        node_binding,
+        NodeBindingSlot::Unbound,
     )
     .await;
 }
@@ -2217,13 +2270,51 @@ mod tests {
         Ok(())
     }
 
-    /// `--relay-only` refuses either binding variable and passes neither.
+    /// A mode without a persistent node key refuses either binding variable
+    /// and passes when neither is set.
     #[test]
-    fn relay_only_refuses_either_binding_variable() {
-        assert!(super::relay_only_binding_refusal(false, false).is_none());
+    fn a_mode_without_a_node_key_refuses_either_binding_variable() {
+        let env = |binding: bool, url: bool| super::NodeBindingEnv {
+            binding: binding.then(|| "{}".to_owned()),
+            url: url.then(|| "wss://n.example/scp/v1".to_owned()),
+        };
+        assert!(
+            env(false, false)
+                .refusal_without_a_node_key("--ephemeral")
+                .is_none()
+        );
         for (binding, url) in [(true, false), (false, true), (true, true)] {
-            assert!(super::relay_only_binding_refusal(binding, url).is_some());
+            let refusal = env(binding, url).refusal_without_a_node_key("--ephemeral");
+            assert!(
+                refusal.is_some_and(|r| r.contains("--ephemeral keeps no node key")),
+                "{binding} {url}"
+            );
         }
+    }
+
+    /// A binding variable that is set but not UTF-8 is an error, never read
+    /// as unset, so no mode starts unbound on a value the operator set.
+    #[test]
+    fn an_unreadable_binding_variable_is_an_error_not_absence() {
+        use std::os::unix::ffi::OsStringExt as _;
+        for name in ["SCP_NODE_BINDING", "SCP_NODE_URL"] {
+            let read = super::NodeBindingEnv::read(|var| {
+                (var == name).then(|| std::ffi::OsString::from_vec(vec![0xff, 0xfe]))
+            });
+            assert!(
+                read.as_ref()
+                    .is_err_and(|e| e.contains(name) && e.contains("not UTF-8")),
+                "{name}: {read:?}"
+            );
+        }
+        assert_eq!(
+            super::NodeBindingEnv::read(|var| (var == "SCP_NODE_URL")
+                .then(|| std::ffi::OsString::from("wss://n.example/scp/v1"))),
+            Ok(super::NodeBindingEnv {
+                binding: None,
+                url: Some("wss://n.example/scp/v1".to_owned()),
+            })
+        );
     }
 
     /// The help text documents the local command and both binding variables.

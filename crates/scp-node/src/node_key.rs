@@ -3,17 +3,19 @@
 //! "Node key and binding").
 //!
 //! The node draws its node key on its first start and keeps the 32-byte
-//! scalar in the storage its SCP instance hands it, under
-//! [`NODE_KEY_STORAGE_KEY`], in a [`StoredValue`] version envelope. Every
-//! later start reads the same key, so the `NodeId` an installed binding names
-//! survives a restart. No separate store exists, and nothing here exports
-//! the key: the scalar leaves this module only as the [`NodeSigningKey`],
-//! whose secret is wiped when it drops.
+//! scalar in the storage its SCP instance hands it, under `scp/node-key`,
+//! through [`ProtocolRepository::store_node_key`] and
+//! [`ProtocolRepository::load_node_key`] (`17-persistence-and-storage.md`
+//! §17.3 "Node key", §17.4). Every later start reads the same key, so the
+//! `NodeId` an installed binding names survives a restart. No separate store
+//! exists, and nothing here exports the key: the scalar leaves storage only
+//! as the [`NodeSigningKey`], whose secret is wiped when it drops.
 //!
 //! [`sign_possession`] is the body of the binary's local `sign-binding`
 //! command (§9.6.3 step 2): it signs `possession_sig` for the operator's
 //! choice of operator, canonical URL and key-state head, against the node's
-//! own storage. Nothing that answers a wire message reaches it: the
+//! own storage, and refuses when that storage holds no key, because only a
+//! node's start draws one (§17.3). Nothing that answers a wire message reaches it: the
 //! transports hold only a [`BoundNodeKey`](scp_protocol::node::BoundNodeKey),
 //! which signs node proofs and nothing else.
 //!
@@ -23,87 +25,63 @@
 
 use std::sync::Arc;
 
-use scp_core::store::{CURRENT_STORE_VERSION, StoredValue};
+use scp_core::store::{ProtocolRepository, StoreError};
 use scp_did::{DidError, Identifier, NodeUrl};
-use scp_platform::PlatformError;
 use scp_platform::traits::Storage;
 use scp_protocol::node::{
     NodeBinding, NodeBindingInstallError, NodeListError, NodeSigningKey, NodeSigningKeyError,
     node_url_hash,
 };
 use scp_transport::native::node_proof::NodeProofs;
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::NodeBindingSlot;
 
-/// The storage key of the node key, a top-level singleton beside
-/// `scp/identity` (spec §17.3 key convention).
-pub const NODE_KEY_STORAGE_KEY: &str = "scp/node-key";
-
-/// Why the node key could not be read, created or stored.
+/// Why the node key could not be read, created, stored or used.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeKeyStoreError {
-    /// The instance storage failed to read the key.
+    /// The instance storage failed to read the key, or holds a value that is
+    /// no node key this build reads (§17.3 "Node key").
     #[error("reading the node key from instance storage: {0}")]
-    Read(#[source] PlatformError),
+    Read(#[source] StoreError),
     /// The instance storage failed to write a new key.
     #[error("writing the node key to instance storage: {0}")]
-    Write(#[source] PlatformError),
-    /// The stored bytes are not a node-key envelope.
-    #[error("the stored node key is not a node-key envelope")]
-    Malformed,
-    /// The stored envelope is newer than this binary reads.
-    #[error("the stored node key has version {0}, newer than this binary reads")]
-    UnsupportedVersion(u16),
-    /// The stored scalar is no P-256 key, or a fresh key names no `NodeId`.
+    Write(#[source] StoreError),
+    /// The instance storage holds no node key, and the operation only signs
+    /// with one: only a node's start draws the key (§17.3 "Node key").
+    #[error(
+        "the instance storage holds no node key; start the node once on this storage so it \
+         draws its key, then sign the binding"
+    )]
+    NoKey,
+    /// A fresh key names no `NodeId`, or signing failed.
     #[error("the node key: {0}")]
     Key(#[from] NodeSigningKeyError),
-    /// A new key's envelope could not be encoded.
-    #[error("encoding the node key envelope")]
-    Encode,
 }
 
-/// Reads the node key from `storage`, or draws and stores one when
-/// `storage` holds none (§9.6.3 step 1).
+/// Reads the node key from `repository`, or draws and stores one when it
+/// holds none (§9.6.3 step 1). Only a node's start calls this.
 ///
 /// # Errors
 ///
-/// [`NodeKeyStoreError`]: a storage failure, a stored value that is not a
-/// node key, or a version this binary does not read. A stored key that
-/// fails to read is never replaced by a fresh one, because a new key would
-/// silently orphan the binding the operator installed for the old one.
-pub async fn load_or_generate<S: Storage + ?Sized>(
-    storage: &S,
+/// [`NodeKeyStoreError::Read`] for a storage failure or a stored value that
+/// is not a node key this build reads, [`NodeKeyStoreError::Write`] when a
+/// new key cannot be stored. A stored key that fails to read is never
+/// replaced by a fresh one, because a new key would silently orphan the
+/// binding the operator installed for the old one.
+pub async fn load_or_generate<S: Storage>(
+    repository: &ProtocolRepository<S>,
 ) -> Result<NodeSigningKey, NodeKeyStoreError> {
-    if let Some(bytes) = storage
-        .retrieve(NODE_KEY_STORAGE_KEY)
+    if let Some(key) = repository
+        .load_node_key()
         .await
         .map_err(NodeKeyStoreError::Read)?
     {
-        let bytes = Zeroizing::new(bytes);
-        let mut envelope: StoredValue<[u8; 32]> =
-            rmp_serde::from_slice(&bytes).map_err(|_| NodeKeyStoreError::Malformed)?;
-        let key = if envelope.version > CURRENT_STORE_VERSION {
-            Err(NodeKeyStoreError::UnsupportedVersion(envelope.version))
-        } else {
-            NodeSigningKey::from_scalar_bytes(&envelope.data).map_err(NodeKeyStoreError::Key)
-        };
-        envelope.data.zeroize();
-        let key = key?;
         tracing::info!(node_id = %key.node_id(), "loaded the node key from instance storage");
         return Ok(key);
     }
     let key = NodeSigningKey::generate(&mut rand::rngs::OsRng)?;
-    let envelope = StoredValue {
-        version: CURRENT_STORE_VERSION,
-        data: *key.to_scalar_bytes(),
-    };
-    let encoded = rmp_serde::to_vec_named(&envelope).map(Zeroizing::new);
-    let mut envelope = envelope;
-    envelope.data.zeroize();
-    let encoded = encoded.map_err(|_| NodeKeyStoreError::Encode)?;
-    storage
-        .store(NODE_KEY_STORAGE_KEY, &encoded)
+    repository
+        .store_node_key(&key)
         .await
         .map_err(NodeKeyStoreError::Write)?;
     tracing::info!(node_id = %key.node_id(), "drew a new node key into instance storage");
@@ -220,26 +198,33 @@ impl PossessionSignature {
     }
 }
 
-/// Signs `possession_sig` with the node key in `storage` (§9.6.3 step 2).
+/// Signs `possession_sig` with the node key `repository` holds (§9.6.3
+/// step 2).
 ///
-/// The signature is over P for `operator`, `url` and `key_state_head`, and
-/// the key is drawn first when `storage` holds none. P carries the node's
-/// own key, so no caller can make the node sign a binding of another key.
+/// The signature is over P for `operator`, `url` and `key_state_head`. P
+/// carries the node's own key, so no caller can make the node sign a binding
+/// of another key. It never draws a key: a key drawn here would be a key no
+/// node has started with (§17.3 "Node key").
 ///
 /// Only the binary's local `sign-binding` command calls this; no transport
 /// holds the storage or the unbound key it reads.
 ///
 /// # Errors
 ///
-/// Every error of [`load_or_generate`], and [`NodeKeyStoreError::Key`] when
-/// signing fails.
-pub async fn sign_possession<S: Storage + ?Sized>(
-    storage: &S,
+/// [`NodeKeyStoreError::NoKey`] when `repository` holds no node key,
+/// [`NodeKeyStoreError::Read`] when the stored key cannot be read, and
+/// [`NodeKeyStoreError::Key`] when signing fails.
+pub async fn sign_possession<S: Storage>(
+    repository: &ProtocolRepository<S>,
     operator: &Identifier,
     url: &NodeUrl,
     key_state_head: &[u8; 32],
 ) -> Result<PossessionSignature, NodeKeyStoreError> {
-    let key = load_or_generate(storage).await?;
+    let key = repository
+        .load_node_key()
+        .await
+        .map_err(NodeKeyStoreError::Read)?
+        .ok_or(NodeKeyStoreError::NoKey)?;
     let url_hash = node_url_hash(url);
     let possession_sig = key.sign_possession(operator, &url_hash, key_state_head)?;
     Ok(PossessionSignature {
@@ -251,6 +236,7 @@ pub async fn sign_possession<S: Storage + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use scp_core::store::node_key::NODE_KEY_KEY;
     use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
@@ -276,11 +262,15 @@ mod tests {
         }
     }
 
+    fn repository() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
+    }
+
     #[tokio::test]
     async fn the_stored_key_is_the_key_every_later_load_reads() -> TestResult {
-        let storage = InMemoryStorage::new();
-        let first = load_or_generate(&storage).await?;
-        let second = load_or_generate(&storage).await?;
+        let repository = repository();
+        let first = load_or_generate(&repository).await?;
+        let second = load_or_generate(&repository).await?;
         assert_eq!(first.node_key(), second.node_key());
         assert_eq!(first.node_id(), second.node_id());
         Ok(())
@@ -288,51 +278,44 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_value_that_is_no_key_refuses_and_stays() -> TestResult {
-        let storage = InMemoryStorage::new();
-        storage.store(NODE_KEY_STORAGE_KEY, b"not a key").await?;
+        let repository = repository();
+        repository
+            .storage()
+            .store(NODE_KEY_KEY, b"not a key")
+            .await?;
         assert!(matches!(
-            load_or_generate(&storage).await,
-            Err(NodeKeyStoreError::Malformed)
+            load_or_generate(&repository).await,
+            Err(NodeKeyStoreError::Read(StoreError::DeserializationFailed(
+                _
+            )))
         ));
         assert_eq!(
-            storage.retrieve(NODE_KEY_STORAGE_KEY).await?.as_deref(),
+            repository
+                .storage()
+                .retrieve(NODE_KEY_KEY)
+                .await?
+                .as_deref(),
             Some(b"not a key".as_slice()),
             "a key that fails to read is never replaced"
         );
         Ok(())
     }
 
+    /// `sign-binding` signs only with a key a start drew; on storage that
+    /// holds none it refuses and draws nothing (§17.3 "Node key").
     #[tokio::test]
-    async fn a_zero_scalar_is_no_key() -> TestResult {
-        let storage = InMemoryStorage::new();
-        let envelope = StoredValue {
-            version: CURRENT_STORE_VERSION,
-            data: [0u8; 32],
-        };
-        storage
-            .store(NODE_KEY_STORAGE_KEY, &rmp_serde::to_vec_named(&envelope)?)
-            .await?;
-        assert!(matches!(
-            load_or_generate(&storage).await,
-            Err(NodeKeyStoreError::Key(NodeSigningKeyError::Scalar(_)))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_newer_envelope_is_refused() -> TestResult {
-        let storage = InMemoryStorage::new();
-        let envelope = StoredValue {
-            version: CURRENT_STORE_VERSION + 1,
-            data: [7u8; 32],
-        };
-        storage
-            .store(NODE_KEY_STORAGE_KEY, &rmp_serde::to_vec_named(&envelope)?)
-            .await?;
-        assert!(matches!(
-            load_or_generate(&storage).await,
-            Err(NodeKeyStoreError::UnsupportedVersion(v)) if v == CURRENT_STORE_VERSION + 1
-        ));
+    async fn signing_a_binding_without_a_held_key_refuses_and_draws_none() -> TestResult {
+        let repository = repository();
+        let refusal =
+            sign_possession(&repository, &operator(), &NodeUrl::new(URL)?, &[0x0b; 32]).await;
+        assert!(
+            matches!(refusal, Err(NodeKeyStoreError::NoKey)),
+            "{refusal:?}"
+        );
+        assert!(
+            repository.load_node_key().await?.is_none(),
+            "a refused signing draws no key"
+        );
         Ok(())
     }
 
@@ -340,12 +323,14 @@ mod tests {
     /// key in the same storage.
     #[tokio::test]
     async fn the_possession_signature_installs_on_the_same_storage() -> TestResult {
-        let storage = InMemoryStorage::new();
+        let repository = repository();
+        let key = load_or_generate(&repository).await?;
         let url = NodeUrl::new(URL)?;
-        let grant = sign_possession(&storage, &operator(), &url, &[0x0b; 32]).await?;
+        let grant = sign_possession(&repository, &operator(), &url, &[0x0b; 32]).await?;
         assert_eq!(grant.url_hash, node_url_hash(&url));
+        assert_eq!(&grant.node_key, key.node_key());
         let proofs = install(
-            load_or_generate(&storage).await?,
+            load_or_generate(&repository).await?,
             NodeBindingSlot::Installed {
                 binding: Box::new(binding_from(&grant)),
                 url,
@@ -381,10 +366,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_binding_and_its_url_read_back() -> TestResult {
-        let storage = InMemoryStorage::new();
+        let repository = repository();
+        load_or_generate(&repository).await?;
         let url = NodeUrl::new(URL)?;
         let binding =
-            binding_from(&sign_possession(&storage, &operator(), &url, &[0x0b; 32]).await?);
+            binding_from(&sign_possession(&repository, &operator(), &url, &[0x0b; 32]).await?);
         let json = String::from_utf8(binding.to_canonical_json()?)?;
         assert_eq!(
             binding_slot_from(Some(&json), Some(URL))?,

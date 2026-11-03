@@ -19,8 +19,8 @@ name = "scp-node"
 path = "src/main.rs"
 required-features = ["node-bin"]
 
-# Both tests spawn the `scp-node` binary through `CARGO_BIN_EXE_scp-node`, which
-# exists only when the binary builds.
+# These tests spawn the `scp-node` binary through `CARGO_BIN_EXE_scp-node`,
+# which exists only when the binary builds.
 [[test]]
 name = "run_mode_selection"
 path = "tests/run_mode_selection.rs"
@@ -29,6 +29,11 @@ required-features = ["node-bin"]
 [[test]]
 name = "storage_backend_selection"
 path = "tests/storage_backend_selection.rs"
+required-features = ["node-bin"]
+
+[[test]]
+name = "sign_binding"
+path = "tests/sign_binding.rs"
 required-features = ["node-bin"]
 
 [dependencies]

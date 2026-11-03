@@ -19,10 +19,12 @@ use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
 use scp_node::{
-    ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, NodeError, PushSlot, Reach,
+    ApplicationNode, DhtMode, IdentitySource, Node, NodeBindingSlot, NodeConfig, NodeError,
+    PushSlot, Reach,
 };
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::traits::Storage;
 
 type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
@@ -118,6 +120,16 @@ pub async fn build_tls_node() -> ApplicationNode<InMemoryStorage> {
 
 /// As [`build_tls_node`], with the relay's push role taken from `push`.
 pub async fn build_tls_node_with_push(push: PushSlot) -> ApplicationNode<InMemoryStorage> {
+    build_tls_node_with(push, InMemoryStorage::new(), NodeBindingSlot::Unbound).await
+}
+
+/// As [`build_tls_node`], over `storage`, with the relay's push role taken
+/// from `push` and the node binding `node_binding` installed at start.
+pub async fn build_tls_node_with<S: Storage + 'static>(
+    push: PushSlot,
+    storage: S,
+    node_binding: NodeBindingSlot,
+) -> ApplicationNode<S> {
     let custody = Arc::new(InMemoryKeyCustody::new());
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
@@ -135,6 +147,7 @@ pub async fn build_tls_node_with_push(push: PushSlot) -> ApplicationNode<InMemor
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         dht: DhtMode::Production,
         push,
+        node_binding,
         ..NodeConfig::defaults(
             Reach::Domain {
                 domain: "localhost".to_owned(),
@@ -143,7 +156,7 @@ pub async fn build_tls_node_with_push(push: PushSlot) -> ApplicationNode<InMemor
                 custody,
                 did_method,
             },
-            InMemoryStorage::new(),
+            storage,
             BlobStorageBackend::in_memory(),
         )
     })
@@ -172,7 +185,7 @@ impl Serving {
 
 /// Binds `node`, asserts its QUIC listener is running, and serves it in the
 /// background until [`Serving::stop`].
-pub async fn serve_in_background(node: ApplicationNode<InMemoryStorage>) -> Serving {
+pub async fn serve_in_background<S: Storage + 'static>(node: ApplicationNode<S>) -> Serving {
     let bound = node
         .bind()
         .await

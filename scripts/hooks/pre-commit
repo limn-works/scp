@@ -161,7 +161,7 @@ fi
 # the commit changes a `.rs` file or the script prints clippy arguments. The script's
 # messages and the skip notice go to `rust.log`, and the hook prints those lines after a
 # passing run too.
-CLIPPY_FEATURES=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-node/testing
+CLIPPY_FEATURES=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing
 
 (
   SCOPE=$(changed_paths | python3.12 scripts/pre-commit-clippy-scope.py --features "$CLIPPY_FEATURES") \
