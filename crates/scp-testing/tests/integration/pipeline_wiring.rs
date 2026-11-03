@@ -29,19 +29,19 @@
 // or in `<domain>_logic.rs` (the free-function logic that used to share
 // a file with `impl ContextManager` blocks).
 const MANAGER_SRC: &str = concat!(
-    include_str!("../../../../crates/scp-runtime/src/context/economy_logic.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_logic.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/governance_logic.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/outlets_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-economy/src/logic.rs"),
+    include_str!("../../../../crates/scp-runtime-lifecycle/src/logic.rs"),
+    include_str!("../../../../crates/scp-runtime-governance/src/logic.rs"),
+    include_str!("../../../../crates/scp-runtime-messaging/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-lifecycle/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-governance/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-standing/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-outlets/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-broadcast/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-queries/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-economy/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-trust-recovery/src/helpers.rs"),
+    include_str!("../../../../crates/scp-runtime-ttl-close/src/helpers.rs"),
     include_str!("../../../../crates/scp-runtime-core/src/context/snapshot.rs"),
     include_str!("../../../../crates/scp-runtime-core/src/context/push_routes.rs"),
     include_str!("../../../../crates/scp-runtime-core/src/context/shared/messaging.rs"),
@@ -204,7 +204,7 @@ const PYO3_PUSH_SRC: &str = include_str!("../../../../crates/scp-ffi/src/push.rs
 // the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
 // crate boundary (ADR-029).
 const HANDLERS_MESSAGING_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
+    include_str!("../../../../crates/scp-runtime-messaging/src/handler.rs");
 
 // Actor broadcast-handler source — owns `handle_subscribe_broadcast`, the
 // actor-turn body that builds a REAL UCAN `ValidationContext` from actor-owned
@@ -216,7 +216,7 @@ const HANDLERS_MESSAGING_SRC: &str =
 // `None` (which made gated subscribe unreachable — every SDK gated-subscribe
 // died at the protocol's missing-UCAN reject before validation ran).
 const HANDLERS_BROADCAST_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/broadcast.rs");
+    include_str!("../../../../crates/scp-runtime-broadcast/src/handler.rs");
 
 // ContextActor run-loop source — owns `run()`, `reconcile_timers`,
 // `on_ttl_tick`, `on_governance_timeout` (the ACTOR-OWNED timer arms,
@@ -233,12 +233,10 @@ const PSEUDONYM_ROTATION_SRC: &str =
 
 // Push handler source — owns `handlers::push::dispatch`, the mailbox step of
 // the PUSH-013 push routing-ID query (§10.7.1).
-const HANDLERS_PUSH_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+const HANDLERS_PUSH_SRC: &str = include_str!("../../../../crates/scp-runtime-push/src/handler.rs");
 // Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
 // target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
-const PUSH_HELPERS_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/push_helpers.rs");
+const PUSH_HELPERS_SRC: &str = include_str!("../../../../crates/scp-runtime-push/src/helpers.rs");
 // Push registrar source — owns `PushRegistrar::register`, which signs one
 // `PushRegistration` per relay and publishes it at that relay's push routing ID
 // (PUSH-014, §10.7.1). Pinned by `push_registrar_register_reaches_relay_publish`.
@@ -252,7 +250,7 @@ const PUSH_PUBLISHER_SRC: &str =
 // arm that answers through `queries_helpers::local_routing_ids` (spec 09
 // §9.10.4.1). Pinned by `local_pseudonym_rotation_reaches_its_helpers`.
 const HANDLERS_QUERIES_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/queries.rs");
+    include_str!("../../../../crates/scp-runtime-queries/src/handler.rs");
 
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
@@ -1160,7 +1158,7 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
 // call it in `lifecycle_helpers`; a Welcome joiner calls it in
 // `Supervisor::build_welcome_joiner_state`, after bundle verification.
 const LIFECYCLE_HELPERS_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+    include_str!("../../../../crates/scp-runtime-lifecycle/src/helpers.rs");
 // ADR-070: `normalize_relay_urls`, the `FirstStateRollback` guard and the
 // first-state writes read and write only core state, so they live in core.
 const LIFECYCLE_CORE_SRC: &str =
@@ -2695,7 +2693,7 @@ fn key_request_answer_is_queued_through_the_superseding_enqueue() {
 #[test]
 fn governance_timer_retries_sender_key_distributions() {
     const HANDLERS_GOVERNANCE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/handler.rs");
     let body = extract_fn_body(HANDLERS_GOVERNANCE_SRC, "evaluate_governance_timeouts")
         .expect("evaluate_governance_timeouts body");
     assert!(
@@ -2726,7 +2724,7 @@ fn send_queued_sender_keys_replies_with_the_report() {
 #[test]
 fn join_and_add_share_the_add_then_distribute_step() {
     const GOVERNANCE_HELPERS_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/helpers.rs");
     for (src, caller) in [
         (MANAGER_SRC, "join_context"),
         (GOVERNANCE_HELPERS_SRC, "execute_add_member"),
@@ -3087,7 +3085,7 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
         fn_body_contains(
             HANDLERS_MESSAGING_SRC,
             "handle_rotate_pseudonym",
-            "messaging_helpers::rotate_pseudonym("
+            "helpers::rotate_pseudonym("
         ),
         "handle_rotate_pseudonym must call messaging_helpers::rotate_pseudonym"
     );
@@ -3118,7 +3116,7 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
         .expect("the queries handler dispatch exists");
     assert!(
         queries.contains("QueriesCommand::LocalRoutingIds")
-            && queries.contains("queries_helpers::local_routing_ids("),
+            && queries.contains("helpers::local_routing_ids("),
         "the queries dispatch must answer LocalRoutingIds through \
          queries_helpers::local_routing_ids"
     );
@@ -3290,7 +3288,7 @@ fn leave_context_calls_rotate_sender_key() {
 #[test]
 fn leave_and_write_revoke_rotate_through_the_reporting_helper() {
     const HANDLERS_GOVERNANCE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/handler.rs");
     let helper = extract_fn_body(MANAGER_SRC, "rotate_sender_key_and_distribute")
         .expect("rotate_sender_key_and_distribute exists");
     for needle in [
@@ -4855,11 +4853,7 @@ fn push_wake_targets_reach_push_helpers() {
         );
     }
     assert!(
-        fn_body_contains(
-            HANDLERS_PUSH_SRC,
-            "dispatch",
-            "push_helpers::wake_target(state)"
-        ),
+        fn_body_contains(HANDLERS_PUSH_SRC, "dispatch", "helpers::wake_target(state)"),
         "handlers::push::dispatch must answer PushCommand::WakeTarget from push_helpers::wake_target"
     );
     // §9.10.4.1 "Subscription" and ADR-029 §2: a push wake pulls the shared
@@ -8775,9 +8769,9 @@ fn seal_builds_no_outer_envelope() {
 #[test]
 fn commit_publishes_go_through_publish_commit() {
     const GOVERNANCE_HELPERS_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/helpers.rs");
     const HANDLERS_GOVERNANCE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/handler.rs");
     assert!(
         fn_body_contains(
             GOVERNANCE_HELPERS_SRC,
@@ -8801,7 +8795,7 @@ fn commit_publishes_go_through_publish_commit() {
 #[test]
 fn the_phase_5_update_publishes_through_try_broadcast_commit() {
     const HANDLERS_LIFECYCLE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+        include_str!("../../../../crates/scp-runtime-lifecycle/src/handler.rs");
     let body = extract_fn_body(HANDLERS_LIFECYCLE_SRC, "handle_issue_mls_update_actor")
         .expect("handlers/lifecycle.rs must define handle_issue_mls_update_actor");
     let broadcast = body
@@ -8818,13 +8812,13 @@ fn the_phase_5_update_publishes_through_try_broadcast_commit() {
 #[test]
 fn no_commit_producer_sends_commit_bytes_directly() {
     const GOVERNANCE_HELPERS_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+        include_str!("../../../../crates/scp-runtime-governance/src/helpers.rs");
     const LIFECYCLE_HELPERS_SRC_FULL: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+        include_str!("../../../../crates/scp-runtime-lifecycle/src/helpers.rs");
     const TRUST_RECOVERY_HELPERS_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs");
+        include_str!("../../../../crates/scp-runtime-trust-recovery/src/helpers.rs");
     const HANDLERS_LIFECYCLE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+        include_str!("../../../../crates/scp-runtime-lifecycle/src/handler.rs");
     let publish_commit = extract_fn_body(GOVERNANCE_HELPERS_SRC, "publish_commit")
         .expect("governance_helpers.rs must define publish_commit");
     let governance = strip_non_code(GOVERNANCE_HELPERS_SRC);
@@ -9747,7 +9741,7 @@ fn push_registrar_register_reaches_relay_publish() {
 #[test]
 fn shutdown_releases_the_event_log_and_never_destroys_it() {
     const HANDLERS_LIFECYCLE_SRC: &str =
-        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+        include_str!("../../../../crates/scp-runtime-lifecycle/src/handler.rs");
     let code = strip_non_code(HANDLERS_LIFECYCLE_SRC);
     let body = extract_fn_body(&code, "handle_shutdown_self_actor")
         .expect("handlers/lifecycle.rs must define handle_shutdown_self_actor");

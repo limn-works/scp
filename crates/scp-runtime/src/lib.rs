@@ -16,31 +16,28 @@ use std::sync::Arc;
 
 use scp_runtime_core::context::domains::DomainHandlers;
 
-mod context;
-
 /// Builds the 13 domain handlers every
 /// [`Supervisor`](scp_runtime_core::context::supervisor::Supervisor) takes as its
 /// last constructor argument (ADR-070 §3).
 ///
 /// This is the one production constructor of [`DomainHandlers`]: each field
-/// holds the field-less struct that forwards to its domain's functions.
+/// holds the field-less struct of its domain crate.
 #[must_use]
 pub fn domain_handlers() -> DomainHandlers {
-    use context::actor::handlers;
     DomainHandlers {
-        messaging: Arc::new(handlers::messaging::Messaging),
-        lifecycle: Arc::new(handlers::lifecycle::Lifecycle),
-        governance: Arc::new(handlers::governance::Governance),
-        broadcast: Arc::new(handlers::broadcast::Broadcast),
-        economy: Arc::new(handlers::economy::Economy),
-        trust_recovery: Arc::new(handlers::trust_recovery::TrustRecovery),
-        standing: Arc::new(handlers::standing::Standing),
-        ttl_close: Arc::new(handlers::ttl_close::TtlClose),
-        outlets: Arc::new(handlers::outlets::Outlets),
-        push: Arc::new(handlers::push::Push),
-        queries: Arc::new(handlers::queries::Queries),
-        saga: Arc::new(handlers::saga::Saga),
-        lifecycle_control: Arc::new(handlers::lifecycle_control::LifecycleControl),
+        messaging: Arc::new(scp_runtime_messaging::Messaging),
+        lifecycle: Arc::new(scp_runtime_lifecycle::Lifecycle),
+        governance: Arc::new(scp_runtime_governance::Governance),
+        broadcast: Arc::new(scp_runtime_broadcast::Broadcast),
+        economy: Arc::new(scp_runtime_economy::Economy),
+        trust_recovery: Arc::new(scp_runtime_trust_recovery::TrustRecovery),
+        standing: Arc::new(scp_runtime_standing::Standing),
+        ttl_close: Arc::new(scp_runtime_ttl_close::TtlClose),
+        outlets: Arc::new(scp_runtime_outlets::Outlets),
+        push: Arc::new(scp_runtime_push::Push),
+        queries: Arc::new(scp_runtime_queries::Queries),
+        saga: Arc::new(scp_runtime_saga::Saga),
+        lifecycle_control: Arc::new(scp_runtime_lifecycle_control::LifecycleControl),
     }
 }
 
@@ -75,23 +72,11 @@ pub fn test_supervisor(
     event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider>,
     key_resolver: scp_protocol::context::governance::KeyResolver,
 ) -> Arc<scp_runtime_core::context::supervisor::Supervisor> {
-    let mls_storage: Arc<
-        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
-    > = Arc::new(
-        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-        ),
-    );
-    scp_runtime_core::context::supervisor::Supervisor::with_providers(
+    scp_runtime_core::context::supervisor::test_support::test_supervisor_with_domains(
         crypto,
         transport,
         event_log,
         key_resolver,
-        None,
-        None,
-        None,
-        None,
-        mls_storage,
         domain_handlers(),
     )
 }

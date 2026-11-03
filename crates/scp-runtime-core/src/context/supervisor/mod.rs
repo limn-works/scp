@@ -131,6 +131,13 @@ pub mod transport_slot;
 #[cfg(any(test, feature = "testing"))]
 pub mod faulty_storage;
 
+/// Test Supervisors and fixtures for the runtime crates' tests (`testing` only).
+///
+/// Each caller passes the [`DomainHandlers`](crate::context::domains::DomainHandlers)
+/// it builds, since core names no domain crate (ADR-070 §3).
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
+
 #[cfg(any(test, feature = "testing"))]
 mod two_instance_seams;
 /// The capture behind the two-instance receive seams (`testing` only).
