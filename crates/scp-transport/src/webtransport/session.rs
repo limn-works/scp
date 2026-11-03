@@ -715,11 +715,12 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         };
 
         // The proof covers the blobs in the order they are returned below.
+        let proof_query =
+            node_proof::proof_query(proof_nonce, routing_id, since, after_blob, limit);
         let complete = node_proof::query_complete(
             &self.config.node_proofs,
             ref_id,
-            proof_nonce,
-            routing_id,
+            proof_query.as_ref(),
             &blobs,
         );
         let mut messages = Vec::with_capacity(blobs.len() + 1);
@@ -1396,13 +1397,27 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
         );
         handler.mark_active();
+        let before = crate::native::node_proof::tests::now_secs();
         let messages = handler
             .handle_query_inner(None, routing_id, None, None, None, Some([0x5a; 32]))
             .await
             .unwrap();
+        let after = crate::native::node_proof::tests::now_secs();
         let proof =
             crate::native::node_proof::tests::proof_of(&key, messages.last().unwrap()).unwrap();
         assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(
+            proof.query_digest,
+            scp_protocol::node::SentQuery {
+                nonce: [0x5a; 32],
+                routing_id,
+                since: None,
+                after_blob: None,
+                limit: None,
+            }
+            .digest()
+        );
+        assert!((before..=after).contains(&proof.observed_at));
         assert_eq!(
             proof.value_digest,
             scp_protocol::node::response_value_digest(&[b"blob-data".as_slice()]).unwrap()

@@ -19,7 +19,7 @@ use scp_kel::{NodeKeyError, derive_node_id};
 use zeroize::Zeroizing;
 
 use super::binding::{NODE_KEY_LEN, NodeBinding, node_url_hash};
-use super::proof::{NodeProof, NodeProofError};
+use super::proof::{NodeProof, NodeProofError, SentQuery};
 
 /// Why a node key cannot be loaded or cannot sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -205,22 +205,32 @@ impl BoundNodeKey {
         self.key.node_id()
     }
 
-    /// The node proof over one QUERY response (§9.7.4.2): `nonce` echoed
-    /// from the QUERY, the `routing_id` served, `value_digest` from
-    /// [`super::response_value_digest`] over the blobs returned, and the
-    /// node's clock `observed_at` in seconds.
+    /// The node proof over one QUERY response (§9.7.4.2): `query` the
+    /// QUERY as received, whose nonce the proof echoes and whose fields it
+    /// digests, `value_digest` from [`super::response_value_digest`] over
+    /// the blobs returned, and the node's clock `observed_at` in seconds.
+    ///
+    /// This is the only signer of a node proof outside this crate:
+    ///
+    /// ```
+    /// fn prove(
+    ///     bound: &scp_protocol::node::BoundNodeKey,
+    ///     query: &scp_protocol::node::SentQuery,
+    /// ) {
+    ///     let _ = bound.prove(query, [0; 32], 0);
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
     /// [`NodeProofError::Sign`] when signing fails.
     pub fn prove(
         &self,
-        nonce: [u8; 32],
-        routing_id: [u8; 32],
+        query: &SentQuery,
         value_digest: [u8; 32],
         observed_at: u64,
     ) -> Result<NodeProof, NodeProofError> {
-        NodeProof::sign(&self.key, nonce, routing_id, value_digest, observed_at)
+        NodeProof::sign(&self.key, query, value_digest, observed_at)
     }
 }
 
@@ -259,32 +269,58 @@ mod tests {
         Ok(binding)
     }
 
+    fn query() -> SentQuery {
+        SentQuery {
+            nonce: [9; 32],
+            routing_id: [3; 32],
+            since: None,
+            after_blob: None,
+            limit: Some(10),
+        }
+    }
+
     /// The possession signature the local command returns makes a binding a
-    /// party verifies, and the proof the bound key signs verifies under it.
+    /// party verifies, and the proof the bound key signs verifies under it
+    /// against the QUERY it answered.
     #[test]
     fn the_proof_verifies_under_the_binding_key() -> TestResult {
         let (node, _) = own(7)?;
         let binding = operator_binding(&node, &url()?)?;
         let verified = VerifiedNodeBinding::verify(binding.clone(), &operator()?.resolved()?)?;
         let bound = node.install(binding, &url()?)?;
-        let digest = response_value_digest(&[b"a".as_slice()])?;
-        let proof = bound.prove([9; 32], [3; 32], digest, 1_700_000_000)?;
-        assert_eq!(proof.verify_signature(&verified), Ok(()));
+        let blobs = [b"a".as_slice()];
+        let digest = response_value_digest(&blobs)?;
+        let proof = bound.prove(&query(), digest, 1_700_000_000)?;
+        assert_eq!(
+            proof.verify(&verified, &query(), &blobs, 1_700_000_000, 0),
+            Ok(())
+        );
         assert_eq!(&proof.node_id, verified.node_id());
         Ok(())
     }
 
-    /// A proof read back with any nonce other than the one it signed fails.
+    /// A proof whose echoed nonce is altered fails the nonce check, and a
+    /// proof whose nonce was altered and re-matched fails the signature.
     #[test]
     fn a_wrong_nonce_fails() -> TestResult {
         let (node, _) = own(7)?;
         let binding = operator_binding(&node, &url()?)?;
         let verified = VerifiedNodeBinding::verify(binding.clone(), &operator()?.resolved()?)?;
         let bound = node.install(binding, &url()?)?;
-        let mut proof = bound.prove([9; 32], [3; 32], [4; 32], 5)?;
+        let blobs: [&[u8]; 0] = [];
+        let mut proof = bound.prove(&query(), response_value_digest(&blobs)?, 5)?;
         proof.nonce = [8; 32];
         assert_eq!(
-            proof.verify_signature(&verified),
+            proof.verify(&verified, &query(), &blobs, 5, 0),
+            Err(NodeProofError::NonceMismatch)
+        );
+        let resent = SentQuery {
+            nonce: [8; 32],
+            ..query()
+        };
+        proof.query_digest = resent.digest();
+        assert_eq!(
+            proof.verify(&verified, &resent, &blobs, 5, 0),
             Err(NodeProofError::Signature(P256Error::VerificationFailed))
         );
         Ok(())

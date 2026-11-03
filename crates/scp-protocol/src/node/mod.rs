@@ -61,8 +61,8 @@ pub use list::{
 };
 pub use own_key::{BoundNodeKey, NodeBindingInstallError, NodeSigningKey, NodeSigningKeyError};
 pub use proof::{
-    NODE_PROOF_FIELDS_LEN, NODE_PROOF_LEN, NODE_PROOF_SEPARATOR, NodeProof, NodeProofError,
-    response_value_digest,
+    NODE_PROOF_FIELDS_LEN, NODE_PROOF_LEN, NODE_PROOF_SEPARATOR, NODE_QUERY_SEPARATOR, NodeProof,
+    NodeProofError, SentQuery, response_value_digest,
 };
 pub use service::{
     IDENTITY_PRIVATE_STATE_TYPE, SERVICE_RECORD_FRAME_VERSION, SERVICE_RECORD_SEPARATOR,

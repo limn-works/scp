@@ -1562,8 +1562,9 @@ async fn handle_query(
     };
 
     // The proof covers the blobs in the order they are sent below.
+    let proof_query = node_proof::proof_query(proof_nonce, routing_id, since, after_blob, limit);
     let complete =
-        node_proof::query_complete(&config.node_proofs, ref_id, proof_nonce, routing_id, &blobs);
+        node_proof::query_complete(&config.node_proofs, ref_id, proof_query.as_ref(), &blobs);
     for stored in blobs {
         let _ = tx.send(public_records::blob_message(stored)).await;
     }
@@ -2190,8 +2191,9 @@ mod tests {
             routing_id,
             since: None,
             after_blob: None,
-            limit: None,
+            limit: Some(5),
         };
+        let before = crate::native::node_proof::tests::now_secs();
         send_msg(&mut sink, &query).await;
         let mut blobs = Vec::new();
         for _ in 0..2 {
@@ -2201,9 +2203,22 @@ mod tests {
             blobs.push(blob);
         }
         let event = recv_msg(&mut stream).await;
+        let after = crate::native::node_proof::tests::now_secs();
         let proof = crate::native::node_proof::tests::proof_of(&key, &event).unwrap();
         assert_eq!(proof.nonce, [0x5a; 32]);
         assert_eq!(proof.routing_id, routing_id);
+        assert_eq!(
+            proof.query_digest,
+            scp_protocol::node::SentQuery {
+                nonce: [0x5a; 32],
+                routing_id,
+                since: None,
+                after_blob: None,
+                limit: Some(5),
+            }
+            .digest()
+        );
+        assert!((before..=after).contains(&proof.observed_at));
         assert_eq!(
             proof.value_digest,
             scp_protocol::node::response_value_digest(&blobs).unwrap()

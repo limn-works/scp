@@ -1127,8 +1127,9 @@ async fn handle_query<S: BlobStorage>(
     };
 
     // The proof covers the blobs in the order they are written below.
+    let proof_query = node_proof::proof_query(proof_nonce, routing_id, since, after_blob, limit);
     let complete =
-        node_proof::query_complete(&config.node_proofs, ref_id, proof_nonce, routing_id, &blobs);
+        node_proof::query_complete(&config.node_proofs, ref_id, proof_query.as_ref(), &blobs);
     for stored in blobs {
         write_relay_message(&mut send, &public_records::blob_message(stored)).await?;
     }
@@ -1452,12 +1453,26 @@ mod tests {
             routing_id,
             since: None,
             after_blob: None,
-            limit: None,
+            limit: Some(5),
         };
+        let before = crate::native::node_proof::tests::now_secs();
         let responses = send_and_recv(&connection, &query).await;
+        let after = crate::native::node_proof::tests::now_secs();
         let proof =
             crate::native::node_proof::tests::proof_of(&key, responses.last().unwrap()).unwrap();
         assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(
+            proof.query_digest,
+            scp_protocol::node::SentQuery {
+                nonce: [0x5a; 32],
+                routing_id,
+                since: None,
+                after_blob: None,
+                limit: Some(5),
+            }
+            .digest()
+        );
+        assert!((before..=after).contains(&proof.observed_at));
         assert_eq!(
             proof.value_digest,
             scp_protocol::node::response_value_digest(&[vec![99u8; 50]]).unwrap()

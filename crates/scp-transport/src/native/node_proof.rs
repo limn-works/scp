@@ -9,8 +9,9 @@
 //!
 //! - A server built with [`NodeProofs::Sign`] holds the node key its
 //!   operator's installed binding binds, and answers a QUERY that carries a
-//!   `proof_nonce` with a proof over exactly the blobs it returned, in the
-//!   order it returned them, zero blobs included.
+//!   `proof_nonce` with a proof over the QUERY as received and over exactly
+//!   the blobs it returned, in the order it returned them, zero blobs
+//!   included.
 //! - A server built with [`NodeProofs::Unbound`] holds no binding, which is
 //!   the absent state §9.10.12 permits: it returns no `node_proof`, never a
 //!   proof under a placeholder key.
@@ -20,7 +21,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scp_protocol::node::{BoundNodeKey, NodeProofError, response_value_digest};
+use scp_protocol::node::{
+    BoundNodeKey, NodeProof, NodeProofError, SentQuery, response_value_digest,
+};
 use scp_relay_client::{RelayMessage, code};
 
 use super::storage::StoredBlob;
@@ -45,12 +48,38 @@ impl fmt::Debug for NodeProofs {
     }
 }
 
-/// The `EVENT query_complete` that ends a QUERY response at `routing_id`
-/// whose blobs were `blobs`, in the order the transport sent them.
+/// The fields of a received QUERY a node proof covers.
 ///
-/// It carries a `node_proof` when `proofs` is [`NodeProofs::Sign`] and the
-/// QUERY carried `proof_nonce`; the proof echoes the nonce, covers the
-/// blobs' bytes, and names the node's clock in seconds. When the proof
+/// It exists where the QUERY carried a `proof_nonce`: `None` for a QUERY
+/// without one, which gets no proof. Each optional field is as the QUERY carried it, never the
+/// effective default the node applied (§9.7.4.2 "The query digest").
+#[must_use]
+pub const fn proof_query(
+    proof_nonce: Option<[u8; 32]>,
+    routing_id: [u8; 32],
+    since: Option<u64>,
+    after_blob: Option<[u8; 32]>,
+    limit: Option<u32>,
+) -> Option<SentQuery> {
+    match proof_nonce {
+        Some(nonce) => Some(SentQuery {
+            nonce,
+            routing_id,
+            since,
+            after_blob,
+            limit,
+        }),
+        None => None,
+    }
+}
+
+/// The `EVENT query_complete` that ends a QUERY response whose blobs were
+/// `blobs`, in the order the transport sent them.
+///
+/// It carries a `node_proof` when `proofs` is [`NodeProofs::Sign`] and
+/// `query` is the QUERY's [`proof_query`]; the proof echoes the nonce,
+/// digests the QUERY's routing id, `since`, `after_blob` and `limit`, covers
+/// the blobs' bytes, and names the node's clock in seconds. When the proof
 /// cannot be built the response ends with `ERR` `5000` instead, so a
 /// requester never reads a response the node meant to prove as one it chose
 /// not to.
@@ -58,13 +87,12 @@ impl fmt::Debug for NodeProofs {
 pub fn query_complete(
     proofs: &NodeProofs,
     ref_id: Option<String>,
-    proof_nonce: Option<[u8; 32]>,
-    routing_id: [u8; 32],
+    query: Option<&SentQuery>,
     blobs: &[StoredBlob],
 ) -> RelayMessage {
-    let node_proof = match (proofs, proof_nonce) {
-        (NodeProofs::Sign(key), Some(nonce)) => match sign(key, nonce, routing_id, blobs) {
-            Ok(bytes) => Some(Box::new(bytes)),
+    let node_proof = match (proofs, query) {
+        (NodeProofs::Sign(key), Some(query)) => match sign(key, query, blobs) {
+            Ok(proof) => Some(Box::new(proof)),
             Err(e) => {
                 tracing::error!(error = %e, "node proof could not be signed");
                 return RelayMessage::Err {
@@ -85,10 +113,9 @@ pub fn query_complete(
 
 fn sign(
     key: &BoundNodeKey,
-    nonce: [u8; 32],
-    routing_id: [u8; 32],
+    query: &SentQuery,
     blobs: &[StoredBlob],
-) -> Result<[u8; scp_protocol::node::NODE_PROOF_LEN], NodeProofError> {
+) -> Result<NodeProof, NodeProofError> {
     let bytes: Vec<&[u8]> = blobs.iter().map(|b| b.blob.as_slice()).collect();
     let value_digest = response_value_digest(&bytes)?;
     // A clock before 1970 reads as 0, which the requester's clock-skew check
@@ -96,9 +123,7 @@ fn sign(
     let observed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    Ok(key
-        .prove(nonce, routing_id, value_digest, observed_at)?
-        .to_bytes())
+    key.prove(query, value_digest, observed_at)
 }
 
 #[cfg(test)]
@@ -136,11 +161,11 @@ pub(crate) mod tests {
         Ok(Arc::new(node.install(binding, &url)?))
     }
 
-    /// The proof a `query_complete` carries, checked the way a resolver
-    /// checks it: the signature under the binding's node key.
+    /// The proof a `query_complete` carries, with its signature checked
+    /// under the binding's node key and its `node_id` the key's.
     pub fn proof_of(key: &BoundNodeKey, msg: &RelayMessage) -> TestResult<NodeProof> {
         let RelayMessage::Event {
-            node_proof: Some(bytes),
+            node_proof: Some(proof),
             event_type,
             ..
         } = msg
@@ -148,11 +173,17 @@ pub(crate) mod tests {
             return Err(format!("expected a proved query_complete, got {msg:?}").into());
         };
         assert_eq!(event_type, "query_complete");
-        let proof = NodeProof::from_bytes(bytes.as_slice())?;
         let node_key = P256PublicKey::from_sec1(&key.binding().node_key)?;
         verify_prehash_strict(&node_key, &proof.digest(), &proof.signature)?;
         assert_eq!(&proof.node_id, key.node_id());
-        Ok(proof)
+        Ok((**proof).clone())
+    }
+
+    /// The seconds clock a test brackets a signing with.
+    pub fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
     }
 
     fn blob(bytes: &[u8]) -> StoredBlob {
@@ -166,25 +197,64 @@ pub(crate) mod tests {
         }
     }
 
+    fn query() -> SentQuery {
+        SentQuery {
+            nonce: [9; 32],
+            routing_id: [1; 32],
+            since: Some(4),
+            after_blob: Some([5; 32]),
+            limit: Some(2),
+        }
+    }
+
     #[test]
-    fn a_bound_server_proves_the_blobs_it_returned() -> TestResult {
+    fn a_bound_server_proves_the_query_and_the_blobs_it_returned() -> TestResult {
         let key = bound_key(7)?;
         let blobs = [blob(b"one"), blob(b"two")];
+        let before = now_secs();
         let msg = query_complete(
             &NodeProofs::Sign(Arc::clone(&key)),
             None,
-            Some([9; 32]),
-            [1; 32],
+            Some(&query()),
             &blobs,
         );
+        let after = now_secs();
         let proof = proof_of(&key, &msg)?;
         assert_eq!(proof.nonce, [9; 32]);
         assert_eq!(proof.routing_id, [1; 32]);
+        assert_eq!(proof.query_digest, query().digest());
         assert_eq!(
             proof.value_digest,
             response_value_digest(&[b"one".as_slice(), b"two"])?
         );
+        assert!(
+            (before..=after).contains(&proof.observed_at),
+            "observed_at {} outside [{before}, {after}]",
+            proof.observed_at
+        );
         Ok(())
+    }
+
+    /// `proof_query` carries each optional field as the QUERY carried it,
+    /// so an omitted `limit` is digested as omitted, not as 100.
+    #[test]
+    fn the_proof_query_keeps_omitted_fields_omitted() {
+        assert_eq!(proof_query(None, [1; 32], Some(4), None, Some(2)), None);
+        let sent = proof_query(Some([9; 32]), [1; 32], None, None, None);
+        assert_eq!(
+            sent,
+            Some(SentQuery {
+                nonce: [9; 32],
+                routing_id: [1; 32],
+                since: None,
+                after_blob: None,
+                limit: None,
+            })
+        );
+        assert_eq!(
+            proof_query(Some([9; 32]), [1; 32], Some(4), Some([5; 32]), Some(2)),
+            Some(query())
+        );
     }
 
     #[test]
@@ -193,8 +263,7 @@ pub(crate) mod tests {
         let msg = query_complete(
             &NodeProofs::Sign(Arc::clone(&key)),
             None,
-            Some([9; 32]),
-            [1; 32],
+            Some(&query()),
             &[],
         );
         let proof = proof_of(&key, &msg)?;
@@ -204,13 +273,7 @@ pub(crate) mod tests {
 
     #[test]
     fn no_binding_means_no_proof() {
-        let msg = query_complete(
-            &NodeProofs::Unbound,
-            None,
-            Some([9; 32]),
-            [1; 32],
-            &[blob(b"x")],
-        );
+        let msg = query_complete(&NodeProofs::Unbound, None, Some(&query()), &[blob(b"x")]);
         assert!(matches!(
             msg,
             RelayMessage::Event {
@@ -222,7 +285,7 @@ pub(crate) mod tests {
 
     #[test]
     fn no_nonce_means_no_proof() -> TestResult {
-        let msg = query_complete(&NodeProofs::Sign(bound_key(7)?), None, None, [1; 32], &[]);
+        let msg = query_complete(&NodeProofs::Sign(bound_key(7)?), None, None, &[]);
         assert!(matches!(
             msg,
             RelayMessage::Event {
