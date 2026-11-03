@@ -777,7 +777,8 @@ One adapter covers the entire S3-compatible ecosystem: AWS S3, MinIO, Ceph, Seaw
 ```
 {bucket}/
   blobs/{blob_id_hex}                    # blob content
-  routing/{routing_id_hex}/{blob_id_hex} # routing index (empty object, metadata has stored_at/expires_at)
+  routing/{routing_id_hex}/r/{blob_id_hex} # routing index of a retained record (empty object, metadata has stored_at and admission)
+  routing/{routing_id_hex}/t/{blob_id_hex} # routing index of a TTL blob (empty object, metadata has stored_at and expires_at)
   expiry/{expires_at}/{blob_id_hex}      # expiry index (for efficient TTL enforcement via prefix listing)
 ```
 
@@ -791,12 +792,15 @@ CREATE TABLE blobs (
     blob_ttl INTEGER,          -- NULL: a retained record (09-security-model.md §9.10.12)
     stored_at INTEGER NOT NULL,
     expires_at INTEGER,        -- NULL: never expires
+    admission INTEGER,         -- a retained record's admission counter; NULL on a TTL blob
     blob BLOB NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_routing ON blobs (routing_id, stored_at, blob_id);
 CREATE INDEX idx_expiry ON blobs (expires_at);
 ```
+
+**Retained records and the lifetime filter.** A retained record (`09-security-model.md` §9.10.12) carries no TTL and an admission counter, the order the node admitted it in at its routing id, which every backend persists with the record: the `admission` column here and in PostgreSQL, the serialized `StoredBlob` in redb, and the routing object's metadata in S3. `BlobStorage::query` takes a lifetime filter (any, retained only, TTL only) that every backend applies before its limit, inside the query: the SQL backends in the `WHERE` clause, redb and the in-memory store before they copy a body, and S3 by listing only the class prefix the filter names (`r/` or `t/`) and reading each routing object's metadata before any body, so S3 reads no body of a blob the filter drops or the limit cuts. An overwrite of a `blob_id` leaves no routing or expiry index entry of the blob it replaces (S3 deletes those objects, redb those multimap entries), and S3's TTL purge re-reads a blob's metadata before it deletes it and skips a retained or unexpired blob.
 
 ### RedbBlobStore
 
