@@ -23,6 +23,11 @@ jobs:
     with:
       scp-core-version: 0.0.0-check
 
+  build-matrix-main:
+    uses: ./.github/workflows/tmp-build-matrix-main.yml
+    with:
+      scp-core-version: 0.0.0-check
+
   fuzz-toolchain:
     runs-on: ubuntu-latest
     timeout-minutes: 10
