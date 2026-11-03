@@ -48,11 +48,20 @@ OLD_MTIME = 946_684_800
 # holds every dependency unit they need.
 COMMANDS = [
     ["cargo", "test", "--no-run", "-p", "scp-ffi-napi", "--features", "server"],
-    ["cargo", "test", "--no-run", "-p", "scp-ffi-common"],
+    ["cargo", "test", "--no-run", "-p", "scp-ffi-common", "--features", "server"],
 ]
 SOURCE_FILE = "crates/scp-ffi/common/src/lib.rs"
 INCLUDE_FILE = "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
-FIXTURE_TEST = ["cargo", "test", "-p", "scp-ffi-common", "--lib", "node_start_config"]
+FIXTURE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "scp-ffi-common",
+    "--features",
+    "server",
+    "--lib",
+    "node_start_config",
+]
 
 failures: list[str] = []
 
@@ -241,7 +250,7 @@ def flip_byte(rel: str, old: bytes, new: bytes) -> bytes:
 def main() -> int:
     rdeps = reverse_deps()
     baseline = build()
-    print(f"baseline: {len(baseline)} workspace units")
+    print(f"baseline: {len({unit_key(m) for m in baseline})} workspace units")
     tmp = Path(tempfile.mkdtemp())
     archive = tmp / "units.tar.zst"
     subprocess.run(
