@@ -86,6 +86,21 @@ pub fn start_test_listener() -> (
     Arc<InMemoryBlobStorage>,
     SubscriptionRegistry,
 ) {
+    start_test_listener_with_proofs(crate::native::node_proof::NodeProofs::Unbound)
+}
+
+/// [`start_test_listener`] with `node_proofs` as the listener's node-proof
+/// signer.
+#[must_use]
+pub fn start_test_listener_with_proofs(
+    node_proofs: crate::native::node_proof::NodeProofs,
+) -> (
+    QuicShutdownHandle,
+    SocketAddr,
+    Vec<CertificateDer<'static>>,
+    Arc<InMemoryBlobStorage>,
+    SubscriptionRegistry,
+) {
     let (server_config, certs) = test_server_config();
     let storage = Arc::new(InMemoryBlobStorage::new());
     let subscriptions = subscription::new_registry();
@@ -95,6 +110,7 @@ pub fn start_test_listener() -> (
     let config = QuicListenerConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
+        node_proofs,
         ..QuicListenerConfig::defaults(crate::relay::push_gate::LiveRelayUrl::new(
             crate::relay::push_gate::PushReservation::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
         ))

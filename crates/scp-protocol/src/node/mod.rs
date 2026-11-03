@@ -12,6 +12,8 @@
 //!   `0x06` frame it is published in at `scp:nls:`.
 //! - [`proof`]: the node proof of control a node signs over a QUERY
 //!   response.
+//! - [`own_key`]: a node's own node key and the binding its operator
+//!   installed, which sign possession and node proofs.
 //!
 //! These are pure types and codecs. Each verification returns a `Verified*`
 //! type whose only constructor is that verification. A binding and a record
@@ -26,6 +28,7 @@ pub mod frame;
 pub mod key_events;
 pub mod kind;
 pub mod list;
+pub mod own_key;
 pub mod proof;
 pub mod service;
 
@@ -56,6 +59,7 @@ pub use list::{
     VerifiedNodeListEntry, VerifiedNodeListRecord, check_node_list_publish, decode_node_list_frame,
     encode_node_list_frame, entries_canonical_json,
 };
+pub use own_key::{BoundNodeKey, NodeBindingInstallError, NodeSigningKey, NodeSigningKeyError};
 pub use proof::{
     NODE_PROOF_FIELDS_LEN, NODE_PROOF_LEN, NODE_PROOF_SEPARATOR, NodeProof, NodeProofError,
     response_value_digest,

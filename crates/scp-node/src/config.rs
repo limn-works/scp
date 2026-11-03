@@ -24,14 +24,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
-use scp_did::DidDocument;
+use scp_did::{DidDocument, NodeUrl};
 use scp_identity::{DidMethod, dht::ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
+use scp_protocol::node::NodeBinding;
 use scp_transport::nat::NetworkChangeDetector;
+use scp_transport::native::node_proof::NodeProofs;
 use scp_transport::native::public_records::PublicRecords;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
 
+use crate::node_key;
 use crate::public_records::{NodePublicRecords, PublicRecordTerms};
 use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::push::WebPushSender;
@@ -639,6 +642,34 @@ pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
     /// §9.18.B). Defaults to [`PublicRecordTerms::UNCONFIGURED`]: no quota
     /// bound, and no node-list context, so no conflict statement is admitted.
     pub public_records: PublicRecordTerms,
+    /// The `NodeBinding` the node's operator installed (`09-security-model.md`
+    /// §9.6.3 "How a node gets its key and its binding", step 4). Defaults to
+    /// [`NodeBindingSlot::Unbound`]: the node still draws and keeps its node
+    /// key, and returns no `node_proof`. [`Node::start`] refuses an
+    /// [`NodeBindingSlot::Installed`] binding that fails the installation
+    /// checks with [`NodeError::NodeBinding`].
+    pub node_binding: NodeBindingSlot,
+}
+
+/// Whether the node's operator installed a `NodeBinding` (§9.6.3 step 4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NodeBindingSlot {
+    /// No binding: the node answers every QUERY without a `node_proof`, the
+    /// absent state §9.10.12 permits.
+    #[default]
+    Unbound,
+    /// The finished binding and the canonical URL the node serves under. At
+    /// start the node checks that `binding.node_key` is its own key, that
+    /// `possession_sig` verifies under it, and that `url_hash` is the
+    /// SHA-256 of `url`.
+    Installed {
+        /// The binding, with the operator's `operator_sig` and the
+        /// `possession_sig` the node's local `sign-binding` command made.
+        /// Boxed so the common `Unbound` slot stays one word wide.
+        binding: Box<NodeBinding>,
+        /// The node's canonical URL.
+        url: NodeUrl,
+    },
 }
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
@@ -692,6 +723,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
             blob_storage,
             push: PushSlot::Disabled,
             public_records: PublicRecordTerms::UNCONFIGURED,
+            node_binding: NodeBindingSlot::Unbound,
         }
     }
 }
@@ -763,6 +795,11 @@ struct ConfigTail {
     own_lookup: OwnAddressLookup,
     /// The store every transport admits retained records through.
     public_records: PublicRecords,
+    /// What every transport signs node proofs with. [`split_config`] sets
+    /// [`NodeProofs::Unbound`], and [`start_on_repository`], which every
+    /// start constructor reaches, replaces it with the result of
+    /// [`node_key::install`] before any listener opens.
+    node_proofs: NodeProofs,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -866,7 +903,7 @@ pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeEr
 /// from [`start_push_slot`].
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
-) -> Result<(S, IdentitySource<K, D>, ConfigTail), NodeError> {
+) -> Result<(S, IdentitySource<K, D>, NodeBindingSlot, ConfigTail), NodeError> {
     let NodeConfig {
         reach,
         identity,
@@ -891,6 +928,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         blob_storage,
         push,
         public_records,
+        node_binding,
     } = config;
     let push = start_push_slot(push, &reach)?;
 
@@ -912,9 +950,10 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         push,
         own_lookup: OwnAddressLookup::system(),
         public_records: PublicRecords::Store(Arc::new(NodePublicRecords::new(public_records))),
+        node_proofs: NodeProofs::Unbound,
     };
 
-    Ok((storage, identity, tail))
+    Ok((storage, identity, node_binding, tail))
 }
 
 /// Resolves a [`NatSlot`] into the concrete `Arc<dyn NatStrategy>` the engine
@@ -1072,6 +1111,7 @@ where
         push,
         own_lookup,
         public_records,
+        node_proofs,
     } = tail;
 
     // The Reach selects the build path. `Domain` reproduces the former
@@ -1101,6 +1141,7 @@ where
                 push,
                 own_lookup,
                 public_records,
+                node_proofs,
             )
             .await
         }
@@ -1135,6 +1176,7 @@ where
                 blob_storage,
                 push,
                 public_records,
+                node_proofs,
                 skip_nat_probe,
             )
             .await
@@ -1172,6 +1214,7 @@ async fn build_node_domain<D, S>(
     push: PendingPush,
     own_lookup: OwnAddressLookup,
     public_records: PublicRecords,
+    node_proofs: NodeProofs,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -1227,6 +1270,7 @@ where
         bridge_secret: Some(*bridge_secret),
         push,
         public_records,
+        node_proofs,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1358,6 +1402,7 @@ async fn build_node_no_domain<D, S>(
     blob_storage: BlobStorageBackend,
     push: PendingPush,
     public_records: PublicRecords,
+    node_proofs: NodeProofs,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -1396,6 +1441,7 @@ where
         bridge_secret: Some(*bridge_secret),
         push,
         public_records,
+        node_proofs,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1524,13 +1570,13 @@ impl Node {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
         validate_reach_and_tls(&config.reach, &config.tls)?;
-        let (storage, identity, tail) = split_config(config)?;
+        let (storage, identity, node_binding, tail) = split_config(config)?;
 
         // Production constructor: `ProtocolRepository::new` (the only difference
         // from `start_for_testing`). Identity is resolved against the storage,
         // then the one shared engine orchestrates the build.
         let protocol_repository = Arc::new(ProtocolRepository::new(storage));
-        start_on_repository(protocol_repository, identity, tail).await
+        start_on_repository(protocol_repository, identity, node_binding, tail).await
     }
 
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
@@ -1582,12 +1628,12 @@ impl Node {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
         validate_reach_and_tls(&config.reach, &config.tls)?;
-        let (storage, identity, tail) = split_config(config)?;
+        let (storage, identity, node_binding, tail) = split_config(config)?;
 
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
         // difference from `start`). The build then flows through the same engine.
         let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
-        start_on_repository(protocol_repository, identity, tail).await
+        start_on_repository(protocol_repository, identity, node_binding, tail).await
     }
 
     /// [`Node::start_for_testing`] with `lookup` resolving the relay's own
@@ -1604,26 +1650,34 @@ impl Node {
         S: Storage + 'static,
     {
         validate_reach_and_tls(&config.reach, &config.tls)?;
-        let (storage, identity, mut tail) = split_config(config)?;
+        let (storage, identity, node_binding, mut tail) = split_config(config)?;
         tail.own_lookup = lookup;
         let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
-        start_on_repository(protocol_repository, identity, tail).await
+        start_on_repository(protocol_repository, identity, node_binding, tail).await
     }
 }
 
-/// Resolves the identity against `protocol_repository`'s storage and builds
-/// the node: the part both start constructors share after each builds its
-/// repository.
+/// Loads the node key and installs the binding, resolves the identity
+/// against `protocol_repository`'s storage, and builds the node: the part
+/// every start constructor shares after it builds its repository.
+///
+/// The node key comes from the same storage as the identity (§9.6.3 step
+/// 1), and a binding that fails the installation checks refuses the start
+/// before any listener opens (§9.6.3 step 4).
 async fn start_on_repository<K, D, S>(
     protocol_repository: Arc<ProtocolRepository<S>>,
     identity: IdentitySource<K, D>,
-    tail: ConfigTail,
+    node_binding: NodeBindingSlot,
+    mut tail: ConfigTail,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     K: KeyCustody + 'static,
     D: DidMethod + 'static,
     S: Storage + 'static,
 {
+    let node_key = node_key::load_or_generate(protocol_repository.storage()).await?;
+    tail.node_proofs = node_key::install(node_key, node_binding)?;
+
     // `Persisted` is the load-or-create-and-persist source. It normalizes to
     // a `Generate` source with `persist = true` (exactly as the legacy
     // builder's `identity_with_storage` did): `resolve_identity_persistent`
@@ -2838,5 +2892,249 @@ mod tests {
             "Local builds a no-domain node regardless of TlsMode::Terminated"
         );
         node.shutdown();
+    }
+
+    // --- Node key and binding (`09-security-model.md` §9.6.3) ---------------
+
+    const NODE_URL: &str = "wss://node.example.com/scp/v1";
+
+    /// The binding an operator assembles from the node's `sign-binding`
+    /// output and signs with its own key.
+    fn binding_from(grant: &node_key::PossessionSignature) -> NodeBinding {
+        use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
+        let mut binding = NodeBinding {
+            operator: scp_did::Identifier::from_bytes([0x0a; 32]),
+            node_key: grant.node_key,
+            url_hash: grant.url_hash,
+            key_state_head: [0x0b; 32],
+            operator_sig: [0; 64],
+            possession_sig: grant.possession_sig,
+        };
+        let operator_key = P256SecretKey::from_scalar_bytes(&[0x0c; 32]).unwrap();
+        binding.operator_sig = sign_prehash_rfc6979(&operator_key, &binding.digest()).unwrap();
+        binding
+    }
+
+    /// Runs the local `sign-binding` step against `storage` for
+    /// [`NODE_URL`] and returns the finished binding.
+    async fn signed_binding(storage: &InMemoryStorage) -> NodeBinding {
+        let grant = node_key::sign_possession(
+            storage,
+            &scp_did::Identifier::from_bytes([0x0a; 32]),
+            &NodeUrl::new(NODE_URL).unwrap(),
+            &[0x0b; 32],
+        )
+        .await
+        .unwrap();
+        binding_from(&grant)
+    }
+
+    fn installed(binding: NodeBinding) -> NodeBindingSlot {
+        NodeBindingSlot::Installed {
+            binding: Box::new(binding),
+            url: NodeUrl::new(NODE_URL).unwrap(),
+        }
+    }
+
+    async fn start_local(
+        storage: Arc<InMemoryStorage>,
+        node_binding: NodeBindingSlot,
+    ) -> Result<crate::ApplicationNode<Arc<InMemoryStorage>>, NodeError> {
+        Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            node_binding,
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                storage,
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await
+    }
+
+    /// Sends a QUERY carrying `proof_nonce` to `node`'s WebSocket listener and
+    /// returns the `EVENT query_complete` that ends the (empty) response.
+    async fn query_complete_of<S: Storage + 'static>(
+        node: &crate::ApplicationNode<S>,
+        proof_nonce: [u8; 32],
+    ) -> scp_relay_client::RelayMessage {
+        use futures::{SinkExt as _, StreamExt as _};
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+
+        let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.bridge_token_hex().as_str())
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        let query = ClientMessage::Query {
+            ref_id: Some("proof".to_owned()),
+            routing_id: [0x3c; 32],
+            since: None,
+            after_blob: None,
+            limit: None,
+            proof_nonce: Some(proof_nonce),
+        };
+        sink.send(Message::Binary(query.to_bytes().unwrap()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary frame, got {frame:?}");
+        };
+        RelayMessage::from_bytes(&bytes).unwrap()
+    }
+
+    /// The node key a first start draws into instance storage is the key a
+    /// second start reads: the binding signed between the two starts, against
+    /// the same storage, installs on the second start, and the second node's
+    /// QUERY responses carry a proof that verifies under the binding's key.
+    #[tokio::test]
+    async fn the_node_key_persists_across_restart_and_proves_queries() {
+        use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
+        use scp_protocol::node::NodeProof;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let first = start_local(Arc::clone(&storage), NodeBindingSlot::Unbound)
+            .await
+            .unwrap();
+        first.shutdown();
+        assert!(
+            storage
+                .retrieve(node_key::NODE_KEY_STORAGE_KEY)
+                .await
+                .unwrap()
+                .is_some(),
+            "the first start keeps its node key in instance storage"
+        );
+
+        let binding = signed_binding(&storage).await;
+        let second = start_local(Arc::clone(&storage), installed(binding.clone()))
+            .await
+            .unwrap();
+        let scp_relay_client::RelayMessage::Event {
+            node_proof: Some(bytes),
+            event_type,
+            ..
+        } = query_complete_of(&second, [0x5e; 32]).await
+        else {
+            panic!("a bound node's query_complete carries a node proof");
+        };
+        assert_eq!(event_type, "query_complete");
+        let proof = NodeProof::from_bytes(bytes.as_slice()).unwrap();
+        let node_key = P256PublicKey::from_sec1(&binding.node_key).unwrap();
+        verify_prehash_strict(&node_key, &proof.digest(), &proof.signature).unwrap();
+        assert_eq!(proof.nonce, [0x5e; 32]);
+        assert_eq!(proof.routing_id, [0x3c; 32]);
+        assert_eq!(
+            proof.node_id,
+            scp_kel::derive_node_id(&binding.node_key).unwrap()
+        );
+        second.shutdown();
+    }
+
+    /// A node with no binding answers a QUERY carrying `proof_nonce` with no
+    /// `node_proof` (§9.10.12's absent state).
+    #[tokio::test]
+    async fn an_unbound_node_sends_no_proof() {
+        let node = start_local(Arc::new(InMemoryStorage::new()), NodeBindingSlot::Unbound)
+            .await
+            .unwrap();
+        let reply = query_complete_of(&node, [0x5e; 32]).await;
+        assert!(
+            matches!(
+                reply,
+                scp_relay_client::RelayMessage::Event {
+                    node_proof: None,
+                    ..
+                }
+            ),
+            "an unbound node returns no proof: {reply:?}"
+        );
+        node.shutdown();
+    }
+
+    /// The installation failure a start with `binding` returns.
+    async fn refusal_of(
+        storage: Arc<InMemoryStorage>,
+        binding: NodeBinding,
+    ) -> scp_protocol::node::NodeBindingInstallError {
+        match start_local(storage, installed(binding)).await {
+            Err(NodeError::NodeBinding(e)) => e,
+            Err(other) => panic!("expected NodeError::NodeBinding, got {other:?}"),
+            Ok(node) => {
+                node.shutdown();
+                panic!("a node must not start with a binding that fails installation");
+            }
+        }
+    }
+
+    /// A binding of another node's key refuses the start.
+    #[tokio::test]
+    async fn a_binding_for_another_key_refuses_the_start() {
+        let other = signed_binding(&InMemoryStorage::new()).await;
+        let refusal = refusal_of(Arc::new(InMemoryStorage::new()), other).await;
+        assert_eq!(
+            refusal,
+            scp_protocol::node::NodeBindingInstallError::ForeignNodeKey
+        );
+    }
+
+    /// A binding of this node's key whose `possession_sig` fails under it
+    /// refuses the start.
+    #[tokio::test]
+    async fn a_bad_possession_signature_refuses_the_start() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut binding = signed_binding(&storage).await;
+        binding.possession_sig[10] ^= 0x01;
+        let refusal = refusal_of(storage, binding).await;
+        assert!(
+            matches!(
+                refusal,
+                scp_protocol::node::NodeBindingInstallError::PossessionSignature(_)
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    /// A binding signed for another canonical URL refuses the start.
+    #[tokio::test]
+    async fn a_binding_for_another_url_refuses_the_start() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let binding = signed_binding(&storage).await;
+        let refusal = match start_local(
+            storage,
+            NodeBindingSlot::Installed {
+                binding: Box::new(binding),
+                url: NodeUrl::new("wss://elsewhere.example.com/scp/v1").unwrap(),
+            },
+        )
+        .await
+        {
+            Err(NodeError::NodeBinding(e)) => e,
+            Err(other) => panic!("expected NodeError::NodeBinding, got {other:?}"),
+            Ok(node) => {
+                node.shutdown();
+                panic!("a node must not start with a binding for another URL");
+            }
+        };
+        assert!(
+            matches!(
+                refusal,
+                scp_protocol::node::NodeBindingInstallError::UrlMismatch(_)
+            ),
+            "{refusal:?}"
+        );
     }
 }

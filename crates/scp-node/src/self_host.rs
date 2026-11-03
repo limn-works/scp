@@ -46,7 +46,9 @@ use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 use scp_platform::{KeyCustody, PlatformError};
 
-use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
+use crate::config::{
+    DhtMode, IdentitySource, NatSlot, Node, NodeBindingSlot, NodeConfig, Reach, TlsMode,
+};
 use crate::{ApplicationNode, NodeError, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
@@ -1209,6 +1211,12 @@ pub struct HostSiteConfig {
     /// so a caller (e.g. the binary) can print an operator banner. The library
     /// itself prints nothing.
     pub on_ready: Option<Box<dyn FnOnce(HostSiteReady) + Send>>,
+    /// The `NodeBinding` the operator installed, with the canonical URL
+    /// (`09-security-model.md` §9.6.3 step 4). Defaults to
+    /// [`NodeBindingSlot::Unbound`]: the node keeps its node key and returns
+    /// no `node_proof`. A binding that fails the installation checks fails
+    /// the start with [`NodeError::NodeBinding`](crate::NodeError::NodeBinding).
+    pub node_binding: NodeBindingSlot,
 }
 
 impl HostSiteConfig {
@@ -1220,7 +1228,8 @@ impl HostSiteConfig {
     /// (no publish), `site_dir = None` (embedded site), `port =
     /// DEFAULT_HTTP_BIND_ADDR.port()`, `storage_path = None` (XDG default),
     /// `dht_gateways = []`, `projection_rate_limit = DEFAULT_PROJECTION_RATE_LIMIT`,
-    /// `refresh_interval = 1800s`, `on_ready = None`.
+    /// `refresh_interval = 1800s`, `on_ready = None`, `node_binding =
+    /// NodeBindingSlot::Unbound`.
     ///
     /// This enables the spread idiom. Because `reach` is moved into the returned
     /// struct, the caller passes a `reach` value to `defaults(...)` separate
@@ -1245,6 +1254,7 @@ impl HostSiteConfig {
             projection_rate_limit: crate::DEFAULT_PROJECTION_RATE_LIMIT,
             refresh_interval: Duration::from_secs(SELF_HOST_DEPLOY_REFRESH_SECS),
             on_ready: None,
+            node_binding: NodeBindingSlot::Unbound,
         }
     }
 }
@@ -1262,6 +1272,7 @@ impl std::fmt::Debug for HostSiteConfig {
             .field("projection_rate_limit", &self.projection_rate_limit)
             .field("refresh_interval", &self.refresh_interval)
             .field("on_ready", &self.on_ready.as_ref().map(|_| "<callback>"))
+            .field("node_binding", &self.node_binding)
             .finish()
     }
 }
@@ -1541,6 +1552,7 @@ where
         projection_rate_limit,
         refresh_interval,
         on_ready,
+        node_binding,
     } = config;
 
     // -- Validate (TLS×Reach) and lower the construction-pattern enums onto
@@ -1614,6 +1626,7 @@ where
         custody,
         site_dir,
         on_ready,
+        node_binding,
     };
 
     dispatch_hosted_site_by_dht_mode(
@@ -1771,6 +1784,7 @@ struct ServeHostedSite {
     custody: Arc<SqliteKeyCustody>,
     site_dir: Option<PathBuf>,
     on_ready: Option<Box<dyn FnOnce(HostSiteReady) + Send>>,
+    node_binding: NodeBindingSlot,
 }
 
 /// Builds the node over the concrete `did_method`, deploys the site, opens the
@@ -1808,6 +1822,7 @@ where
         custody,
         site_dir,
         on_ready,
+        node_binding,
     } = common;
 
     // -- Build the no-domain node (persistent blob storage + retained NAT mapper
@@ -1822,6 +1837,7 @@ where
         projection_rate_limit,
         skip_nat,
         dht_mode,
+        node_binding,
     )
     .await?;
 
@@ -2794,6 +2810,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     projection_rate_limit: u32,
     skip_nat: bool,
     dht_mode: DhtMode,
+    node_binding: NodeBindingSlot,
 ) -> Result<
     (
         Arc<ApplicationNode<Arc<SqliteStorage>>>,
@@ -2849,6 +2866,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
         nat,
         http_bind_addr: Some(http_addr),
         projection_rate_limit: Some(projection_rate_limit),
+        node_binding,
         // The self-host binary's operator-chosen backend: a durable, persistent
         // SQLite blob store (opened above, fail-closed on error). Passed as the
         // required `blob_storage` selection at this construction boundary — the

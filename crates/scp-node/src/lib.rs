@@ -16,6 +16,7 @@ pub mod dev_api;
 pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
+pub mod node_key;
 pub mod projection;
 pub mod public_records;
 mod published_state;
@@ -70,8 +71,8 @@ pub use self_host::{
 // lowering in `config`; the `pub use` brings them into crate-root scope for
 // both that path and external consumers.
 pub use config::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodePushProviders,
-    PushSlot, Reach, TlsMode, validate_reach_and_tls,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeBindingSlot, NodeConfig,
+    NodePushProviders, PushSlot, Reach, TlsMode, validate_reach_and_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -299,6 +300,18 @@ pub enum NodeError {
          read its VAPID key (SCP-CAPSEL-8001)"
     )]
     WebPushWithoutWellKnown,
+
+    /// The node key could not be read from, or drawn into, the instance
+    /// storage (`09-security-model.md` §9.6.3 step 1).
+    #[error("node key: {0}")]
+    NodeKey(#[from] node_key::NodeKeyStoreError),
+
+    /// The installed `NodeBinding` binds another node key, carries a
+    /// `possession_sig` that fails under the node key, or carries a
+    /// `url_hash` that is not the configured URL's (§9.6.3 step 4). The node
+    /// refuses to start rather than start without it.
+    #[error("installed node binding refused: {0}")]
+    NodeBinding(#[from] scp_protocol::node::NodeBindingInstallError),
 
     /// The relay's own addresses did not resolve at start, so the `WebPush`
     /// sender could never tell an endpoint at the relay itself from another

@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::dtls::AsyncDtlsSession;
+use crate::native::node_proof;
 use crate::native::public_records;
 use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
@@ -804,10 +805,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
             since,
             after_blob,
             limit,
-            // This listener holds no bound node key, so it answers every
-            // QUERY without a `node_proof`: the absent state §9.10.12
-            // permits, never a proof under a placeholder key.
-            proof_nonce: _,
+            proof_nonce,
         } => {
             handle_udp_query(
                 ref_id,
@@ -815,6 +813,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
                 since,
                 after_blob,
                 limit,
+                proof_nonce,
                 sessions,
                 &remote_addr,
                 storage,
@@ -965,6 +964,7 @@ async fn handle_udp_query<S: BlobStorage>(
     since: Option<u64>,
     after_blob: Option<[u8; 32]>,
     limit: Option<u32>,
+    proof_nonce: Option<[u8; 32]>,
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
@@ -1017,16 +1017,13 @@ async fn handle_udp_query<S: BlobStorage>(
         }
     };
 
+    // The proof covers the blobs in the order they are sent below.
+    let complete =
+        node_proof::query_complete(&config.node_proofs, ref_id, proof_nonce, routing_id, &blobs);
     for stored in blobs {
         send_dtls_response(sessions, remote_addr, &public_records::blob_message(stored)).await;
     }
-
-    let event = RelayMessage::Event {
-        node_proof: None,
-        ref_id,
-        event_type: "query_complete".to_string(),
-    };
-    send_dtls_response(sessions, remote_addr, &event).await;
+    send_dtls_response(sessions, remote_addr, &complete).await;
 }
 
 /// Handles a DELETE operation over UDP/DTLS: `4041` for a retained record
@@ -1660,13 +1657,45 @@ mod tests {
 
         let response = send_and_recv(&client, &query_msg).await;
         match &response {
-            RelayMessage::Event { ref_id, event_type } => {
+            RelayMessage::Event {
+                ref_id,
+                event_type,
+                node_proof,
+            } => {
                 assert_eq!(ref_id.as_deref(), Some("empty-q"));
                 assert_eq!(event_type, "query_complete");
+                assert_eq!(*node_proof, None, "an unbound listener returns no proof");
             }
             other => panic!("expected query_complete Event for empty query, got: {other:?}"),
         }
 
+        handle.shutdown();
+    }
+
+    /// A listener whose relay config carries the node's bound key answers a
+    /// QUERY carrying `proof_nonce` with a proof that verifies under the
+    /// binding's node key and echoes the nonce.
+    #[tokio::test]
+    async fn a_bound_listener_signs_the_query_complete() {
+        let key = crate::native::node_proof::tests::bound_key(7).unwrap();
+        let (handle, addr, _storage) = start_test_listener_with_relay_config(RelayConfig {
+            node_proofs: crate::native::node_proof::NodeProofs::Sign(Arc::clone(&key)),
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+        })
+        .await;
+        let client = create_dtls_client(addr).await;
+        let query_msg = ClientMessage::Query {
+            proof_nonce: Some([0x5a; 32]),
+            ref_id: Some("proved-q".to_string()),
+            routing_id: [0x11; 32],
+            since: None,
+            after_blob: None,
+            limit: None,
+        };
+        let response = send_and_recv(&client, &query_msg).await;
+        let proof = crate::native::node_proof::tests::proof_of(&key, &response).unwrap();
+        assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(proof.routing_id, [0x11; 32]);
         handle.shutdown();
     }
 

@@ -49,6 +49,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::node_proof::{self, NodeProofs};
 use super::public_records::{self, PublicRecords};
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend, QueryCursor};
@@ -168,6 +169,12 @@ pub struct RelayConfig {
     /// every `retain` PUBLISH with `4040`; a node sets
     /// [`PublicRecords::Store`].
     pub public_records: PublicRecords,
+    /// Whether the server signs node proofs on `query_complete`, and under
+    /// which bound node key (§9.7.4.2, §9.10.12). Defaults to
+    /// [`NodeProofs::Unbound`], which returns no `node_proof`; a node whose
+    /// operator installed a binding sets [`NodeProofs::Sign`]. The QUIC, UDP
+    /// and WebTransport listeners of the same node take the same value.
+    pub node_proofs: NodeProofs,
     /// The relay entries whose push routing IDs every listener sharing this
     /// handle reserves (§10.7.1 step 2, "Tier 3 relays"): the relay's own URL,
     /// or, for a node, its own `SCPRelay` entry and every tier 3 entry it
@@ -205,6 +212,9 @@ impl RelayConfig {
             // Fail-closed like `bridge` and `push`: a server stores no
             // retained record until a node hands it its store.
             public_records: PublicRecords::Refused,
+            // A relay holds no node key; only a node with an installed
+            // binding signs proofs.
+            node_proofs: NodeProofs::Unbound,
             relay_url,
             // Fail-safe push default, like `bridge`: a relay stores no push
             // token until push is explicitly enabled (construction.md M2).
@@ -1117,10 +1127,7 @@ async fn handle_client_message(
             since,
             after_blob,
             limit,
-            // This server holds no bound node key, so it answers every
-            // QUERY without a `node_proof`: the absent state §9.10.12
-            // permits, never a proof under a placeholder key.
-            proof_nonce: _,
+            proof_nonce,
         } => {
             handle_query(
                 ref_id.clone(),
@@ -1128,6 +1135,7 @@ async fn handle_client_message(
                 *since,
                 *after_blob,
                 *limit,
+                *proof_nonce,
                 tx,
                 storage,
                 config,
@@ -1499,6 +1507,7 @@ async fn handle_query(
     since: Option<u64>,
     after_blob: Option<[u8; 32]>,
     limit: Option<u32>,
+    proof_nonce: Option<[u8; 32]>,
     tx: &mpsc::Sender<RelayMessage>,
     storage: &Arc<BlobStorageBackend>,
     config: &RelayConfig,
@@ -1552,17 +1561,13 @@ async fn handle_query(
         }
     };
 
+    // The proof covers the blobs in the order they are sent below.
+    let complete =
+        node_proof::query_complete(&config.node_proofs, ref_id, proof_nonce, routing_id, &blobs);
     for stored in blobs {
         let _ = tx.send(public_records::blob_message(stored)).await;
     }
-
-    // Emit query_complete event.
-    let event = RelayMessage::Event {
-        node_proof: None,
-        ref_id,
-        event_type: "query_complete".to_string(),
-    };
-    let _ = tx.send(event).await;
+    let _ = tx.send(complete).await;
 }
 
 /// Handles a DELETE operation: `4041` for a retained record (§9.10.12),
@@ -2151,6 +2156,197 @@ mod tests {
             }
             other => panic!("expected EVENT, got {other:?}"),
         }
+    }
+
+    /// A server holding the node's bound key ends a QUERY carrying
+    /// `proof_nonce` with a proof over the blobs it returned, in order.
+    #[tokio::test]
+    async fn a_bound_server_signs_the_query_complete() {
+        let key = crate::native::node_proof::tests::bound_key(7).unwrap();
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            node_proofs: NodeProofs::Sign(Arc::clone(&key)),
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (_handle, addr) = server.start().await.unwrap();
+        let routing_id = [0xDD; 32];
+        let (mut sink, mut stream) = connect_client(addr).await;
+        for i in 0u8..2 {
+            let publish = ClientMessage::Publish {
+                ref_id: None,
+                routing_id,
+                recipient_hint: None,
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
+                blob: vec![i; 10],
+            };
+            send_msg(&mut sink, &publish).await;
+            let _ = recv_msg(&mut stream).await;
+        }
+        let query = ClientMessage::Query {
+            proof_nonce: Some([0x5a; 32]),
+            ref_id: Some("q-1".to_string()),
+            routing_id,
+            since: None,
+            after_blob: None,
+            limit: None,
+        };
+        send_msg(&mut sink, &query).await;
+        let mut blobs = Vec::new();
+        for _ in 0..2 {
+            let RelayMessage::Blob { blob, .. } = recv_msg(&mut stream).await else {
+                panic!("expected BLOB");
+            };
+            blobs.push(blob);
+        }
+        let event = recv_msg(&mut stream).await;
+        let proof = crate::native::node_proof::tests::proof_of(&key, &event).unwrap();
+        assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(proof.routing_id, routing_id);
+        assert_eq!(
+            proof.value_digest,
+            scp_protocol::node::response_value_digest(&blobs).unwrap()
+        );
+    }
+
+    /// The wire name of `msg`. The match names every `ClientMessage` variant
+    /// and has no wildcard, so a new variant fails to compile here until
+    /// [`one_of_each_client_message`] sends it too.
+    const fn wire_name(msg: &ClientMessage) -> &'static str {
+        match msg {
+            ClientMessage::Publish { .. } => "PUBLISH",
+            ClientMessage::Subscribe { .. } => "SUBSCRIBE",
+            ClientMessage::Unsubscribe { .. } => "UNSUBSCRIBE",
+            ClientMessage::Query { .. } => "QUERY",
+            ClientMessage::Delete { .. } => "DELETE",
+            ClientMessage::Ack { .. } => "ACK",
+            ClientMessage::Ping { .. } => "PING",
+            ClientMessage::BridgeRegister { .. } => "BRIDGE_REGISTER",
+            ClientMessage::BridgeData { .. } => "BRIDGE_DATA",
+        }
+    }
+
+    /// The number of arms in [`wire_name`].
+    const CLIENT_MESSAGE_VARIANTS: usize = 9;
+
+    /// One message of every variant, each carrying `chosen` wherever a
+    /// requester picks 32 bytes, as an attacker choosing the operator and
+    /// key-state head of a binding would.
+    fn one_of_each_client_message(chosen: [u8; 32]) -> Vec<ClientMessage> {
+        vec![
+            ClientMessage::Publish {
+                ref_id: Some("publish".to_owned()),
+                routing_id: chosen,
+                recipient_hint: Some(chosen),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
+                blob: chosen.to_vec(),
+            },
+            ClientMessage::Subscribe {
+                ref_id: Some("subscribe".to_owned()),
+                routing_id: chosen,
+                since: Some(0),
+            },
+            ClientMessage::Unsubscribe {
+                ref_id: Some("unsubscribe".to_owned()),
+                routing_id: chosen,
+            },
+            ClientMessage::Query {
+                ref_id: Some("query".to_owned()),
+                routing_id: chosen,
+                since: None,
+                after_blob: None,
+                limit: None,
+                proof_nonce: Some(chosen),
+            },
+            ClientMessage::Delete {
+                ref_id: Some("delete".to_owned()),
+                blob_id: chosen,
+            },
+            ClientMessage::Ack { blob_id: chosen },
+            ClientMessage::Ping { ts: 1 },
+            ClientMessage::BridgeRegister {
+                ref_id: Some("bridge".to_owned()),
+                routing_id: chosen,
+                public_key: chosen,
+                signature: [0xA7; 64],
+                timestamp: 1,
+                target_relay_hint: None,
+            },
+            ClientMessage::BridgeData {
+                ref_id: Some("data".to_owned()),
+                target_routing_id: chosen,
+                payload: chosen.to_vec(),
+            },
+        ]
+    }
+
+    /// No wire message makes a bound node sign a binding's P
+    /// (`09-security-model.md` §9.6.3 step 2): every variant goes to a bound
+    /// server, and no 64-byte window of any frame it answers with verifies
+    /// under the node key over P, for the installed binding's operator and
+    /// head or for the ones the messages carry.
+    #[tokio::test]
+    async fn no_wire_message_produces_a_possession_signature() {
+        use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
+        use scp_protocol::node::NodeBinding;
+
+        let key = crate::native::node_proof::tests::bound_key(7).unwrap();
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            node_proofs: NodeProofs::Sign(Arc::clone(&key)),
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (_handle, addr) = server.start().await.unwrap();
+
+        let chosen = [0xA7; 32];
+        let binding = key.binding();
+        let node_key = P256PublicKey::from_sec1(&binding.node_key).unwrap();
+        let digests = [
+            binding.digest(),
+            NodeBinding::signing_digest(
+                &scp_did::Identifier::from_bytes(chosen),
+                &binding.node_key,
+                &binding.url_hash,
+                &chosen,
+            ),
+        ];
+
+        // The detector recognizes a possession signature when one is there.
+        assert!(verify_prehash_strict(&node_key, &digests[0], &binding.possession_sig).is_ok());
+
+        let messages = one_of_each_client_message(chosen);
+        let names: std::collections::BTreeSet<_> = messages.iter().map(wire_name).collect();
+        assert_eq!(names.len(), CLIENT_MESSAGE_VARIANTS, "{names:?}");
+
+        let (mut sink, mut stream) = connect_client(addr).await;
+        let mut frames = 0usize;
+        for msg in &messages {
+            send_msg(&mut sink, msg).await;
+            while let Ok(Some(Ok(frame))) =
+                tokio::time::timeout(Duration::from_millis(300), stream.next()).await
+            {
+                let Message::Binary(bytes) = frame else {
+                    continue;
+                };
+                frames += 1;
+                for window in bytes.windows(64) {
+                    let Ok(signature) = <[u8; 64]>::try_from(window) else {
+                        continue;
+                    };
+                    for digest in &digests {
+                        assert!(
+                            verify_prehash_strict(&node_key, digest, &signature).is_err(),
+                            "a {} answer carries a possession signature",
+                            wire_name(msg)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(frames > 0, "the server answered no message");
     }
 
     #[tokio::test]

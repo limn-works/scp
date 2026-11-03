@@ -360,19 +360,68 @@ struct WireRecord {
     signature: String,
 }
 
+fn wire_binding(b: &NodeBinding) -> WireBinding {
+    WireBinding {
+        operator: hex::encode(b.operator.as_bytes()),
+        node_key: hex::encode(b.node_key),
+        url_hash: hex::encode(b.url_hash),
+        key_state_head: hex::encode(b.key_state_head),
+        operator_sig: hex::encode(b.operator_sig),
+        possession_sig: hex::encode(b.possession_sig),
+    }
+}
+
 fn wire_entry(entry: &NodeListEntry) -> WireEntry {
-    let b = &entry.binding;
     WireEntry {
-        binding: WireBinding {
-            operator: hex::encode(b.operator.as_bytes()),
-            node_key: hex::encode(b.node_key),
-            url_hash: hex::encode(b.url_hash),
-            key_state_head: hex::encode(b.key_state_head),
-            operator_sig: hex::encode(b.operator_sig),
-            possession_sig: hex::encode(b.possession_sig),
-        },
+        binding: wire_binding(&entry.binding),
         url: entry.url.as_str().to_owned(),
         free: entry.free,
+    }
+}
+
+fn binding_from_wire(b: &WireBinding) -> Result<NodeBinding, NodeListError> {
+    Ok(NodeBinding {
+        operator: Identifier::from_bytes(from_hex("operator", &b.operator)?),
+        node_key: from_hex::<NODE_KEY_LEN>("node_key", &b.node_key)?,
+        url_hash: from_hex("url_hash", &b.url_hash)?,
+        key_state_head: from_hex("key_state_head", &b.key_state_head)?,
+        operator_sig: from_hex("operator_sig", &b.operator_sig)?,
+        possession_sig: from_hex("possession_sig", &b.possession_sig)?,
+    })
+}
+
+impl NodeBinding {
+    /// The RFC 8785 canonical JSON of the binding: the object an entry's
+    /// `binding` member carries, six lowercase-hex members (§9.6.3 "The
+    /// entry"). An operator installs a binding on its node in this form.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeListError::Encode`] when serialization fails.
+    pub fn to_canonical_json(&self) -> Result<Vec<u8>, NodeListError> {
+        crate::jcs::to_vec(&wire_binding(self)).map_err(|_| NodeListError::Encode)
+    }
+
+    /// Reads a binding from exactly its RFC 8785 canonical JSON
+    /// ([`Self::to_canonical_json`]).
+    ///
+    /// # Errors
+    ///
+    /// [`NodeListError::Json`] for bytes that are not the JSON of a binding,
+    /// [`NodeListError::BadHex`] for a member of the wrong length, and
+    /// [`NodeListError::NotCanonical`] for any other form of the same
+    /// binding.
+    pub fn from_canonical_json(bytes: &[u8]) -> Result<Self, NodeListError> {
+        let wire: WireBinding = serde_json::from_slice(bytes).map_err(|e| NodeListError::Json {
+            category: e.classify(),
+            line: e.line(),
+            column: e.column(),
+        })?;
+        let binding = binding_from_wire(&wire)?;
+        if binding.to_canonical_json()? != bytes {
+            return Err(NodeListError::NotCanonical);
+        }
+        Ok(binding)
     }
 }
 
@@ -382,17 +431,9 @@ fn from_hex<const N: usize>(member: &'static str, s: &str) -> Result<[u8; N], No
     Ok(out)
 }
 
-fn entry_from_wire(wire: WireEntry) -> Result<NodeListEntry, NodeListError> {
-    let b = wire.binding;
+fn entry_from_wire(wire: &WireEntry) -> Result<NodeListEntry, NodeListError> {
     Ok(NodeListEntry {
-        binding: NodeBinding {
-            operator: Identifier::from_bytes(from_hex("operator", &b.operator)?),
-            node_key: from_hex::<NODE_KEY_LEN>("node_key", &b.node_key)?,
-            url_hash: from_hex("url_hash", &b.url_hash)?,
-            key_state_head: from_hex("key_state_head", &b.key_state_head)?,
-            operator_sig: from_hex("operator_sig", &b.operator_sig)?,
-            possession_sig: from_hex("possession_sig", &b.possession_sig)?,
-        },
+        binding: binding_from_wire(&wire.binding)?,
         url: NodeUrl::new(&wire.url).map_err(|e| match e {
             DidError::InvalidNodeUrl { reason, .. } => NodeListError::BadUrl(Some(reason)),
             _ => NodeListError::BadUrl(None),
@@ -519,7 +560,7 @@ impl NodeListRecord {
             )?,
             entries: wire
                 .entries
-                .into_iter()
+                .iter()
                 .map(entry_from_wire)
                 .collect::<Result<_, _>>()?,
             signature: from_hex("signature", &wire.signature)?,
@@ -838,7 +879,7 @@ mod tests {
     use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
 
     use super::super::binding::tests::{
-        Identity, TestResult, incept, key, operator, signed_binding,
+        Identity, TestResult, incept, key, operator, signed_binding, url,
     };
     use super::*;
 
@@ -1392,6 +1433,40 @@ mod tests {
             AdmittedNodeListEntry::admit(&moved, &op.retained()?),
             Err(NodeListEntryError::UrlHashMismatch)
         );
+        Ok(())
+    }
+
+    /// The installable binding JSON round-trips, and any other form of the
+    /// same binding is refused.
+    #[test]
+    fn a_binding_reads_back_only_from_its_canonical_json() -> TestResult {
+        let binding = signed_binding(&operator()?, &key(1), &key(2), &url()?)?;
+        let json = binding.to_canonical_json()?;
+        assert_eq!(NodeBinding::from_canonical_json(&json)?, binding);
+        let upper = String::from_utf8(json.clone())?.replacen(
+            &hex::encode(binding.node_key),
+            &hex::encode_upper(binding.node_key),
+            1,
+        );
+        assert_eq!(
+            NodeBinding::from_canonical_json(upper.as_bytes()),
+            Err(NodeListError::NotCanonical)
+        );
+        let mut spaced = json.clone();
+        spaced.push(b' ');
+        assert_eq!(
+            NodeBinding::from_canonical_json(&spaced),
+            Err(NodeListError::NotCanonical)
+        );
+        let short = String::from_utf8(json)?.replacen(&hex::encode(binding.url_hash), "00", 1);
+        assert_eq!(
+            NodeBinding::from_canonical_json(short.as_bytes()),
+            Err(NodeListError::BadHex("url_hash"))
+        );
+        assert!(matches!(
+            NodeBinding::from_canonical_json(b"{}"),
+            Err(NodeListError::Json { .. })
+        ));
         Ok(())
     }
 }

@@ -18,6 +18,7 @@ use scp_did::NodeId;
 use sha2::{Digest, Sha256};
 
 use super::binding::VerifiedNodeBinding;
+use super::own_key::NodeSigningKey;
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
 
 /// The §9.18.2 separator of the node-proof preimage.
@@ -63,6 +64,9 @@ pub enum NodeProofError {
     /// 4-byte counts encode.
     #[error("node proof response: {0}")]
     Response(#[from] CanonicalError),
+    /// The node key could not sign the proof.
+    #[error("node proof signing: {0}")]
+    Sign(P256Error),
     /// The response carries more than `u32::MAX` blobs.
     #[error("node proof response holds {0} blobs, more than a 4-byte count encodes")]
     TooManyBlobs(usize),
@@ -104,6 +108,36 @@ impl NodeProof {
         hasher.update(value_digest);
         hasher.update(observed_at.to_be_bytes());
         hasher.finalize().into()
+    }
+
+    /// Signs the proof of one QUERY response under the node's own key
+    /// (§9.7.4.2): `node_id` is `key`'s, `nonce` the QUERY's `proof_nonce`
+    /// echoed verbatim, `value_digest` from [`response_value_digest`] over the
+    /// blobs in the order the node returned them, and `observed_at` the
+    /// node's clock in seconds.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeProofError::Sign`] when signing fails.
+    pub fn sign(
+        key: &NodeSigningKey,
+        nonce: [u8; 32],
+        routing_id: [u8; 32],
+        value_digest: [u8; 32],
+        observed_at: u64,
+    ) -> Result<Self, NodeProofError> {
+        let node_id = *key.node_id();
+        let digest =
+            Self::signing_digest(&node_id, &nonce, &routing_id, &value_digest, observed_at);
+        let signature = key.sign_digest(&digest).map_err(NodeProofError::Sign)?;
+        Ok(Self {
+            node_id,
+            nonce,
+            routing_id,
+            value_digest,
+            observed_at,
+            signature,
+        })
     }
 
     /// The digest over this proof's five fields.
