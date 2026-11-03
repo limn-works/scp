@@ -794,13 +794,15 @@ BRIDGE_SESSION_CLOSE (either direction, on either leg) {
 
 #### 10.12.4.1 Routing ID Derivation Disambiguation
 
-The protocol uses two distinct routing ID derivation schemes for different purposes. Implementations MUST NOT conflate them:
+The protocol derives routing IDs in several distinct ways for different purposes. Implementations MUST NOT conflate them:
 
 | Routing ID type | Derivation | Purpose | Used by |
 |----------------|------------|---------|---------|
 | **Identity routing ID** | `SHA-256("scp:did:" \|\| identifier)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13) | Identity-level routing — locating an identity's node presence. Used for bridge registration, directed messages outside context scope, and node discovery. | `BRIDGE_REGISTER` (§10.12.4), node SUBSCRIBE for identity-level messages |
 | **Context pseudonym** | `HMAC-SHA256(pseudonym_secret, context_id \|\| "scp-pseudonym")` | Context-level routing — routing messages within a specific context. Unlinkable across contexts. Never publicly derivable (§9.10.4.A). | Context message delivery, node SUBSCRIBE for context messages |
 | **Metadata routing ID** | `HMAC-SHA256(context_metadata_key, context_id \|\| "scp-metadata-v2")` | Context metadata retrieval — pre-join inspection of context parameters. | Node QUERY for context metadata (§9.10.4.B) |
+| **Head routing ID** | `HMAC-SHA256(head_routing_key, context_id \|\| "scp-head-route-v1")`, where `head_routing_key` is the 32-byte key the context's `0xFF02` extension commits, which only parties that hold group state know | Head records off the context's node: split and silencing detection (`09-security-model.md` §9.9.2). | Node `PUBLISH`, `SUBSCRIBE` and `QUERY` on each node of the member's record set |
+| **Resubmission routing ID** | `HMAC-SHA256(head_routing_key, context_id \|\| "scp-resubmission-route-v1")` | A member's submission that the context's node refused, sealed to the other leaves, for any member to submit (`09-security-model.md` §9.9.4). | Node `PUBLISH`, `SUBSCRIBE` and `QUERY` on each node of the member's record set |
 
 **Key distinction:** identity routing IDs are publicly derivable by design — any party that knows an identifier can compute its routing ID and send messages to it. Context pseudonyms are NOT publicly derivable — they require the pseudonym secret (§9.10.4.A), which is private key material. These serve fundamentally different privacy goals.
 
