@@ -1,31 +1,9 @@
 name: Cache warm
 
-# Writes every cache group a job of ci.yml restores, on each push to `main`: every cargo
-# group, the shared Gradle home, and nothing ci.yml's own push run writes (the bridge
-# artifacts, the Docker layer cache). A push to `main` runs no test, lint or gate: the
-# merge-queue run already ran every one of them on the tree that push lands, and ci.yml
-# gates those jobs off `push`. So the jobs here compile, and run nothing that asserts.
-#
-# Each cargo job restores one group, and when the restore is not an exact match it
-# compiles every feature set, in every compile mode, that any job reading the group
-# compiles, so the entry it saves holds every dependency unit each reader needs. A reader
-# that restores an entry missing its units compiles them from source on every run and
-# never saves them, because an exact match skips the save (merge_group run 41499098021:
-# rust-doctest recompiled 223 registry crates, wasm-test 228).
-#
-# The commands below are the readers' own commands made compile-only: `--no-run` where
-# cargo accepts it, `-- --list` for `cargo test --doc` and `wasm-pack test` (the libtest
-# and wasm-bindgen-test-runner harnesses print the test names and run none), clippy
-# without `-- -D warnings` (arguments after `--` reach only the workspace members clippy
-# lints, never a dependency the cache holds), and scripts/compile-examples.sh in place of
-# the examples gate. Test filters are dropped, because a filter changes which tests run
-# and not what compiles. Check `group coverage` in scripts/check-workflow-compile-steps.py
-# fails when a reader of a group compiles a command no job writing that group compiles on
-# a push, so a reader's new feature set or mode lands here in the same change, and check
-# `push runs` fails when a job a push runs does anything but set up, compile and write a
-# cache. Editing this file changes the key of every group it writes, because
-# ./.github/actions/rust-cache digests it into those groups' `prefix-key`, so the next
-# push to `main` re-warms each one under the new commands.
+# EXPERIMENT (branch ci/workspace-crate-cache-exp, dispatched by hand): measures
+# workspace-crate reuse by (a) content manifest and (b) sccache against today's
+# deps-only restore. Writes no Actions cache entry (every rust-cache step has
+# save-if false); artifacts expire after one day.
 
 on:
   push:
@@ -34,38 +12,34 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
-concurrency:
-  group: cache-warm-${{ github.ref }}
-  cancel-in-progress: false
-
-# Identical to ci.yml's `env:`: rust-cache hashes every CARGO*/RUST* variable into the
-# key, so a value that differed here would write an entry no ci.yml job restores, and
-# check `group coverage` compares the two. ci.yml's `env:` says why each value is set.
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: "0"
   RUSTUP_AUTO_INSTALL: "0"
   PYO3_PYTHON: python3.12
+  MAIN_SHA: 63eca462b75ef4962e7bea0c136348852fbac4a2
 
 jobs:
-  workspace-debug:
-    name: Warm workspace-debug
+  writer:
+    name: writer ${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [workspace-debug, workspace-check, clippy-packages]
     steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
       - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          cp .github/workflows/cache-warm.yml "$RUNNER_TEMP/exp.yml"
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+          cp .github/workflows/cache-warm.yml "$RUNNER_TEMP/main-warm.yml"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -75,578 +49,200 @@ jobs:
       - id: cache
         uses: ./.github/actions/rust-cache
         with:
-          shared-key: workspace-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test, one command per leg.
-      - name: Compile rust-test's legs
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo nextest run --no-run -p scp-ffi -p scp-ffi-common -p scp-ffi-napi -p scp-ffi-napi-test-stubs -p scp-ffi-uniffi --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-platform/filesystem,scp-testing/testing
-          cargo nextest run --no-run -p scp-runtime -p scp-core --features scp-core/testing,scp-core/allow_unencrypted_storage,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io
-          cargo nextest run --no-run -p scp-testing -p scp-platform --features openmls_basic_credential/test-utils,serde_json/unbounded_depth,scp-core/outlet-capability-test-grant,tokio/test-util,scp-runtime/outlet-capability-test-grant,scp-runtime/saga-witness-test-mint,scp-platform/filesystem,scp-ffi-common/custody,scp-ffi-common/server,scp-ffi-common/testing
-          cargo nextest run --no-run -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
-      # fail-closed-pre-rotation and rust-test-prose.
-      - name: Compile the fail-closed and prose-reading test targets
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo nextest run --no-run -p scp-node --lib
-          cargo nextest run --no-run -p scp-node --test run_mode_selection
-          cargo nextest run --no-run -p scp-identity --lib
-          cargo nextest run --no-run -p scp-testing --features openmls_basic_credential/test-utils,serde_json/unbounded_depth,scp-core/outlet-capability-test-grant,tokio/test-util,scp-runtime/outlet-capability-test-grant,scp-runtime/saga-witness-test-mint,scp-platform/filesystem,scp-ffi-common/custody,scp-ffi-common/server,scp-ffi-common/testing --test ffi_conformance --test trust
-          cargo nextest run --no-run -p scp-event-log -p scp-protocol --features scp-protocol/testing,serde_json/unbounded_depth --lib
-      # rust-test-napi-production, rust-build-pyo3-production,
-      # rust-build-uniffi-production and uniffi-cdylib-linux.
-      - name: Compile the production-configuration bridges
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --no-run -p scp-ffi-napi --features server
-          cargo test --no-run -p scp-ffi-common
-          cargo nextest run --no-run -p scp-ffi-common --features server --test node_start_shipped
-          cargo nextest run --no-run -p scp-ffi-napi --features server --lib
-          cargo build -p scp-ffi-napi --features server --lib
-          cargo build -p scp-ffi --features server
-          cargo nextest run --no-run -p scp-ffi --features server --lib
-          FEATURES="$(python3 -c 'import tomllib; print(",".join(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["tool"]["maturin"]["features"]))')"
-          cargo build -p scp-ffi --lib --features "${FEATURES}"
-          cargo build -p scp-ffi-uniffi --features server
-          cargo clippy -p scp-ffi-uniffi --all-targets --features server
-          cargo test --no-run -p scp-ffi-uniffi --features server
-          cargo nextest run --no-run -p scp-ffi-uniffi --features server --lib
-          cargo build -p scp-ffi-uniffi --features testing
-          ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
-      # rust-doctest: `-- --list` compiles every doctest and runs none.
-      - name: Compile rust-doctest's doc tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs -- --list
-
-  workspace-check:
-    name: Warm workspace-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          components: clippy
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: workspace-check
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # rust-clippy's `workspace` leg and rust-doc.
-      - name: Compile the workspace in check mode and document it
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
-          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
-
-  clippy-packages:
-    name: Warm clippy-packages
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          components: clippy
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: clippy-packages
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # rust-clippy's six `packages-*` legs.
-      - name: Compile every package feature set in check mode
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --all-targets
-          cargo clippy -p scp-transport --features quic,http3,udp,push-store,testing --all-targets
-          cargo clippy -p scp-node --features quic,http3,udp,coap,upnp,testing --all-targets
-          cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets
-          cargo clippy -p scp-testing --features sync,combined --all-targets
-          cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets
-          cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup,webpush --all-targets
-          cargo clippy -p scp-transport --features push-store --all-targets
-          cargo clippy -p scp-transport --features push-store,testing --all-targets
-          cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp --all-targets
-          cargo clippy -p scp-node --features cloud-blobs,testing --all-targets
-          cargo clippy -p scp-relay --features cloud-blobs --all-targets
-          cargo clippy -p scp-node --no-default-features --lib
-          cargo clippy -p scp-node --no-default-features --features testing --all-targets
-
-  workspace-ci-bridge:
-    name: Warm workspace-ci-bridge
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: workspace-ci-bridge
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # pyo3-module and napi-addon.
-      - name: Build the PyO3 module and the NAPI addon under the ci-bridge profile
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install maturin
-          cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing
-          cd bindings/python
-          maturin develop --profile ci-bridge --features testing
-
-  wasm32:
-    name: Warm wasm32
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          targets: wasm32-unknown-unknown
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: wasm32
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        name: Install wasm-pack
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-pack@0.14.0
-      # typescript-wasm-check and scaffold-typescript-web-check.
-      - name: Build the wasm package
-        if: steps.cache.outputs.cache-hit != 'true'
-        working-directory: bindings/typescript-wasm
-        run: |
-          bun install
-          bun run build
-      # wasm-protocol and wasm-test: `-- --list` builds the wasm test binaries and runs
-      # none.
-      - name: Check the wasm32 protocol crates and build the wasm tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
-          cargo check -p scp-kel --tests --target wasm32-unknown-unknown
-          wasm-pack test --node crates/scp-client-wasm -- --list
-
-  clippy-examples:
-    name: Warm clippy-examples
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          components: clippy
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: clippy-examples
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # rust-clippy's `examples` leg, which runs scripts/check-examples-compile.sh.
-      - name: Compile every example target
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          bash scripts/compile-examples.sh
-
-  transport-optional-sqlite-without-memory-management:
-    name: Warm transport-optional-sqlite-without-memory-management
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: transport-optional-sqlite-without-memory-management
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test-optional-features's `sqlite-without-memory-management` leg, under the
-      # same LIBSQLITE3_FLAGS, which libsqlite3-sys's build script reads.
-      - name: Compile scp-sqlite-pools against a SQLite built without ENABLE_MEMORY_MANAGEMENT
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          LIBSQLITE3_FLAGS: -USQLITE_ENABLE_MEMORY_MANAGEMENT
-        run: cargo nextest run --no-run -p scp-sqlite-pools --lib
-
-  python-wheel:
-    name: Warm python-wheel
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # python-wheel-build's job `env:`; rust-cache hashes RUSTFLAGS into the key.
-    env:
-      RUSTFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: |
-            3.10
-            3.12
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: python-wheel
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - name: Install maturin
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
-      # python-wheel-build.
-      - name: Build a debug wheel for CPython 3.10 and 3.12
-        if: steps.cache.outputs.cache-hit != 'true'
-        working-directory: bindings/python
-        run: maturin build --out dist -i python3.10 python3.12 --locked
-
-  fuzz:
-    name: Warm fuzz
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain-file: fuzz/rust-toolchain.toml
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          workspaces: "fuzz -> target"
-          shared-key: fuzz
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-        with:
-          working-directory: fuzz
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # fuzz-build.
-      - name: Check the fuzz crate and compile its library tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        working-directory: fuzz
-        run: |
-          cargo check --locked
-          cargo nextest run --no-run --lib
-
-  android-x86_64-testing:
-    name: Warm android-x86_64-testing
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
-      - uses: actions/checkout@v5
-      - uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "ndk;27.2.12479018"
-      # The same linker and C toolchain variables kotlin-android-instrumented writes, before
-      # rust-cache, which hashes every CARGO* variable into the key.
-      - name: Point cargo at the NDK linker
-        run: |
-          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          {
-            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ndk_bin/x86_64-linux-android21-clang"
-            echo "CC_x86_64_linux_android=$ndk_bin/x86_64-linux-android21-clang"
-            echo "AR_x86_64_linux_android=$ndk_bin/llvm-ar"
-            echo "RANLIB_x86_64_linux_android=$ndk_bin/llvm-ranlib"
-          } >> "$GITHUB_ENV"
-      - uses: ./.github/actions/rust-toolchain
-        with:
-          targets: x86_64-linux-android
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: android-x86_64-testing
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # kotlin-android-instrumented.
-      - name: Build the UniFFI cdylib for the emulator
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo build -p scp-ffi-uniffi --features testing,scp-platform/vendored-openssl --target x86_64-linux-android
-
-  # The Gradle user home that kotlin-lint, kotlin-test, kotlin-android-instrumented and
-  # bridge-parity-kotlin restore read-only. Each of those sets the same
-  # GRADLE_BUILD_ACTION_CACHE_KEY_JOB, so setup-gradle keys all five on one job name and
-  # each restores the entry this job writes, one entry instead of one per job and leg.
-  # setup-gradle saves only on the default branch.
-  gradle:
-    name: Warm gradle
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
-    steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/rust-toolchain
-      # uniffi-cdylib-linux builds the cdylib and bindings the Kotlin jobs download; the
-      # Gradle tasks below compile against the same bindings.
-      - uses: ./.github/actions/rust-cache
-        with:
-          shared-key: workspace-debug
+          shared-key: ${{ matrix.group }}
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - name: Build the UniFFI cdylib and generate its Kotlin bindings
+      - uses: taiki-e/install-action@nextest
+      - name: Compile the group's commands
         run: |
-          cargo build -p scp-ffi-uniffi --features testing
-          ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
-      - uses: actions/setup-java@v4
-        with:
-          distribution: zulu
-          java-version: "17"
-      - uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
+          pip install -q pyyaml
+          python3 scripts/ws-exp-writer.py "${{ matrix.group }}" "$RUNNER_TEMP/main-warm.yml" > "$RUNNER_TEMP/w.sh"
+          start=$(date +%s)
+          bash "$RUNNER_TEMP/w.sh" 2>&1 | command grep -vE '^\s+(Compiling|Checking|Fresh)' | tail -200
+          echo "WRITER group=${{ matrix.group }} compile_seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Pack
         run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35"
-      - uses: gradle/actions/setup-gradle@v4
-      # Resolves every configuration of every project (the ktlint and detekt tool
-      # classpaths among them), and compiles and packages what kotlin-test,
-      # kotlin-android-instrumented and kotlin-lint build, so the entry holds their
-      # dependencies and artifact transforms.
-      - name: Resolve and compile every Kotlin project
-        working-directory: bindings/kotlin
-        run: >-
-          ./gradlew --init-script ../../.github/gradle/warm-dependency-cache.gradle
-          warmDependencyCache :scp-kt:testClasses :scp-kt:jar
-          :scp-kt-android:compileDebugUnitTestKotlin :scp-kt-android:assembleDebugAndroidTest
-          -Pscp.uniffi.prebuiltBindings=true
-      # bridge-parity-kotlin.
-      - name: Build the Kotlin parity runner
-        run: >-
-          bindings/kotlin/gradlew -p bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner
-          --init-script "$GITHUB_WORKSPACE/.github/gradle/warm-dependency-cache.gradle"
-          warmDependencyCache installDist --no-daemon -Pscp.uniffi.prebuiltBindings=true
+          start=$(date +%s)
+          python3 scripts/ci-workspace-cache.py pack --target target --out "$RUNNER_TEMP/ws.tar.zst"
+          echo "PACK group=${{ matrix.group }} seconds=$(( $(date +%s) - start )) bytes=$(stat -c %s "$RUNNER_TEMP/ws.tar.zst")" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ws-${{ matrix.group }}
+          path: ${{ runner.temp }}/ws.tar.zst
+          compression-level: 0
+          retention-days: 1
 
-  optional-features:
-    name: Warm optional-features
+  base:
+    name: base ${{ matrix.reader }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { reader: testing, group: workspace-debug }
+          - { reader: runtime, group: workspace-debug }
+          - { reader: napi, group: workspace-debug }
+          - { reader: pyo3, group: workspace-debug }
+          - { reader: uniffi, group: workspace-debug }
+          - { reader: doctest, group: workspace-debug }
+          - { reader: clippy-ws, group: workspace-check }
+          - { reader: clippy-cloud, group: clippy-packages }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: ${{ matrix.group }}
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - name: Compile
+        run: |
+          source scripts/ws-exp.sh
+          run_reader "${{ matrix.reader }}" base
+
+  manifest:
+    needs: writer
+    name: manifest ${{ matrix.reader }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { reader: testing, group: workspace-debug }
+          - { reader: runtime, group: workspace-debug }
+          - { reader: napi, group: workspace-debug }
+          - { reader: pyo3, group: workspace-debug }
+          - { reader: uniffi, group: workspace-debug }
+          - { reader: doctest, group: workspace-debug }
+          - { reader: clippy-ws, group: workspace-check }
+          - { reader: clippy-cloud, group: clippy-packages }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: ${{ matrix.group }}
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - name: Download
+        id: dl
+        run: |
+          start=$(date +%s)
+          echo "start=$start" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ws-${{ matrix.group }}
+          path: ${{ runner.temp }}/ws
+      - name: Restore
+        run: |
+          echo "DOWNLOAD seconds=$(( $(date +%s) - ${{ steps.dl.outputs.start }} ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          start=$(date +%s)
+          python3 scripts/ci-workspace-cache.py restore --target target --archive "$RUNNER_TEMP/ws/ws.tar.zst"
+          echo "RESTORE seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compile under each scenario
+        run: |
+          source scripts/ws-exp.sh
+          r="${{ matrix.reader }}"
+          run_reader "$r" none
+          if [[ $r == clippy-ws ]]; then
+            echo "pub fn workspace_cache_plant(v: &[u8]) -> bool { v.len() == 0 }" >> crates/scp-clock/src/lib.rs
+            run_reader "$r" plant-warning-in-changed-crate
+            git checkout -q crates/scp-clock/src/lib.rs
+            run_reader "$r" plant-reverted
+            sed -i 's/-D warnings/-D warnings -A clippy::len_zero/' scripts/ws-exp.sh
+            source scripts/ws-exp.sh
+            run_reader "$r" clippy-args-changed
+            git checkout -q scripts/ws-exp.sh
+            source scripts/ws-exp.sh
+            run_reader "$r" clippy-args-restored
+            echo "# workspace-cache experiment" >> .clippy.toml
+            run_reader "$r" clippy-toml-changed
+          fi
+          edit leaf "$(leaf_file "$r")"
+          run_reader "$r" leaf
+          edit mid crates/scp-runtime/src/lib.rs
+          run_reader "$r" mid
+          edit root crates/scp-crypto/src/lib.rs
+          run_reader "$r" root
+
+  sccache:
+    name: sccache ${{ matrix.reader }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { reader: testing, group: workspace-debug }
+          - { reader: napi, group: workspace-debug }
+          - { reader: uniffi, group: workspace-debug }
+          - { reader: clippy-ws, group: workspace-check }
     steps:
       - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
       - id: cache
         uses: ./.github/actions/rust-cache
         with:
-          shared-key: optional-features
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test-optional-features's four `transport-*` legs.
-      - name: Compile every scp-transport feature set the transport legs test
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo test --no-run -p scp-transport --features combined,local-cache
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test nostr_roundtrip
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test webrtc_roundtrip
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,push-store,testing --lib
-          cargo nextest run --no-run -p scp-transport --features push-store,testing --lib --tests
-          cargo nextest run --no-run -p scp-transport --features push-store --lib --tests
-          cargo nextest run --no-run -p scp-transport --features push-store --lib
-          cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib
-          cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
-      # rust-test-optional-features's `node-relay` leg.
-      - name: Compile every scp-node and scp-relay feature set the node-relay leg tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_listener
-          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_cross_transport
-          cargo nextest run --no-run -p scp-node --features http3,udp,testing --lib
-          cargo nextest run --no-run -p scp-node --features http3,testing --lib
-          cargo nextest run --no-run -p scp-node --features cloud-blobs,testing --test storage_backend_selection
-          cargo nextest run --no-run -p scp-relay --features cloud-blobs --test storage_backend
-      # rust-test-optional-features's `platform-testing` leg.
-      - name: Compile every scp-platform and scp-testing feature set the platform-testing leg tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib
-          cargo nextest run --no-run -p scp-testing --features sync,combined --test persistence_advanced
-          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence
-          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence_sdk
-          cargo nextest run --no-run -p scp-testing --features sqlite --test saga_bridge_journal_swap
-          cargo check -p scp-testing --lib
-          cargo check -p scp-testing --lib --features testing
-
-  apple-transport-platform:
-    name: Warm apple-transport-platform
-    runs-on: macos-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+          shared-key: ${{ matrix.group }}
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
         with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: apple-transport-platform
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test-macos's three legs.
-      - name: Compile every scp-transport and scp-platform feature set the macOS legs test
-        if: steps.cache.outputs.cache-hit != 'true'
+          tool: sccache
+      - name: Compile under each scenario, every hit served from a local sccache dir
         run: |
-          cargo test --no-run -p scp-transport --features combined,local-cache
-          cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,startup
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test nostr_roundtrip
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
-          cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib
-          cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib
-          cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing
-
-  apple-uniffi-ci-bridge:
-    name: Warm apple-uniffi-ci-bridge
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: apple-uniffi-ci-bridge
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # xcframework.
-      - name: Build the XCFramework under the ci-bridge profile
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: bindings/swift/build-xcframework.sh --dev --profile ci-bridge
-
-  apple-parity-ci-bridge:
-    name: Warm apple-parity-ci-bridge
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: apple-parity-ci-bridge
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      # pyo3-module-macos.
-      - name: Build the PyO3 module under the ci-bridge profile
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install maturin
-          cd bindings/python
-          maturin develop --profile ci-bridge --features testing
+          export RUSTC_WRAPPER=sccache SCCACHE_DIR="$RUNNER_TEMP/sccache" SCCACHE_CACHE_SIZE=30G
+          source scripts/ws-exp.sh
+          r="${{ matrix.reader }}"
+          run_reader "$r" populate
+          sccache --show-stats | head -30
+          du -sh "$SCCACHE_DIR"
+          sccache --zero-stats >/dev/null
+          python3 scripts/ci-workspace-cache.py clean --target target
+          run_reader "$r" none
+          sccache --show-stats | head -30
+          python3 scripts/ci-workspace-cache.py clean --target target
+          edit leaf "$(leaf_file "$r")"
+          run_reader "$r" leaf
+          python3 scripts/ci-workspace-cache.py clean --target target
+          edit mid crates/scp-runtime/src/lib.rs
+          run_reader "$r" mid
+          python3 scripts/ci-workspace-cache.py clean --target target
+          edit root crates/scp-crypto/src/lib.rs
+          run_reader "$r" root
+          sccache --show-stats | head -30
