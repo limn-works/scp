@@ -1632,6 +1632,7 @@ mod tests {
 
     /// Calls every UCAN entry point against `ctx_id`, for
     /// `every_ucan_entry_point_withholds_a_faulted_actor`.
+    #[cfg(feature = "testing")]
     fn faulted_ucan_refusals(
         py: Python<'_>,
         scp: &crate::scp::PyScp,

@@ -8372,6 +8372,10 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
                 "cargo clippy -p scp-node --no-default-features --features testing --all-targets "
                 "-- -D warnings"
             ),
+            (
+                "cargo clippy --workspace --tests --release --features "
+                "scp-core/testing,scp-runtime/saga-witness-test-mint -- -D warnings"
+            ),
         ),
     ),
     # Job rust-test-optional-features, whose `group` axis runs the transport

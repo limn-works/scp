@@ -1651,28 +1651,6 @@ mod tests {
     const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
     const VALID_DID: &str = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imbdhgy";
 
-    /// `n` exact-match test cases whose weights sum to 10000.
-    fn test_cases_json(n: usize) -> String {
-        let weight = 10_000 / n;
-        let cases: Vec<scp_core::trust::TestCase> = (0..n)
-            .map(|i| scp_core::trust::TestCase {
-                test_id: format!("t{i}"),
-                input: serde_json::json!({ "i": i }),
-                expected: scp_core::trust::ExpectedOutput::ExactMatch {
-                    value: serde_json::json!({ "ok": true }),
-                },
-                category: "basic".to_owned(),
-                weight: u32::try_from(if i == 0 {
-                    10_000 - weight * (n - 1)
-                } else {
-                    weight
-                })
-                .unwrap(),
-            })
-            .collect();
-        serde_json::to_string(&cases).unwrap()
-    }
-
     fn assert_code<T: std::fmt::Debug>(result: PyResult<T>, code: &str) {
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains(code), "expected {code}, got: {msg}");
@@ -1869,6 +1847,28 @@ mod tests {
         use scp_platform::KeyCustody as _;
 
         use super::*;
+
+        /// `n` exact-match test cases whose weights sum to 10000.
+        fn test_cases_json(n: usize) -> String {
+            let weight = 10_000 / n;
+            let cases: Vec<scp_core::trust::TestCase> = (0..n)
+                .map(|i| scp_core::trust::TestCase {
+                    test_id: format!("t{i}"),
+                    input: serde_json::json!({ "i": i }),
+                    expected: scp_core::trust::ExpectedOutput::ExactMatch {
+                        value: serde_json::json!({ "ok": true }),
+                    },
+                    category: "basic".to_owned(),
+                    weight: u32::try_from(if i == 0 {
+                        10_000 - weight * (n - 1)
+                    } else {
+                        weight
+                    })
+                    .unwrap(),
+                })
+                .collect();
+            serde_json::to_string(&cases).unwrap()
+        }
 
         /// The custody and `(identity, #active)` key handles of `did`.
         fn keys(

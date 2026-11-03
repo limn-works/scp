@@ -303,6 +303,42 @@ jobs:
           export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           bash scripts/compile-examples.sh
 
+  release-check:
+    name: Warm release-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space when the runner is short of it
+        run: |
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: release-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cargo-fetch
+      # rust-clippy's `release-tests` leg.
+      - name: Compile the workspace tests in check mode under the release profile
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          cargo clippy --workspace --tests --release --features scp-core/testing,scp-runtime/saga-witness-test-mint
+
   transport-optional-sqlite-without-memory-management:
     name: Warm transport-optional-sqlite-without-memory-management
     runs-on: ubuntu-latest
