@@ -1605,15 +1605,18 @@ impl ResolvedState {
 
 /// One chain a validating store retains under `09-security-model.md`
 /// §9.7.4.2 R9, accepted or suffix, with the key state replaying it derives.
-/// Only `AcceptedChainHolder`, the holder of a store's retained set,
-/// constructs it, from that set, so a store's admission and selection
-/// (`09-security-model.md` §9.10.12) read a chain the store holds and never a
-/// chain a caller hands in. It carries no verdict and no resolution instant:
-/// a store admits a record for availability, and no party's trust decision
-/// reads a `RetainedChain`. A verifier of a log-anchored or current-key
-/// signature (`09-security-model.md` §9.7.1) takes a `ResolvedState` or a
-/// `RetainedChain` and applies the same identity check and the same refusal
-/// of a head off the chain to either.
+/// Only `RetainedLog` below constructs it, from the chains it holds, and a
+/// `RetainedLog` takes event units and never a validated chain: it validates
+/// each frame's units against the chains it holds and ranks the result under
+/// R9 itself. No caller can present a chain the log did not validate and
+/// rank. It carries no verdict and no resolution instant: a store admits a
+/// record for availability, and no party's trust decision reads a
+/// `RetainedChain`. A party's verifier of a log-anchored or current-key
+/// signature (`09-security-model.md` §9.7.1) takes a `ResolvedState` only. A
+/// store's admission of a node-list record or entry (§9.10.12) has its own
+/// entry points, which take a `RetainedChain` and return admitted types that
+/// are distinct from a party's verified types, so no party consumer accepts a
+/// value a store verified.
 pub struct RetainedChain { /* the validated chain, the replayed state, the identifier; private */ }
 
 impl RetainedChain {
@@ -1628,6 +1631,25 @@ impl RetainedChain {
     /// `ResolvedState::key_state_at` reads it. `NotOnChain` where no event of
     /// the retained chain has that digest.
     pub fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain>;
+}
+
+/// One identifier's key-event log as a validating store holds it
+/// (`09-security-model.md` §9.10.12): the chains it retains under
+/// `09-security-model.md` §9.7.4.2 R9, built from the event units of the
+/// frames the store admitted, in the order it admitted them.
+pub struct RetainedLog { /* the identifier and the R9 holder; private */ }
+
+impl RetainedLog {
+    pub fn new(identifier: Identifier) -> Self;
+    /// Admits one frame's event units under R10's frame admission and R3:
+    /// the first unit is the identifier's inception or extends an event of
+    /// a chain the log holds, and is not an event the log holds; each later
+    /// unit extends the unit before it; each passes R3's check order. It then
+    /// holds the extended chain under R9. Each unit is validated once,
+    /// against the chain it extends, and never replayed with the log.
+    pub fn admit(&mut self, units: &[&[u8]]) -> Result<HoldOutcome, FrameRefusal>;
+    /// Every chain the log retains, accepted or suffix, as `RetainedChain`.
+    pub fn retained(&self) -> Vec<RetainedChain>;
 }
 
 /// The commitment the latest reveal-authorized event fixed, or the
