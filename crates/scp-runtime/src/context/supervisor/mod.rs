@@ -123,7 +123,6 @@ mod floors;
 pub mod handle;
 pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;
-pub mod saga_journal;
 pub mod saga_prepared_state;
 #[allow(clippy::module_inception)]
 pub mod supervisor;
@@ -170,10 +169,6 @@ pub use handle::SupervisorHandle;
 pub use key_package_actor::{
     KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackageStoreActor,
     KeyPackageStoreHandle, KpRef, PooledKeyPackages, ReservationId,
-};
-pub use saga_journal::{
-    JournalEntry, JournalError, ProtocolRepositorySagaJournal, SAGA_JOURNAL_KEY_PREFIX, SagaId,
-    SagaJournal, SagaState, SagaTerminalState,
 };
 pub use saga_prepared_state::{
     CrossContextOutletInvocationPrepared, CrossContextOutletInvocationSnapshot, SagaPreparedState,

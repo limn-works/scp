@@ -440,12 +440,16 @@ pub trait ContextEventLogProvider: Send + Sync {
     ) -> Result<(), ContextCreationError> {
         // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
         // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
-        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, chunks)
-            .map_err(|err| {
-                let log_err =
-                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
-                ContextCreationError::EventLogFailed(log_err.to_string())
-            })?;
+        scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_manifest(
+            event, chunks,
+        )
+        .map_err(|err| {
+            let log_err =
+                scp_runtime_types::context::outlets::stream::chunks_billed_error_to_event_log_error(
+                    err,
+                );
+            ContextCreationError::EventLogFailed(log_err.to_string())
+        })?;
         // (2) Serialize and append through the standard boundary, which
         // re-runs the durable event-local `<=` backstop.
         let data = serde_json::to_vec(event).map_err(|e| {

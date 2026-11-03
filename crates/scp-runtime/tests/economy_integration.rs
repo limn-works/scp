@@ -50,12 +50,12 @@ use scp_protocol::economy::types::{
     Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
     PricingFormula, PricingMetric, PricingVariable,
 };
-use scp_runtime::economy::adapter::{
+use scp_runtime_types::economy::adapter::{
     AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata,
     PaymentReceipt, RefundConfirmation, VerificationResult,
 };
-use scp_runtime::economy::receipt::{ReceiptFilter, payment_history};
-use scp_runtime::well_known::{RelayConfig, RelayEconomicConfig, WellKnownScp};
+use scp_runtime_types::economy::receipt::{ReceiptFilter, payment_history};
+use scp_runtime_types::well_known::{RelayConfig, RelayEconomicConfig, WellKnownScp};
 
 // ===========================================================================
 // Test adapter -- in-memory, no real money, for integration tests

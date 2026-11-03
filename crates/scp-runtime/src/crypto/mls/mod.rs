@@ -25,25 +25,14 @@
 #[cfg(test)]
 mod wrapping_extension_runtime_tests;
 
-// The adder's KeyPackage-attestation verifier over the supervisor's
-// `KeyResolver` — §9.7.1 checks 1 and 3–13 on an Add (CRYPTO-22 S4, Layer B),
-// wired at `Supervisor::invite_member`.
-pub mod attestation_verification;
-
 // The signer of a KeyPackage's `0xFF03` attestation, bound to the owner's
 // resolved `#active` key, and the one mint path every native KeyPackage
 // minter uses (§9.7.1).
 pub mod attestation_signer;
 
-// Test-only minting of attested KeyPackages with a local Ed25519 key.
-#[cfg(test)]
-pub mod test_support;
-
-// Async MLS backend and provider — stay in scp-runtime (tokio-coupled, node-only).
-pub mod backend;
-pub mod production_backend;
+// The async MLS provider (tokio-coupled, node-only). The backend and storage
+// adapter it drives live in `scp_runtime_types::crypto::mls`.
 pub mod provider;
-pub mod storage_adapter;
 
 // Shared two-party joined-pair bootstrap for provider-level unit tests (drives
 // the REAL reserve → creator-add → sign → HPKE-seal → spawn-from-Welcome join

@@ -21,9 +21,9 @@ use scp_protocol::context::params::{
 };
 use scp_protocol::context::{CeilingDeclaration, ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::config::{ContextConfig, ContextCreation};
 use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_types::context::config::{ContextConfig, ContextCreation};
 
 // ---------------------------------------------------------------------------
 // Mock providers (mirrors governance_integration.rs)

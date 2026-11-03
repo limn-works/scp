@@ -285,13 +285,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 use super::deps::ActorDeps;
-use super::sequence::SendSequenceTracker;
 use super::state::{
     ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState, ContextRouting,
     PerContextState, RecvSequenceTracker, WelcomeProcessing,
 };
 use crate::context::ContextHandle;
-use crate::context::governance::timeout::DeadlockDetectionState;
+use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
+use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
 use crate::context::snapshot::persist_state_best_effort;
 use crate::context::snapshot::persist_state_fail_closed;
@@ -300,7 +300,6 @@ use crate::context::state::{
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
     TtlState,
 };
-use crate::economy::adapter::PaymentReceipt;
 use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_protocol::context::ContextError;
@@ -328,6 +327,7 @@ use scp_protocol::economy::types::EconomicPolicy;
 use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
 use scp_protocol::trust::consequence::ConsequenceRule;
 use scp_protocol::trust::participation::ParticipationRecord;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
 
 /// Mutable view over a [`PerContextState`] that EXPOSES the Class-S sub-structs.
 ///
@@ -2786,7 +2786,7 @@ impl ClassSCell {
     /// `class_s_no_persist_mutator_whitelist_is_bounded`.
     pub(crate) fn clear_committed_reservation_idempotent(
         &mut self,
-        saga_id: &crate::context::supervisor::saga_journal::SagaId,
+        saga_id: &scp_runtime_types::context::supervisor::saga_journal::SagaId,
     ) -> bool {
         let removed = self
             .state
@@ -3820,7 +3820,7 @@ impl Drop for ClassSCommitToken {
                 "ClassSCommitToken dropped without commit — a Class-S consume \
                  (e.g. a burned spending nonce) may be unpersisted (ADR-049 §9)"
             );
-            crate::metrics::record_class_s_token_dropped_uncommitted();
+            scp_runtime_types::metrics::record_class_s_token_dropped_uncommitted();
             debug_assert!(
                 false,
                 "ClassSCommitToken dropped without commit for context {}",
@@ -5530,12 +5530,13 @@ impl ClassSCell
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -5590,8 +5591,8 @@ impl ClassSCell
         s
     }
 
-    fn saga(id: &str) -> crate::context::supervisor::saga_journal::SagaId {
-        crate::context::supervisor::saga_journal::SagaId(id.to_owned())
+    fn saga(id: &str) -> scp_runtime_types::context::supervisor::saga_journal::SagaId {
+        scp_runtime_types::context::supervisor::saga_journal::SagaId(id.to_owned())
     }
 
     /// Build a `CrossContextOutletInvocation` prepared-state for `saga_pending`.
@@ -5621,7 +5622,7 @@ impl ClassSCell
         cell: &mut ClassSCell,
         deps: &ActorDeps,
         context_id: &str,
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         record: crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     ) {
         cell.commit_class_s_restore(deps, context_id, |mut view| {

@@ -333,12 +333,12 @@ mod tests {
         settle_outlet_stream,
     };
     use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
-    use crate::economy::adapter::{
+    use crate::trust::caveat_counters::CaveatCounters;
+    use scp_runtime_types::economy::adapter::{
         AdapterCapabilities, CountingPaymentAdapter, PaymentAdapter, PaymentAdapterDyn,
         PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt, RefundConfirmation,
         VerificationResult,
     };
-    use crate::trust::caveat_counters::CaveatCounters;
 
     const INVOKER: &str = "did:dht:z6MkStreamSettleInvoker";
     const CTX_BYTE: u8 = 0x5D;
@@ -487,12 +487,13 @@ mod tests {
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(crate::context::providers::MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(NOW));
         Supervisor::with_providers(
             crypto,
@@ -663,8 +664,8 @@ mod tests {
     /// asserts `captured == 1` and FAILS.
     #[tokio::test]
     async fn already_settled_witness_with_failing_store_does_not_recapture() {
-        use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation;
+        use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
         let captured = Arc::new(AtomicUsize::new(0));
         // Counting payment adapter + a FAILING persistence backend: the settle's

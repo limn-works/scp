@@ -79,15 +79,15 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::context::ContextHandle;
-use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceState, MigrationState,
     PendingCommit, TtlState,
 };
-use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::SagaPreparedState;
-use crate::economy::adapter::PaymentReceipt;
 use scp_mls::group::ScpMlsGroup;
+use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
+use scp_runtime_types::context::supervisor::saga_journal::SagaId;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
 
 // ADR-049 PR-7 (crypto-state move, prep A — SCP-CRYPTOMOVE-000a): types named by
 // the per-context crypto orchestration + state-management methods moved VERBATIM
@@ -1450,7 +1450,7 @@ pub struct PerContextState {
     /// before `push_back`). This buffer is therefore a SLIDING WINDOW of the
     /// most recent captures, NOT the authoritative payment ledger; the full
     /// persisted history is a separate, store-backed surface (not yet wired —
-    /// see [`crate::economy::receipt::payment_history`]).
+    /// see [`scp_runtime_types::economy::receipt::payment_history`]).
     pub payment_receipts: VecDeque<PaymentReceipt>,
 
     // -----------------------------------------------------------------
@@ -1606,7 +1606,7 @@ pub struct PerContextState {
     // New actor-shape fields (no legacy equivalent)
     // -----------------------------------------------------------------
     /// Send-sequence counter with RAII rollback
-    /// ([`SequenceReservation`](crate::context::actor::SequenceReservation)).
+    /// ([`SequenceReservation`](scp_runtime_types::context::actor::sequence::SequenceReservation)).
     /// Replaces the legacy per-sender `MembershipState::next_sequence_number`
     /// as the authoritative send-sequence counter.
     pub send_tracker: SendSequenceTracker,
@@ -2401,7 +2401,7 @@ impl ContextCryptoState {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
         let (sealed_vec, ephemeral_pub) =
-            crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+            scp_runtime_types::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 sender_key.as_bytes(),
                 &request.wrapping_pubkey,
                 &ctx_id_hex,
@@ -2694,8 +2694,10 @@ impl PerContextState {
         let blob = crypto.seal(&context_id, local_did, inner, aad_sequence)?;
         // Advance exactly once on success — the caller-side counterpart to the
         // provider's `state.send_sequence.checked_add(1)`.
-        crate::context::actor::sequence::SequenceReservation::reserve(&mut self.send_tracker)
-            .commit();
+        scp_runtime_types::context::actor::sequence::SequenceReservation::reserve(
+            &mut self.send_tracker,
+        )
+        .commit();
         Ok(blob)
     }
 
@@ -3095,7 +3097,7 @@ impl PerContextState {
         let recipient = crypto.member_wrapping_keys.get(member_did).copied();
         if let Some(recipient_wrapping_pub) = recipient {
             let (sealed_vec, ephemeral_pub) =
-                crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                scp_runtime_types::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                     sender_key.as_bytes(),
                     &recipient_wrapping_pub,
                     &ctx_id_hex,
@@ -3219,13 +3221,14 @@ impl PerContextState {
             if *member_did == local_did || read_excluded.contains(member_did) {
                 continue;
             }
-            let seal_result = crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
-                &new_key_bytes,
-                wrapping_pub,
-                &ctx_id_hex,
-                local_did,
-                sender_key_epoch,
-            );
+            let seal_result =
+                scp_runtime_types::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                    &new_key_bytes,
+                    wrapping_pub,
+                    &ctx_id_hex,
+                    local_did,
+                    sender_key_epoch,
+                );
 
             match seal_result {
                 Ok((sealed_vec, ephemeral_pub)) => {
@@ -4224,7 +4227,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn class_s_and_governance_class_s_snapshot_restore_is_lossless() {
-        use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::{
             CallerReservationRecord, CommittedOutletInvocation,
             CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
@@ -4234,6 +4236,7 @@ mod tests {
             ChunkPayload, MerkleFrontier, OutletStreamChunk,
         };
         use scp_protocol::economy::types::Amount;
+        use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
         let mut state =
             PerContextState::new_for_test_encrypted([0xC5u8; 32], 1_700_000_000, test_admin());
@@ -5608,13 +5611,14 @@ mod crypto_ops_golden {
             ))
             .await
             .unwrap();
-        let key_actor = crate::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
-            &dh,
-            ephemeral.public(),
-            &ctx_hex,
-            &resp,
-        )
-        .unwrap();
+        let key_actor =
+            scp_runtime_types::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
+                &dh,
+                ephemeral.public(),
+                &ctx_hex,
+                &resp,
+            )
+            .unwrap();
 
         // Ground truth: the recovered key is Alice's ACTUAL local sender key, and
         // the metadata echoes the request.

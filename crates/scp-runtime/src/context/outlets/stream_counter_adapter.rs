@@ -253,12 +253,13 @@ mod tests {
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(crate::context::providers::MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         // A fixed test clock so the adapter's `now_secs` is deterministic across
         // every round-trip; no-op persistence so `commit_class_s_keep` succeeds.
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));

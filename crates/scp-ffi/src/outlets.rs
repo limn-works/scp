@@ -3014,7 +3014,8 @@ mod tests {
     // preserved (never coerced to `Some(0)`).
     // ------------------------------------------------------------------
 
-    use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError, SagaId};
+    use scp_core::context::saga_journal::SagaId;
+    use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError};
 
     /// `Aborted` routes through `common` onto `ScpPyError::SagaAborted` with the
     /// `SCP-SAGA-{code}` string and `retry_after_ms` carried structurally; a

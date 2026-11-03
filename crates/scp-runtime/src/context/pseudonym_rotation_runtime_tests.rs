@@ -250,11 +250,12 @@ struct Node {
     sent: Arc<Sent>,
 }
 
-fn mls_storage() -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+fn mls_storage() -> Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
+{
     Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     )
 }
 

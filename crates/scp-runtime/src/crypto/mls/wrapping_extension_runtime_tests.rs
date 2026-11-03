@@ -2,7 +2,7 @@
 //!
 //! The synchronous helpers under test live in the wasm32-safe `scp-mls` crate
 //! (ADR-057), but these tests exercise the **runtime** sender-key protocol
-//! (`crate::crypto::sender_keys`, `scp_platform` async key custody), which is
+//! (`scp_runtime_types::crypto::sender_keys`, `scp_platform` async key custody), which is
 //! tokio-coupled and node-only. They therefore stay in `scp-runtime` and drive
 //! `scp_mls::wrapping_extension` from the runtime side. The pure-sync extension
 //! tests moved with the file into `scp_mls::wrapping_extension`.
@@ -29,8 +29,10 @@ fn test_credential(name: &str) -> scp_mls::ScpCredential {
 /// 65-byte uncompressed public point and its 32-byte scalar.
 #[test]
 fn generate_wrapping_keypair_produces_valid_keypair() {
-    let (pub1, sec1) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
-    let (pub2, sec2) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
+    let (pub1, sec1) =
+        scp_runtime_types::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
+    let (pub2, sec2) =
+        scp_runtime_types::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
 
     assert_eq!(pub1.as_bytes()[0], 0x04);
     assert_eq!(sec1.len(), 32);
@@ -53,13 +55,13 @@ fn generate_wrapping_keypair_produces_valid_keypair() {
 /// wrapping key -> requester decrypts successfully.
 #[tokio::test]
 async fn sender_key_request_response_with_wrapping_key() {
-    use crate::crypto::sender_keys::key_protocol::{
-        HandleRequestParams, NonceDedup, handle_sender_key_request, open_sender_key_response,
-        request_sender_key,
-    };
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_protocol::crypto::sender_keys::generate_sender_key;
+    use scp_runtime_types::crypto::sender_keys::key_protocol::{
+        HandleRequestParams, NonceDedup, handle_sender_key_request, open_sender_key_response,
+        request_sender_key,
+    };
     use std::collections::HashSet;
 
     let custody = InMemoryKeyCustody::new();
@@ -135,13 +137,13 @@ async fn sender_key_request_response_with_wrapping_key() {
 /// tampering with the wrapping key causes signature verification failure.
 #[tokio::test]
 async fn tampered_wrapping_key_prevents_decryption() {
-    use crate::crypto::sender_keys::key_protocol::{
-        HandleRequestParams, NonceDedup, generate_wrapping_keypair, handle_sender_key_request,
-        request_sender_key,
-    };
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_protocol::crypto::sender_keys::generate_sender_key;
+    use scp_runtime_types::crypto::sender_keys::key_protocol::{
+        HandleRequestParams, NonceDedup, generate_wrapping_keypair, handle_sender_key_request,
+        request_sender_key,
+    };
     use std::collections::HashSet;
 
     let custody = InMemoryKeyCustody::new();
@@ -204,7 +206,7 @@ async fn tampered_wrapping_key_prevents_decryption() {
 /// as the `scp_wrapping_key` `LeafNode` extension.
 #[test]
 fn sender_keys_wrapping_stable_001() {
-    use crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair;
+    use scp_runtime_types::crypto::sender_keys::key_protocol::generate_wrapping_keypair;
 
     let (pub_key, sec_key) = generate_wrapping_keypair();
 

@@ -36,7 +36,7 @@ use scp_runtime::context::builder::{ContextEventLogProvider, NotConfiguredTransp
 use scp_runtime::context::providers::MerkleEventLogProvider;
 use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::NodeMlsFactory;
-use scp_runtime::crypto::mls::storage_adapter::{
+use scp_runtime_types::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
 };
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::context::actor::signer::CommandSigner;
-use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
 use scp_platform::in_memory::InMemoryStorage;
+use scp_runtime_types::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
 
 /// A `Supervisor` built without providers holds no transport slot, so a
 /// bridge cannot bind a node's relay transport to it.
@@ -93,8 +93,8 @@ fn hard_rate_limit_wedged_actor_fails_closed() {
 
 #[tokio::test]
 async fn durable_providers_from_handle_shares_one_backend() {
-    use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
     use scp_platform::traits::Storage;
+    use scp_runtime_types::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
 
     // ONE chosen backend handed to `from_handle`.
     let storage = Arc::new(InMemoryStorage::new());
@@ -118,7 +118,7 @@ async fn durable_providers_from_handle_shares_one_backend() {
     // Production journal write key: `saga_journal/{saga_id}/{seq:020}`.
     let expected_key = format!(
         "{}{saga}/{seq:020}",
-        crate::context::supervisor::SAGA_JOURNAL_KEY_PREFIX
+        scp_runtime_types::context::supervisor::saga_journal::SAGA_JOURNAL_KEY_PREFIX
     );
 
     journal
@@ -449,7 +449,7 @@ async fn stored_wrapping_record(sup: &Supervisor, did: &str) -> Option<Vec<u8>> 
 
 /// The public point custody reports for `handle`.
 async fn custody_public(
-    custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+    custody: &scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody,
     handle: &scp_platform::KeyHandle,
 ) -> [u8; 65] {
     use scp_platform::traits::KeyCustody as _;
@@ -471,7 +471,8 @@ async fn custody_public(
 #[tokio::test]
 async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle() {
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let alice = DID("did:example:wrap-alice".to_owned());
     let bob = DID("did:example:wrap-bob".to_owned());
@@ -520,7 +521,8 @@ async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle
 #[tokio::test]
 async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let alice = DID("did:example:wrap-restart".to_owned());
 
     let first = supervisor_over_storage(Arc::clone(&storage), &custody);
@@ -552,14 +554,15 @@ async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
 async fn load_wrapping_key_refuses_a_record_whose_handle_the_custody_does_not_hold() {
     let storage = Arc::new(InMemoryStorage::new());
     let did = DID("did:example:wrap-lost-custody".to_owned());
-    let original = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let original =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let first = supervisor_over_storage(Arc::clone(&storage), &original);
     first.load_wrapping_key(&did).await.unwrap();
     let before = stored_wrapping_record(&first, &did.0).await;
     first.shutdown_all_contexts().await;
     drop(first);
 
-    let other = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let other = Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(storage, &other);
     let err = sup.load_wrapping_key(&did).await.unwrap_err();
     assert!(
@@ -582,7 +585,8 @@ async fn load_wrapping_key_refuses_a_record_whose_handle_the_custody_does_not_ho
 async fn load_wrapping_key_refuses_a_record_whose_public_key_differs_from_the_record() {
     use scp_platform::traits::KeyCustody as _;
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-swapped".to_owned());
     let held = custody
@@ -1327,7 +1331,8 @@ fn key_package_wrapping_key(kp_bytes: &[u8]) -> Option<[u8; 65]> {
 fn kp_owner_key_and_resolver(owner: &DID) -> (ed25519_dalek::SigningKey, KeyResolver) {
     let key = ed25519_dalek::SigningKey::from_bytes(&[0x3C; 32]);
     let owner = owner.clone();
-    let resolver = crate::crypto::mls::test_support::role_resolver(&[(owner, key.clone())]);
+    let resolver =
+        scp_runtime_types::crypto::mls::test_support::role_resolver(&[(owner, key.clone())]);
     (key, resolver)
 }
 
@@ -1366,7 +1371,7 @@ async fn production_key_package_carries_the_owner_wrapping_key() {
         .attestation
         .as_ref()
         .expect("the KeyPackage carries 0xFF03");
-    crate::crypto::mls::attestation_verification::verify_add_attestation(
+    scp_runtime_types::crypto::mls::attestation_verification::verify_add_attestation(
         resolver,
         &scp_clock::SystemClock,
         &validated.leaf,
@@ -1507,7 +1512,8 @@ async fn load_wrapping_key_fails_closed_on_an_old_format_record() {
         key: Vec<u8>,
     }
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-corrupt".to_owned());
     let bytes =
@@ -1538,7 +1544,7 @@ async fn load_wrapping_key_fails_closed_on_an_old_format_record() {
 async fn load_wrapping_key_stores_the_generated_key_when_its_caller_is_dropped() {
     let storage = Arc::new(InMemoryStorage::new());
     let (custody, gate) =
-        crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
     let custody = Arc::new(custody);
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-dropped".to_owned());
@@ -1576,7 +1582,7 @@ async fn load_wrapping_key_stores_the_generated_key_when_its_caller_is_dropped()
 async fn load_wrapping_key_times_out_when_custody_never_answers_generate() {
     let storage = Arc::new(InMemoryStorage::new());
     let (custody, _gate) =
-        crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
     let custody = Arc::new(custody);
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-generate-timeout".to_owned());
@@ -1607,7 +1613,8 @@ async fn load_wrapping_key_destroys_the_generated_key_when_its_record_cannot_be_
         )),
     );
     storage.fail_store_prefix("wrapping_key/");
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-store-fails".to_owned());
 
@@ -1629,7 +1636,7 @@ async fn load_wrapping_key_destroys_the_generated_key_when_its_record_cannot_be_
 
 /// Whether custody still holds `handle`.
 async fn custody_holds(
-    custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+    custody: &scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody,
     handle: &scp_platform::KeyHandle,
 ) -> bool {
     use scp_platform::traits::KeyCustody as _;
@@ -1652,7 +1659,8 @@ async fn a_record_write_that_commits_and_errors_is_removed_before_its_key_is_des
         )),
     );
     storage.fail_after_commit_prefix("wrapping_key/");
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-store-commits-then-fails".to_owned());
 
@@ -1695,7 +1703,8 @@ async fn a_committed_record_that_cannot_be_removed_keeps_its_key() {
     );
     storage.fail_after_commit_prefix("wrapping_key/");
     storage.fail_delete_prefix("wrapping_key/");
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-store-commits-delete-fails".to_owned());
 
@@ -1720,7 +1729,8 @@ async fn a_committed_record_that_cannot_be_removed_keeps_its_key() {
 #[tokio::test]
 async fn load_wrapping_key_passes_a_custody_refusal_through_on_a_stored_record() {
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let did = DID("did:example:wrap-refused-record".to_owned());
     let first = supervisor_over_storage(Arc::clone(&storage), &custody);
     first.load_wrapping_key(&did).await.unwrap();
@@ -1728,7 +1738,7 @@ async fn load_wrapping_key_passes_a_custody_refusal_through_on_a_stored_record()
     drop(first);
 
     custody.set_public_key_fault(Some(
-        crate::crypto::dh_counting_custody::PublicKeyFault::Refuse(
+        scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Refuse(
             "the device is locked".to_owned(),
         ),
     ));
@@ -1751,7 +1761,8 @@ async fn load_wrapping_key_passes_a_custody_refusal_through_on_a_stored_record()
 #[tokio::test]
 async fn load_wrapping_key_refuses_a_custody_public_key_that_is_not_a_p256_point() {
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let fresh = DID("did:example:wrap-bad-point-fresh".to_owned());
     let stored = DID("did:example:wrap-bad-point-stored".to_owned());
     let first = supervisor_over_storage(Arc::clone(&storage), &custody);
@@ -1760,7 +1771,7 @@ async fn load_wrapping_key_refuses_a_custody_public_key_that_is_not_a_p256_point
     drop(first);
 
     custody.set_public_key_fault(Some(
-        crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
+        scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
     ));
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let err = sup.load_wrapping_key(&fresh).await.unwrap_err();
@@ -1779,7 +1790,7 @@ async fn load_wrapping_key_refuses_a_custody_public_key_that_is_not_a_p256_point
     assert!(stored_wrapping_record(&sup, &fresh.0).await.is_none());
 
     custody.set_public_key_fault(Some(
-        crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
+        scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
     ));
     let err = sup.load_wrapping_key(&stored).await.unwrap_err();
     assert!(
@@ -1794,7 +1805,7 @@ async fn load_wrapping_key_refuses_a_custody_public_key_that_is_not_a_p256_point
 async fn concurrent_first_loads_of_one_identity_generate_one_key() {
     let storage = Arc::new(InMemoryStorage::new());
     let (custody, gate) =
-        crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
     let custody = Arc::new(custody);
     let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
     let did = DID("did:example:wrap-concurrent".to_owned());
@@ -2183,10 +2194,12 @@ fn supervisor_with_event_log_and_resolver(
     ));
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -2304,10 +2317,12 @@ fn supervisor_with_crypto_and_resolver(
 ) -> Arc<Supervisor> {
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -2359,8 +2374,8 @@ async fn await_kp_crash_processed(rx: &mut tokio::sync::watch::Receiver<u64>, ba
 /// would make this join fail closed and the test would fail.
 #[tokio::test]
 async fn with_providers_attaches_consumed_init_key_store() {
-    use crate::crypto::mls::test_support::MintAttestedForTest as _;
     use scp_mls::credential::ScpCredential;
+    use scp_runtime_types::crypto::mls::test_support::MintAttestedForTest as _;
 
     let supervisor = supervisor_with_providers();
     let crypto = supervisor
@@ -4338,10 +4353,12 @@ async fn retry_stamps_convergent_leaf_timestamp() {
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let sup = Supervisor::with_providers(
         crypto,
@@ -4485,10 +4502,12 @@ async fn retry_stamps_reset_extended_convergent_deadline() {
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let sup = Supervisor::with_providers(
         crypto,
@@ -6760,10 +6779,12 @@ fn supervisor_with_clock_persistence_and_merkle_log(
     let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
         Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -7862,7 +7883,7 @@ async fn create_event_log_data(
 fn build_deps_fixture() -> (
     Arc<Supervisor>,
     Arc<crate::crypto::mls::provider::NodeMlsFactory>,
-    Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
 ) {
     let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
         "did:dht:z6MktestBuildDeps".to_owned(),
@@ -7881,10 +7902,12 @@ fn build_deps_fixture() -> (
         }
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     });
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let supervisor = Supervisor::with_providers(
         Arc::clone(&crypto),
@@ -8486,10 +8509,12 @@ fn supervisor_with_clock_persistence_and_event_log(
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -10475,7 +10500,8 @@ async fn key_response_opens_through_custody_dh_agree() {
         ..
     } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
         .await
         .expect("bob's wrapping key is created in custody");
@@ -10582,7 +10608,8 @@ async fn key_response_public_checks_run_before_custody() {
         ..
     } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
         .await
         .expect("bob's wrapping key is created in custody");
@@ -10691,7 +10718,8 @@ async fn alice_and_bob_with_counting_custody(
         ctx_bytes,
         ..
     } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, alice, bob);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
         .await
         .expect("bob's wrapping key is created in custody");
@@ -10875,8 +10903,11 @@ fn supervisor_with_crypto_storage_and_custody<
     storage: Arc<S>,
     custody: &Arc<C>,
 ) -> Arc<Supervisor> {
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage));
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage),
+    );
     Supervisor::with_providers_and_wrapping_custody(
         crypto,
         Box::new(crate::context::builder::NotConfiguredTransportProvider),
@@ -10977,9 +11008,11 @@ fn alice_rotates_for_bob(
 async fn key_response_fails_closed_when_custody_cannot_agree() {
     let ctx_str = "e2e-key-response-custody-cannot-agree";
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
-        crate::crypto::key_loss_custody::KeyLoss::OnDhAgree,
-    ));
+    let custody = Arc::new(
+        scp_runtime_types::crypto::key_loss_custody::KeyLossCustody::new(
+            scp_runtime_types::crypto::key_loss_custody::KeyLoss::OnDhAgree,
+        ),
+    );
     let KeyResponseToBob {
         mut alice_actor,
         mut bob_actor,
@@ -11047,9 +11080,11 @@ async fn key_response_fails_closed_when_custody_cannot_agree() {
 async fn key_response_opens_then_a_reload_reports_the_wrapping_handle_invalid() {
     let ctx_str = "e2e-key-response-then-handle-invalid";
     let storage = Arc::new(InMemoryStorage::new());
-    let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
-        crate::crypto::key_loss_custody::KeyLoss::AfterDhAgree,
-    ));
+    let custody = Arc::new(
+        scp_runtime_types::crypto::key_loss_custody::KeyLossCustody::new(
+            scp_runtime_types::crypto::key_loss_custody::KeyLoss::AfterDhAgree,
+        ),
+    );
     let KeyResponseToBob {
         mut alice_actor,
         mut bob_actor,
@@ -11236,10 +11271,12 @@ fn supervisor_with_persistence_and_custody_source(
         "did:dht:z6MktestDoNotRely".to_owned(),
         Arc::new(scp_clock::SystemClock),
     ));
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers_and_wrapping_custody(
         crypto,
@@ -11444,9 +11481,9 @@ fn durable_with_failing_contacts() -> DurableProviders {
     DurableProviders::for_test_with_relay_contacts(
         Arc::new(NoOpSagaJournal),
         Arc::new(
-            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                InMemoryStorage::new(),
-            )),
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
         ),
         Arc::new(FailingRelayContacts),
     )
@@ -15518,8 +15555,9 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     // evidence). Stage the cross-context-outlet prepared variant (eight
     // journaled fields); it must survive the snapshot round-trip through
     // its sanctioned non-derive mirror.
-    let xctx_saga_id =
-        crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
+    let xctx_saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId(
+        "saga-class-s-xctx".to_owned(),
+    );
     state.class_s.saga_pending.insert(
             xctx_saga_id.clone(),
             crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextOutletInvocation(
@@ -15541,8 +15579,9 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     // are Class S: a coalesce-window rollback would re-invoke the outlet /
     // double-settle the escrow on replay. Seed both so the round-trip
     // asserts they survive the production sync-persist builder.
-    let committed_saga_id =
-        crate::context::supervisor::saga_journal::SagaId("saga-class-s-committed".to_owned());
+    let committed_saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId(
+        "saga-class-s-committed".to_owned(),
+    );
     let committed_receipt =
         scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[0x3Cu8; 32]),
@@ -17352,10 +17391,12 @@ fn xctx_supervisor_with_event_log(
             None
         }
     });
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -17460,10 +17501,12 @@ fn xctx_supervisor_with_persistence(
             None
         }
     });
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,
@@ -17646,14 +17689,16 @@ async fn spawn_xctx_pair(
 /// over the SAME inner storage observes the real durable state.
 struct FailingSagaJournal {
     inner: ProtocolRepositorySagaJournal<InMemoryStorage>,
-    fail_append_on_state: Option<crate::context::supervisor::saga_journal::SagaState>,
+    fail_append_on_state: Option<scp_runtime_types::context::supervisor::saga_journal::SagaState>,
     fail_mark_resolved_committed: std::sync::atomic::AtomicBool,
 }
 
 impl FailingSagaJournal {
     fn new(
         storage: Arc<InMemoryStorage>,
-        fail_append_on_state: Option<crate::context::supervisor::saga_journal::SagaState>,
+        fail_append_on_state: Option<
+            scp_runtime_types::context::supervisor::saga_journal::SagaState,
+        >,
         fail_mark_resolved_committed: bool,
     ) -> Self {
         Self {
@@ -17670,12 +17715,14 @@ impl FailingSagaJournal {
 impl SagaJournal for FailingSagaJournal {
     async fn append(
         &self,
-        entry: crate::context::supervisor::saga_journal::JournalEntry,
-    ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
+        entry: scp_runtime_types::context::supervisor::saga_journal::JournalEntry,
+    ) -> Result<(), scp_runtime_types::context::supervisor::saga_journal::JournalError> {
         if self.fail_append_on_state == Some(entry.state) {
-            return Err(crate::context::supervisor::saga_journal::JournalError::Io(
-                "injected saga-journal append fault".to_owned(),
-            ));
+            return Err(
+                scp_runtime_types::context::supervisor::saga_journal::JournalError::Io(
+                    "injected saga-journal append fault".to_owned(),
+                ),
+            );
         }
         self.inner.append(entry).await
     }
@@ -17683,8 +17730,8 @@ impl SagaJournal for FailingSagaJournal {
     async fn load_unresolved(
         &self,
     ) -> Result<
-        Vec<crate::context::supervisor::saga_journal::JournalEntry>,
-        crate::context::supervisor::saga_journal::JournalError,
+        Vec<scp_runtime_types::context::supervisor::saga_journal::JournalEntry>,
+        scp_runtime_types::context::supervisor::saga_journal::JournalError,
     > {
         self.inner.load_unresolved().await
     }
@@ -17692,17 +17739,20 @@ impl SagaJournal for FailingSagaJournal {
     async fn mark_resolved(
         &self,
         saga_id: SagaId,
-        terminal: crate::context::supervisor::saga_journal::SagaTerminalState,
+        terminal: scp_runtime_types::context::supervisor::saga_journal::SagaTerminalState,
         secret_bearing: bool,
-    ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
-        if terminal == crate::context::supervisor::saga_journal::SagaTerminalState::Committed
+    ) -> Result<(), scp_runtime_types::context::supervisor::saga_journal::JournalError> {
+        if terminal
+            == scp_runtime_types::context::supervisor::saga_journal::SagaTerminalState::Committed
             && self
                 .fail_mark_resolved_committed
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(crate::context::supervisor::saga_journal::JournalError::Io(
-                "injected mark_resolved(Committed) fault".to_owned(),
-            ));
+            return Err(
+                scp_runtime_types::context::supervisor::saga_journal::JournalError::Io(
+                    "injected mark_resolved(Committed) fault".to_owned(),
+                ),
+            );
         }
         self.inner
             .mark_resolved(saga_id, terminal, secret_bearing)
@@ -17721,7 +17771,7 @@ fn xctx_supervisor_with_journal(
     creator_did: String,
     creator_key: ed25519_dalek::VerifyingKey,
     journal: Arc<dyn SagaJournal>,
-    mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    mls_storage: Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     persistence: Box<dyn ContextPersistence>,
     wrapping_custody: WrappingCustodySource,
 ) -> Arc<Supervisor> {
@@ -17800,10 +17850,12 @@ async fn drive_commit_exhaustion(
         always: true,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let supervisor = xctx_supervisor_with_journal(
         creator_did.to_owned(),
@@ -17943,7 +17995,7 @@ fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
             let entry = &unresolved[0];
             assert_eq!(
                 entry.state,
-                crate::context::supervisor::saga_journal::SagaState::NeedsRepair,
+                scp_runtime_types::context::supervisor::saga_journal::SagaState::NeedsRepair,
                 "the durable journal must record the NeedsRepair terminal, got {entry:?}"
             );
             // Per-variant pin: variant 1's SUCCESSFUL NeedsRepair append
@@ -17961,7 +18013,7 @@ fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
             // journal append's success.
             let journal2: Arc<dyn SagaJournal> = Arc::new(FailingSagaJournal::new(
                 Arc::new(InMemoryStorage::new()),
-                Some(crate::context::supervisor::saga_journal::SagaState::NeedsRepair),
+                Some(scp_runtime_types::context::supervisor::saga_journal::SagaState::NeedsRepair),
                 false,
             ));
             let result2 = Box::pin(drive_commit_exhaustion(
@@ -17989,7 +18041,7 @@ fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
             let entry2 = &unresolved2[0];
             assert_eq!(
                 entry2.state,
-                crate::context::supervisor::saga_journal::SagaState::Committing,
+                scp_runtime_types::context::supervisor::saga_journal::SagaState::Committing,
                 "with the NeedsRepair append faulted, the durable latest entry stays at \
                      Committing, got {entry2:?}"
             );
@@ -18057,10 +18109,12 @@ async fn drive_xctx_mark_resolved_committed_fault() -> (
         None,
         /*fail_mark_resolved_committed=*/ true,
     ));
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::clone(
-            &mls_inner,
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::clone(&mls_inner),
+        ),
     );
     // The wrapping keys' custody outlives supervisor #1, as the host's
     // custody outlives a process restart.
@@ -18164,7 +18218,7 @@ async fn xctx_saga_ok_arm_mark_resolved_fault_is_needs_repair_not_aborted() {
     let entry = &unresolved[0];
     assert_eq!(
         entry.state,
-        crate::context::supervisor::saga_journal::SagaState::Committing,
+        scp_runtime_types::context::supervisor::saga_journal::SagaState::Committing,
         "the durable journal must still show the Committing entry (mark_resolved faulted), \
              got {entry:?}"
     );
@@ -18201,10 +18255,12 @@ async fn xctx_saga_committing_self_heals_to_committed_on_reopen() {
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(
         &journal_storage,
     )));
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::clone(
-            &mls_inner,
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::clone(&mls_inner),
+        ),
     );
     // Pre-reopen: the durable journal is NOT empty from the start — it holds
     // exactly the one unresolved saga at `Committing` that supervisor #1 left
@@ -18219,7 +18275,7 @@ async fn xctx_saga_committing_self_heals_to_committed_on_reopen() {
     );
     assert_eq!(
         pre_reopen[0].state,
-        crate::context::supervisor::saga_journal::SagaState::Committing,
+        scp_runtime_types::context::supervisor::saga_journal::SagaState::Committing,
         "pre-reopen: the single unresolved saga must be at Committing, got {:?}",
         pre_reopen[0]
     );
@@ -18528,7 +18584,7 @@ async fn xctx_saga_prepare_b_confused_deputy_aborts_no_execution() {
     // Proof audience = OTHER, NOT the carried caller_did.
     let ctx_hex = hex::encode(XCTX_TARGET);
     let caps = vec![format!("outlet_call:{XCTX_OUTLET}")];
-    let params = crate::crypto::ucan::mint::MintParams {
+    let params = scp_runtime_types::crypto::ucan::mint::MintParams {
         issuer_did: &creator_did,
         issuer_key: &creator_handle,
         audience_did: other_did,
@@ -18542,9 +18598,13 @@ async fn xctx_saga_prepare_b_confused_deputy_aborts_no_execution() {
         signing_key_id: None,
         ceiling: None,
     };
-    let token = crate::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
-        .await
-        .expect("mint");
+    let token = scp_runtime_types::crypto::ucan::mint::mint_ucan(
+        &params,
+        &custody,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .expect("mint");
     target_state
         .xctx_ucan_proofs
         .proofs
@@ -19493,7 +19553,7 @@ async fn xctx_saga_commit_replay_reemits_without_reinvoke() {
         .strip_prefix("OutletInvoked:")
         .expect("event id carries the saga id")
         .to_owned();
-    let saga_id = crate::context::supervisor::saga_journal::SagaId(saga_id_str);
+    let saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId(saga_id_str);
 
     // Re-drive Commit-B reserve for the SAME saga id (the replay path).
     let target = supervisor
@@ -19632,7 +19692,7 @@ async fn xctx_needs_repair_emits_dual_signed_divergence_markers() {
     let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
     let nonce = [0x42u8; 16];
-    let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+    let saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId::new();
     let committed_event_id = format!("OutletInvoked:{}", saga_id.0);
 
     let ctx = divergence_ctx(
@@ -19735,7 +19795,7 @@ async fn xctx_needs_repair_unreachable_side_records_supervisor_repair() {
     let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
     let nonce = [0x55u8; 16];
-    let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+    let saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId::new();
     let committed_event_id = format!("OutletInvoked:{}", saga_id.0);
 
     let ctx = divergence_ctx(
@@ -19788,8 +19848,10 @@ async fn xctx_needs_repair_unreachable_side_records_supervisor_repair() {
 /// account lost.
 #[tokio::test]
 async fn supervisor_repair_record_survives_restart() {
-    use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaId};
     use scp_protocol::context::outlets::cross_context_saga::CommittedSide;
+    use scp_runtime_types::context::supervisor::saga_journal::{
+        ProtocolRepositorySagaJournal, SagaId,
+    };
 
     // Shared durable storage so a second supervisor sees the first's writes.
     let storage = Arc::new(InMemoryStorage::new());
@@ -19919,8 +19981,8 @@ async fn xctx_needs_repair_releases_concurrency_slot() {
 /// reservation-gap the field doc flags is closed.
 #[test]
 fn xctx_replay_reconstructs_full_participant_set() {
-    use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
     use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+    use scp_runtime_types::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
 
     let prepared = CrossContextOutletInvocationPrepared {
         caller_context_id: XCTX_CALLER,
@@ -20037,7 +20099,7 @@ impl ContextPersistence for ErringLoadPersistence {
 fn xctx_recovery_supervisor_with_persistence(
     persistence: Box<dyn ContextPersistence>,
 ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
-    use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+    use scp_runtime_types::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
 
     let storage = Arc::new(InMemoryStorage::new());
     let journal: Arc<dyn SagaJournal> =
@@ -20050,10 +20112,12 @@ fn xctx_recovery_supervisor_with_persistence(
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let supervisor = Supervisor::with_providers_and_journal(
         crypto,
@@ -20081,10 +20145,10 @@ fn xctx_recovery_supervisor_with_persistence(
 async fn replay_corrupt_evidence_preparing_b(
     supervisor: &Arc<Supervisor>,
     journal: &Arc<dyn SagaJournal>,
-    saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    saga_id: &scp_runtime_types::context::supervisor::saga_journal::SagaId,
     caller_hex: &str,
 ) -> bool {
-    use crate::context::supervisor::saga_journal::{JournalEntry, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{JournalEntry, SagaState};
 
     // A real xctx PreparingB entry: `participants = [hex(caller), did, outlet]`
     // (length 3, 64-hex first element) but with corrupt/unparseable evidence
@@ -20147,7 +20211,7 @@ async fn replay_corrupt_evidence_preparing_b(
 /// `SettledOrAbsent` → terminal-`Aborted`. POST-FIX it stays `PreparingB`.
 #[tokio::test]
 async fn xctx_corrupt_evidence_preparing_b_reconciles_caller_not_stranded() {
-    use crate::context::supervisor::saga_journal::SagaId;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let caller_hex = hex::encode(XCTX_CALLER);
     // Caller PRESENT in persistence (not-yet-restored, not deleted) so the
@@ -20176,7 +20240,7 @@ async fn xctx_corrupt_evidence_preparing_b_reconciles_caller_not_stranded() {
 /// non-terminal (the prior test).
 #[tokio::test]
 async fn xctx_corrupt_evidence_preparing_b_deleted_caller_is_reaped() {
-    use crate::context::supervisor::saga_journal::SagaId;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let caller_hex = hex::encode(XCTX_CALLER);
     // Caller ABSENT from persistence (deleted): `present` is empty.
@@ -20202,7 +20266,7 @@ async fn xctx_corrupt_evidence_preparing_b_deleted_caller_is_reaped() {
 /// non-terminal, absent ⇒ reap.
 #[tokio::test]
 async fn xctx_corrupt_evidence_preparing_b_present_caller_not_reaped() {
-    use crate::context::supervisor::saga_journal::SagaId;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let caller_hex = hex::encode(XCTX_CALLER);
     let (supervisor, journal) =
@@ -20231,7 +20295,7 @@ async fn xctx_corrupt_evidence_preparing_b_present_caller_not_reaped() {
 /// FAILS if the `Err` arm is inverted to reap (e.g. `Err(_) => true`).
 #[tokio::test]
 async fn xctx_corrupt_evidence_preparing_b_load_error_not_reaped() {
-    use crate::context::supervisor::saga_journal::SagaId;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let caller_hex = hex::encode(XCTX_CALLER);
     // `load_context` ALWAYS errors → the existence check cannot confirm
@@ -20308,8 +20372,8 @@ async fn caller_context_deleted_predicate_reaps_only_on_confirmed_absence() {
 /// via the idempotent `AlreadyCommitted`, and the executor counter stays 1.
 #[tokio::test]
 async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
-    use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
     use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+    use scp_runtime_types::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let creator_did = "did:dht:z6MkXctxReplay2Creator".to_owned();
@@ -20409,8 +20473,8 @@ async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
 /// consumes to choose `mark_resolved(Committed)` vs the NeedsRepair append.)
 #[tokio::test]
 async fn xctx_commit_in_progress_with_witness_resolves_committed() {
-    use crate::context::supervisor::saga_journal::SagaId;
     use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let creator_did = "did:dht:z6MkXctxWitnessCreator".to_owned();
@@ -20516,8 +20580,8 @@ async fn xctx_commit_in_progress_with_witness_resolves_committed() {
 /// unreachable") rather than silently resolving to a bare `NeedsRepair`.
 #[tokio::test]
 async fn xctx_commit_in_progress_one_sided_records_supervisor_repair() {
-    use crate::context::supervisor::saga_journal::SagaId;
     use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let creator_did = "did:dht:z6MkXctxOneSidedCreator".to_owned();
@@ -20634,10 +20698,10 @@ async fn xctx_commit_in_progress_one_sided_records_supervisor_repair() {
 /// signed by key X.
 #[tokio::test]
 async fn xctx_commit_a_rejects_receipt_signed_by_wrong_key() {
-    use crate::context::supervisor::saga_journal::SagaId;
     use scp_protocol::context::outlets::cross_context_saga::{
         CrossContextOutletReceipt, CrossContextOutletReceiptFields,
     };
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let authorized = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
@@ -21099,7 +21163,7 @@ async fn flush_and_read_snapshot(
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // full send-failure abort E2E: reserve + journal + re-drive
 async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
-    use crate::context::supervisor::saga_journal::{
+    use scp_runtime_types::context::supervisor::saga_journal::{
         ProtocolRepositorySagaJournal, SagaId, SagaState,
     };
 
@@ -21129,10 +21193,12 @@ async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
             }
         })
     };
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let supervisor = Supervisor::with_providers_and_journal(
         crypto,
@@ -21354,7 +21420,7 @@ fn xctx_supervisor_with_real_journal_persistence(
     creator_key: ed25519_dalek::VerifyingKey,
     persistence: CapturingPersistence,
 ) -> (Arc<Supervisor>, CapturingPersistence) {
-    use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+    use scp_runtime_types::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     let journal_storage = Arc::new(InMemoryStorage::new());
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(
         &journal_storage,
@@ -21372,10 +21438,12 @@ fn xctx_supervisor_with_real_journal_persistence(
             None
         }
     });
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let supervisor = Supervisor::with_providers_and_journal(
         crypto,
@@ -21542,7 +21610,7 @@ async fn stage_xctx_preparing_b_crash(
 /// marked terminal-Aborted.
 #[tokio::test]
 async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
-    use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{SagaId, SagaState};
 
     let creator_did = "did:dht:z6MkXctxWave15NonResCreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -21681,7 +21749,7 @@ async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
 async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal() {
-    use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{SagaId, SagaState};
 
     let creator_did = "did:dht:z6MkXctxWave15ResCreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -22031,7 +22099,7 @@ async fn restore_on_startup_restores_caller_from_persistence_then_delivers_rever
 /// reap-vs-stay-non-terminal decision through the production startup path.
 #[tokio::test]
 async fn restore_on_startup_xctx_deleted_caller_is_reaped_terminal() {
-    use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{SagaId, SagaState};
 
     let creator_did = "did:dht:z6MkRestoreReplayDelCreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -22116,7 +22184,7 @@ async fn restore_on_startup_xctx_deleted_caller_is_reaped_terminal() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
 async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal() {
-    use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{SagaId, SagaState};
 
     let creator_did = "did:dht:z6MkXctxWave23PrepACreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -22269,7 +22337,7 @@ async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + despawn + recover + assert
 async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
-    use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+    use scp_runtime_types::context::supervisor::saga_journal::{SagaId, SagaState};
 
     let creator_did = "did:dht:z6MkXctxWave23PrepANonResCreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -22538,8 +22606,8 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
 #[tokio::test]
 async fn xctx_replay_prepare_in_progress_releases_and_discards() {
     use crate::context::actor::commands::SagaPhaseMessage;
-    use crate::context::supervisor::saga_journal::SagaId;
     use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     let creator_did = "did:dht:z6MkXctxPrepReplayCreator".to_owned();
     let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -22651,8 +22719,8 @@ fn void_counting_auth(
     payee: &DID,
     amount: scp_protocol::economy::types::Amount,
     currency: scp_protocol::economy::types::CurrencyCode,
-) -> crate::economy::adapter::PaymentAuthorization {
-    crate::economy::adapter::PaymentAuthorization {
+) -> scp_runtime_types::economy::adapter::PaymentAuthorization {
+    scp_runtime_types::economy::adapter::PaymentAuthorization {
         auth_id: [9u8; 32],
         payer: payer.clone(),
         payee: payee.clone(),
@@ -22666,7 +22734,7 @@ fn void_counting_auth(
 }
 
 /// A supervisor whose `payment_adapter_ref()` returns a shared
-/// [`CountingPaymentAdapter`](crate::economy::adapter::CountingPaymentAdapter)
+/// [`CountingPaymentAdapter`](scp_runtime_types::economy::adapter::CountingPaymentAdapter)
 /// wired over the shared void counter, so the REAL
 /// `drain_terminal_reservation` void path is observable.
 fn supervisor_with_void_counter(voids: &Arc<std::sync::atomic::AtomicUsize>) -> Arc<Supervisor> {
@@ -22679,16 +22747,19 @@ fn supervisor_with_void_counter(voids: &Arc<std::sync::atomic::AtomicUsize>) -> 
     let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
         Box::new(TestEventLog);
     let key_resolver: KeyResolver = Arc::new(|_, _| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
-    let payment_adapter: Arc<dyn PaymentAdapterDyn> =
-        Arc::new(crate::economy::adapter::CountingPaymentAdapter {
+    let payment_adapter: Arc<dyn PaymentAdapterDyn> = Arc::new(
+        scp_runtime_types::economy::adapter::CountingPaymentAdapter {
             voided: Arc::clone(voids),
             ..Default::default()
-        });
+        },
+    );
     Supervisor::with_providers(
         crypto,
         transport,
@@ -22739,8 +22810,8 @@ fn build_prepared_a_fields_with_escrow_for_test() -> crate::context::actor::comm
         pricing_formula: None,
         payee: payee.clone(),
     };
-    let escrow = crate::economy::integration::PreparedAction {
-        envelope: crate::economy::integration::ActionEnvelope {
+    let escrow = scp_runtime_types::economy::integration::PreparedAction {
+        envelope: scp_runtime_types::economy::integration::ActionEnvelope {
             actor: invoker.clone(),
             action_type: PaidActionType::OutletCall,
             context_id: None,

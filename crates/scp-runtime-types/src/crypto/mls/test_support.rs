@@ -2,7 +2,7 @@
 //! the attestation signed by a local Ed25519 key in place of custody.
 //!
 //! Production mints through
-//! [`mint_attested_key_package`](super::attestation_signer::mint_attested_key_package),
+//! `mint_attested_key_package`,
 //! which signs with the owner's custody-backed `#active` key after checking
 //! it against the owner's DID document. A test that needs a `KeyPackage` and
 //! no resolver mints here. [`GatedSigner`] stands in for a custody whose
@@ -64,10 +64,12 @@ impl<B: MlsBackend + ?Sized> MintAttestedForTest for B {
     }
 }
 
-/// The `#agent` key the test resolvers name for an identity whose `#active`
-/// key is `active`: a fixed key derived from it and distinct from it, so a
-/// test can sign with the `#agent` key of any fixture identity.
-pub(crate) fn test_agent_key(active: &SigningKey) -> SigningKey {
+/// The `#agent` key the test resolvers name for an identity whose `#active` key is `active`.
+///
+/// It is a fixed key derived from `active` and distinct from it, so a test can
+/// sign with the `#agent` key of any fixture identity.
+#[must_use]
+pub fn test_agent_key(active: &SigningKey) -> SigningKey {
     let mut seed = active.to_bytes();
     for byte in &mut seed {
         *byte ^= 0x5A;
@@ -75,11 +77,14 @@ pub(crate) fn test_agent_key(active: &SigningKey) -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
-/// The resolver every in-crate test uses: each `(did, active)` pair resolves
-/// at `#active` to `active`'s key and at `#agent` to [`test_agent_key`]'s,
-/// and every other DID to nothing. Returning different keys per role is what
-/// lets a test catch a verifier or signer that asks for the wrong role.
-pub(crate) fn role_resolver(
+/// The resolver every runtime test uses.
+///
+/// Each `(did, active)` pair resolves at `#active` to `active`'s key and at
+/// `#agent` to [`test_agent_key`]'s, and every other DID to nothing. Returning
+/// different keys per role is what lets a test catch a verifier or signer that
+/// asks for the wrong role.
+#[must_use]
+pub fn role_resolver(
     identities: &[(scp_did::DID, SigningKey)],
 ) -> scp_protocol::context::governance::KeyResolver {
     let table: Vec<(
@@ -107,16 +112,18 @@ pub(crate) fn role_resolver(
     })
 }
 
-/// A local Ed25519 signer whose sign waits for a permit, standing in for a
-/// custody that does not answer: each sign counts itself in `signs` and takes
-/// one permit, and a sign with none left waits until the test adds one.
-pub(crate) struct GatedSigner {
+/// A local Ed25519 signer whose sign waits for a permit.
+///
+/// It stands in for a custody that does not answer: each sign counts itself in
+/// `signs` and takes one permit, and a sign with none left waits until the test
+/// adds one.
+pub struct GatedSigner {
     /// The signing key.
-    pub(crate) key: SigningKey,
+    pub key: SigningKey,
     /// One permit per sign allowed to finish.
-    pub(crate) permits: std::sync::Arc<tokio::sync::Semaphore>,
+    pub permits: std::sync::Arc<tokio::sync::Semaphore>,
     /// How many signs have started.
-    pub(crate) signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl scp_crypto::ScpSigner for GatedSigner {

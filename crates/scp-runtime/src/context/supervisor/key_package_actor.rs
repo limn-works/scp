@@ -125,11 +125,11 @@ use crate::context::builder::ContextTransportProvider;
 use crate::crypto::mls::attestation_signer::{
     KeyPackageAttestationSigner, mint_attested_key_package,
 };
-use crate::crypto::mls::backend::{GeneratedKeyPackage, MlsBackend, SignerState};
-use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::crypto::wrapping::IdentityWrappingKey;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
+use scp_runtime_types::crypto::mls::backend::{GeneratedKeyPackage, MlsBackend, SignerState};
+use scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 
 // ---------------------------------------------------------------------------
 // Constants

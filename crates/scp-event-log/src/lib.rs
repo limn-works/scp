@@ -573,7 +573,7 @@ pub enum EventLogError {
         recorded: u32,
         /// Reference count derived from the chunk manifest +
         /// cancel-ack sequence by
-        /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`.
+        /// `scp_runtime_types::context::outlets::stream::compute_chunks_billed_ref`.
         reference: u32,
     },
 }

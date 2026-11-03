@@ -52,8 +52,8 @@ use scp_protocol::trust::caveats::InvocationCaveats;
 
 use scp_runtime::context::InvocationCaveatBinding;
 use scp_runtime::context::outlets::dispatch::{CancelIdentity, OpenStreamParams};
-use scp_runtime::context::outlets::signer::InProcessStreamSigner;
-use scp_runtime::context::outlets::stream::{AdmissionCaps, StreamIdentity};
+use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
+use scp_runtime_types::context::outlets::stream::{AdmissionCaps, StreamIdentity};
 
 use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;

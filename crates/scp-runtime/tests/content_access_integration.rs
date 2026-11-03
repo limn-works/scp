@@ -39,13 +39,13 @@ use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::state::ProposalOutcome;
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::access_keys::lifecycle::{
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_types::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
 };
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
-use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
-use scp_runtime::identity::blocking::{
+use scp_runtime_types::crypto::sender_keys::key_protocol::send_block_notification;
+use scp_runtime_types::identity::blocking::{
     BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
     is_block_effective,
 };

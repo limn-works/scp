@@ -4,9 +4,6 @@
 //! function, and the types and constants more than one crate names (ADR-070
 //! Appendix).
 use crate::context::actor::deps::ActorDeps;
-use crate::economy::adapter::PaymentAdapterDyn;
-use crate::economy::adapter::PaymentReceipt;
-use crate::economy::integration;
 use scp_did::DID;
 use scp_did::SigningKeyId;
 use scp_protocol::context::ContextError;
@@ -20,6 +17,9 @@ use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::crypto::ucan::validate::RevocationChecker;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
+use scp_runtime_types::economy::adapter::PaymentAdapterDyn;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
+use scp_runtime_types::economy::integration;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -310,7 +310,7 @@ pub fn rollback_economy_ticket_inline_view(
 #[allow(dead_code)]
 pub struct OwnedAuthInputs {
     /// The payment adapter that places the hold.
-    pub adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    pub adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>,
     /// The context's economic policy, cloned out of the state.
     pub policy: scp_protocol::economy::types::EconomicPolicy,
     /// The paid action being authorized.

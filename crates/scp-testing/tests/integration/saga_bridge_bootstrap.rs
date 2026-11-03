@@ -45,10 +45,11 @@ use scp_core::context::builder::ContextCreationError;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::state::ContextSnapshot;
-use scp_core::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState, Supervisor,
+use scp_core::context::saga_journal::{
+    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
 };
+use scp_core::context::state::ContextSnapshot;
+use scp_core::context::supervisor::Supervisor;
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};

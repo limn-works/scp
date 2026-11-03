@@ -19,7 +19,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::ContextHandle;
-use super::governance::timeout::DeadlockDetectionState;
 use super::ttl::{TtlExtension, TtlTimer};
 use scp_clock::Clock;
 use scp_did::DID;
@@ -44,6 +43,7 @@ use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
 use scp_protocol::trust::consequence::ConsequenceRule;
+use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
 // ---------------------------------------------------------------------------
 // Protocol-level collection size limits (§5.9)
@@ -1082,7 +1082,7 @@ pub struct ContextSnapshot {
     /// deserialize as an empty map.
     #[serde(default)]
     pub saga_pending: HashMap<
-        crate::context::supervisor::saga_journal::SagaId,
+        scp_runtime_types::context::supervisor::saga_journal::SagaId,
         crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
     >,
 
@@ -1109,7 +1109,7 @@ pub struct ContextSnapshot {
     /// `#[serde(default)]` so legacy / stripped snapshots deserialize as empty.
     #[serde(default)]
     pub xctx_committed_outputs: HashMap<
-        crate::context::supervisor::saga_journal::SagaId,
+        scp_runtime_types::context::supervisor::saga_journal::SagaId,
         crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
     >,
 
@@ -1133,7 +1133,7 @@ pub struct ContextSnapshot {
     /// deserialize as empty.
     #[serde(default)]
     pub xctx_committed_stream_outputs: HashMap<
-        crate::context::supervisor::saga_journal::SagaId,
+        scp_runtime_types::context::supervisor::saga_journal::SagaId,
         crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
     >,
 
@@ -1159,7 +1159,7 @@ pub struct ContextSnapshot {
     /// `SnapshotSignatureInvalid`.
     #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub xctx_committed_invocations:
-        std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
+        std::collections::HashSet<scp_runtime_types::context::supervisor::saga_journal::SagaId>,
 
     /// Caller-side (A-owned) durable reversal records for in-flight
     /// cross-context outlet-invocation Prepare-A reservations, keyed by `SagaId`
@@ -1182,13 +1182,13 @@ pub struct ContextSnapshot {
     ///
     /// Like `xctx_committed_outputs` this carries no §9.4.3 non-derive barrier —
     /// every field is public economy metadata (the escrow handle is the same
-    /// serde [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+    /// serde [`PaymentAuthorization`](scp_runtime_types::economy::adapter::PaymentAuthorization)
     /// the payment rail issues), so the snapshot stores the live
     /// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
     /// directly.
     #[serde(default)]
     pub xctx_caller_reservations: std::collections::HashMap<
-        crate::context::supervisor::saga_journal::SagaId,
+        scp_runtime_types::context::supervisor::saga_journal::SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
 

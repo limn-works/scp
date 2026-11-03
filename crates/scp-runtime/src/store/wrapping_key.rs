@@ -28,7 +28,7 @@ use scp_platform::traits::KeyHandle;
 use scp_protocol::context::ContextError;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 
 /// The only record version this build reads and writes.
 const RECORD_VERSION: u8 = 1;
@@ -155,7 +155,7 @@ mod tests {
     use scp_platform::traits::Storage as _;
 
     use super::*;
-    use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
+    use scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
 
     fn adapter() -> SpawnBlockingStorageAdapter<InMemoryStorage> {
         SpawnBlockingStorageAdapter::new(Arc::new(InMemoryStorage::new()))

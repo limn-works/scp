@@ -18,9 +18,9 @@ use scp_mls::error::MlsError;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 
-use super::attestation_verification::resolve_active_key;
-use super::backend::{GeneratedKeyPackage, MlsBackend};
 use crate::context::actor::signer::CommandSigner;
+use scp_runtime_types::crypto::mls::attestation_verification::resolve_active_key;
+use scp_runtime_types::crypto::mls::backend::{GeneratedKeyPackage, MlsBackend};
 
 /// Signs `KeyPackage` attestations for one owner with the owner's `#active`
 /// key, through custody.
@@ -211,8 +211,8 @@ mod tests {
     use scp_crypto::{ScpSigner, SigAlg};
 
     use super::*;
-    use crate::crypto::mls::production_backend::ProductionMlsBackend;
     use scp_did::SigningKeyId;
+    use scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend;
 
     fn owner() -> DID {
         DID("did:dht:z6MkAttestationSignerOwner".to_owned())

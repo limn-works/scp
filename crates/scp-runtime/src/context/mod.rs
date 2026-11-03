@@ -37,15 +37,12 @@ pub mod actor;
 pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
-pub mod config;
 pub mod domains;
 pub(crate) mod economy_helpers;
 pub(crate) mod economy_logic;
 pub mod export_import;
-pub mod governance;
 pub(crate) mod governance_helpers;
 pub(crate) mod governance_logic;
-pub mod invitation_helpers;
 pub(crate) mod lifecycle_helpers;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;
@@ -53,7 +50,6 @@ pub(crate) mod messaging_helpers;
 pub(crate) mod outlets_helpers;
 pub(crate) mod params_validation;
 pub mod persistence;
-pub mod policy;
 pub mod providers;
 pub(crate) mod push_helpers;
 pub(crate) mod push_routes;
@@ -77,7 +73,6 @@ use arc_swap::ArcSwap;
 use scp_protocol::context::params;
 use scp_protocol::context::{ContextError, ContextParams, ContextState, transition};
 
-pub use config::{ContextConfig, ContextCreation};
 // §7.3.8: the caveat/CID coupling type the FFI bridges mint from the validated
 // invocation UCAN and thread into `Supervisor::invoke_outlet_with_economy`. The
 // enclosing `outlets_helpers` module is `pub(crate)`; this single type is the
@@ -299,10 +294,12 @@ pub fn test_supervisor(
     event_log: Box<dyn builder::ContextEventLogProvider>,
     key_resolver: scp_protocol::context::governance::KeyResolver,
 ) -> Arc<supervisor::Supervisor> {
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
     );
     supervisor::Supervisor::with_providers(
         crypto,

@@ -1,5 +1,6 @@
-//! Test custody that counts its calls, `dh_agree` and `generate_keypair` calls
-//! separately, so a
+//! Test custody that counts its calls.
+//!
+//! It counts `dh_agree` and `generate_keypair` calls separately, so a
 //! round-trip test can prove the access-key open path performs exactly one key
 //! agreement, and a restart test can prove a wrapping key is generated once.
 //! It records every handle it generates and can be told to refuse
@@ -24,6 +25,7 @@ use scp_platform::{
 /// [`KeyCustody::generate_keypair`] calls and otherwise delegates every call
 /// unchanged.
 pub struct DhCountingCustody {
+    /// The custody every call delegates to.
     pub inner: InMemoryKeyCustody,
     calls: AtomicUsize,
     dh_calls: AtomicUsize,
@@ -50,11 +52,22 @@ pub enum PublicKeyFault {
 /// `release` before generating.
 #[derive(Clone, Default)]
 pub struct GenerateGate {
+    /// Signalled when `generate_keypair` reaches the gate.
     pub entered: Arc<Notify>,
+    /// Notified to let the gated `generate_keypair` proceed.
     pub release: Arc<Notify>,
 }
 
+impl Default for DhCountingCustody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DhCountingCustody {
+    /// A counting custody over a fresh [`InMemoryKeyCustody`], with every
+    /// count at zero and no fault, gate or hang set.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: InMemoryKeyCustody::new(),
@@ -70,6 +83,7 @@ impl DhCountingCustody {
     }
 
     /// A custody whose every `generate_keypair` waits on the returned gate.
+    #[must_use]
     pub fn with_generate_gate() -> (Self, GenerateGate) {
         let gate = GenerateGate::default();
         let custody = Self {

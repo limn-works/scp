@@ -52,15 +52,15 @@ use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
-use crate::context::supervisor::saga_journal::{
+use crate::crypto::wrapping::{IdentityWrappingKey, WrappingCustodySource};
+use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
+use scp_runtime_types::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
+use scp_runtime_types::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
-use crate::crypto::wrapping::{IdentityWrappingKey, WrappingCustodySource};
-use crate::economy::adapter::PaymentAdapterDyn;
-use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
+use scp_runtime_types::economy::adapter::PaymentAdapterDyn;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -1627,7 +1627,7 @@ pub enum InviteMemberOutcome {
         /// `creator_did`, `enc`, `ciphertext`) — the SAME wire type the joiner
         /// passes to [`Supervisor::spawn_actor_from_welcome`], so the invite
         /// output is directly usable as the join input with no re-boxing.
-        bundle: crate::context::invitation_helpers::SealedInvitation,
+        bundle: scp_runtime_types::context::invitation_helpers::SealedInvitation,
         /// `true` if the runtime published the sealed invitation to the
         /// invitee's `scp-invitations` routing id; `false` if the transport
         /// does not support routing-id delivery (the caller must deliver
@@ -2114,7 +2114,8 @@ pub struct Supervisor {
     /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
     /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
     /// read per ADR-049 §Decision 12.
-    mls_storage: OnceLock<Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
+    mls_storage:
+        OnceLock<Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
     /// The store of each context's last successful relay contact (ADR-029
     /// key `sync/{context_id}/last_relay_contact`): the one instance every
     /// writer and reader uses. A production supervisor takes it from
@@ -2286,7 +2287,7 @@ pub struct Supervisor {
 #[derive(Clone)]
 pub struct DurableProviders {
     saga_journal: Arc<dyn SagaJournal>,
-    mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    mls_storage: Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     /// The store of each context's last successful relay contact (ADR-029
     /// key `sync/{context_id}/last_relay_contact`), over the same handle.
     relay_contacts: Arc<dyn crate::store::sync::RelayContactStore>,
@@ -2298,10 +2299,10 @@ impl DurableProviders {
     /// ADR-049).
     ///
     /// This is the ONLY non-test constructor. The journal is a
-    /// [`ProtocolRepositorySagaJournal`](crate::context::supervisor::ProtocolRepositorySagaJournal)
+    /// [`ProtocolRepositorySagaJournal`](scp_runtime_types::context::supervisor::saga_journal::ProtocolRepositorySagaJournal)
     /// over a clone of `handle`; `mls_storage` is the same `handle` erased once
     /// via
-    /// [`SpawnBlockingStorageAdapter`](crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter).
+    /// [`SpawnBlockingStorageAdapter`](scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter).
     /// Because both derive from the one `Arc<S>`, the journal, the `OpenMLS`
     /// view, persistence, and the event log all read/write a single backend.
     #[must_use]
@@ -2310,13 +2311,18 @@ impl DurableProviders {
         S: scp_platform::traits::Storage + 'static,
     {
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(
-            crate::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
+            scp_runtime_types::context::supervisor::saga_journal::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
         );
         let relay_contacts: Arc<dyn crate::store::sync::RelayContactStore> = Arc::new(
             crate::store::sync::StorageRelayContactStore::new(Arc::clone(&handle)),
         );
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle));
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                handle,
+            ),
+        );
         Self {
             saga_journal,
             mls_storage,
@@ -2340,7 +2346,9 @@ impl DurableProviders {
     #[cfg(any(test, feature = "testing"))]
     pub fn for_test(
         saga_journal: Arc<dyn SagaJournal>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
     ) -> Self {
         Self::for_test_with_relay_contacts(saga_journal, mls_storage, in_memory_relay_contacts())
     }
@@ -2353,7 +2361,9 @@ impl DurableProviders {
     #[cfg(any(test, feature = "testing"))]
     pub fn for_test_with_relay_contacts(
         saga_journal: Arc<dyn SagaJournal>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
         relay_contacts: Arc<dyn crate::store::sync::RelayContactStore>,
     ) -> Self {
         Self {
@@ -2371,7 +2381,9 @@ impl DurableProviders {
     /// `SCP-CAPSEL-8000`).
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn with_noop_journal(
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
     ) -> Self {
         Self {
             saga_journal: Arc::new(NoOpSagaJournal),
@@ -2392,7 +2404,7 @@ impl DurableProviders {
     #[must_use]
     pub fn mls_storage(
         &self,
-    ) -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+    ) -> Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
         Arc::clone(&self.mls_storage)
     }
 
@@ -2406,7 +2418,7 @@ impl DurableProviders {
         self,
     ) -> (
         Arc<dyn SagaJournal>,
-        Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         Arc<dyn crate::store::sync::RelayContactStore>,
     ) {
         (self.saga_journal, self.mls_storage, self.relay_contacts)
@@ -2718,7 +2730,9 @@ impl Supervisor {
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
         domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
@@ -2755,7 +2769,9 @@ impl Supervisor {
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
         wrapping_custody: WrappingCustodySource,
         domains: crate::context::domains::DomainHandlers,
     ) -> Arc<Self> {
@@ -2787,7 +2803,9 @@ impl Supervisor {
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >,
         wrapping_custody: WrappingCustodySource,
         testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
         domains: crate::context::domains::DomainHandlers,
@@ -3149,7 +3167,7 @@ impl Supervisor {
     /// section 17.3, "Event log write failures"). The boundary re-runs the
     /// durable event-local
     /// `chunks_billed <= stream_chunk_count` backstop
-    /// ([`verify_outlet_invoked_event_local`](crate::context::outlets::stream::verify_outlet_invoked_event_local)).
+    /// ([`verify_outlet_invoked_event_local`](scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_local)).
     ///
     /// Same-context billing integrity is enforced INLINE in the dispatch pump
     /// before this call (`AuditAnomaly::ChunksBilledSelfMismatch`, escrow-ledger
@@ -3319,7 +3337,8 @@ impl Supervisor {
     #[must_use]
     pub(in crate::context) fn mls_storage_ref(
         &self,
-    ) -> Option<&Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
+    ) -> Option<&Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>
+    {
         self.mls_storage.get()
     }
 
@@ -4067,7 +4086,7 @@ impl Supervisor {
     /// `Self::dispatch_via_mailbox`. The actor's `run()` loop pulls
     /// the command and dispatches it via the actor-shape `dispatch(state,
     /// deps, cmd)` entry point, which exercises the actor-owned
-    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    /// [`SendSequenceTracker`](scp_runtime_types::context::actor::sequence::SendSequenceTracker)
     /// directly. The handler wraps every transport/MLS call in
     /// [`tokio::time::timeout`] with a 30-second budget; a timeout maps
     /// to [`ContextError::TransportTimeout`].
@@ -4966,14 +4985,14 @@ impl Supervisor {
         // verification round-trip, so an unbounded batch is a
         // denial-of-service vector. The FFI bridges enforce the same cap at
         // their boundaries; this guards non-bridge and future callers. See
-        // [`MAX_RECEIPT_BATCH`](crate::economy::adapter::MAX_RECEIPT_BATCH).
+        // [`MAX_RECEIPT_BATCH`](scp_runtime_types::economy::adapter::MAX_RECEIPT_BATCH).
         if let EconomyCommand::VerifyPaymentReceipts { receipts, .. } = &cmd
-            && receipts.len() > crate::economy::adapter::MAX_RECEIPT_BATCH
+            && receipts.len() > scp_runtime_types::economy::adapter::MAX_RECEIPT_BATCH
         {
             return Err(ContextError::LimitExceeded(format!(
                 "receipt batch too large: {} (max {})",
                 receipts.len(),
-                crate::economy::adapter::MAX_RECEIPT_BATCH
+                scp_runtime_types::economy::adapter::MAX_RECEIPT_BATCH
             )));
         }
 
@@ -5038,7 +5057,7 @@ impl Supervisor {
     /// `ActorDeps`/`PerContextState` to borrow, so the verification is
     /// inlined here against `self.payment_adapter_ref()` directly.
     async fn dispatch_economy_direct(&self, cmd: EconomyCommand) -> Outcome<()> {
-        use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
+        use scp_runtime_types::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
         const ECONOMY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -9216,7 +9235,7 @@ impl Supervisor {
                     .await;
                 // §17.16.4 operator-alerting metric: this entry is now
                 // NeedsRepair and requires operator repair.
-                crate::metrics::record_saga_repair_needed();
+                scp_runtime_types::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
                     "saga recovery — Aborting observed; marked NeedsRepair for operator review"
@@ -9426,7 +9445,7 @@ impl Supervisor {
     fn recover_needs_repair_entry(&self, entry: &JournalEntry) {
         // §17.16.4 operator-alerting metric: a NeedsRepair saga is
         // re-surfaced at process start until an operator repairs it.
-        crate::metrics::record_saga_repair_needed();
+        scp_runtime_types::metrics::record_saga_repair_needed();
         tracing::error!(
             saga_id = %entry.saga_id,
             "saga recovery — NeedsRepair carryover; operator intervention required"
@@ -9525,7 +9544,7 @@ impl Supervisor {
                     .await;
                 // §17.16.4 operator-alerting metric: commit-in-progress could
                 // not confirm both sides; this saga is NeedsRepair.
-                crate::metrics::record_saga_repair_needed();
+                scp_runtime_types::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
                     "saga recovery — Commit-in-progress observed; re-drove the idempotent Commit-B \
@@ -9646,7 +9665,7 @@ impl Supervisor {
                         seq_per_saga: entry.seq_per_saga.saturating_add(1),
                     })
                     .await;
-                crate::metrics::record_saga_repair_needed();
+                scp_runtime_types::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %saga_id,
                     "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
@@ -10135,7 +10154,7 @@ impl Supervisor {
             }
             // §17.16.4 operator-alerting metric: a committed saga whose terminal
             // marker did not durably resolve needs operator reconciliation.
-            crate::metrics::record_saga_repair_needed();
+            scp_runtime_types::metrics::record_saga_repair_needed();
             tracing::error!(
                 saga_id = %saga_id,
                 %e,
@@ -10305,7 +10324,7 @@ impl Supervisor {
                 // call, skipping the live operator alert until a later reopen
                 // re-derived it. UNCONDITIONAL (not gated on `xctx`) so the
                 // executor-less `TestForceNeedsRepair` path still fires it.
-                crate::metrics::record_saga_repair_needed();
+                scp_runtime_types::metrics::record_saga_repair_needed();
                 self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
                     .await
                     .inspect_err(|append_err| {
@@ -11503,7 +11522,7 @@ impl Supervisor {
     /// count itself — and avoids double-counting at the coordinator that consumes
     /// the verdict.
     fn reversal_outstanding() -> CallerAbortReversal {
-        crate::metrics::record_saga_caller_reversal_outstanding();
+        scp_runtime_types::metrics::record_saga_caller_reversal_outstanding();
         CallerAbortReversal::ReversalOutstanding
     }
 
@@ -11866,7 +11885,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// [`ContextError::InvalidState`] wrapping the [`JournalError`](crate::context::supervisor::saga_journal::JournalError) if the
+    /// [`ContextError::InvalidState`] wrapping the [`JournalError`](scp_runtime_types::context::supervisor::saga_journal::JournalError) if the
     /// durable `mark_resolved` write fails; the caller logs and defers to the
     /// crash-recovery sweep (the durable committed witness on B's actor is the
     /// authoritative resolution regardless).
@@ -13602,8 +13621,8 @@ impl Supervisor {
     pub async fn payment_history(
         &self,
         context_id: &str,
-        filter: Option<crate::economy::receipt::ReceiptFilter>,
-    ) -> Vec<crate::economy::adapter::PaymentReceipt> {
+        filter: Option<scp_runtime_types::economy::receipt::ReceiptFilter>,
+    ) -> Vec<scp_runtime_types::economy::adapter::PaymentReceipt> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = QueriesCommand::PaymentHistory {
             context_id: context_id.to_owned(),
@@ -15467,10 +15486,11 @@ impl Supervisor {
         // `cost_per_chunk × THE SAME estimate` or the escrow ledger the pump
         // bills against would disagree with the debited hold. Coerce once here
         // and thread the identical value into the reserve.
-        let estimated_chunk_count = crate::context::outlets::stream::coerce_estimated_chunk_count(
-            params.declared_estimated_chunk_count,
-            &params.caveats,
-        );
+        let estimated_chunk_count =
+            scp_runtime_types::context::outlets::stream::coerce_estimated_chunk_count(
+                params.declared_estimated_chunk_count,
+                &params.caveats,
+            );
 
         // Phase 1 — reserve via the actor mailbox. `max_per_action` is `None`:
         // the streaming open surface negotiates no §19.5 SpendingCapability
@@ -15571,7 +15591,7 @@ impl Supervisor {
             }
             .into());
         };
-        params.caps = crate::context::outlets::stream::AdmissionCaps {
+        params.caps = scp_runtime_types::context::outlets::stream::AdmissionCaps {
             per_invoker: ctx_params.max_concurrent_inbound_streams_per_invoker,
             per_origin_invoker: ctx_params.max_concurrent_inbound_streams_per_origin_invoker,
             per_outlet: ctx_params.max_concurrent_inbound_streams_per_outlet,
@@ -15876,7 +15896,7 @@ impl Supervisor {
     ///   validate, names another identity, carries no `0xFF01` or no
     ///   `0xFF03`, its `0xFF01` is not a valid P-256 point, or its
     ///   attestation does not verify; the message ends with
-    ///   the [`AttestationRuntimeVerifyError`](crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError)
+    ///   the [`AttestationRuntimeVerifyError`](scp_runtime_types::crypto::mls::attestation_verification::AttestationRuntimeVerifyError)
     ///   in the last case.
     pub async fn verify_key_package_attestation(
         &self,
@@ -15884,7 +15904,7 @@ impl Supervisor {
         key_package: &[u8],
     ) -> Result<scp_protocol::crypto::hpke::p256::P256Point, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
-        use crate::crypto::mls::attestation_verification::verify_add_attestation;
+        use scp_runtime_types::crypto::mls::attestation_verification::verify_add_attestation;
         let resolver = self.key_resolver()?;
         let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
         let mls = Arc::clone(self.crypto_ref().ok_or_else(not_init)?.mls_backend());
@@ -15973,7 +15993,7 @@ impl Supervisor {
     ///    `0xFF01` key (RFC 9180 Base mode, DHKEM(P-256), `info`/`aad` per
     ///    §5.12.3.1).
     /// 7. Fork C: publishes the sealed
-    ///    [`SealedInvitation`](crate::context::invitation_helpers::SealedInvitation)
+    ///    [`SealedInvitation`](scp_runtime_types::context::invitation_helpers::SealedInvitation)
     ///    to the invitee's `scp-invitations` routing id when the transport
     ///    supports routing-id delivery; otherwise returns the `(enc, ct)` for the
     ///    caller to deliver (`delivered = false`).
@@ -16164,14 +16184,16 @@ impl Supervisor {
                 .member_count(&context_id)
                 .await
                 .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
-            let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
+            let facts = scp_runtime_types::context::invitation_helpers::SnapshotRuntimeFacts {
                 member_count,
                 creator_did: Some(creator_did.clone()),
                 outlet_count: Some(u64::try_from(params.outlets.len()).unwrap_or(u64::MAX)),
-                ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
+                ..scp_runtime_types::context::invitation_helpers::SnapshotRuntimeFacts::default()
             };
             let metadata_snapshot =
-                crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
+                scp_runtime_types::context::invitation_helpers::build_metadata_snapshot(
+                    &params, facts,
+                );
 
             // The key is drawn into a `Zeroizing` buffer and copied once into
             // the bundle's `InvitationKeyMaterial`, which wipes itself on drop.
@@ -16227,7 +16249,7 @@ impl Supervisor {
             // 7. Fork C — deliver to the invitee's scp-invitations routing id when
             //    the transport supports routing-id delivery; otherwise the caller
             //    delivers.
-            let sealed = crate::context::invitation_helpers::SealedInvitation {
+            let sealed = scp_runtime_types::context::invitation_helpers::SealedInvitation {
                 context_id: context_id.clone(),
                 creator_did: creator_did.clone(),
                 enc: enc.as_bytes().to_vec(),
@@ -16548,22 +16570,23 @@ impl Supervisor {
         // failure is treated as a permanent reject (fail-closed), matching the
         // import path: the `KeyResolver` returns `Option` with no transient
         // signal, so there is no retryable-vs-permanent distinction to model here.
-        let creator_vk = crate::crypto::mls::attestation_verification::resolve_active_key(
-            self.key_resolver()?,
-            bundle.creator_did.clone(),
-        )
-        .await
-        .map_err(|e| {
-            ContextError::CryptoFailed(format!(
-                "spawn-from-Welcome: creator #active key resolution task failed: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ContextError::CryptoFailed(format!(
-                "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
-                bundle.creator_did
-            ))
-        })?;
+        let creator_vk =
+            scp_runtime_types::crypto::mls::attestation_verification::resolve_active_key(
+                self.key_resolver()?,
+                bundle.creator_did.clone(),
+            )
+            .await
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: creator #active key resolution task failed: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
+                    bundle.creator_did
+                ))
+            })?;
         bundle.verify(&creator_vk).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "spawn-from-Welcome: invitation signature invalid: {e}"
@@ -17247,7 +17270,7 @@ impl Supervisor {
             relay_urls: crate::context::shared::lifecycle::normalize_relay_urls(
                 relay_urls.to_vec(),
             ),
-            send_tracker: crate::context::actor::sequence::SendSequenceTracker::new(),
+            send_tracker: scp_runtime_types::context::actor::sequence::SendSequenceTracker::new(),
             recv_tracker: crate::context::actor::state::RecvSequenceTracker::new(),
             xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
             class_s: crate::context::actor::state::ClassSState {
@@ -17285,19 +17308,19 @@ impl Supervisor {
         Ok(per_context)
     }
 
-    /// Creates a context from a flat [`ContextConfig`](crate::context::config::ContextConfig)
+    /// Creates a context from a flat [`ContextConfig`](scp_runtime_types::context::config::ContextConfig)
     /// (ADR-052 / construction.md).
     ///
     /// This is the options-object front-end over [`Self::create_context`]: it
     /// lowers `config` into
     /// [`ContextParams`](scp_protocol::context::ContextParams) via
-    /// [`ContextConfig::into_params`](crate::context::config::ContextConfig::into_params)
+    /// [`ContextConfig::into_params`](scp_runtime_types::context::config::ContextConfig::into_params)
     /// and calls the existing creation engine. The Rust SDK thereby gains the
     /// same options-object shape Python/TypeScript/Swift already use.
     ///
     /// # Bilateral peer
     ///
-    /// [`ContextCreation::Template`](crate::context::config::ContextCreation::Template)
+    /// [`ContextCreation::Template`](scp_runtime_types::context::config::ContextCreation::Template)
     /// may carry an optional bilateral `peer` DID for the invitation step. The
     /// core creation engine builds only the creator's local context; the
     /// invitation/Welcome-delivery that actually adds the peer is a higher SDK
@@ -17321,7 +17344,7 @@ impl Supervisor {
     pub async fn create(
         self: &Arc<Self>,
         context_id: String,
-        config: crate::context::config::ContextConfig,
+        config: scp_runtime_types::context::config::ContextConfig,
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
         relay_urls: Vec<String>,
@@ -19112,16 +19135,16 @@ struct NoOpSagaJournal;
 impl SagaJournal for NoOpSagaJournal {
     async fn append(
         &self,
-        _entry: crate::context::supervisor::saga_journal::JournalEntry,
-    ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
+        _entry: scp_runtime_types::context::supervisor::saga_journal::JournalEntry,
+    ) -> Result<(), scp_runtime_types::context::supervisor::saga_journal::JournalError> {
         Ok(())
     }
 
     async fn load_unresolved(
         &self,
     ) -> Result<
-        Vec<crate::context::supervisor::saga_journal::JournalEntry>,
-        crate::context::supervisor::saga_journal::JournalError,
+        Vec<scp_runtime_types::context::supervisor::saga_journal::JournalEntry>,
+        scp_runtime_types::context::supervisor::saga_journal::JournalError,
     > {
         Ok(Vec::new())
     }
@@ -19129,9 +19152,9 @@ impl SagaJournal for NoOpSagaJournal {
     async fn mark_resolved(
         &self,
         _saga_id: SagaId,
-        _terminal: crate::context::supervisor::saga_journal::SagaTerminalState,
+        _terminal: scp_runtime_types::context::supervisor::saga_journal::SagaTerminalState,
         _secret_bearing: bool,
-    ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
+    ) -> Result<(), scp_runtime_types::context::supervisor::saga_journal::JournalError> {
         Ok(())
     }
 }

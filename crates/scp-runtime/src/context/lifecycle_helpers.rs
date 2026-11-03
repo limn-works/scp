@@ -90,17 +90,17 @@ use scp_protocol::context::{ContextError, ContextParams, ContextState};
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::DistributionReport;
 use crate::context::actor::state::{
     ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
 };
-use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
 };
 use crate::context::ttl::{self, CloseResult, TtlTimer};
+use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
+use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
 // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
 // — type unification, single PerContextState): the prior alias to the
@@ -2969,7 +2969,6 @@ pub async fn restore_context(
     handle: &ContextHandle,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
-    use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
         sanitize_cooldown_until, validate_consequence_rules_for_import,
         validate_context_params_for_import,
@@ -2981,6 +2980,7 @@ pub async fn restore_context(
     };
     use scp_protocol::context::governance::mls_integration::EpochCoordinator;
     use scp_protocol::context::membership::ReceiveBuffer;
+    use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
@@ -4122,11 +4122,12 @@ mod restore_reconcile_tests {
         }
     }
 
-    fn mls_storage() -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+    fn mls_storage()
+    -> Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
         Arc::new(
-            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                InMemoryStorage::new(),
-            )),
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
         )
     }
 
@@ -5278,11 +5279,13 @@ mod restore_reconcile_tests {
         };
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
-                captured: Arc::clone(&captured),
-                voided: Arc::clone(&voided),
-            });
+        let payment_adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(
+                scp_runtime_types::economy::adapter::CountingPaymentAdapter {
+                    captured: Arc::clone(&captured),
+                    voided: Arc::clone(&voided),
+                },
+            );
 
         let sup = Supervisor::with_providers(
             crypto,
@@ -5658,11 +5661,13 @@ mod restore_reconcile_tests {
             Arc::new(|_: &DID, _| None);
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
-                captured: Arc::clone(&captured),
-                voided: Arc::clone(&voided),
-            });
+        let payment_adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(
+                scp_runtime_types::economy::adapter::CountingPaymentAdapter {
+                    captured: Arc::clone(&captured),
+                    voided: Arc::clone(&voided),
+                },
+            );
 
         let admin = DID("did:dht:z6MkPayConvergeAdmin".to_owned());
         let sup = Supervisor::with_providers(
@@ -5790,7 +5795,7 @@ mod restore_reconcile_tests {
             let id = if i == 0 { oldest_id } else { id };
             state
                 .payment_receipts
-                .push_back(crate::economy::adapter::PaymentReceipt {
+                .push_back(scp_runtime_types::economy::adapter::PaymentReceipt {
                     receipt_id: id,
                     payer: payer.clone(),
                     payee: admin.clone(),
@@ -6357,12 +6362,13 @@ mod flush_sweep_tests {
             "did:dht:z6MkFlushSweep".to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    scp_platform::in_memory::InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+            ),
+        );
         Supervisor::with_providers(
             crypto,
             Box::new(crate::context::builder::NotConfiguredTransportProvider),

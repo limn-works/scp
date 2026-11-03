@@ -1211,7 +1211,7 @@ fn fold_chunk_leaf_hashes(leaves: Vec<[u8; 32]>) -> [u8; 32] {
 ///                            && chunk_i.sequence <= cancel_ack_ceiling }|
 /// ```
 ///
-/// matching `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`
+/// matching `scp_runtime_types::context::outlets::stream::compute_chunks_billed_ref`
 /// (which filters on `chunk.sequence`, the renumbered outer-pump sequence,
 /// not the slice index). The ceiling is fixed at construction:
 /// [`Self::new`] uses `u64::MAX` (no cancel — the predicate reduces to
@@ -2947,7 +2947,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Batch reference for the billed count, mirroring
-    /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`
+    /// `scp_runtime_types::context::outlets::stream::compute_chunks_billed_ref`
     /// (kept here as an independent oracle so the frontier is checked
     /// against a second implementation, not against itself).
     fn billed_ref(chunks: &[OutletStreamChunk], ceiling: u64) -> u64 {

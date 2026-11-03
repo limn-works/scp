@@ -390,7 +390,7 @@ async fn handle_settle_outlet_stream(
     deps: &ActorDeps,
     settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
     generation: u64,
-    witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
+    witness_saga_id: Option<scp_runtime_types::context::supervisor::saga_journal::SagaId>,
     reply: oneshot::Sender<
         Result<crate::context::actor::commands::StreamSettleApplication, ContextError>,
     >,

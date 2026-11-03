@@ -60,13 +60,15 @@ use crate::context::actor::{ContextCryptoState, ContextModeState, PerContextStat
 use crate::crypto::wrapping::{IdentityWrappingKey, test_wrapping_key};
 
 use super::provider::NodeMlsFactory;
-use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::supervisor::Supervisor;
 use crate::context::supervisor::key_package_actor::KeyPackageCommand;
+use scp_runtime_types::crypto::mls::storage_adapter::{
+    OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
+};
 
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
@@ -103,7 +105,7 @@ pub(crate) fn bob_signing_key() -> SigningKey {
 /// crate-wide).
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
-    super::test_support::role_resolver(&[
+    scp_runtime_types::crypto::mls::test_support::role_resolver(&[
         (DID::from(alice_did), alice_signing_key()),
         (DID::from(bob_did), bob_signing_key()),
     ])
@@ -363,7 +365,7 @@ fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) ->
             // (the actor wire shape), which Bob decodes, opens via his ephemeral
             // wrapping key in custody, and installs on his actor state through the
             // actor-native `set_sender_key_unchecked` seam.
-            let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
+            let request = scp_runtime_types::crypto::sender_keys::key_protocol::request_sender_key(
                 &bob_custody,
                 &bob_handle,
                 bob_did,
@@ -395,15 +397,16 @@ fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) ->
                 other => panic!("expected a KeyResponse envelope, got {other:?}"),
             };
             let ctx_id_hex = hex::encode(ctx_bytes);
-            let alice_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
-                &bob_custody,
-                &request.wrapping_key_handle,
-                &ctx_id_hex,
-                alice_did,
-                &response,
-            )
-            .await
-            .expect("bob opens alice's HPKE-sealed sender key");
+            let alice_key =
+                scp_runtime_types::crypto::sender_keys::key_protocol::open_sender_key_response(
+                    &bob_custody,
+                    &request.wrapping_key_handle,
+                    &ctx_id_hex,
+                    alice_did,
+                    &response,
+                )
+                .await
+                .expect("bob opens alice's HPKE-sealed sender key");
             bob_state.set_sender_key_unchecked(alice_did, alice_key);
 
             // Drop the joiner supervisor; each party's crypto lives on its owned

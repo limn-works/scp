@@ -471,7 +471,7 @@ fn ingest_pseudonym_announcement(
             reason,
             claimed_did,
         } => {
-            crate::metrics::record_pseudonym_announcement_rejected();
+            scp_runtime_types::metrics::record_pseudonym_announcement_rejected();
             // Reproduce the exact warn that fired before for each rejection
             // branch. The sender-mismatch branch is the ONLY one carrying a
             // `claimed_did`, and it logs it as a field (`%claimed_did` renders
@@ -1564,7 +1564,7 @@ pub async fn encrypt_and_send(
             message_type,
         )
         .await?;
-        crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
+        scp_runtime_types::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
     };
     // §9.10.4: fan-out — seal once, send to all routing IDs.
@@ -1588,7 +1588,7 @@ pub async fn encrypt_and_send(
         match deps.transport.send_message(rid, &encrypted, ttl).await {
             Ok(()) => {
                 any_success = true;
-                crate::metrics::record_message_sent();
+                scp_runtime_types::metrics::record_message_sent();
             }
             Err(e) => {
                 tracing::warn!(routing_id = ?rid, error = %e, "fan-out send failed");
@@ -2416,7 +2416,7 @@ pub(super) async fn decrypt_and_dispatch(
         )
     })?;
     let open_result = cs.open(context_id_bytes, context_id, encrypted_blob)?;
-    crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
+    scp_runtime_types::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
         scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -3176,7 +3176,7 @@ pub async fn deliver_message_and_drain_buffered(
     }
 
     *view.checkpoint_events_since_mut() += 1;
-    crate::metrics::record_message_received();
+    scp_runtime_types::metrics::record_message_received();
 
     Ok(false)
 }
@@ -4347,12 +4347,13 @@ mod pseudonym_routing_tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,
@@ -4874,12 +4875,13 @@ pub mod dropped_supervisor_tests {
                 OWNER.to_owned(),
                 Arc::new(scp_clock::SystemClock),
             ));
-            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-                Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
+            let mls_storage: Arc<
+                dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                    Arc::new(InMemoryStorage::new()),
+                ),
+            );
             let clock: Arc<dyn scp_clock::Clock> =
                 Arc::new(scp_clock::TestClock::new(1_700_000_000));
             let key_resolver: scp_protocol::context::governance::KeyResolver =

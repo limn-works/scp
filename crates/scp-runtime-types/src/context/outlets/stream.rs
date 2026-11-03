@@ -151,14 +151,11 @@ pub const fn grant_error_to_slug(err: GrantError) -> &'static str {
 /// unknown-stream.
 ///
 /// [`Self::CursorAdvanced`] and [`Self::Signing`] are round-8 additions for
-/// the [`StreamSessionHandle::apply_outlet_cancel_signed`] atomic primitive
+/// the `StreamSessionHandle::apply_outlet_cancel_signed` atomic primitive
 /// (the runtime signs the cancel itself, deriving `next_seq` from the live
 /// cursor): `CursorAdvanced` is a **retryable** race signal (the cursor
 /// moved between the lock-free preimage build and the re-lock), `Signing`
 /// wraps a signer-side failure.
-///
-/// [`StreamSessionHandle::apply_outlet_cancel_signed`]:
-///   super::dispatch::StreamSessionHandle::apply_outlet_cancel_signed
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelError {
     /// Ed25519 signature verification failed under the pinned
@@ -641,12 +638,12 @@ pub fn coerce_estimated_chunk_count(declared: Option<u32>, caveats: &InvocationC
 /// The effective ceiling is the MINIMUM of the two. Folding the value cap into
 /// the chunk ceiling is what physically prevents a stream from billing more
 /// cumulative value than the cap permits: the per-chunk gate
-/// ([`crate::context::outlets::invoke::apply_stream_chunk_gate`]) consults
+/// (`crate::context::outlets::invoke::apply_stream_chunk_gate`) consults
 /// [`CreditTracker::cumulative_ceiling_reached`] and terminates the stream once
 /// `billed_emitted` reaches this ceiling, regardless of available credit or how
 /// small the invoker-declared `estimated_chunk_count` was. `credit_window` only
 /// bounds the INITIAL window — grants extend billing up to this ceiling (clamped
-/// by [`CreditTracker::replenish_clamped`]) but never past it.
+/// by `CreditTracker::replenish_clamped`) but never past it.
 ///
 /// Returns `None` (unbounded) only when BOTH `max_calls` is absent AND there is
 /// no value-cap constraint (no `amount_max_cumulative`, or `cost_per_chunk == 0`
@@ -937,7 +934,7 @@ impl StreamEscrow {
 
     /// Extends the escrow ceiling by a top-up that has ALREADY been
     /// reserved (DEBITED) against the invoker's `MemberBudgetTracker` by
-    /// [`Supervisor::outlet_stream_reserve_grant`](crate::context::supervisor::Supervisor::outlet_stream_reserve_grant).
+    /// `Supervisor::outlet_stream_reserve_grant`.
     ///
     /// This is the production per-grant path (E2 remediation): the
     /// overflow / insufficient-funds decision happened in the manager
@@ -1066,7 +1063,7 @@ impl CancelAckTracker {
     /// belongs to the **terminal cancel-ack chunk**, and per §5.4.5:530(1)
     /// any `Data`/`Progress` still in flight at `sequence >= cancel_ack_seq`
     /// is dropped-and-not-billed by the pump gate
-    /// ([`super::invoke::apply_stream_chunk_gate`], `>=` boundary). The
+    /// (`super::invoke::apply_stream_chunk_gate`, `>=` boundary). The
     /// §5.4.5:558/563 `chunks_billed` formula
     /// (`compute_chunks_billed_ref`) stays **inclusive** (`sequence <=
     /// cancel_ack_seq`); it yields the correct count because the sealed
@@ -1637,7 +1634,7 @@ pub const fn verify_outlet_invoked_event_local(
 /// when the chunk sequence cannot be JCS-canonicalized into a manifest root.
 /// The runtime MUST refuse the event at log-insert time per the §5.4.5
 /// wire-layer rejection rule.
-pub(crate) fn verify_outlet_invoked_event_manifest(
+pub fn verify_outlet_invoked_event_manifest(
     event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
     chunks: &[OutletStreamChunk],
 ) -> Result<(), ChunksBilledError> {

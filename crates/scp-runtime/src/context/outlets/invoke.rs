@@ -20,7 +20,6 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::context::ContextHandle;
-use crate::context::outlets::signer::{StreamSigner, StreamSignerError};
 use scp_did::DID;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::outlets::OutletId;
@@ -45,6 +44,7 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::crypto::ucan::{UcanError, UcanToken};
 use scp_protocol::trust::consequence::evaluate_consequence_rules;
+use scp_runtime_types::context::outlets::signer::{StreamSigner, StreamSignerError};
 
 // ---------------------------------------------------------------------------
 // InvocationError
@@ -346,7 +346,8 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     ///
     /// When `Some`, `invoke_outlet` runs `prepare_paid_action` + `process_paid_action`
     /// before outlet execution. When `None`, only budget enforcement runs.
-    pub payment_adapter: Option<std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+    pub payment_adapter:
+        Option<std::sync::Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>>,
     /// Observable metrics for dynamic cost evaluation. Populated from
     /// `PerContextState` by the caller so that outlet economy uses real
     /// metrics instead of zeros.
@@ -418,7 +419,7 @@ pub async fn invoke_outlet_aggregating<F, Fut, S: BuildHasher>(
         serde_json::Value,
         OutletInvokedEvent,
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
-        Option<crate::economy::adapter::PaymentReceipt>,
+        Option<scp_runtime_types::economy::adapter::PaymentReceipt>,
     ),
     InvocationError,
 >
@@ -877,7 +878,7 @@ pub async fn invoke_outlet_with_cancellation_aggregating<F, Fut, C, CFut, S: Bui
         serde_json::Value,
         OutletInvokedEvent,
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
-        Option<crate::economy::adapter::PaymentReceipt>,
+        Option<scp_runtime_types::economy::adapter::PaymentReceipt>,
     ),
     InvocationError,
 >
@@ -1151,12 +1152,12 @@ fn extract_escrow_parts<S: BuildHasher>(
 /// Returns the payment receipt (if any). On capture failure, rolls back budget
 /// and returns the error.
 async fn finalize_outlet_escrow<S: BuildHasher>(
-    escrow: Option<crate::economy::integration::PreparedAction>,
+    escrow: Option<scp_runtime_types::economy::integration::PreparedAction>,
     escrow_parts: Option<&EscrowParts>,
     action_cost: Option<scp_protocol::economy::types::Amount>,
     economy: &mut Option<&mut OutletEconomyContext<'_, S>>,
     invoker_did: &DID,
-) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
+) -> Result<Option<scp_runtime_types::economy::adapter::PaymentReceipt>, InvocationError> {
     if let (Some(prepared), Some((adapter, policy, metrics, _))) = (escrow, escrow_parts) {
         match complete_outlet_payment(adapter.as_ref(), Some(policy), &prepared, metrics).await {
             Ok(receipt) => Ok(receipt),
@@ -1178,7 +1179,7 @@ async fn finalize_outlet_escrow<S: BuildHasher>(
 
 /// Extracted escrow context: adapter, policy, metrics, context ID.
 type EscrowParts = (
-    std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    std::sync::Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>,
     scp_protocol::economy::types::EconomicPolicy,
     scp_protocol::economy::policy::ObservableMetrics,
     String,
@@ -1189,7 +1190,7 @@ type EscrowParts = (
 /// Combines the void + rollback pattern that appears in every failure branch
 /// of `invoke_outlet` and `invoke_outlet_with_cancellation`.
 async fn void_escrow_and_rollback<S: BuildHasher>(
-    escrow: Option<&crate::economy::integration::PreparedAction>,
+    escrow: Option<&scp_runtime_types::economy::integration::PreparedAction>,
     escrow_parts: Option<&EscrowParts>,
     action_cost: Option<scp_protocol::economy::types::Amount>,
     economy: &mut Option<&mut OutletEconomyContext<'_, S>>,
@@ -1218,12 +1219,12 @@ async fn void_escrow_and_rollback<S: BuildHasher>(
 /// Called BEFORE outlet execution. On success, the caller must eventually call
 /// `complete_outlet_payment` or `void_outlet_escrow`.
 pub(crate) async fn authorize_outlet_payment(
-    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
     policy: &scp_protocol::economy::types::EconomicPolicy,
     context_id: &str,
     invoker_did: &DID,
     metrics: &scp_protocol::economy::policy::ObservableMetrics,
-) -> Result<Option<crate::economy::integration::PreparedAction>, InvocationError> {
+) -> Result<Option<scp_runtime_types::economy::integration::PreparedAction>, InvocationError> {
     let cost = scp_protocol::economy::policy::evaluate_cost(
         policy,
         &scp_protocol::economy::types::PaidActionType::OutletCall,
@@ -1233,13 +1234,13 @@ pub(crate) async fn authorize_outlet_payment(
         return Ok(None);
     };
 
-    let metadata = crate::economy::adapter::PaymentMetadata {
+    let metadata = scp_runtime_types::economy::adapter::PaymentMetadata {
         action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
         context_id: Some(context_id.to_owned()),
         idempotency_key: *uuid::Uuid::new_v4().as_bytes(),
     };
 
-    let prepared = crate::economy::integration::prepare_paid_action(
+    let prepared = scp_runtime_types::economy::integration::prepare_paid_action(
         adapter,
         Some(policy),
         scp_protocol::economy::types::PaidActionType::OutletCall,
@@ -1264,12 +1265,12 @@ pub(crate) async fn authorize_outlet_payment(
 /// Called AFTER successful outlet execution. Captures the escrowed payment
 /// and returns the receipt.
 pub(crate) async fn complete_outlet_payment(
-    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
     policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-    prepared: &crate::economy::integration::PreparedAction,
+    prepared: &scp_runtime_types::economy::integration::PreparedAction,
     metrics: &scp_protocol::economy::policy::ObservableMetrics,
-) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
-    let processed = crate::economy::integration::process_paid_action(
+) -> Result<Option<scp_runtime_types::economy::adapter::PaymentReceipt>, InvocationError> {
+    let processed = scp_runtime_types::economy::integration::process_paid_action(
         adapter,
         policy,
         &prepared.envelope,
@@ -1298,8 +1299,8 @@ pub(crate) async fn complete_outlet_payment(
 /// release the escrow hold. Best-effort — logs but does not propagate
 /// void failures.
 pub(crate) async fn void_outlet_escrow(
-    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
-    prepared: &crate::economy::integration::PreparedAction,
+    adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
+    prepared: &scp_runtime_types::economy::integration::PreparedAction,
 ) {
     if let Some(ref authorization) = prepared.envelope.authorization
         && let Err(e) = adapter.void_dyn(authorization).await
@@ -1655,7 +1656,7 @@ pub trait OutletInvokedEventSink: Send + Sync {
     /// [`ContextEventLogProvider::append_event`](crate::context::builder::ContextEventLogProvider::append_event),
     /// whose override re-runs the durable event-local
     /// `chunks_billed <= stream_chunk_count` backstop
-    /// ([`verify_outlet_invoked_event_local`](super::stream::verify_outlet_invoked_event_local)).
+    /// ([`verify_outlet_invoked_event_local`](scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_local)).
     /// Same-context billing integrity is enforced INLINE in the pump before this
     /// call (`AuditAnomaly::ChunksBilledSelfMismatch`), not re-derived here: the
     /// pump does not retain the payload set, so the full §5.4.5:566 manifest
@@ -1715,7 +1716,7 @@ pub struct StreamSettlement {
     /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
     /// counter at the open-time final gate — `cost_per_chunk ×
     /// effective_max_billable_chunks` (`<= cap` by construction), from
-    /// [`super::stream::cumulative_reserve_amount`].
+    /// [`scp_runtime_types::context::outlets::stream::cumulative_reserve_amount`].
     /// `0` when the cap is absent, `cost_per_chunk == 0`, or no counter store
     /// was wired. Close-time settlement releases the UNSPENT portion —
     /// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating)
@@ -2607,7 +2608,7 @@ pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool 
 /// chunks:
 ///
 /// 1. Compare `chunk.sequence` against
-///    [`super::stream::CancelAckTracker::billing_ceiling`] — non-terminal
+///    [`scp_runtime_types::context::outlets::stream::CancelAckTracker::billing_ceiling`] — non-terminal
 ///    chunks at OR above the cancel-ack sequence return
 ///    [`StreamGateOutcome::DropAboveCancelAck`]. The boundary is `>=`, not
 ///    `>`, because §5.4.5:530(3) reserves the cancel-ack sequence slot for
@@ -2624,12 +2625,12 @@ pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool 
 /// 2. §5.4.5:758 cumulative ceiling: if the chunk is billable (a `Data`
 ///    chunk at/below the cancel-ack ceiling) AND the §5.4.5:758
 ///    cumulative ceiling has already been reached
-///    ([`super::stream::CreditTracker::cumulative_ceiling_reached`]),
+///    ([`scp_runtime_types::context::outlets::stream::CreditTracker::cumulative_ceiling_reached`]),
 ///    return [`StreamGateOutcome::CreditExhausted`] WITHOUT consuming
 ///    credit — the HARD `min(credit_window, max_calls)` cap is reached and
 ///    the stream MUST terminate.
-/// 3. Call [`super::stream::CreditTracker::try_consume`]. On
-///    [`super::stream::OutOfCredit::Exhausted`], stamp
+/// 3. Call [`scp_runtime_types::context::outlets::stream::CreditTracker::try_consume`]. On
+///    [`scp_runtime_types::context::outlets::stream::OutOfCredit::Exhausted`], stamp
 ///    `credit_stall_armed_at` to the current `Instant` and return
 ///    [`StreamGateOutcome::Stall`].
 /// 4. Otherwise return [`StreamGateOutcome::Forward`].
@@ -2637,12 +2638,12 @@ pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool 
 /// The function takes a single mutex guard window so the
 /// (ceiling → cumulative → consume → bill) decision is atomic with respect
 /// to concurrent grant / cancel deliveries on
-/// [`super::stream::CreditTracker::grant_with_identity`] /
-/// [`super::stream::CancelAckTracker::record_cancel`].
+/// [`scp_runtime_types::context::outlets::stream::CreditTracker::grant_with_identity`] /
+/// [`scp_runtime_types::context::outlets::stream::CancelAckTracker::record_cancel`].
 #[must_use]
 pub fn apply_stream_chunk_gate(
-    credit: &mut super::stream::CreditTracker,
-    cancel_ack: &super::stream::CancelAckTracker,
+    credit: &mut scp_runtime_types::context::outlets::stream::CreditTracker,
+    cancel_ack: &scp_runtime_types::context::outlets::stream::CancelAckTracker,
     credit_stall_armed_at: &mut Option<std::time::Instant>,
     chunk: &OutletStreamChunk,
 ) -> StreamGateOutcome {
@@ -2678,14 +2679,14 @@ pub fn apply_stream_chunk_gate(
     StreamGateOutcome::Forward
 }
 
-/// Accrues a Data chunk in the per-stream [`super::stream::StreamEscrow`].
+/// Accrues a Data chunk in the per-stream [`scp_runtime_types::context::outlets::stream::StreamEscrow`].
 ///
 /// Bills only when the chunk is billable (a `Data` chunk at or below the
 /// cancel-ack ceiling — see [`is_billable_chunk`]). Progress / End / Error
 /// chunks and chunks above the ceiling are NOT billed (§5.4.5).
 pub const fn accrue_data_chunk_if_billable(
-    escrow: &mut super::stream::StreamEscrow,
-    cancel_ack: &super::stream::CancelAckTracker,
+    escrow: &mut scp_runtime_types::context::outlets::stream::StreamEscrow,
+    cancel_ack: &scp_runtime_types::context::outlets::stream::CancelAckTracker,
     chunk: &OutletStreamChunk,
 ) {
     if is_billable_chunk(chunk, cancel_ack.billing_ceiling()) {
@@ -2701,12 +2702,12 @@ pub const fn accrue_data_chunk_if_billable(
 /// operator-scoped `origin_admission` tracker (§5.4.5),
 /// under both trackers' critical sections. Idempotent on a
 /// never-admitted triple (matches
-/// [`super::stream::StreamAdmissionTracker::release`] semantics). The
+/// [`scp_runtime_types::context::outlets::stream::StreamAdmissionTracker::release`] semantics). The
 /// caller MUST hold both write guards with the per-context lock acquired
 /// before the operator-scoped one (the sanctioned lock order).
 pub fn release_stream_admission(
-    admission: &mut super::stream::StreamAdmissionTracker,
-    origin_admission: &mut super::stream::OriginAdmissionTracker,
+    admission: &mut scp_runtime_types::context::outlets::stream::StreamAdmissionTracker,
+    origin_admission: &mut scp_runtime_types::context::outlets::stream::OriginAdmissionTracker,
     invoker_did: &str,
     origin_invoker_did: &str,
     outlet_id: &str,
@@ -2886,7 +2887,7 @@ pub struct DispatchedOutletOutcome {
     /// Triggered consequences from the post-invocation bookkeeping pass.
     pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
     /// Payment receipt when an adapter is configured for paid Action outlets.
-    pub payment_receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    pub payment_receipt: Option<scp_runtime_types::economy::adapter::PaymentReceipt>,
 }
 
 /// Dispatches an outlet invocation through an [`OutletExecutor`], routing
@@ -3602,7 +3603,8 @@ pub(crate) struct InnerPumpSigningContext {
     /// the nullifier cannot be reached on any path — production, WASM, or
     /// test. Native FFI bridges supply a custody-backed adapter (ADR-006);
     /// tests / WASM supply an `InProcessStreamSigner`.
-    pub(crate) operator_signer: std::sync::Arc<dyn super::signer::StreamSigner>,
+    pub(crate) operator_signer:
+        std::sync::Arc<dyn scp_runtime_types::context::outlets::signer::StreamSigner>,
     /// Hosting context id (committed into the preimage).
     pub(crate) context_id: String,
     /// Outlet id (committed into the preimage).
@@ -4852,8 +4854,10 @@ async fn record_cross_context_a_event(
     // §5.4.5 billing ceiling is `u64::MAX` and `chunks_billed` reduces to the
     // count of `Data` leaves — identical to the frontier-derived value B's pump
     // committed, so the verified append passes on the happy path.
-    let chunks_billed =
-        crate::context::outlets::stream::compute_chunks_billed_ref(reassembled, u64::MAX);
+    let chunks_billed = scp_runtime_types::context::outlets::stream::compute_chunks_billed_ref(
+        reassembled,
+        u64::MAX,
+    );
     let event = build_streaming_outlet_event(
         request_id,
         outlet_id,
@@ -5272,7 +5276,7 @@ pub(crate) async fn run_cross_context_bridge(
 pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
-    saga_id: crate::context::supervisor::saga_journal::SagaId,
+    saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
     target_signer: crate::context::actor::signer::CommandSigner,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
@@ -5688,7 +5692,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
 /// un-committing the sealed saga. Never re-signs, never re-invokes.
 pub(crate) async fn record_streaming_saga_a_event(
     a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
-    saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    saga_id: &scp_runtime_types::context::supervisor::saga_journal::SagaId,
     outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
 ) {
     let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt =
@@ -6211,8 +6215,8 @@ mod tests {
     /// its chunks must not open), so there is no `None` path to a forged
     /// all-zero signature.
     fn test_signer() -> std::sync::Arc<dyn StreamSigner> {
-        use crate::context::outlets::signer::InProcessStreamSigner;
         use ed25519_dalek::SigningKey;
+        use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
         std::sync::Arc::new(InProcessStreamSigner::new(SigningKey::from_bytes(
             &[0x5c; 32],
         )))
@@ -7009,7 +7013,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_outlet_invocation_ucan_rejects_non_outlet_capability() {
-        use crate::crypto::ucan::mint::{MintParams, mint_ucan};
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::ucan::validate::{
@@ -7017,6 +7020,7 @@ mod tests {
             InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver,
             ValidationContext,
         };
+        use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
         // Set up issuer identity.
         let custody = InMemoryKeyCustody::new();
@@ -7104,7 +7108,6 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // two token mints + four validation assertions
     async fn validate_outlet_invocation_ucan_selects_stem_by_kind() {
-        use crate::crypto::ucan::mint::{MintParams, mint_ucan};
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::ucan::validate::{
@@ -7112,6 +7115,7 @@ mod tests {
             InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver,
             ValidationContext,
         };
+        use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
         let custody = InMemoryKeyCustody::new();
         let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -7637,7 +7641,7 @@ mod tests {
         async fn sign(&self, _preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
             Err(StreamSignerError::Custody {
                 category:
-                    crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+                    scp_runtime_types::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
             })
         }
         fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
@@ -7720,14 +7724,14 @@ mod tests {
     /// (`End`) signing branch, which the always-failing [`FailingStreamSigner`]
     /// (which fails the FIRST chunk) can never reach.
     struct SucceedNThenFailStreamSigner {
-        inner: crate::context::outlets::signer::InProcessStreamSigner,
+        inner: scp_runtime_types::context::outlets::signer::InProcessStreamSigner,
         remaining: std::sync::atomic::AtomicUsize,
     }
     impl SucceedNThenFailStreamSigner {
         fn new(n: usize) -> Self {
             use ed25519_dalek::SigningKey;
             Self {
-                inner: crate::context::outlets::signer::InProcessStreamSigner::new(
+                inner: scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
                     SigningKey::from_bytes(&[0x5c; 32]),
                 ),
                 remaining: std::sync::atomic::AtomicUsize::new(n),
@@ -7752,7 +7756,7 @@ mod tests {
             } else {
                 Err(StreamSignerError::Custody {
                     category:
-                        crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+                        scp_runtime_types::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
                 })
             }
         }
@@ -8524,12 +8528,12 @@ mod tests {
 
         use super::*;
         use crate::context::builder::ContextEventLogProvider;
-        use crate::context::outlets::signer::InProcessStreamSigner;
         use crate::context::providers::event_log::MerkleEventLogProvider;
         use crate::context::state::context_id_to_bytes;
         use scp_protocol::context::outlets::stream::{
             OutletStreamOpen, compute_chunk_sig_preimage,
         };
+        use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
 
         const B_CTX: &str = "ctx-b-036";
         const A_CTX: &str = "ctx-a-036";
@@ -9055,7 +9059,7 @@ mod tests {
             let registry = setup_registry_with_outlet(&role_state, creator_did);
             let outlet_id_owned: OutletId = OUTLET.to_owned();
             let executor: Arc<dyn super::super::OutletExecutor> = Arc::new(NineDataExecutor);
-            let signer: Arc<dyn crate::context::outlets::signer::StreamSigner> =
+            let signer: Arc<dyn scp_runtime_types::context::outlets::signer::StreamSigner> =
                 Arc::new(InProcessStreamSigner::new(op.clone()));
             let (tx, mut b_events) = tokio::sync::mpsc::unbounded_channel();
             let b_sink: Arc<dyn super::super::OutletInvokedEventSink> =
@@ -9330,13 +9334,13 @@ mod tests {
         ) {
             let operator = operator_key();
             let params = crate::context::outlets::dispatch::OpenStreamParams {
-                identity: crate::context::outlets::stream::StreamIdentity {
+                identity: scp_runtime_types::context::outlets::stream::StreamIdentity {
                     context_id: B_CTX.to_owned(),
                     outlet_id: OUTLET.to_owned(),
                     stream_epoch: 1,
                     caveats_binding: CB,
                 },
-                caps: crate::context::outlets::stream::AdmissionCaps {
+                caps: scp_runtime_types::context::outlets::stream::AdmissionCaps {
                     per_invoker: 10,
                     per_origin_invoker: 10,
                     per_outlet: 10,
@@ -9874,7 +9878,9 @@ mod tests {
                 run_streaming_saga_seal_task(
                     std::sync::Weak::new(),
                     B_CTX.to_owned(),
-                    crate::context::supervisor::saga_journal::SagaId("saga-dropped-sup".to_owned()),
+                    scp_runtime_types::context::supervisor::saga_journal::SagaId(
+                        "saga-dropped-sup".to_owned(),
+                    ),
                     crate::context::actor::signer::CommandSigner::local_ed25519(operator_key()),
                     inner_rx,
                     outer_tx,

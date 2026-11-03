@@ -39,8 +39,9 @@ use super::adapter::PaymentAdapter;
 /// 3.7). Raw `Vec<u8>` could contain plaintext; `EncryptedBlob` communicates
 /// that the bytes are already encrypted and safe for storage.
 ///
-/// The `from_encrypted` constructor is `pub(crate)` so that only code within
-/// `scp-core` (i.e., the encryption layer) can produce an `EncryptedBlob`.
+/// The `from_encrypted` constructor compiles only under `test` or the
+/// `testing` feature: no production path builds an `EncryptedBlob` from raw
+/// bytes, so a shipped build has no constructor that could wrap plaintext.
 /// External consumers receive them from the SDK but cannot forge one from
 /// arbitrary plaintext.
 ///
@@ -54,9 +55,12 @@ impl EncryptedBlob {
     ///
     /// This is the only constructor. It should be called exclusively by the
     /// identity private state encryption layer (spec section 3.7). Library
-    /// consumers should never construct this directly from plaintext.
-    #[allow(dead_code)] // Called by tests now; identity encryption layer will use it
-    pub(crate) const fn from_encrypted(data: Vec<u8>) -> Self {
+    /// consumers should never construct this directly from plaintext. Only
+    /// tests call it, so it compiles only under `test` or the `testing`
+    /// feature.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn from_encrypted(data: Vec<u8>) -> Self {
         Self(data)
     }
 

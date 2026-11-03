@@ -31,7 +31,7 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
-use scp_runtime::crypto::ucan::mint::{DelegateParams, MintParams, compute_cid, mint_ucan};
+use scp_runtime_types::crypto::ucan::mint::{DelegateParams, MintParams, compute_cid, mint_ucan};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -278,7 +278,7 @@ async fn validate_ucan_accepts_delegated_token() {
     let root_cid = compute_cid(&root_token);
 
     // Delegator delegates to agent (narrowing to just write).
-    let delegated_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+    let delegated_token = scp_runtime_types::crypto::ucan::mint::delegate_ucan(
         &DelegateParams {
             parent_token: &root_token,
             delegator_did: &delegator_did,
@@ -574,7 +574,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
     let root_cid = compute_cid(&root_token);
 
     // Delegator -> agent.
-    let delegated_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+    let delegated_token = scp_runtime_types::crypto::ucan::mint::delegate_ucan(
         &DelegateParams {
             parent_token: &root_token,
             delegator_did: &delegator_did,
@@ -1345,7 +1345,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
     let root_cid = compute_cid(&root_token);
 
     // Delegator narrows to read + write.
-    let delegated = scp_runtime::crypto::ucan::mint::delegate_ucan(
+    let delegated = scp_runtime_types::crypto::ucan::mint::delegate_ucan(
         &DelegateParams {
             parent_token: &root_token,
             delegator_did: &delegator_did,
@@ -2809,7 +2809,7 @@ async fn mint_delegate_validate_outlet(
     let root_cid = compute_cid(&root_token);
 
     // Delegator delegates the SAME outlet capability to the agent.
-    let delegated_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+    let delegated_token = scp_runtime_types::crypto::ucan::mint::delegate_ucan(
         &DelegateParams {
             parent_token: &root_token,
             delegator_did: &delegator_did,

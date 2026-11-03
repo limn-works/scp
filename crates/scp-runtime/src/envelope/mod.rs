@@ -6,4 +6,3 @@
 //! (`ContextCryptoState::seal` and `ContextCryptoState::open`).
 
 pub mod inner;
-pub mod pseudonym;

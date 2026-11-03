@@ -10,8 +10,6 @@ use crate::context::outlets::invoke::InvocationError;
 use crate::context::outlets::invoke::InvokeExecuteOutcome;
 use crate::context::outlets::invoke::build_outlet_event;
 use crate::context::outlets::invoke::invoke_outlet_execute_and_validate;
-use crate::economy::adapter::PaymentReceipt;
-use crate::economy::integration::PreparedAction;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::outlets::OutletId;
@@ -22,6 +20,8 @@ use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
+use scp_runtime_types::economy::integration::PreparedAction;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -161,7 +161,7 @@ impl OutletEconomyTicket {
     /// with no escrow simply consumes.
     pub async fn void_external_and_consume(
         mut self,
-        payment_adapter: Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+        payment_adapter: Option<&Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>>,
     ) {
         if let (Some(adapter), Some(prepared)) = (payment_adapter, self.escrow.as_ref()) {
             invoke::void_outlet_escrow(adapter.as_ref(), prepared).await;
@@ -236,7 +236,7 @@ impl OutletEconomyTicket {
     /// Reads — does NOT consume — the reversal-relevant fields: the budget
     /// delta, the hard-rate-limit refund flag, the external escrow
     /// authorization handle (the serde-safe
-    /// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+    /// [`PaymentAuthorization`](scp_runtime_types::economy::adapter::PaymentAuthorization)
     /// inside the non-serde [`PreparedAction`]), and the velocity-entry
     /// timestamp. The non-durable [`VelocityRollbackToken`] is intentionally
     /// dropped — a restored tracker re-synthesizes sequence numbers, so the
@@ -378,15 +378,15 @@ pub const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// # Idempotency (both legs)
 ///
 /// The stable `request_id` is set as
-/// [`PaymentMetadata::idempotency_key`](crate::economy::adapter::PaymentMetadata::idempotency_key)
+/// [`PaymentMetadata::idempotency_key`](scp_runtime_types::economy::adapter::PaymentMetadata::idempotency_key)
 /// on the `authorize_dyn` leg. `capture_dyn` takes ONLY `&PaymentAuthorization`
 /// — the trait exposes NO capture-side metadata/idempotency parameter — so
 /// capture idempotency rides the AUTHORIZATION IDENTITY rather than a second
 /// key: a key-honoring adapter dedups `authorize` on `request_id` and returns
-/// the SAME [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+/// the SAME [`PaymentAuthorization`](scp_runtime_types::economy::adapter::PaymentAuthorization)
 /// (same `auth_id`) for a repeated `request_id`, and a conforming adapter is
 /// idempotent on `capture` of that already-captured authorization (returning the
-/// same receipt or [`PaymentError::AlreadyCaptured`](crate::economy::adapter::PaymentError::AlreadyCaptured)).
+/// same receipt or [`PaymentError::AlreadyCaptured`](scp_runtime_types::economy::adapter::PaymentError::AlreadyCaptured)).
 /// Because BOTH the authorize key AND the capture authorization derive from the
 /// one stable `request_id`, a crash-window re-run of this function reconstructs
 /// the identical authorize key and is dedup-able by a key-honoring adapter at
@@ -397,18 +397,18 @@ pub const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 ///
 /// # Errors
 ///
-/// Propagates the adapter's [`PaymentError`](crate::economy::adapter::PaymentError)
+/// Propagates the adapter's [`PaymentError`](scp_runtime_types::economy::adapter::PaymentError)
 /// from either the authorize or the capture leg (service was rendered — the
 /// caller records a `PaymentCaptureFailed` and does NOT reverse the budget).
 pub async fn authorize_and_capture_stream_billed(
-    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
     policy: &scp_protocol::economy::types::EconomicPolicy,
     invoker_did: &DID,
     billed_amount: Amount,
     request_id: scp_protocol::context::outlets::stream::RequestId,
     context_id: &str,
-) -> Result<PaymentReceipt, crate::economy::adapter::PaymentError> {
-    let metadata = crate::economy::adapter::PaymentMetadata {
+) -> Result<PaymentReceipt, scp_runtime_types::economy::adapter::PaymentError> {
+    let metadata = scp_runtime_types::economy::adapter::PaymentMetadata {
         action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
         context_id: Some(context_id.to_owned()),
         idempotency_key: request_id,

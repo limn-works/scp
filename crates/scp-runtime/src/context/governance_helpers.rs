@@ -3090,12 +3090,13 @@ pub async fn execute_rotate_content_keys(
                     .max()
                     .unwrap_or(0);
                 let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-                let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-                    context_id,
-                    &did_refs,
-                    current_epoch,
-                )
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                let rotation =
+                    scp_runtime_types::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                        context_id,
+                        &did_refs,
+                        current_epoch,
+                    )
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
                 for new_key in rotation.new_keys {
                     let did = new_key.member_did().to_owned();
                     state.access.access_key_store.set(context_id, &did, new_key);
@@ -6764,7 +6765,7 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
 pub fn translate_timeout_events(
     result_events: &[GovernanceEvent],
     mls_epoch: u64,
-    conditions: &[crate::context::governance::timeout::DeadlockCondition],
+    conditions: &[scp_runtime_types::context::governance::timeout::DeadlockCondition],
     recovery_in_progress: bool,
 ) -> Vec<ContextEvent> {
     let mut ctx_events = Vec::new();
@@ -6811,13 +6812,13 @@ pub fn translate_timeout_events(
     if !conditions.is_empty() && !recovery_in_progress {
         for condition in conditions {
             let summary = match condition {
-                crate::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
+                scp_runtime_types::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
                     ..
                 } => "ThresholdInsufficient",
-                crate::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
+                scp_runtime_types::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
                     ..
                 } => "MajorityUnresponsive",
-                crate::context::governance::timeout::DeadlockCondition::UnanimityOffline {
+                scp_runtime_types::context::governance::timeout::DeadlockCondition::UnanimityOffline {
                     ..
                 } => "UnanimityOffline",
             };
@@ -7085,12 +7086,13 @@ mod commit_broadcast_retry_tests {
             Arc::new(scp_clock::SystemClock),
         ));
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(TestEventLog);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let clock: Arc<dyn scp_clock::Clock> = clock;
         let supervisor = Supervisor::with_providers(
             crypto,

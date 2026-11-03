@@ -37,8 +37,9 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::supervisor::{
-    ProtocolRepositorySagaJournal, SagaInput, SagaJournal, Supervisor, SupervisorConfig,
+use scp_runtime::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    ProtocolRepositorySagaJournal, SagaJournal,
 };
 
 struct NoOpPersistence;

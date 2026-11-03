@@ -1777,14 +1777,16 @@ mod tests {
         // xctx_committed_invocations: HashSet<SagaId> (serde_sorted_set) — the
         // last unsorted set in this struct; two elements are enough for a
         // `RandomState` order to differ between two `HashSet`s.
-        base.xctx_committed_invocations
-            .insert(crate::context::supervisor::saga_journal::SagaId(
+        base.xctx_committed_invocations.insert(
+            scp_runtime_types::context::supervisor::saga_journal::SagaId(
                 "saga-zulu-0001".to_owned(),
-            ));
-        base.xctx_committed_invocations
-            .insert(crate::context::supervisor::saga_journal::SagaId(
+            ),
+        );
+        base.xctx_committed_invocations.insert(
+            scp_runtime_types::context::supervisor::saga_journal::SagaId(
                 "saga-alpha-0002".to_owned(),
-            ));
+            ),
+        );
 
         // Structurally-identical copy with every set/map rebuilt in reverse
         // iteration order.
@@ -2861,9 +2863,9 @@ mod tests {
     /// `xctx_nonce_dedup` round-trip above for the other Class-S saga field.
     #[test]
     fn caller_reservation_record_persistence_roundtrips_value_stable() {
-        use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
-        use crate::economy::adapter::PaymentAuthorization;
+        use scp_runtime_types::context::supervisor::saga_journal::SagaId;
+        use scp_runtime_types::economy::adapter::PaymentAuthorization;
 
         let mut snapshot = test_snapshot("ctx-caller-reservation-roundtrip");
         let caller = DID::from("did:key:caller-roundtrip");
@@ -3054,8 +3056,8 @@ mod tests {
     /// from the record. Asserts both halves of the asymmetry.
     #[test]
     fn caller_reservation_records_retained_full_dropped_public() {
-        use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+        use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
         let mut snapshot = test_snapshot("ctx-caller-reservation-strip");
         let caller = DID::from("did:key:caller-strip");

@@ -29,9 +29,9 @@ use scp_protocol::economy::types::PaidActionType;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::shared::economy::PaidActionAuthorization;
-use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
-use crate::economy::integration;
-use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
+use scp_runtime_types::economy::adapter::{PaymentMetadata, PaymentReceipt};
+use scp_runtime_types::economy::integration;
+use scp_runtime_types::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
 // ---------------------------------------------------------------------------
 // verify_payment_receipts (top-level, actor-handler entry point)

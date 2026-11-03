@@ -128,7 +128,7 @@ pub fn persist_state_best_effort<'d, 'c>(
         let snapshot = match snapshot {
             Ok(ref snapshot) => snapshot,
             Err(e) => {
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -138,7 +138,7 @@ pub fn persist_state_best_effort<'d, 'c>(
             }
         };
         if let Err(e) = deps.persistence.persist_context(context_id, snapshot).await {
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -220,7 +220,7 @@ pub async fn persist_snapshot_fail_closed(
         .persist_context(context_id, snapshot)
         .await
         .map_err(|e| {
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::error!(
                 context_id = %context_id,
                 error = %e,
@@ -417,7 +417,7 @@ pub fn build_snapshot_from_state(
 pub fn saga_pending_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
+    scp_runtime_types::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
 > {
     use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
@@ -446,7 +446,7 @@ pub fn saga_pending_snapshot(
 pub fn xctx_committed_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
+    scp_runtime_types::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
 > {
     state.class_s.xctx_committed_outputs.clone()
@@ -464,7 +464,7 @@ pub fn xctx_committed_outputs_snapshot(
 pub fn xctx_committed_stream_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
+    scp_runtime_types::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
 > {
     state.class_s.xctx_committed_stream_outputs.clone()
@@ -485,7 +485,7 @@ pub fn xctx_committed_stream_outputs_snapshot(
 /// double-settle the caller escrow on replay.
 pub fn xctx_committed_invocations_snapshot(
     state: &PerContextState,
-) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
+) -> std::collections::HashSet<scp_runtime_types::context::supervisor::saga_journal::SagaId> {
     state.class_s.xctx_committed_invocations.clone()
 }
 
@@ -506,7 +506,7 @@ pub fn xctx_committed_invocations_snapshot(
 pub fn xctx_caller_reservations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
+    scp_runtime_types::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
 > {
     state.class_s.xctx_caller_reservations.clone()

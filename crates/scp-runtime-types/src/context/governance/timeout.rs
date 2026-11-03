@@ -3,7 +3,7 @@
 //! The timeout / deadlock-detection pipeline (`process_pending_proposals`,
 //! `detect_deadlock`, `update_detection_state`) is run once every 60 seconds
 //! by the ACTOR-OWNED governance-timeout arm
-//! ([`ContextActor::run`](crate::context::actor::ContextActor)'s
+//! (`ContextActor::run`'s
 //! `governance_timeout` interval → `evaluate_governance_timeouts`; ADR-049
 //! Decision-1 / finding A3). Each tick:
 //!

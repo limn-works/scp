@@ -2,7 +2,7 @@
 //! `PerContextState.saga_pending` between Prepare and Commit (ADR-049 §3,
 //! plan §"`SagaPreparedState` contents" table).
 //!
-//! Unlike [`crate::context::supervisor::saga_journal::JournalEntry`] —
+//! Unlike [`scp_runtime_types::context::supervisor::saga_journal::JournalEntry`] —
 //! which is the supervisor-side durable coordinator record — values of
 //! [`SagaPreparedState`] live in actor-local memory and are persisted only
 //! as part of the actor's coalesced [`ContextSnapshot`](crate::context::state::ContextSnapshot). The split is
@@ -52,7 +52,7 @@ use scp_protocol::context::outlets::stream::MerkleFrontier;
 use scp_protocol::economy::types::Amount;
 use serde::{Deserialize, Serialize};
 
-use crate::context::supervisor::saga_journal::SagaId;
+use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
 // ---------------------------------------------------------------------------
 // Discriminated union over the ADR-049 §3 saga type-space (one variant today; extensible)
@@ -151,7 +151,7 @@ pub enum SagaPreparedState {
 /// [`CrossContextOutletInvocationPrepared::to_evidence_bytes`] /
 /// [`CrossContextOutletInvocationPrepared::from_evidence_bytes`], mirroring
 /// the `JournalEntryWire`/`EvidenceWire` discipline in
-/// [`crate::context::supervisor::saga_journal`].
+/// [`scp_runtime_types::context::supervisor::saga_journal`].
 pub struct CrossContextOutletInvocationPrepared {
     /// Calling context ID — the raw 32-byte context-id digest (never a
     /// `"standing-"`-prefixed string), matching the id-form rule §6.2.4
@@ -195,7 +195,7 @@ pub struct CrossContextOutletInvocationPrepared {
 /// because the wrapping [`SagaPreparedState`] enum carries the §9.4.3
 /// non-derive barrier; this explicit mirror is the sanctioned serialization
 /// path, matching the `JournalEntryWire`/`EvidenceWire` discipline in
-/// [`crate::context::supervisor::saga_journal`].
+/// [`scp_runtime_types::context::supervisor::saga_journal`].
 ///
 /// All eight fields are public plan-metadata classified **public** — there
 /// is no §9.4.3 secret commitment (`mark_resolved(secret_bearing=false)`).
@@ -828,7 +828,7 @@ pub struct CommittedStreamingOutletInvocation {
 /// **Escrow void MUST be idempotent across a recovery re-drive.** The crash
 /// abort voids the escrow BEFORE its Class-S persist; if that persist fails the
 /// record stays durable, so the next recovery sweep voids the SAME
-/// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+/// [`PaymentAuthorization`](scp_runtime_types::economy::adapter::PaymentAuthorization)
 /// again. This is the same idempotency the carrier's `void_external_and_consume`
 /// already relies on and the payment-adapter `void` contract guarantees.
 ///
@@ -851,7 +851,7 @@ pub struct CommittedStreamingOutletInvocation {
 /// pruned with the journal entry it belongs to.
 ///
 /// **Not bearer-bearing.** Every field is public economy metadata —
-/// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization) is
+/// [`PaymentAuthorization`](scp_runtime_types::economy::adapter::PaymentAuthorization) is
 /// the same serde type the payment rail issues, and the velocity entry is
 /// reversed by its TIMESTAMP (the non-durable `VelocityRollbackToken` is
 /// deliberately NOT stored — a restored tracker re-synthesizes sequence numbers,
@@ -879,7 +879,7 @@ pub struct CallerReservationRecord {
     /// when no economic policy / payment adapter is configured). Serde-safe; the
     /// `PreparedAction`/`ActionEnvelope` wrappers are NOT, so only the
     /// authorization handle is persisted.
-    pub escrow_authorization: Option<crate::economy::adapter::PaymentAuthorization>,
+    pub escrow_authorization: Option<scp_runtime_types::economy::adapter::PaymentAuthorization>,
 }
 
 // ---------------------------------------------------------------------------

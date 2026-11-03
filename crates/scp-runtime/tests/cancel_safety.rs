@@ -12,7 +12,7 @@
 //! already cover):
 //!
 //! 1. Cases 1 & 2 — the
-//!    [`SequenceReservation`](scp_runtime::context::actor::SequenceReservation)
+//!    [`SequenceReservation`](scp_runtime_types::context::actor::sequence::SequenceReservation)
 //!    RAII TYPE CONTRACT (ADR-049 §8 "`SequenceReservation` RAII": rollback
 //!    fires on `Drop` unless `commit()` ran; monotonicity "holds across
 //!    panics, cancellations, and early `?` returns"). These are
@@ -111,9 +111,10 @@ use std::time::Duration;
 
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::actor::{SendSequenceTracker, SequenceReservation};
-use scp_runtime::context::supervisor::{
-    ProtocolRepositorySagaJournal, SagaInput, SagaJournal, Supervisor, SupervisorConfig,
+use scp_runtime::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::actor::sequence::{SendSequenceTracker, SequenceReservation};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    ProtocolRepositorySagaJournal, SagaJournal,
 };
 
 // ---------------------------------------------------------------------------

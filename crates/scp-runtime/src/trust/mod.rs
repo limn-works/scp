@@ -5,7 +5,6 @@
 //! scp-identity types (`DidDocument`).
 
 pub mod caveat_counters;
-pub mod participation_service;
 
 // Async submodule re-exports remain here. Pure types are in scp-protocol.
 pub use crate::store::trust::ProtocolRepositoryTrustBridge;
