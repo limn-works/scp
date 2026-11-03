@@ -59,6 +59,31 @@ workspace_member_dirs() {
     echo "$metadata" | grep -oE '"manifest_path":"[^"]*"' | sed -E 's/^"manifest_path":"(.*)\/Cargo\.toml"$/\1/'
 }
 
+# runtime_sibling_edges METADATA prints "<pkg> depends on <dep>" for every
+# normal or build dependency that one ADR-070 runtime domain crate takes on
+# another. METADATA is `cargo metadata --no-deps --format-version 1` output. A
+# domain crate is a package named `scp-runtime-*` other than
+# `scp-runtime-types` and `scp-runtime-core`; each may depend on types and
+# core, and on a sibling only as a dev-dependency (kind "dev"). Returns 2 when
+# METADATA does not parse.
+runtime_sibling_edges() {
+    python3.12 -I -c '
+import json, sys
+SHARED = {"scp-runtime-types", "scp-runtime-core"}
+def is_domain(name):
+    return name.startswith("scp-runtime-") and name not in SHARED
+try:
+    packages = json.loads(sys.argv[1])["packages"]
+    edges = [(p["name"], d["name"], d.get("kind")) for p in packages for d in p.get("dependencies", [])]
+except (ValueError, KeyError, TypeError):
+    print("runtime_sibling_edges: metadata does not parse", file=sys.stderr)
+    sys.exit(2)
+for line in sorted({f"{pkg} depends on {dep}" for pkg, dep, kind in edges
+                    if is_domain(pkg) and is_domain(dep) and kind in (None, "build")}):
+    print(line)
+' "$1"
+}
+
 # --self-test feeds network_crates_in a canned listing with two network crates
 # and three names that contain a network crate's name, and requires exactly
 # the two network crates back. It runs no cargo command.
@@ -114,8 +139,54 @@ if [ "${1:-}" = "--self-test" ]; then
         fi
     done
     echo "packages_from_other_sources self-test passed: refused a git source, two foreign paths, a registry and a non-member path."
+
+    # The runtime sibling check: governance depending on messaging through a
+    # normal edge (kind null) or a build edge is reported; a dev edge, an edge
+    # to types or core, and a non-runtime package depending on a domain pass.
+    sibling_meta() {
+        printf '{"packages":[{"name":"scp-runtime-governance","dependencies":[{"name":"scp-runtime-core","kind":null},{"name":"scp-runtime-types","kind":null},{"name":"scp-runtime-messaging","kind":%s}]},{"name":"scp-runtime","dependencies":[{"name":"scp-runtime-messaging","kind":null}]}]}' "$1"
+    }
+    for kind in null '"build"'; do
+        got=$(runtime_sibling_edges "$(sibling_meta "$kind")")
+        if [ "$got" != "scp-runtime-governance depends on scp-runtime-messaging" ]; then
+            echo "ERROR: runtime_sibling_edges self-test: kind $kind reported [$got]"
+            exit 1
+        fi
+    done
+    got=$(runtime_sibling_edges "$(sibling_meta '"dev"')")
+    if [ -n "$got" ]; then
+        echo "ERROR: runtime_sibling_edges self-test: a dev edge reported [$got]"
+        exit 1
+    fi
+    if runtime_sibling_edges 'not json' >/dev/null 2>&1; then
+        echo "ERROR: runtime_sibling_edges self-test: unparseable metadata passed"
+        exit 1
+    fi
+    echo "runtime_sibling_edges self-test passed: refused a normal and a build sibling edge, allowed a dev edge."
     exit 0
 fi
+
+# runtime_domains_are_siblings: ADR-070 makes the 13 runtime domain crates
+# siblings that reach one another only through core's DomainHandlers, so no
+# domain crate takes a normal or build dependency on another.
+runtime_domains_are_siblings() {
+    local metadata edges
+    metadata=$(cargo metadata --no-deps --format-version 1 2>/dev/null) || {
+        echo "ERROR: cargo metadata failed"
+        exit 1
+    }
+    if ! edges=$(runtime_sibling_edges "$metadata"); then
+        echo "ERROR: runtime sibling check could not read cargo metadata"
+        exit 1
+    fi
+    if [ -n "$edges" ]; then
+        echo "ERROR: a runtime domain crate depends on a sibling domain crate (ADR-070):"
+        echo "$edges"
+        exit 1
+    fi
+    echo "runtime sibling check passed: no domain crate has a non-dev dependency on another."
+}
+runtime_domains_are_siblings
 
 echo "Checking scp-protocol dependency tree..."
 

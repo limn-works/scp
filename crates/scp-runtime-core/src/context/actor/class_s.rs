@@ -4932,25 +4932,24 @@ mod tests {
     /// coalesce-window re-grant hazard — a one-line flip. There is no live exploit
     /// today; the only two production callers honor the precondition:
     ///
-    /// - `messaging_helpers.rs` (paid-send reconcile) — the sibling is the nonce
-    ///   `ClassSCommitToken` committed in `persist_finalized_send`.
-    /// - `governance_helpers.rs` (governance finalize) — the sibling is the ambient
-    ///   `execute_governance_action` `discharge_with` token.
+    /// - `crates/scp-runtime-messaging/src/helpers.rs` (paid-send reconcile) — the
+    ///   sibling is the nonce `ClassSCommitToken` committed in
+    ///   `persist_finalized_send`.
+    /// - `crates/scp-runtime-governance/src/helpers.rs` (governance finalize) — the
+    ///   sibling is the ambient `execute_governance_action` `discharge_with` token.
     ///
     /// # Approach (and why it is robust)
     ///
-    /// The scan is scoped to the two production helper files via `include_str!`,
-    /// each comment/string-stripped through the shared `code_only` lexer so a
-    /// `.subsume(` mention in a comment or string does not count (both files DO
-    /// carry such prose mentions). These two files contain ONLY the two production
-    /// `.subsume(` sites and no `#[cfg(test)]` `subsume` calls — so scoping the
-    /// scan to them sidesteps the fragile job of distinguishing production from
-    /// test calls inside `class_s.rs` (whose test module legitimately calls
-    /// `.subsume(` from `subsume_discharges_without_panicking` /
-    /// `subsume_wrong_context_panics_in_debug`) and never matches the `fn subsume`
-    /// definition itself. The allowlist is a CLOSED POSITIVE set keyed on
-    /// `(file, count)`: each sanctioned file must contain EXACTLY its expected
-    /// number of production calls, and NO un-listed file may appear.
+    /// The scan reads every `.rs` file under each `crates/scp-runtime*/src`
+    /// directory (ADR-070 split the runtime into 16 crates), each
+    /// comment/string-stripped through the shared `code_only` lexer so a
+    /// `.subsume(` mention in a comment or string does not count (both sanctioned
+    /// files DO carry such prose mentions). It skips `class_s.rs` itself, whose
+    /// test module legitimately calls `.subsume(` from
+    /// `subsume_discharges_without_panicking` /
+    /// `subsume_wrong_context_panics_in_debug`. The allowlist is a CLOSED POSITIVE
+    /// set keyed on `(file, count)`: each sanctioned file must contain EXACTLY its
+    /// expected number of calls, and NO un-listed file may contain one.
     ///
     /// # Honest scope
     ///
@@ -4965,51 +4964,84 @@ mod tests {
     fn subsume_caller_allowlist_is_bounded() {
         // The closed positive allowlist: each sanctioned production file and the
         // EXACT number of `.subsume(` call sites it is permitted to contain. A new
-        // caller (a 3rd site in either file, or a call in any other file) trips the
+        // caller (a 2nd site in either file, or a call in any other file) trips the
         // assert. Adding a deliberately-sanctioned site means bumping the count
         // here WITH a §9 sibling-commit safety argument on the new call.
-        const KNOWN_SUBSUME_SITES: [(&str, &str, usize); 2] = [
-            (
-                "messaging_helpers.rs",
-                include_str!("../../../../scp-runtime-messaging/src/helpers.rs"),
-                1,
-            ),
-            (
-                "governance_helpers.rs",
-                include_str!("../../../../scp-runtime-governance/src/helpers.rs"),
-                1,
-            ),
+        const KNOWN_SUBSUME_SITES: [(&str, usize); 2] = [
+            ("crates/scp-runtime-messaging/src/helpers.rs", 1),
+            ("crates/scp-runtime-governance/src/helpers.rs", 1),
         ];
+        // The definition plus `#[cfg(test)]` test calls, neither a production caller.
+        const SELF: &str = "crates/scp-runtime-core/src/context/actor/class_s.rs";
 
-        // Count production `.subsume(` call sites per sanctioned file over the
-        // COMMENT/STRING-stripped source, so a `.subsume(` inside a `//`/`/* */`
-        // comment or a string literal (both files carry such prose) does not count.
-        for (name, src, expected) in KNOWN_SUBSUME_SITES {
-            let code = code_only(src);
-            let found = code.matches(".subsume(").count();
-            assert_eq!(
-                found, expected,
-                "ADR-049 §9: production file `{name}` has {found} `ClassSCommitToken::subsume()` \
-                 call site(s), allowlist expects {expected}. A new ClassSCommitToken::subsume() \
-                 caller was added; subsume DISCARDS the owed fail-closed persist — prove a \
-                 sibling token commits the same whole-state persist, then add it to \
-                 KNOWN_SUBSUME_SITES with a §9 safety argument."
-            );
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read a runtime source directory") {
+                let path = entry.expect("read a directory entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
         }
 
-        // Closed-set guard: NO other scp-runtime context source may carry a
-        // production `.subsume(` call. The two helper files above are the ONLY
-        // sanctioned consequence-finalize sites; `class_s.rs` itself contains the
-        // `fn subsume` DEFINITION plus `#[cfg(test)]` test calls (neither a
-        // production caller), so it is deliberately NOT in the allowlist. A NEW
-        // production caller anywhere else is the exact §9 hazard — it must surface
-        // as a reviewed addition to KNOWN_SUBSUME_SITES, not a silent new site.
-        let allow: std::collections::HashSet<&str> =
-            KNOWN_SUBSUME_SITES.iter().map(|(n, _, _)| *n).collect();
+        fn workspace_root() -> std::path::PathBuf {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("the crate sits two levels below the repository root")
+                .to_path_buf()
+        }
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(workspace_root().join("crates")).expect("read crates/") {
+            let dir = entry.expect("read a crates/ entry").path();
+            let is_runtime = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("scp-runtime"));
+            if is_runtime && dir.join("src").is_dir() {
+                rust_files(&dir.join("src"), &mut files);
+            }
+        }
+        assert!(
+            files
+                .iter()
+                .any(|f| f.ends_with("scp-runtime-messaging/src/helpers.rs")),
+            "the scan must reach the domain crates' sources"
+        );
+
+        // Count `.subsume(` call sites per file over the COMMENT/STRING-stripped
+        // source, so a `.subsume(` inside a `//`/`/* */` comment or a string
+        // literal (both sanctioned files carry such prose) does not count.
+        let mut found: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(workspace_root())
+                .expect("a scanned file sits under the repository root")
+                .to_string_lossy()
+                .into_owned();
+            if rel == SELF {
+                continue;
+            }
+            let src = std::fs::read_to_string(file).expect("read a runtime source file");
+            let count = code_only(&src).matches(".subsume(").count();
+            if count > 0 {
+                found.insert(rel, count);
+            }
+        }
+
+        let expected: std::collections::BTreeMap<String, usize> = KNOWN_SUBSUME_SITES
+            .iter()
+            .map(|(f, n)| ((*f).to_owned(), *n))
+            .collect();
         assert_eq!(
-            allow.len(),
-            KNOWN_SUBSUME_SITES.len(),
-            "KNOWN_SUBSUME_SITES must list each sanctioned file once"
+            found, expected,
+            "ADR-049 §9: the `ClassSCommitToken::subsume()` call sites in the runtime \
+             crates differ from KNOWN_SUBSUME_SITES. subsume DISCARDS the owed \
+             fail-closed persist — prove a sibling token commits the same whole-state \
+             persist, then add the site to KNOWN_SUBSUME_SITES with a §9 safety argument."
         );
     }
 
