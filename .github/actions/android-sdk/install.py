@@ -15,13 +15,18 @@ sys-img/android/sys-img2-3.xml) against PINS, and retries a mismatch. Only an ar
 that matches is unpacked; when every attempt mismatches, the step fails naming the
 package and its URL. SHA-1 is the only digest that manifest publishes.
 
-WHY UNPACKING IS ENOUGH TO INSTALL. Every pinned archive holds one top-level directory
-with a `source.properties` that names the package revision. Moved to the package's path
-under the SDK root, sdkmanager reads it as an installed package, and `sdkmanager
---list_installed` writes the `package.xml` avdmanager and the Android Gradle plugin read.
-The final check runs that listing and fails unless every requested package appears at
-its pinned revision; a later `sdkmanager --install` of the same package downloads
-nothing.
+WHAT MAKES AN UNPACKED ARCHIVE AN INSTALLED PACKAGE. Every pinned archive holds one
+top-level directory with a `source.properties` that names the package revision, and the
+script moves that directory to the package's path under the SDK root. sdkmanager lists a
+package by its `package.xml`. For a platform or a system image, whose `source.properties`
+carries the API level, tag and ABI, `sdkmanager --list_installed` writes that file
+itself, with the type details avdmanager and the Android Gradle plugin read. It does not
+recognize the side-by-side NDK or the emulator from their `source.properties` (job
+125641934068 listed neither), so for a package whose pin names a `display_name` (the
+generic packages, whose type details are empty) this script writes the `package.xml`
+sdkmanager would have written. The final check runs that listing and fails unless every
+requested package appears at its pinned revision; a later `sdkmanager --install` of the
+same package downloads nothing.
 
 WHY A PACKAGE ALREADY AT ITS PINNED REVISION IS KEPT. The runner image preinstalls
 some packages (`platforms;android-35` among them). A directory whose `source.properties`
@@ -50,10 +55,15 @@ ATTEMPTS = 4
 
 
 class Pin(NamedTuple):
+    # The revision the archive's `source.properties` records, which is what sdkmanager
+    # lists once the archive is unpacked.
     revision: str
     archive: str
     size: int
     sha1: str
+    # Set for a generic package sdkmanager does not recognize from `source.properties`:
+    # the manifest's display name, written into the package.xml this script creates.
+    display_name: str | None = None
 
 
 PINS: dict[str, Pin] = {
@@ -65,12 +75,14 @@ PINS: dict[str, Pin] = {
         "android-ndk-r27c-linux.zip",
         663987688,
         "090e8083a715fdb1a3e402d0763c388abb03fb4e",
+        "NDK (Side by side) 27.2.12479018",
     ),
     "platform-tools": Pin(
         "37.0.1",
         "platform-tools_r37.0.1-linux.zip",
         9054187,
         "477254aa5f903c15cf51001717bdf347fb6b53e0",
+        "Android SDK Platform-Tools",
     ),
     # The stable channel's emulator on 2026-11-02, the one the emulator runner action
     # installed as "latest" until this pin replaced it.
@@ -79,9 +91,11 @@ PINS: dict[str, Pin] = {
         "emulator-linux_x64-16740729.zip",
         349658551,
         "f41f9e31eb5ca64926603c03265c50bbc0ff4172",
+        "Android Emulator",
     ),
+    # The manifest lists this archive as revision 11; its source.properties records 10.
     "system-images;android-30;default;x86_64": Pin(
-        "11",
+        "10",
         "sys-img/android/x86_64-30_r11.zip",
         676379777,
         "5e4de3946d46f88856c35efcc4d797b381456347",
@@ -194,6 +208,27 @@ def unpack(package: str, pin: Pin, archive: Path, target: Path, root: Path) -> N
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def package_xml(package: str, pin: Pin) -> str:
+    """The package.xml sdkmanager writes for a generic package it installed."""
+    assert pin.display_name is not None
+    names = ("major", "minor", "micro")
+    parts = pin.revision.split(".")
+    revision = "".join(f"<{n}>{p}</{n}>" for n, p in zip(names, parts, strict=False))
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02"'
+        ' xmlns:ns5="http://schemas.android.com/repository/android/generic/02">'
+        '<license id="android-sdk-license" type="text"/>'
+        f'<localPackage path="{package}" obsolete="false">'
+        '<type-details xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+        ' xsi:type="ns5:genericDetailsType"/>'
+        f"<revision>{revision}</revision>"
+        f"<display-name>{pin.display_name}</display-name>"
+        '<uses-license ref="android-sdk-license"/>'
+        "</localPackage></ns2:repository>"
+    )
+
+
 def installed_revisions(sdkmanager: Path, root: Path) -> dict[str, str]:
     """Return each package path `sdkmanager --list_installed` prints, with its version."""
     listing = subprocess.run(
@@ -247,6 +282,8 @@ def main(packages: list[str]) -> int:
             )
             unpack(package, pin, archive, target, root)
             archive.unlink()
+            if pin.display_name is not None:
+                (target / "package.xml").write_text(package_xml(package, pin))
     installed = installed_revisions(tools / "sdkmanager", root)
     wrong = {
         package: installed.get(package)

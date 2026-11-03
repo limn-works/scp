@@ -11636,6 +11636,7 @@ def check_installer_rejects_a_corrupt_archive() -> None:
     import contextlib
     import hashlib
     import io
+    import xml.etree.ElementTree as ET
     import zipfile
 
     installer = load_android_sdk_installer()
@@ -11707,6 +11708,27 @@ def check_installer_rejects_a_corrupt_archive() -> None:
             f"got {error!r}",
         )
         installer.fetch_once = real_fetch
+    # sdkmanager lists the NDK and the emulator only by the package.xml install.py writes
+    # for a pin with a display name; the file must name the package path and revision.
+    wrong = []
+    for package, pin in installer.PINS.items():
+        if pin.display_name is None:
+            continue
+        local = ET.fromstring(installer.package_xml(package, pin)).find("localPackage")
+        revision = local.find("revision") if local is not None else None
+        listed = (
+            ".".join(part.text or "" for part in revision)
+            if revision is not None
+            else None
+        )
+        if local is None or local.get("path") != package or listed != pin.revision:
+            path = local.get("path") if local is not None else None
+            wrong.append(f"{package}: path {path!r}, revision {listed!r}")
+    check(
+        "install.py writes a package.xml naming each generic pin's path and revision",
+        not wrong,
+        "; ".join(wrong),
+    )
 
 
 def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
