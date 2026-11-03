@@ -321,3 +321,101 @@ jobs:
         run: python3 scripts/ci-workspace-cache.py restore --target target --archive "$RUNNER_TEMP/ws/ws.tar.zst"
       - name: Clippy proofs
         run: bash scripts/ws-clippy-proof.sh
+
+  split-writer:
+    if: inputs.mode == 'split'
+    name: split-writer ${{ matrix.reader }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        reader: [testing, runtime, napi, pyo3, uniffi, doctest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - name: Compile the reader's commands
+        run: |
+          source scripts/ws-exp.sh
+          run_reader "${{ matrix.reader }}" writer
+      - name: Pack
+        run: |
+          start=$(date +%s)
+          python3 scripts/ci-workspace-cache.py pack --target target --out "$RUNNER_TEMP/ws.tar.zst"
+          echo "PACK reader=${{ matrix.reader }} seconds=$(( $(date +%s) - start )) bytes=$(stat -c %s "$RUNNER_TEMP/ws.tar.zst")" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ws-split-${{ matrix.reader }}
+          path: ${{ runner.temp }}/ws.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  split-reader:
+    needs: split-writer
+    name: split-reader ${{ matrix.reader }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        reader: [testing, runtime, napi, pyo3, uniffi, doctest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - uses: taiki-e/install-action@nextest
+      - name: Download
+        id: dl
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ws-split-${{ matrix.reader }}
+          path: ${{ runner.temp }}/ws
+      - name: Restore
+        run: |
+          echo "DOWNLOAD seconds=$(( $(date +%s) - ${{ steps.dl.outputs.start }} ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          start=$(date +%s)
+          python3 scripts/ci-workspace-cache.py restore --target target --archive "$RUNNER_TEMP/ws/ws.tar.zst"
+          echo "RESTORE seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compile under each scenario
+        run: |
+          source scripts/ws-exp.sh
+          r="${{ matrix.reader }}"
+          run_reader "$r" none
+          edit leaf "$(leaf_file "$r")"
+          run_reader "$r" leaf
+          edit mid crates/scp-runtime/src/lib.rs
+          run_reader "$r" mid
+          edit root crates/scp-crypto/src/lib.rs
+          run_reader "$r" root
