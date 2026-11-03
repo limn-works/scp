@@ -304,6 +304,9 @@ def cmd_pack(args: argparse.Namespace) -> int:
         )
         return 1
     files = workspace_files(target, names)
+    if not files:
+        print(f"::error::{target} holds no workspace unit, so there is nothing to pack")
+        return 1
     built_at = max((f.lstat().st_mtime for f in files), default=time.time())
     manifest = {
         "version": 1,

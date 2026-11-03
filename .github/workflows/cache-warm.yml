@@ -9,6 +9,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        default: measure
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +29,7 @@ env:
 
 jobs:
   writer:
+    if: inputs.mode != 'exactness'
     name: writer ${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -78,6 +83,7 @@ jobs:
           retention-days: 1
 
   base:
+    if: inputs.mode != 'exactness'
     name: base ${{ matrix.reader }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -195,6 +201,7 @@ jobs:
           run_reader "$r" root
 
   sccache:
+    if: inputs.mode != 'exactness'
     name: sccache ${{ matrix.reader }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -250,3 +257,30 @@ jobs:
           edit root crates/scp-crypto/src/lib.rs
           run_reader "$r" root
           sccache --show-stats | head -30
+
+  exactness:
+    if: inputs.mode == 'exactness'
+    name: exactness
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put main's cache-warm.yml in place for the cache key
+        run: |
+          git fetch -q --depth=1 origin "$MAIN_SHA"
+          git show FETCH_HEAD:.github/workflows/cache-warm.yml > .github/workflows/cache-warm.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - uses: ./.github/actions/cargo-fetch
+      - name: Exactness plants
+        run: |
+          start=$(date +%s)
+          CARGO_TERM_COLOR=never python3 scripts/tests/workspace-cache/exactness.py
+          echo "EXACTNESS seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
