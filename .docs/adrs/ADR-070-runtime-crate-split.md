@@ -1,6 +1,14 @@
 # ADR-070: Split scp-runtime into Types, Core, Domain and Assembly Crates
 
-**Status:** Proposed 2026-11-02. Alec has not approved it. The enforcement-file changes in §Enforcement files need his approval before any code moves, because the root `AGENTS.md` reserves every edit to a protected enforcement file for him.
+**Status:** Accepted 2026-11-03. Alec approved the split and its enforcement-file changes on 2026-11-03: "Yes split it do it all in one go".
+
+**Corrected 2026-11-03:** the execution plan (`~/.claude/plans/runtime-split-plan.md`, §0 "Inventory check against main") checked this record against `main` and found six corrections, which this record now carries:
+1. Five domain sites read `ActorDeps::owned_identity`, which a domain crate cannot reach. Core adds `ActorDeps::my_wrapping_key` (§How ADR-049 stays intact, Decision 5).
+2. `context/pseudonym_rotation_runtime_tests.rs` and three other context test files move to the messaging crate, not to core (§Decision item 5).
+3. The pre-commit hook's `CLIPPY_FEATURES` is at `scripts/hooks/pre-commit:164`, and the hook now lints only the members a commit changes (§Context, §Enforcement files).
+4. `pipeline_wiring.rs` `MANAGER_SRC` adds each core file that receives a function it asserts on (§Enforcement files).
+5. The lifecycle trait names its import method `import_context_from_export` (§Decision item 3).
+6. The pyo3 caller pattern of the `callback-custody-record-store-at-create` call invariant is fixed in the same commit as the zero-match assertion (§Enforcement files).
 
 **Amends:** ADR-049 (actor per context) in where its handler code lives: the handlers move out of `crates/scp-runtime/src/context/actor/handlers/` into one crate per domain. Every numbered ADR-049 decision keeps its rule; §How ADR-049 stays intact gives the argument for each one this split touches. `.docs/architecture.md` §2.1 gains the new crates.
 
@@ -11,7 +19,7 @@
 Agents edit `scp-runtime` more than any other crate. Two waits follow every edit:
 
 1. **The lib-test rebuild:** `cargo test -p scp-runtime --features testing --lib --no-run`. It recompiles the whole crate in its test configuration, which is 221k production lines and 67k test lines in one compilation unit.
-2. **The pre-commit hook's clippy chain:** `scripts/hooks/pre-commit` runs clippy over the edited crate and every workspace crate that depends on it. Cargo has no early cutoff, so every dependent is re-linted even when the edit changed no signature.
+2. **The pre-commit hook's clippy chain:** when this record took its measurements, `scripts/hooks/pre-commit` ran clippy over the edited crate and every workspace crate that depends on it. Cargo has no early cutoff, so the hook re-linted every dependent even when the edit changed no signature. A later hook change, "lint and format only the members a commit changes", made the hook lint only the workspace members that hold a changed path and leave their dependents to CI's workspace clippy. The hook figures in §Measurements predate that change.
 
 The plan recorded ≈66 s for the lib-test rebuild on an idle machine. I could not reproduce that figure on `main` at the commit this record was written against. Both edit kinds I measured rebuild in 7.5 to 9.5 s, as the table below shows. The ≈66 s figure may come from a different edit kind or from the time-passes build the plan used. Every comparison in this record is against today's measured baseline, not against ≈66 s.
 
@@ -50,7 +58,7 @@ Three facts follow from the table:
 
 1. **A crate of 12k to 36k lines rebuilds its lib test in 0.9 to 1.7 s.** That is the floor this machine reaches for a crate that links the full runtime into its test binary. Cut 2's figure includes linking that binary.
 2. **Test code is most of the baseline's rebuild.** After the same messaging edit, the production lib rebuilds in 3.1 s and the lib test in 8.3 s.
-3. **The downstream re-lint is a floor of about 13 s for the hook.** A governance edit in cut 2 re-lints governance and every downstream crate in 13.7 s. Below that, only a hook that stops re-linting unchanged dependents helps, and the crate split does not do that.
+3. **The downstream re-lint is a floor of about 13 s for the hook.** A governance edit in cut 2 re-lints governance and every downstream crate in 13.7 s. Below that, only a hook that stops re-linting unchanged dependents helps, and the crate split does not do that. The later hook change named in §Context stopped that re-lint.
 
 ### Where agents edit
 
@@ -183,7 +191,7 @@ Core defines one trait per domain and one struct that holds one implementation o
 #[async_trait]
 pub trait GovernanceDomain: Send + Sync {
     async fn dispatch(&self, cell: &mut ClassSCell, deps: &ActorDeps, cmd: GovernanceCommand) -> Outcome<()>;
-    async fn evaluate_timeouts(&self, cell: &mut ClassSCell, deps: &ActorDeps);
+    async fn evaluate_governance_timeouts(&self, state: &mut PerContextState, deps: &ActorDeps);
     // one method per governance function core or another domain calls (Appendix)
 }
 
@@ -200,6 +208,7 @@ pub struct DomainHandlers {
 - **The dispatch hub stays in core.** `ContextActor::dispatch_state` keeps its exhaustive `match` over `ContextCommand`, and each arm becomes `deps.domains.<domain>.dispatch(cell, deps, sub).await`. A new `ContextCommand` variant without an arm is still a compile error in core. A new domain without a field is still a compile error in the assembly crate.
 - **Every cross-crate call goes through a trait.** Core reaches a domain as `self.domains.<domain>.<method>(…)` in the Supervisor or as `deps.domains.<domain>.<method>(…)` in the actor. A domain reaches another domain the same way through `deps`. No crate names a sibling domain crate in production code.
 - **Domain functions keep their visibility.** A domain's functions stay `pub(crate)`. Only the trait implementation is public, and its methods sit inside an `impl` block.
+- **Trait methods keep their function names, except one.** Each Appendix function that becomes a trait method keeps its name and its parameters after `&self`. The lifecycle trait names its import method `import_context_from_export`, because the call invariant `snapshot-validation-on-import` in `.docs/standards/sdk-capability-matrix.json` requires every runtime function named `import_context` to call `validate_export_for_import` in its own body. A trait wrapper named `import_context` that delegates to the lifecycle crate's `helpers::import_context` would match that rule and fail it. The rule keeps its two callers: the lifecycle crate's `helpers::import_context` and `Supervisor::import_context`. `EconomyDomain::enforce_economy` keeps its name, because the `economy-enforced-on-send-path` invariant matches the callee by its last path segment.
 
 ### 4. Visibility of core items that domain crates use
 
@@ -215,6 +224,11 @@ Domain code names about 29 core free functions that are restricted today (`pub(c
 - **Domain tests stay in place.** A domain crate's tests that build a Supervisor stay where they are. Each domain crate carries one test helper that builds `DomainHandlers` from `crate::<Domain>` and its 12 siblings, which it lists as dev-dependencies. The required fields keep the 13 helpers from drifting.
 - **Core tests that build a Supervisor move to the assembly crate.** They are 33.6k lines, and they move to `crates/scp-runtime/tests/`, one test target per original module, so each target recompiles alone. A core item that such a test reaches and that is restricted today becomes `pub` under `#[cfg(feature = "testing")]`. `check-shipped-feature-graph.sh` already keeps every `testing` feature off the shipped graph.
 - **Other core tests stay in core.** These are the 18.1k lines that build no Supervisor.
+- **Four context test files move to the messaging crate.** Each calls a messaging function that stays `pub(crate)` or `pub(super)`, so it moves beside that function into `crates/scp-runtime-messaging/src/`:
+  - `context/pseudonym_rotation_runtime_tests.rs` builds a Supervisor and calls `encode_local_announcement`;
+  - `context/agent_binding_pipeline_tests.rs` calls `verify_and_unwrap`, `send_message` and `build_encrypted_envelope_actor`;
+  - `context/processed_commit_tests.rs` calls `decrypt_and_dispatch` and names `Dispatched`;
+  - `context/sender_key_requeue_tests.rs` calls `deliver_incoming` and reaches governance through `deps.domains.governance`.
 
 ## How ADR-049 stays intact
 
@@ -222,18 +236,21 @@ Domain code names about 29 core free functions that are restricted today (`pub(c
 - **Decision 2 (the Supervisor is a plain struct):** the Supervisor stays in core with every field private. The lock order in `crates/scp-runtime/AGENTS.md` stays in core code: `bootstrap_spawn_lock` before `write_lock`, and `wrapping_key_loads[owner]` before `write_lock`. Domain code reaches `try_lock_bootstrap_spawn` only through `SupervisorHandle`, as today.
 - **Decision 3 (capability reduction):** an actor and its domain code still hold a `SupervisorHandle`, never `Arc<Supervisor>`, and the handle still returns no `ContextActorHandle`.
 - **Decision 5 (`OwnedIdentityDid`) and Decision 17 (`IdentityHandle`):** no domain file names either type today, so both stay in core with their constructors at their current visibility. The `compile_fail` doctest and the `#![deny]` guards in `supervisor/identity_capability.rs` move with the file unchanged.
+  - Five domain sites read the `OwnedIdentityDid` value in the field `ActorDeps::owned_identity`, which is `pub(in crate::context)`, so a domain crate cannot reach it. The sites are `actor/handlers/lifecycle.rs:821`, `governance_helpers.rs:3115`, `lifecycle_helpers.rs:1809`, `messaging_helpers.rs:3376` and `trust_recovery_helpers.rs:249`. Each one calls `deps.supervisor.my_wrapping_key(&deps.owned_identity)`.
+  - Core adds `pub fn my_wrapping_key(&self) -> Result<Arc<IdentityWrappingKey>, ContextError>` to `ActorDeps` in `actor/deps.rs`. Its body is `self.supervisor.my_wrapping_key(&self.owned_identity)`, and the five sites call `deps.my_wrapping_key()`.
+  - `owned_identity` keeps its visibility, and `SupervisorHandle::my_wrapping_key` stays `pub(in crate::context)`. A domain crate can therefore load the wrapping key only of the identity that owns its actor, and still cannot name or construct an `OwnedIdentityDid`.
 - **Decision 7 (`Send` providers as `Arc<dyn …>`):** the 13 domain traits follow the same form, `#[async_trait]` with a `Send + Sync` supertrait. A domain call adds one `Box` per call. Every handler `dispatch` already boxes its future with `Box::pin` to stay under clippy's `large_futures` bound, so the dispatch path gains one indirection and no new allocation class.
 - **Decision 9 (Class-S persistence fails closed):** `ClassSCell` stays in core with no `DerefMut`, and its `commit_class_s_*` combinators become `pub` methods. A domain still mutates Class-S state only through them, because only core constructs the cell. The `subsume` caller allowlist test changes as §Enforcement files states.
 - **Decision 10 (no panics on the actor task):** `check-handler-no-panic.sh` keeps its three scopes over the new paths, as §Enforcement files states.
 - **Decision 12 (lock-free reads):** `crates/scp-runtime/clippy.toml` is copied into each new crate, and a new gate keeps the copies byte-identical, as §Enforcement files states.
-- **Decision 14 (a performance regression triggers rollback):** the implementing PR runs `cargo test -p scp-testing --test perf_baseline` before and after the split. A regression above 15% on any operation and concurrency pair blocks the merge.
+- **Decision 14 (performance):** the implementing PR ran `perf_baseline` on `main` and on the split branch on one machine before it deleted the harness, and its description reports both runs. ADR-049 Decision 14, as amended 2026-11-03, names no harness and no merge gate.
 - **Decision 16 (task drain and `Weak<Supervisor>`):** the task tracker and the closed flag stay in the Supervisor in core. Domain code spawns through `ActorDeps` as today.
 
 ## Consequences
 
 - **Faster domain and types edits.** A domain edit's lib test rebuilds in 0.9 to 1.4 s against 7.2 to 9.5 s today. A types edit's rebuilds in 1.2 to 1.7 s against 5.2 s. Together these are 36% of the last 60 days' file changes.
 - **Core edits change little.** They keep a rebuild I estimate at 4 to 5 s against 5.2 to 8.4 s today. Running a moved core test after a core edit also rebuilds that test target in the assembly crate.
-- **The hook.** It drops from 22.9 s to 13.7 s for a domain edit and stays at 20.2 to 20.7 s for core and types edits. The remaining ≈13 s is the re-lint of downstream crates. A hook that skips re-linting unchanged dependents would lower it; this split does not.
+- **The hook.** Under the hook these figures were measured with, the hook drops from 22.9 s to 13.7 s for a domain edit and stays at 20.2 to 20.7 s for core and types edits. The remaining ≈13 s is the re-lint of downstream crates. The hook now lints only the members a commit changes, so a domain edit's hook run lints that domain crate and leaves its dependents to CI. The implementing PR re-measures the hook and the lib-test rebuilds on `main` and on the split branch, and its description reports both.
 - **Import updates.** The 89 `.rs` files and 12 manifests outside `crates/scp-runtime` that name a moved path import it from the owning crate. The assembly crate re-exports nothing, because ADR-057's amendment forbids shim re-exports of moved code.
 - **Cross-domain calls need core.** A new call from one domain to another adds a trait method in core, which is a core edit.
 - **Release.** `release.yml` publishes 15 more crates in dependency order: types, then core, then the 13 domains, then `scp-runtime`.
@@ -241,13 +258,13 @@ Domain code names about 29 core free functions that are restricted today (`pub(c
 
 ## Enforcement files
 
-Every change below needs Alec's approval before any code moves. **P** marks a file the root `AGENTS.md` lists as a protected enforcement file. Abbreviations: `core/` is `crates/scp-runtime-core/src/`, `types/` is `crates/scp-runtime-types/src/`, and `<d>/` is `crates/scp-runtime-<domain>/src/`.
+Alec approved every change below on 2026-11-03, as the Status line states. **P** marks a file the root `AGENTS.md` lists as a protected enforcement file. Abbreviations: `core/` is `crates/scp-runtime-core/src/`, `types/` is `crates/scp-runtime-types/src/`, and `<d>/` is `crates/scp-runtime-<domain>/src/`.
 
 ### Path updates that keep each assertion as strong as today
 
 | File | Today | Change |
 |---|---|---|
-| **P** `crates/scp-testing/tests/integration/pipeline_wiring.rs`, `MANAGER_SRC` (lines 31-45) | Concatenates 3 `*_logic.rs` and 10 `*_helpers.rs` files and asserts pipeline steps in the result | Each `include_str!` points at `<d>/logic.rs` or `<d>/helpers.rs`. The same 13 files, so the same set |
+| **P** `crates/scp-testing/tests/integration/pipeline_wiring.rs`, `MANAGER_SRC` (lines 31-45) | Concatenates 3 `*_logic.rs` and 10 `*_helpers.rs` files and asserts pipeline steps in the result | Each `include_str!` points at `<d>/logic.rs` or `<d>/helpers.rs`. `MANAGER_SRC` also adds `core/context/snapshot.rs`, `core/context/push_routes.rs` and every other core file that receives a function from a helper file and that an assertion over `MANAGER_SRC` names. Without those files, each assertion that names a function moved to core fails |
 | **P** same, the constants `PROVIDER_SRC`, `STATE_SRC`, `SUPERVISOR_SRC`, `OUTLETS_INVOKE_SRC`, `ACTOR_MOD_SRC`, `PSEUDONYM_ROTATION_SRC`, `PUSH_REGISTRAR_SRC`, `LEDGER_SRC` (lines 47-288) | Assert against those core files | The same relative path under `core/` |
 | **P** same, `HANDLERS_{MESSAGING,BROADCAST,PUSH,QUERIES}_SRC`, `PUSH_HELPERS_SRC` (lines 193-239) | Assert against handler files | `<d>/handler.rs`, and `crates/scp-runtime-push/src/helpers.rs` |
 | **P** same, the local `include_str!` calls at lines 1147, 2678, 2709, 2726, 3273, 4671, 5062, 8755-8804, 9630 | Single-file assertions | Governance, lifecycle and trust-recovery files go to `<d>/handler.rs` or `<d>/helpers.rs`. `actor/state.rs`, `supervisor/handle.rs` and `supervisor.rs` go to `core/` |
@@ -264,8 +281,8 @@ Every change below needs Alec's approval before any code moves. **P** marks a fi
 | `scripts/check-handler-no-panic.sh` (lines 117, 360, 389, 976) | Three scopes: `handlers/`, the hub `actor/mod.rs`, and the helper layer under `src/context` with a 5,000-line floor | Handlers: the 13 `<d>/handler.rs` files and `core/context/actor/handlers/mod.rs` if it survives. Hub: `core/context/actor/mod.rs`. Helper layer: `core/context`, `types/context`, and every `<d>/{helpers,logic,handler,lib}.rs`, with the floor summed over the union. The script gains multi-root scanning |
 | `scripts/check-deleted-primitives.sh` (lines 106-127) | 13 rows, each scoped to `crates/scp-runtime` or `crates/scp-runtime/src/crypto` | Each row's scope becomes every `crates/scp-runtime*` directory, through a loop in the script. The `crypto` row covers `types/crypto` and `core/crypto` |
 | `ratchet/block-in-place-count.json` | Per-file counts and a summary of 14 for `scp-runtime` | Rekey `context/lifecycle_helpers.rs` (2) to `crates/scp-runtime-lifecycle/src/helpers.rs`. Rekey `identity/recovery.rs` (0), `store/context.rs` (0) and `store/trust.rs` (6) under core. Replace the summary with one entry per crate. The counts do not change |
-| `scripts/check-test-vectors-p256.py` (lines 190, 194) | Golden hex literals must be in two named files | `core/context/pseudonym_rotation_runtime_tests.rs` and `types/crypto/access_keys/wire.rs` |
-| `scripts/hooks/pre-commit` (line 141), `scripts/tests/pre-commit-clippy-scope/run-tests.sh` (line 96) | `CLIPPY_FEATURES` names `scp-runtime/testing` | Add `scp-runtime-<x>/testing` for each new crate that declares it. Otherwise a commit that touches only a domain crate lints it without `testing`, while CI lints it with `testing` through feature unification |
+| `scripts/check-test-vectors-p256.py` (lines 190, 194) | Golden hex literals must be in two named files | `crates/scp-runtime-messaging/src/pseudonym_rotation_runtime_tests.rs` and `types/crypto/access_keys/wire.rs`. The golden hex values do not change |
+| `scripts/hooks/pre-commit` (line 164), `scripts/tests/pre-commit-clippy-scope/run-tests.sh` (line 97, `ALL_FEATURES`) | `CLIPPY_FEATURES` names `scp-runtime/testing`. The hook lints only the members a commit changes and keeps only the `CLIPPY_FEATURES` entries whose package it selects | Add `scp-runtime-types/testing`, `scp-runtime-core/testing`, `scp-runtime-core/saga-witness-test-mint` and the 13 `scp-runtime-<d>/testing`. Otherwise a commit that touches only a domain crate lints it without `testing`, while CI lints it with `testing` through feature unification. `run-tests.sh` adds a case in which an edit to `crates/scp-runtime-governance/src/lib.rs` selects `-p scp-runtime-governance --features scp-runtime-governance/testing` |
 | `.github/workflows/ci.yml` (lines 599, 1966), `cache-warm.yml` (line 91), `scripts/tests/ci-gate/ci_gate_selftest.py` (lines 8259-8267) | The fuzz path filter and the runtime nextest shard `-p scp-runtime -p scp-core` | Add `'crates/scp-runtime-*/**'` to the filter and `-p` for the 15 crates to the shard. `check-test-shard-features.py` requires each member in exactly one shard |
 | `Cargo.toml` (lines 20, 103), `crates/scp-runtime/Cargo.toml` features, `release.yml` (lines 184, 212, 620-623) | Workspace members, features and publish order | Add the 15 crates with `[lints] workspace = true`. Each `scp-runtime` feature forwards to the same feature on every new crate that declares it, so the CI feature strings keep reaching the moved code. Publish in dependency order |
 | `crates/scp-runtime/AGENTS.md`, `.claude/agents/{completionist,black-hat,bug-catcher,security-reviewer,performance-optimizer,architect}.md` | Name runtime paths and the handler route | Move the invariants to `crates/scp-runtime-core/AGENTS.md`, and give each domain crate a one-line `AGENTS.md` that points there |
@@ -276,7 +293,7 @@ These files need no change, because they find new crates or name no moved path: 
 
 | File | Why a path update is not enough | Added assertion |
 |---|---|---|
-| **P** `scripts/check-call-invariants.py` | `crates/scp-runtime/src` still exists as the assembly crate. With only that root, the two runtime rules (`economy-enforced-on-send-path`, `snapshot-validation-on-import`) find no caller that matches and pass with no violation | A rule whose caller pattern matches zero functions fails |
+| **P** `scripts/check-call-invariants.py` | `crates/scp-runtime/src` still exists as the assembly crate. With only that root, the two runtime rules (`economy-enforced-on-send-path`, `snapshot-validation-on-import`) find no caller that matches and pass with no violation | A rule whose caller pattern matches zero production functions under a bridge root it applies to fails. This assertion fails on `main` today: `callback-custody-record-store-at-create` applies to `pyo3` with the caller pattern `^(build_key_custody\|decide_custody_for_create)$`, and the pyo3 bridge renamed `build_key_custody` to `callback_custody` (`crates/scp-ffi/src/identity.rs`). The same commit changes that pattern to `^(callback_custody\|decide_custody_for_create)$` and its code site in `.docs/standards/sdk-capability-matrix.json` to `callback_custody → callback_registry → create_records`. The rule id does not change, so the baseline digest does not change |
 | New: `scripts/check-runtime-clippy-config.sh` | Clippy reads the nearest `clippy.toml` and has no include. A new crate without a copy falls back to the root `.clippy.toml`, which lacks ADR-049 Decision 12's `disallowed-types` | Every `crates/scp-runtime*/clippy.toml` exists and matches `crates/scp-runtime-core/clippy.toml` byte for byte |
 | **P** `scripts/check-protocol-deps.sh`, a new manifest check | Option D depends on domain crates being siblings, and Cargo accepts a domain-to-domain dependency without complaint | No `crates/scp-runtime-<domain>/Cargo.toml` lists another `scp-runtime-<domain>` under `[dependencies]` |
 | **P** `scripts/check-shipped-feature-graph.sh` | `NULLIFIER_CONTROL_FEATURES` knows only the names it lists, so a `testing` feature added to a new runtime crate later is unlisted | Every feature named `testing`, `allow_unencrypted_storage`, `saga-witness-test-mint` or `outlet-capability-test-grant` on any `scp-runtime*` crate appears in the list |
