@@ -2094,7 +2094,9 @@ mod tests {
             ref_id: Some("push".to_owned()),
             routing_id,
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0xC1],
         };
         sink.send(Message::Binary(publish.to_bytes().unwrap()))

@@ -879,7 +879,6 @@ mod tests {
     use crate::native::storage::InMemoryBlobStorage;
     use crate::relay::rate_limit::PublishRateLimiter;
     use crate::relay::subscription::SubscriberEntry;
-    use scp_relay_client::MAX_BLOB_TTL;
     use sha2::{Digest, Sha256};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1113,7 +1112,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(60),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 blob: vec![],
             })
             .await;
@@ -1129,7 +1128,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(60),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 blob: vec![0u8; MAX_BLOB_SIZE + 1],
             })
             .await;
@@ -1137,44 +1136,6 @@ mod tests {
         match unwrap_single(result.unwrap()) {
             RelayMessage::Err { code, .. } => assert_eq!(code, code::BLOB_TOO_LARGE),
             other => panic!("expected Err(BLOB_TOO_LARGE), got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn publish_validates_ttl() {
-        let mut handler = make_handler();
-        handler.mark_active();
-
-        // TTL = 0 should fail.
-        let result = handler
-            .dispatch_message_multi(&ClientMessage::Publish {
-                ref_id: None,
-                routing_id: [0x11; 32],
-                recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(0),
-                blob: vec![1, 2, 3],
-            })
-            .await;
-        assert!(result.is_ok());
-        match unwrap_single(result.unwrap()) {
-            RelayMessage::Err { code, .. } => assert_eq!(code, code::TTL_TOO_LONG),
-            other => panic!("expected Err(TTL_TOO_LONG), got {:?}", other),
-        }
-
-        // TTL > max should fail.
-        let result = handler
-            .dispatch_message_multi(&ClientMessage::Publish {
-                ref_id: None,
-                routing_id: [0x11; 32],
-                recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
-                blob: vec![1, 2, 3],
-            })
-            .await;
-        assert!(result.is_ok());
-        match unwrap_single(result.unwrap()) {
-            RelayMessage::Err { code, .. } => assert_eq!(code, code::TTL_TOO_LONG),
-            other => panic!("expected Err(TTL_TOO_LONG), got {:?}", other),
         }
     }
 
@@ -1198,7 +1159,7 @@ mod tests {
                 ref_id: Some("test-ref".to_owned()),
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(60),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 blob: blob_data,
             })
             .await;
@@ -1441,7 +1402,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(60),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 blob: b"published-blob".to_vec(),
             })
             .await;
@@ -1514,7 +1475,7 @@ mod tests {
                 ref_id: Some("push".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(60),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 blob: vec![0x42; 64],
             })
             .await
@@ -1569,7 +1530,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(3600),
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob,
                 })
                 .await

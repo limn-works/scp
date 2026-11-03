@@ -202,7 +202,7 @@ async fn application_node_relay_publish_subscribe_roundtrip() {
         ref_id: Some("pub-test".to_string()),
         routing_id,
         recipient_hint: None,
-        lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+        lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
         blob: payload.clone(),
     };
     pub_sink

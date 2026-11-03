@@ -879,8 +879,8 @@ impl NativeRelayClient {
     /// # Errors
     ///
     /// - [`TransportError::NotConnected`] if the client is not connected.
-    /// - [`TransportError::SendFailed`] if `blob_ttl` exceeds the `u32` wire
-    ///   field.
+    /// - [`TransportError::SendFailed`] if `blob_ttl` lies outside
+    ///   `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
     /// - [`TransportError::RelayRejected`] with the relay's code if the relay
     ///   answers `ERR`, so a caller such as the push registrar can tell a
     ///   `4xxx` refusal from a retryable `5xxx` failure (ADR-004).
@@ -895,9 +895,14 @@ impl NativeRelayClient {
         // match the identity-layer RelayPublisher. A DID record's 7-day TTL
         // (604800) fits comfortably; reject an out-of-range value loudly rather
         // than silently truncating.
-        let blob_ttl = u32::try_from(blob_ttl).map_err(|_| {
-            TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
-        })?;
+        let blob_ttl = u32::try_from(blob_ttl)
+            .map_err(|_| {
+                TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
+            })
+            .and_then(|secs| {
+                scp_relay_client::PublishTtl::new(secs)
+                    .map_err(|e| TransportError::SendFailed(e.to_string()))
+            })?;
 
         let msg = ClientMessage::Publish {
             ref_id: None,
@@ -1292,7 +1297,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             blob: payload,
         };
 
@@ -1337,7 +1342,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0x01],
         };
         assign_ref_id(&mut msg, "test-1");
@@ -1858,7 +1865,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0x01],
         };
 
@@ -1891,7 +1900,9 @@ mod tests {
                 ref_id: None,
                 routing_id: [i; 32],
                 recipient_hint: None,
-                lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+                lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<
+                    3600,
+                >()),
                 blob: vec![i],
             };
 
@@ -1942,7 +1953,9 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![0xDE, 0xAD],
         };
 

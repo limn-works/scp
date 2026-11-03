@@ -1779,7 +1779,9 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(
+                scp_relay_client::PublishTtl::of::<3600>(),
+            ),
             blob: vec![1],
         };
         ws.send(Message::Binary(publish.to_bytes().unwrap()))

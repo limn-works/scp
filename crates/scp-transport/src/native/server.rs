@@ -1938,7 +1938,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data,
         };
         send_msg(&mut sink, &publish).await;
@@ -1965,7 +1965,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink1, &publish).await;
@@ -2032,7 +2032,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink2, &publish).await;
@@ -2082,7 +2082,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![99],
         };
         send_msg(&mut sink2, &publish).await;
@@ -2105,7 +2105,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2151,7 +2151,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink, &publish).await;
@@ -2219,7 +2219,7 @@ mod tests {
             ref_id: Some("big".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             blob: vec![0x00; MAX_BLOB_SIZE + 1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2242,7 +2242,7 @@ mod tests {
             ref_id: Some("empty".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             blob: vec![],
         };
         send_msg(&mut sink, &publish).await;
@@ -2256,27 +2256,28 @@ mod tests {
         }
     }
 
+    /// A PUBLISH frame whose `blob_ttl` lies outside
+    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL` (0, or `MAX_BLOB_TTL + 1`) is answered
+    /// `TTL_TOO_LONG` (4011) with its `ref`.
     #[tokio::test]
-    async fn publish_ttl_too_long_returns_error() {
+    async fn a_publish_frame_with_an_out_of_range_ttl_returns_4011() {
         let addr = start_test_server().await;
         let (mut sink, mut stream) = connect_client(addr).await;
 
-        let publish = ClientMessage::Publish {
-            ref_id: Some("ttl".to_string()),
-            routing_id: [0x00; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
-            blob: vec![1],
-        };
-        send_msg(&mut sink, &publish).await;
+        for ttl in [0, MAX_BLOB_TTL + 1] {
+            let frame =
+                crate::native::public_records::publish_frame_with_ttl("ttl", [0x00; 32], ttl, &[1])
+                    .unwrap();
+            sink.send(Message::Binary(frame)).await.unwrap();
 
-        let reply = recv_msg(&mut stream).await;
-        match reply {
-            RelayMessage::Err { code, .. } => {
-                assert_eq!(code, code::TTL_TOO_LONG);
-                assert_eq!(code, 4011);
+            match recv_msg(&mut stream).await {
+                RelayMessage::Err { code, ref_id, .. } => {
+                    assert_eq!(code, code::TTL_TOO_LONG, "ttl {ttl}");
+                    assert_eq!(code, 4011, "ttl {ttl}");
+                    assert_eq!(ref_id.as_deref(), Some("ttl"), "ttl {ttl}");
+                }
+                other => panic!("ttl {ttl}: expected ERR, got {other:?}"),
             }
-            other => panic!("expected ERR, got {other:?}"),
         }
     }
 
@@ -2291,7 +2292,7 @@ mod tests {
             ref_id: Some("ttl-max".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::MAX),
             blob: vec![1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2299,29 +2300,6 @@ mod tests {
         match recv_msg(&mut stream).await {
             RelayMessage::Ok { ref_id, .. } => assert_eq!(ref_id.as_deref(), Some("ttl-max")),
             other => panic!("expected OK, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn publish_ttl_zero_returns_error() {
-        let addr = start_test_server().await;
-        let (mut sink, mut stream) = connect_client(addr).await;
-
-        let publish = ClientMessage::Publish {
-            ref_id: Some("ttl0".to_string()),
-            routing_id: [0x00; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(0),
-            blob: vec![1],
-        };
-        send_msg(&mut sink, &publish).await;
-
-        let reply = recv_msg(&mut stream).await;
-        match reply {
-            RelayMessage::Err { code, .. } => {
-                assert_eq!(code, code::TTL_TOO_LONG);
-            }
-            other => panic!("expected ERR, got {other:?}"),
         }
     }
 
@@ -2355,7 +2333,7 @@ mod tests {
             ref_id: None,
             routing_id: routing_id_a,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![1],
         };
         send_msg(&mut sink2, &pub_a).await;
@@ -2366,7 +2344,7 @@ mod tests {
             ref_id: None,
             routing_id: routing_id_b,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![2],
         };
         send_msg(&mut sink2, &pub_b).await;
@@ -2412,7 +2390,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: data,
             };
             send_msg(&mut sink, &publish).await;
@@ -2474,7 +2452,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2545,7 +2523,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(1), // 1 second TTL
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<1>()), // 1 second TTL
 
             blob: vec![1, 2, 3],
         };
@@ -2659,7 +2637,7 @@ mod tests {
                 ref_id: Some(format!("p-{i}")),
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2675,7 +2653,7 @@ mod tests {
             ref_id: Some("p-excess".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![99; 10],
         };
         send_msg(&mut sink, &publish).await;
@@ -2874,7 +2852,7 @@ mod tests {
                 ref_id: Some(format!("p-{i}")),
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2890,7 +2868,7 @@ mod tests {
             ref_id: Some("p-full".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![99; 10],
         };
         send_msg(&mut sink, &publish).await;
@@ -3062,7 +3040,7 @@ mod tests {
             ref_id: Some("pub-jitter".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink3, &publish).await;
@@ -3584,7 +3562,7 @@ mod tests {
                 ref_id: Some("push".to_string()),
                 routing_id,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob,
             },
         )
@@ -3655,7 +3633,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0xAB; 32],
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![1],
             },
         )

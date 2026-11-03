@@ -554,8 +554,12 @@ impl Client {
     }
 
     async fn ttl(&mut self, routing_id: [u8; 32], blob: Vec<u8>) -> Reply {
-        self.publish_with(routing_id, BlobLifetime::Ttl(3600), blob)
-            .await
+        self.publish_with(
+            routing_id,
+            BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
+            blob,
+        )
+        .await
     }
 
     /// The blobs a QUERY at `routing_id` is served, in served order.

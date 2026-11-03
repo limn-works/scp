@@ -260,7 +260,9 @@ impl Relay {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: scp_relay_client::BlobLifetime::Ttl(DEFAULT_APP_DATA_BLOB_TTL_SECS),
+                lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<
+                    DEFAULT_APP_DATA_BLOB_TTL_SECS,
+                >()),
                 blob,
             },
         );
@@ -326,7 +328,7 @@ impl RelayState {
                 blob,
                 ..
             } => {
-                let blob_ttl = lifetime.ttl();
+                let blob_ttl = lifetime.ttl().map(scp_relay_client::PublishTtl::secs);
                 self.clock += 1;
                 let mut blob_id = [0u8; 32];
                 blob_id[..8].copy_from_slice(&self.clock.to_be_bytes());

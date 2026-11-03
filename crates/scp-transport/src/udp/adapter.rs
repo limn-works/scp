@@ -247,6 +247,9 @@ impl TransportAdapter for UdpDtlsAdapter {
                 );
             }
 
+            let blob_ttl = scp_relay_client::PublishTtl::new(blob_ttl)
+                .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
             let msg = ClientMessage::Publish {
                 ref_id: None,
                 routing_id,

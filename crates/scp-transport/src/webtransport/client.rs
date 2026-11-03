@@ -886,12 +886,14 @@ impl TransportAdapter for WebTransportAdapter {
                     // WebSocket path: serialize ClientMessage with ref_id,
                     // send over WebSocket, correlate response by ref_id.
                     let ref_id = self.next_ref_id();
+                    let blob_ttl = scp_relay_client::PublishTtl::new(envelope.blob_ttl)
+                        .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
                     let msg = ClientMessage::Publish {
                         ref_id: Some(ref_id.clone()),
                         routing_id,
                         recipient_hint,
-                        lifetime: BlobLifetime::Ttl(envelope.blob_ttl),
+                        lifetime: BlobLifetime::Ttl(blob_ttl),
                         blob,
                     };
 

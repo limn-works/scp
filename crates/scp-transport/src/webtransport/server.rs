@@ -328,7 +328,9 @@ mod tests {
                     ref_id: Some("push".to_owned()),
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+                    lifetime: scp_relay_client::BlobLifetime::Ttl(
+                        scp_relay_client::PublishTtl::of::<60>(),
+                    ),
                     blob: vec![0x42; 64],
                 })
                 .await
@@ -425,7 +427,9 @@ mod tests {
                 ref_id: Some("p".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+                lifetime: scp_relay_client::BlobLifetime::Ttl(
+                    scp_relay_client::PublishTtl::of::<60>(),
+                ),
                 blob: vec![0x42; 64],
             })
             .await
@@ -475,7 +479,7 @@ mod tests {
             ref_id: Some("push".to_owned()),
             routing_id: rid,
             recipient_hint: None,
-            lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+            lifetime: scp_relay_client::BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             blob: vec![0x42; 64],
         };
 
@@ -570,7 +574,9 @@ mod tests {
                 ref_id: Some("push".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: scp_relay_client::BlobLifetime::Ttl(60),
+                lifetime: scp_relay_client::BlobLifetime::Ttl(
+                    scp_relay_client::PublishTtl::of::<60>(),
+                ),
                 blob: vec![0x42; 64],
             };
             let reply = session.dispatch_message_multi(&publish).await.unwrap();

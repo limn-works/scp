@@ -1256,12 +1256,19 @@ mod tests {
         connection: &quinn::Connection,
         msg: &ClientMessage,
     ) -> Vec<RelayMessage> {
+        send_bytes_and_recv(connection, &msg.to_bytes().unwrap()).await
+    }
+
+    /// Helper: send raw frame bytes on a QUIC stream and read the response.
+    async fn send_bytes_and_recv(
+        connection: &quinn::Connection,
+        payload: &[u8],
+    ) -> Vec<RelayMessage> {
         let (mut send, recv) = connection.open_bi().await.unwrap();
 
-        let payload = msg.to_bytes().unwrap();
         let len = u32::try_from(payload.len()).unwrap();
         send.write_all(&len.to_be_bytes()).await.unwrap();
-        send.write_all(&payload).await.unwrap();
+        send.write_all(payload).await.unwrap();
         send.finish().unwrap();
 
         read_all_responses(recv).await
@@ -1376,7 +1383,7 @@ mod tests {
             ref_id: Some("test-1".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob.clone(),
         };
 
@@ -1416,7 +1423,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![99u8; 50],
         };
         let _ = send_and_recv(&connection, &publish).await;
@@ -1521,7 +1528,7 @@ mod tests {
             ref_id: Some("size-1".to_string()),
             routing_id: [4u8; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![],
         };
 
@@ -1546,16 +1553,12 @@ mod tests {
         let (handle, addr, certs, _storage, _subs) = start_test_listener();
         let connection = connect_client(addr, &certs).await;
 
-        // TTL of 0 should be rejected.
-        let msg = ClientMessage::Publish {
-            ref_id: Some("ttl-1".to_string()),
-            routing_id: [5u8; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(0),
-            blob: vec![1u8; 10],
-        };
-
-        let responses = send_and_recv(&connection, &msg).await;
+        // A frame with blob_ttl 0 is refused.
+        let frame = crate::native::public_records::publish_frame_with_ttl(
+            "ttl-1", [5u8; 32], 0, &[1u8; 10],
+        )
+        .unwrap();
+        let responses = send_bytes_and_recv(&connection, &frame).await;
         assert_eq!(responses.len(), 1);
         match &responses[0] {
             RelayMessage::Err {
@@ -1583,7 +1586,7 @@ mod tests {
             ref_id: Some("ttl-max".to_string()),
             routing_id: [6u8; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::MAX),
             blob: vec![1u8; 10],
         };
         let responses = send_and_recv(&connection, &at_max).await;
@@ -1593,14 +1596,14 @@ mod tests {
             other => panic!("expected OK, got {other:?}"),
         }
 
-        let over_max = ClientMessage::Publish {
-            ref_id: Some("ttl-over".to_string()),
-            routing_id: [6u8; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
-            blob: vec![2u8; 10],
-        };
-        let responses = send_and_recv(&connection, &over_max).await;
+        let over_max = crate::native::public_records::publish_frame_with_ttl(
+            "ttl-over",
+            [6u8; 32],
+            MAX_BLOB_TTL + 1,
+            &[2u8; 10],
+        )
+        .unwrap();
+        let responses = send_bytes_and_recv(&connection, &over_max).await;
         assert_eq!(responses.len(), 1);
         match &responses[0] {
             RelayMessage::Err {
@@ -1692,7 +1695,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![88u8; 20],
         };
         let pub_responses = send_and_recv(&pub_conn, &publish_msg).await;
@@ -1776,7 +1779,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![77u8; 10],
         };
         let _ = send_and_recv(&connection, &publish_msg).await;
@@ -1910,7 +1913,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![55u8; 30],
         };
         let _ = send_and_recv(&connection, &publish_msg).await;
@@ -1983,7 +1986,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
 
@@ -2042,7 +2045,7 @@ mod tests {
                     ref_id: Some("push".into()),
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(3600),
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob: vec![0x42; 64],
                 },
             )
@@ -2175,7 +2178,7 @@ mod tests {
                 ref_id: Some("p".into()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             },
         )
@@ -2239,7 +2242,7 @@ mod tests {
             ref_id: Some("push".into()),
             routing_id: rid,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![0x42; 64],
         };
 
@@ -2332,7 +2335,7 @@ mod tests {
                 ref_id: Some("push".into()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             };
             let responses = send_and_recv(&connection, &publish).await;
@@ -2394,7 +2397,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(3600),
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob,
                 },
             )

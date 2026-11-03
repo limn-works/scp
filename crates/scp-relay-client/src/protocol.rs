@@ -82,21 +82,110 @@ pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
 // PUBLISH lifetime
 // ---------------------------------------------------------------------------
 
+/// A PUBLISH `blob_ttl` in seconds, always within
+/// `MIN_BLOB_TTL..=MAX_BLOB_TTL` (`09-security-model.md` §9.10.12, ADR-004
+/// operation 1).
+///
+/// The field is private. [`new`](Self::new) refuses a value outside the range
+/// with [`LifetimeError::TtlOutOfRange`] (`4011`), and decoding goes through
+/// it, so no `PublishTtl` holds an out-of-range value and no seam checks one
+/// again. [`of`](Self::of) builds a literal with the range checked at compile
+/// time:
+///
+/// ```
+/// use scp_relay_client::{MAX_BLOB_TTL, PublishTtl};
+/// assert_eq!(PublishTtl::of::<3600>().secs(), 3600);
+/// assert_eq!(PublishTtl::new(MAX_BLOB_TTL).map(PublishTtl::secs), Ok(MAX_BLOB_TTL));
+/// ```
+///
+/// A literal outside the range does not build:
+///
+/// ```compile_fail,E0080
+/// let _ = scp_relay_client::PublishTtl::of::<0>();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct PublishTtl(u32);
+
+impl PublishTtl {
+    /// The shortest TTL, [`MIN_BLOB_TTL`].
+    pub const MIN: Self = Self::of::<MIN_BLOB_TTL>();
+
+    /// The longest TTL, [`MAX_BLOB_TTL`].
+    pub const MAX: Self = Self::of::<MAX_BLOB_TTL>();
+
+    /// The TTL of `secs` seconds.
+    ///
+    /// # Errors
+    ///
+    /// [`LifetimeError::TtlOutOfRange`] for `secs` outside
+    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+    pub const fn new(secs: u32) -> Result<Self, LifetimeError> {
+        if secs < MIN_BLOB_TTL || secs > MAX_BLOB_TTL {
+            return Err(LifetimeError::TtlOutOfRange(secs));
+        }
+        Ok(Self(secs))
+    }
+
+    /// The TTL of the literal `SECS` seconds; an out-of-range `SECS` fails
+    /// the build.
+    #[must_use]
+    pub const fn of<const SECS: u32>() -> Self {
+        const {
+            assert!(
+                SECS >= MIN_BLOB_TTL && SECS <= MAX_BLOB_TTL,
+                "a PUBLISH blob_ttl lies in MIN_BLOB_TTL..=MAX_BLOB_TTL"
+            );
+        }
+        Self(SECS)
+    }
+
+    /// The TTL in seconds.
+    #[must_use]
+    pub const fn secs(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for PublishTtl {
+    type Error = LifetimeError;
+
+    fn try_from(secs: u32) -> Result<Self, LifetimeError> {
+        Self::new(secs)
+    }
+}
+
+impl From<PublishTtl> for u32 {
+    fn from(ttl: PublishTtl) -> Self {
+        ttl.0
+    }
+}
+
 /// How long a node keeps a published blob, the one choice a PUBLISH makes
 /// between the shared TTL and retention (`09-security-model.md` §9.10.12,
 /// ADR-004 operation 1).
 ///
 /// On the wire it is the two §9.10.12 keys: `blob_ttl: <seconds>` for
 /// [`Ttl`](Self::Ttl), `retain: true` for [`Retained`](Self::Retained). A
-/// decoder refuses a PUBLISH that carries both keys, neither key, or
-/// `retain: false` ([`LifetimeError`]), so no decoded PUBLISH holds a
-/// combination §9.10.12 forbids.
+/// decoder refuses a PUBLISH that carries both keys, neither key,
+/// `retain: false`, or a `blob_ttl` outside `MIN_BLOB_TTL..=MAX_BLOB_TTL`
+/// ([`LifetimeError`]), so no decoded PUBLISH holds a combination §9.10.12
+/// forbids. A `Ttl` holds a [`PublishTtl`], so a raw integer does not build
+/// one:
+///
+/// ```compile_fail,E0308
+/// let _ = scp_relay_client::BlobLifetime::Ttl(0);
+/// ```
+///
+/// ```
+/// use scp_relay_client::{BlobLifetime, PublishTtl};
+/// let _ = BlobLifetime::Ttl(PublishTtl::of::<60>());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "LifetimeFields", into = "LifetimeFields")]
 pub enum BlobLifetime {
-    /// Stored under the shared TTL for this many seconds,
-    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
-    Ttl(u32),
+    /// Stored under the shared TTL.
+    Ttl(PublishTtl),
     /// A record of a retained kind (`scp:did:`, `scp:svc:`, `scp:wit:`,
     /// `scp:wcf:`, `scp:nls:`), kept with no TTL.
     Retained,
@@ -118,30 +207,16 @@ impl BlobLifetime {
             (Some(true), Some(_)) => Err(LifetimeError::Both),
             (Some(false), _) => Err(LifetimeError::RetainFalse),
             (None, None) => Err(LifetimeError::Neither),
-            (None, Some(ttl)) => Self::Ttl(ttl).check(),
+            (None, Some(secs)) => match PublishTtl::new(secs) {
+                Ok(ttl) => Ok(Self::Ttl(ttl)),
+                Err(error) => Err(error),
+            },
         }
     }
 
-    /// This lifetime, where its TTL lies in `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
-    ///
-    /// A decoded PUBLISH always passes, but a `Ttl` built in code holds any
-    /// `u32`, so every seam that stores a PUBLISH checks it.
-    ///
-    /// # Errors
-    ///
-    /// [`LifetimeError::TtlOutOfRange`] for a TTL outside the range.
-    pub const fn check(self) -> Result<Self, LifetimeError> {
-        match self {
-            Self::Ttl(ttl) if ttl < MIN_BLOB_TTL || ttl > MAX_BLOB_TTL => {
-                Err(LifetimeError::TtlOutOfRange(ttl))
-            }
-            Self::Ttl(_) | Self::Retained => Ok(self),
-        }
-    }
-
-    /// The TTL in seconds; `None` for a retained record.
+    /// The TTL; `None` for a retained record.
     #[must_use]
-    pub const fn ttl(self) -> Option<u32> {
+    pub const fn ttl(self) -> Option<PublishTtl> {
         match self {
             Self::Ttl(ttl) => Some(ttl),
             Self::Retained => None,
@@ -201,7 +276,7 @@ impl From<BlobLifetime> for LifetimeFields {
     fn from(lifetime: BlobLifetime) -> Self {
         match lifetime {
             BlobLifetime::Ttl(ttl) => Self {
-                blob_ttl: Some(ttl),
+                blob_ttl: Some(ttl.secs()),
                 retain: None,
             },
             BlobLifetime::Retained => Self {
@@ -555,9 +630,11 @@ impl ClientMessage {
     ///
     /// Checks:
     /// - `ref_id` length (max 64 bytes)
-    /// - `blob_ttl` range (1--604800)
     /// - `blob` size (1--262144 bytes)
     /// - `limit` range (1--1000)
+    ///
+    /// A PUBLISH `blob_ttl` needs no check: [`PublishTtl`] holds only an
+    /// in-range value.
     ///
     /// # Errors
     ///
@@ -565,19 +642,8 @@ impl ClientMessage {
     /// constraint violation found.
     pub fn validate(&self) -> Result<(), RelayProtocolError> {
         match self {
-            Self::Publish {
-                ref_id,
-                lifetime,
-                blob,
-                ..
-            } => {
+            Self::Publish { ref_id, blob, .. } => {
                 validate_ref_id(ref_id)?;
-                lifetime
-                    .check()
-                    .map_err(|error| RelayProtocolError::Lifetime {
-                        ref_id: ref_id.clone(),
-                        error,
-                    })?;
                 validate_blob(blob)?;
             }
             Self::Subscribe { ref_id, .. }
@@ -853,7 +919,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(ttl),
+            lifetime: BlobLifetime::Ttl(PublishTtl::new(ttl).unwrap()),
             blob: vec![0x01],
         };
         let decoded = ClientMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
@@ -870,7 +936,7 @@ mod tests {
             ref_id: Some("req-1".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: Some([0xBB; 32]),
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<3600>()),
             blob: vec![0x01, 0x02, 0x03],
         };
 
@@ -885,7 +951,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xCC; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(1),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<1>()),
             blob: vec![0xFF],
         };
 
@@ -1304,13 +1370,15 @@ mod tests {
             publish(BlobLifetime::Retained)
         );
 
-        let ttl = publish(BlobLifetime::Ttl(60)).to_bytes().unwrap();
+        let ttl = publish(BlobLifetime::Ttl(PublishTtl::of::<60>()))
+            .to_bytes()
+            .unwrap();
         let keys_ttl = keys(&ttl);
         assert!(keys_ttl.contains(&"blob_ttl".to_string()));
         assert!(!keys_ttl.contains(&"retain".to_string()));
         assert_eq!(
             ClientMessage::from_bytes(&ttl).unwrap(),
-            publish(BlobLifetime::Ttl(60))
+            publish(BlobLifetime::Ttl(PublishTtl::of::<60>()))
         );
     }
 
@@ -1375,7 +1443,7 @@ mod tests {
                 ClientMessage::Publish {
                     lifetime: BlobLifetime::Ttl(t),
                     ..
-                } if t == ttl
+                } if t.secs() == ttl
             ));
         }
     }
@@ -1423,7 +1491,7 @@ mod tests {
             ref_id: Some("ok".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<3600>()),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1435,7 +1503,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![0x00; MAX_BLOB_SIZE + 1],
         };
         let err = msg.validate().unwrap_err();
@@ -1448,37 +1516,39 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![],
         };
         let err = msg.validate().unwrap_err();
         assert!(err.to_string().contains("blob must be"));
     }
 
+    /// The one fallible constructor refuses each value just outside the
+    /// §9.10.12 range with `4011`, accepts both bounds, and is the path
+    /// `TryFrom` and decoding take.
     #[test]
-    fn validate_publish_ttl_zero() {
-        let msg = ClientMessage::Publish {
-            ref_id: None,
-            routing_id: [0x00; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(0),
-            blob: vec![0x01],
-        };
-        let err = msg.validate().unwrap_err();
-        assert!(err.to_string().contains("blob_ttl"));
-    }
-
-    #[test]
-    fn validate_publish_ttl_too_long() {
-        let msg = ClientMessage::Publish {
-            ref_id: None,
-            routing_id: [0x00; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
-            blob: vec![0x01],
-        };
-        let err = msg.validate().unwrap_err();
-        assert!(err.to_string().contains("blob_ttl"));
+    fn publish_ttl_refuses_each_side_of_the_range_and_accepts_both_bounds() {
+        for secs in [0, MAX_BLOB_TTL + 1] {
+            let err = PublishTtl::new(secs).unwrap_err();
+            assert_eq!(err, LifetimeError::TtlOutOfRange(secs));
+            assert_eq!(err.code(), code::TTL_TOO_LONG);
+            assert_eq!(PublishTtl::try_from(secs), Err(err));
+            let wire = rmp_serde::to_vec(&secs).unwrap();
+            assert!(
+                rmp_serde::from_slice::<PublishTtl>(&wire).is_err(),
+                "{secs}"
+            );
+        }
+        for secs in [MIN_BLOB_TTL, MAX_BLOB_TTL] {
+            assert_eq!(PublishTtl::new(secs).map(PublishTtl::secs), Ok(secs));
+            let wire = rmp_serde::to_vec(&secs).unwrap();
+            assert_eq!(
+                rmp_serde::from_slice::<PublishTtl>(&wire).unwrap().secs(),
+                secs
+            );
+        }
+        assert_eq!(PublishTtl::MIN.secs(), MIN_BLOB_TTL);
+        assert_eq!(PublishTtl::MAX.secs(), MAX_BLOB_TTL);
     }
 
     #[test]
@@ -1488,7 +1558,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MIN_BLOB_TTL),
+            lifetime: BlobLifetime::Ttl(PublishTtl::MIN),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1498,7 +1568,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL),
+            lifetime: BlobLifetime::Ttl(PublishTtl::MAX),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1510,7 +1580,7 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN + 1)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1523,7 +1593,7 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1700,7 +1770,7 @@ mod tests {
                     ref_id: None,
                     routing_id: [0; 32],
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(1),
+                    lifetime: BlobLifetime::Ttl(PublishTtl::of::<1>()),
                     blob: vec![0x01],
                 },
                 "PUBLISH",
@@ -1848,7 +1918,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![0xAB; MAX_BLOB_SIZE],
         };
 
@@ -1939,7 +2009,7 @@ mod tests {
             ref_id: Some("test-ref".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(60),
+            lifetime: BlobLifetime::Ttl(PublishTtl::of::<60>()),
             blob: vec![0x01],
         };
         let bytes = msg.to_bytes().unwrap();
@@ -2039,7 +2109,7 @@ mod tests {
                 ref_id: Some("r".into()),
                 routing_id: [0; 32],
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(1),
+                lifetime: BlobLifetime::Ttl(PublishTtl::of::<1>()),
                 blob: vec![0x01],
             },
             ClientMessage::Subscribe {

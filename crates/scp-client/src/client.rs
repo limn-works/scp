@@ -1126,6 +1126,8 @@ impl ScpClient {
         // traffic), and only a TOTAL failure surfaces `Transport` (a retry then
         // re-fans a NEW message, producing a tolerable sequence GAP, never a
         // duplicate).
+        let publish_ttl = scp_relay_client::PublishTtl::new(ttl.secs())
+            .map_err(|e| ClientError::Codec(format!("PUBLISH blob_ttl: {e}")))?;
         let mut any_success = false;
         let mut last_transport_err: Option<String> = None;
         for routing_id in routing_ids {
@@ -1133,7 +1135,7 @@ impl ScpClient {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                lifetime: scp_relay_client::BlobLifetime::Ttl(ttl.secs()),
+                lifetime: scp_relay_client::BlobLifetime::Ttl(publish_ttl),
                 blob: blob.clone(),
             }
             .to_bytes()

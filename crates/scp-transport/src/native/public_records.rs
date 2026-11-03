@@ -229,9 +229,6 @@ impl fmt::Debug for PublicRecords {
 ///   with `4042`, a blob whose `blob_id` names a retained record with
 ///   `4040`, and every other blob goes to the TTL path.
 ///
-/// A TTL outside `MIN_BLOB_TTL..=MAX_BLOB_TTL` is refused with `4011` first,
-/// for a caller that built the lifetime rather than decoding it.
-///
 /// # Errors
 ///
 /// The [`PublicRecordRefusal`] whose code the `ERR` carries.
@@ -243,9 +240,6 @@ pub async fn admit_publish<S: BlobStorage>(
     lifetime: BlobLifetime,
     blob: &[u8],
 ) -> Result<StoredBlob, PublicRecordRefusal> {
-    let lifetime = lifetime
-        .check()
-        .map_err(|error| PublicRecordRefusal::new(error.code(), error.to_string()))?;
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
     let kind = classify_node_record(&routing_id, blob);
     match lifetime {
@@ -296,7 +290,7 @@ pub async fn admit_publish<S: BlobStorage>(
                 routing_id,
                 recipient_hint,
                 blob_id,
-                ttl,
+                ttl: ttl.secs(),
                 blob: blob.to_vec(),
             };
             match records {
@@ -465,6 +459,32 @@ pub async fn delete_unretained<S: BlobStorage + ?Sized>(
         .map_err(|e| PublicRecordRefusal::storage("deleting the blob", &e))
 }
 
+/// A PUBLISH frame whose `blob_ttl` is the raw wire value `blob_ttl`, in or
+/// out of range: a [`PublishTtl`](scp_relay_client::PublishTtl) holds no
+/// out-of-range value, so a test of a transport's refusal sends these bytes.
+#[cfg(test)]
+pub(crate) fn publish_frame_with_ttl(
+    ref_id: &str,
+    routing_id: [u8; 32],
+    blob_ttl: u32,
+    blob: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use rmpv::Value;
+    let frame = Value::Map(vec![
+        (Value::from("op"), Value::from("PUBLISH")),
+        (Value::from("ref"), Value::from(ref_id)),
+        (
+            Value::from("routing_id"),
+            Value::Binary(routing_id.to_vec()),
+        ),
+        (Value::from("blob_ttl"), Value::from(blob_ttl)),
+        (Value::from("blob"), Value::Binary(blob.to_vec())),
+    ]);
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, &frame).map_err(std::io::Error::other)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use scp_did::Identifier;
@@ -548,7 +568,7 @@ mod tests {
                 &storage,
                 routing_id,
                 None,
-                BlobLifetime::Ttl(60),
+                BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
                 &blob,
             )
             .await;
@@ -585,7 +605,7 @@ mod tests {
             &storage,
             [2; 32],
             None,
-            BlobLifetime::Ttl(60),
+            BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             &blob,
         )
         .await;
@@ -604,7 +624,7 @@ mod tests {
             &storage,
             [3; 32],
             None,
-            BlobLifetime::Ttl(60),
+            BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<60>()),
             b"ciphertext",
         )
         .await?;
@@ -616,36 +636,46 @@ mod tests {
         Ok(())
     }
 
-    /// A lifetime built in code reaches the seam undecoded: a TTL outside
-    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL` is refused with `4011` and nothing is
-    /// stored, and each bound is stored.
+    /// The seam takes a decoded lifetime, so an out-of-range TTL stops at the
+    /// decode every transport runs first: a frame whose `blob_ttl` lies
+    /// outside `MIN_BLOB_TTL..=MAX_BLOB_TTL` gets `4011` with its `ref` from
+    /// [`decode_refusal`], and a frame at each bound decodes and is stored
+    /// under that TTL.
     #[tokio::test]
-    async fn an_out_of_range_ttl_is_refused_with_4011_at_the_seam() -> TestResult {
-        use scp_relay_client::{MAX_BLOB_TTL, MIN_BLOB_TTL};
+    async fn an_out_of_range_ttl_frame_is_refused_with_4011_before_the_seam() -> TestResult {
+        use scp_relay_client::{ClientMessage, MAX_BLOB_TTL, MIN_BLOB_TTL};
 
-        let storage = InMemoryBlobStorage::new();
-        for (ttl, blob) in [(0, b"zero".as_slice()), (MAX_BLOB_TTL + 1, b"long")] {
-            let result = admit_publish(
-                &PublicRecords::Refused,
-                &storage,
-                [4; 32],
-                None,
-                BlobLifetime::Ttl(ttl),
-                blob,
-            )
-            .await;
-            assert_eq!(code_of(result), Some(code::TTL_TOO_LONG), "ttl {ttl}");
-            let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
-            assert!(storage.get(&blob_id).await?.is_none(), "ttl {ttl}");
+        for ttl in [0, MAX_BLOB_TTL + 1] {
+            let frame = publish_frame_with_ttl("ttl", [4; 32], ttl, b"blob")?;
+            let Err(error) = ClientMessage::from_bytes(&frame) else {
+                return Err(format!("blob_ttl {ttl} decoded").into());
+            };
+            let RelayMessage::Err { ref_id, code, .. } = decode_refusal(&error) else {
+                return Err(format!("blob_ttl {ttl}: the refusal is no ERR").into());
+            };
+            assert_eq!(code, code::TTL_TOO_LONG, "ttl {ttl}");
+            assert_eq!(ref_id.as_deref(), Some("ttl"), "ttl {ttl}");
         }
+        let storage = InMemoryBlobStorage::new();
         for ttl in [MIN_BLOB_TTL, MAX_BLOB_TTL] {
+            let frame = publish_frame_with_ttl("ttl", [4; 32], ttl, &ttl.to_be_bytes())?;
+            let ClientMessage::Publish {
+                routing_id,
+                recipient_hint,
+                lifetime,
+                blob,
+                ..
+            } = ClientMessage::from_bytes(&frame)?
+            else {
+                return Err("a PUBLISH frame decoded as another operation".into());
+            };
             let stored = admit_publish(
                 &PublicRecords::Refused,
                 &storage,
-                [4; 32],
-                None,
-                BlobLifetime::Ttl(ttl),
-                &ttl.to_be_bytes(),
+                routing_id,
+                recipient_hint,
+                lifetime,
+                &blob,
             )
             .await?;
             assert_eq!(stored.lifetime, StoredLifetime::Ttl(ttl));

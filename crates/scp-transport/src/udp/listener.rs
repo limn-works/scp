@@ -1375,7 +1375,11 @@ mod tests {
 
     /// Helper: send a `ClientMessage` and receive the response via DTLS.
     async fn send_and_recv(client: &AsyncDtlsSession, msg: &ClientMessage) -> RelayMessage {
-        let data = rmp_serde::to_vec_named(msg).unwrap();
+        send_bytes_and_recv(client, rmp_serde::to_vec_named(msg).unwrap()).await
+    }
+
+    /// Helper: send raw frame bytes and receive the response via DTLS.
+    async fn send_bytes_and_recv(client: &AsyncDtlsSession, data: Vec<u8>) -> RelayMessage {
         client.send(data).await.unwrap();
 
         let response_data = tokio::time::timeout(Duration::from_secs(5), client.recv())
@@ -1435,7 +1439,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: blob_data.clone(),
         };
 
@@ -1597,7 +1601,7 @@ mod tests {
             ref_id: Some("big-1".to_string()),
             routing_id: [0xEE; 32],
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: oversized_blob,
         };
 
@@ -1618,15 +1622,11 @@ mod tests {
         let (handle, addr, _storage) = start_test_listener().await;
         let client = create_dtls_client(addr).await;
 
-        let publish_msg = ClientMessage::Publish {
-            ref_id: Some("ttl-0".to_string()),
-            routing_id: [0xFF; 32],
-            recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(0),
-            blob: vec![0x01],
-        };
+        let frame =
+            crate::native::public_records::publish_frame_with_ttl("ttl-0", [0xFF; 32], 0, &[0x01])
+                .unwrap();
 
-        let response = send_and_recv(&client, &publish_msg).await;
+        let response = send_bytes_and_recv(&client, frame).await;
         match &response {
             RelayMessage::Err { ref_id, code, .. } => {
                 assert_eq!(ref_id.as_deref(), Some("ttl-0"));
@@ -1717,7 +1717,7 @@ mod tests {
             ref_id: Some("hint-1".to_string()),
             routing_id,
             recipient_hint: Some(hint),
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![0xAB, 0xCD],
         };
 
@@ -1772,7 +1772,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![0x99],
         };
         let pub_resp = send_and_recv(&client, &publish_msg).await;
@@ -1833,7 +1833,7 @@ mod tests {
                     ref_id: Some("push".to_string()),
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(3600),
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob: vec![0x42; 64],
                 },
             )
@@ -1905,7 +1905,7 @@ mod tests {
                 ref_id: Some("p".to_string()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             },
         )
@@ -1949,7 +1949,7 @@ mod tests {
             ref_id: Some("push".to_string()),
             routing_id: rid,
             recipient_hint: None,
-            lifetime: BlobLifetime::Ttl(3600),
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
             blob: vec![0x42; 64],
         };
 
@@ -2033,7 +2033,7 @@ mod tests {
                 ref_id: Some("push".to_string()),
                 routing_id: rid,
                 recipient_hint: None,
-                lifetime: BlobLifetime::Ttl(3600),
+                lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                 blob: vec![0x42; 64],
             };
             let response = send_and_recv(&client, &publish).await;
@@ -2085,7 +2085,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    lifetime: BlobLifetime::Ttl(3600),
+                    lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
                     blob,
                 },
             )
