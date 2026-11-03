@@ -12595,102 +12595,168 @@ def run_filter_key(inputs: Inputs) -> None:
         )
 
 
-def command_features(doc: dict, job: str, prefix: str) -> list[set[str]]:
-    """Return the `--features` set of each command in `job` that starts with `prefix`.
+def release_test_features(doc: dict) -> list[tuple[str, set[str]]]:
+    """Return (job, `--features` set) for each release-profile `cargo test` in `doc`.
 
-    A command that names no `--features` contributes an empty set, so a dropped
-    flag reads as a mismatch rather than as no command.
+    A release test is a logical `run:` line that starts with `cargo test` and
+    carries a `--release` token. A command that names no `--features`
+    contributes an empty set, so a dropped flag reads as a mismatch.
     """
     found = []
-    for step in doc["jobs"][job].get("steps") or []:
-        if not isinstance(step, dict):
-            continue
-        for line in logical_lines(str(step.get("run") or "")):
-            if not line.startswith(prefix):
+    for job_name, job in (doc.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
                 continue
-            tokens = split_command(line)
-            features: set[str] = set()
-            for index, token in enumerate(tokens):
-                if token == "--features" and index + 1 < len(tokens):
-                    features |= set(tokens[index + 1].split(","))
-                elif token.startswith("--features="):
-                    features |= set(token.removeprefix("--features=").split(","))
-            found.append(features)
+            for line in logical_lines(str(step.get("run") or "")):
+                if not line.startswith("cargo test"):
+                    continue
+                tokens = split_command(line)
+                if "--release" not in tokens:
+                    continue
+                found.append((job_name, command_feature_set(tokens)))
     return found
 
 
-RELEASE_TEST_PREFIX = "cargo test --workspace --release"
+def command_feature_set(tokens: list[str]) -> set[str]:
+    """Return the union of every `--features` value among `tokens`."""
+    features: set[str] = set()
+    for index, token in enumerate(tokens):
+        if token == "--features" and index + 1 < len(tokens):
+            features |= set(tokens[index + 1].split(","))
+        elif token.startswith("--features="):
+            features |= set(token.removeprefix("--features=").split(","))
+    return features
+
+
 WORKSPACE_CLIPPY_PREFIX = "cargo clippy --workspace --all-targets"
 
 
-def release_test_feature_gaps(ci: dict, build_matrix: dict) -> list[str]:
-    """Return each way build-matrix's release test features differ from CI's.
+def workspace_clippy_features(ci: dict) -> list[set[str]]:
+    """Return the `--features` set of each workspace clippy command in rust-clippy."""
+    found = []
+    for step in ci["jobs"]["rust-clippy"].get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for line in logical_lines(str(step.get("run") or "")):
+            if line.startswith(WORKSPACE_CLIPPY_PREFIX):
+                found.append(command_feature_set(split_command(line)))
+    return found
 
-    CRITERION: job `rust` of build-matrix.yml runs `cargo test --workspace
-    --release` under `RUSTFLAGS=-D warnings` at tag time, and the `workspace` leg
-    of job rust-clippy in ci.yml is the only pull-request build that denies
-    warnings across every workspace test target. A `#[cfg(feature = ...)]` test
-    or helper is compiled by both exactly when both name the same feature set. A
-    feature only one of them names lets a helper be live on every pull request
-    and dead, and so a `dead_code` error, at tag time.
+
+def release_test_feature_gaps(
+    ci: dict, documents: list[tuple[str, dict]]
+) -> list[str]:
+    """Return each way a workflow's release test features differ from CI's.
+
+    CRITERION: a `cargo test --release` step in any workflow compiles every
+    workspace test target in the release profile, and build-matrix.yml and
+    release.yml run theirs under `RUSTFLAGS=-D warnings` at tag time. The
+    `workspace` leg of job rust-clippy in ci.yml is the only pull-request build
+    that denies warnings across every workspace test target. A
+    `#[cfg(feature = ...)]` test or helper is compiled by both exactly when both
+    name the same feature set. A feature only one of them names lets a helper be
+    live on every pull request and dead, and so a `dead_code` error, at tag time.
+    `documents` is (file name, parsed workflow) for every workflow file.
     """
-    released = command_features(build_matrix, "rust", RELEASE_TEST_PREFIX)
-    linted = command_features(ci, "rust-clippy", WORKSPACE_CLIPPY_PREFIX)
-    if len(released) != 1:
-        return [f"build-matrix.yml rust runs {len(released)} `{RELEASE_TEST_PREFIX}` commands, not 1"]
+    linted = workspace_clippy_features(ci)
     if len(linted) != 1:
         return [f"ci.yml rust-clippy runs {len(linted)} `{WORKSPACE_CLIPPY_PREFIX}` commands, not 1"]
-    gaps = [f"only the release test names {f}" for f in sorted(released[0] - linted[0])]
-    gaps += [f"only the workspace clippy names {f}" for f in sorted(linted[0] - released[0])]
+    gaps = []
+    for name, doc in documents:
+        for job, released in release_test_features(doc):
+            gaps += [
+                f"{name}:{job}: only the release test names {f}"
+                for f in sorted(released - linted[0])
+            ]
+            gaps += [
+                f"{name}:{job}: only the workspace clippy names {f}"
+                for f in sorted(linted[0] - released)
+            ]
     return gaps
 
 
 def run_release_test_features(inputs: Inputs) -> None:
     print(
-        "release-test-features — build-matrix's release `cargo test` names the "
+        "release-test-features — every workflow's release `cargo test` names the "
         "features ci.yml's workspace clippy lints"
     )
-    by_name = {path.name: doc for path, doc in inputs.documents}
-    build_matrix = by_name["build-matrix.yml"]
-    gaps = release_test_feature_gaps(inputs.workflow, build_matrix)
+    documents = [(path.name, doc) for path, doc in inputs.documents]
+    by_name = dict(documents)
+    released = {
+        name: [job for job, _ in release_test_features(doc)] for name, doc in documents
+    }
+    released = {name: jobs for name, jobs in released.items() if jobs}
+    # The two release tests this check exists for. A rename that hid either from
+    # the reader would leave the equality below vacuously true for it.
     check(
-        "build-matrix.yml's release test features equal ci.yml's workspace clippy features",
+        "the reader finds the release tests of build-matrix.yml rust and release.yml",
+        "rust" in released.get("build-matrix.yml", [])
+        and len(released.get("release.yml", [])) == 1,
+        f"{released}",
+    )
+    gaps = release_test_feature_gaps(inputs.workflow, documents)
+    check(
+        "every workflow's release test features equal ci.yml's workspace clippy features",
         not gaps,
         "; ".join(gaps),
     )
 
-    # Controls: a release list that drops a feature, one that adds a feature, and
-    # one with no release test command each report.
-    def with_release_command(command: str) -> dict:
-        mutated = copy.deepcopy(build_matrix)
-        for step in mutated["jobs"]["rust"]["steps"]:
-            if isinstance(step, dict) and RELEASE_TEST_PREFIX in str(step.get("run") or ""):
-                step["run"] = command
-        return mutated
+    # Controls: a narrowed list, a widened list, a release test in a workflow file
+    # no check names, and a multi-line `run:` block each report.
+    narrow = "cargo test --workspace --release --features scp-core/testing,scp-runtime/saga-witness-test-mint"
 
-    narrowed = with_release_command(
-        "cargo test --workspace --release --target x "
-        "--features scp-core/testing,scp-runtime/saga-witness-test-mint"
+    def with_release_command(name: str, command: str) -> list[tuple[str, dict]]:
+        mutated = copy.deepcopy(by_name[name])
+        for job in mutated["jobs"].values():
+            for step in job.get("steps") or []:
+                if isinstance(step, dict) and "cargo test --workspace --release" in str(
+                    step.get("run") or ""
+                ):
+                    step["run"] = command
+        return [(n, mutated if n == name else d) for n, d in documents]
+
+    gaps = release_test_feature_gaps(
+        inputs.workflow, with_release_command("build-matrix.yml", narrow + " --target x")
     )
-    gaps = release_test_feature_gaps(inputs.workflow, narrowed)
     check(
-        "a release test without the bridges' testing features is reported",
-        "only the workspace clippy names scp-ffi/testing" in gaps,
+        "a build-matrix release test without the bridges' testing features is reported",
+        "build-matrix.yml:rust: only the workspace clippy names scp-ffi/testing" in gaps,
         f"{gaps}",
     )
-    widened = with_release_command(
-        f"cargo test --workspace --release --features {CLIPPY_WORKSPACE_FEATURES},scp-node/cloud-blobs"
+    gaps = release_test_feature_gaps(inputs.workflow, with_release_command("release.yml", narrow))
+    check(
+        "a release.yml release test without scp-runtime/testing is reported",
+        any(
+            g.startswith("release.yml:") and g.endswith("only the workspace clippy names scp-runtime/testing")
+            for g in gaps
+        ),
+        f"{gaps}",
     )
-    gaps = release_test_feature_gaps(inputs.workflow, widened)
+    gaps = release_test_feature_gaps(
+        inputs.workflow,
+        with_release_command(
+            "release.yml",
+            f"cargo test --workspace --release --features {CLIPPY_WORKSPACE_FEATURES},scp-node/cloud-blobs",
+        ),
+    )
     check(
         "a release test naming a feature the workspace clippy does not is reported",
-        gaps == ["only the release test names scp-node/cloud-blobs"],
+        len(gaps) == 1 and gaps[0].endswith("only the release test names scp-node/cloud-blobs"),
         f"{gaps}",
     )
-    gaps = release_test_feature_gaps(inputs.workflow, with_release_command("cargo build --workspace"))
+    planted = {
+        "jobs": {
+            "nightly": {
+                "steps": [
+                    {"run": "echo start\ncargo test -p scp-core \\\n  --release --features scp-core/testing"}
+                ]
+            }
+        }
+    }
+    gaps = release_test_feature_gaps(inputs.workflow, [*documents, ("planted.yml", planted)])
     check(
-        "a build-matrix rust job with no release test command is reported",
-        any("runs 0" in gap for gap in gaps),
+        "a release test in a new workflow file, split across lines, is reported",
+        "planted.yml:nightly: only the workspace clippy names scp-ffi/testing" in gaps,
         f"{gaps}",
     )
 

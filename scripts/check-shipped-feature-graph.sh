@@ -510,7 +510,7 @@ MATURIN_PROJECT_FILES=(
 # list and FAILS on any difference, in either direction. The two `cargo test`
 # lines below compile no shipped artifact, so neither one changes what ARTIFACTS
 # must gate. Both are test runs, and every feature they select is a test feature;
-# the build-matrix one names the feature list of ci.yml's workspace clippy leg. The three PowerShell lines below carry no cargo flag at all: a
+# both name the feature list of ci.yml's workspace clippy leg. The three PowerShell lines below carry no cargo flag at all: a
 # PowerShell parameter is one dash plus a name (`-FilePath`, `-Force`), which is
 # the same token as cargo's `-F` with an attached value, and the reader cannot
 # tell a PowerShell command from a cargo command without a denylist of command
@@ -526,7 +526,7 @@ MATURIN_PROJECT_FILES=(
 # returns 1 at end of input, hence `|| true` under `set -e`.
 IFS= read -r -d '' DECLARED_SHIPPING_FEATURE_FLAG_LINES <<'EOF' || true
 run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
-run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
+run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
 $cert = Import-PfxCertificate -FilePath $certPath `
 -Password (ConvertTo-SecureString -String $env:WINDOWS_SIGN_PWD -AsPlainText -Force)
 New-Item -ItemType Directory -Force napi-out | Out-Null
