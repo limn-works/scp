@@ -17,6 +17,7 @@ members = [
     "crates/scp-client",
     "crates/scp-client-wasm",
     "crates/scp-relay-mock",
+    "crates/scp-runtime-types",
     "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",
@@ -100,6 +101,7 @@ default-members = [
     "crates/scp-client",
     "crates/scp-client-wasm",
     "crates/scp-relay-mock",
+    "crates/scp-runtime-types",
     "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",
@@ -289,8 +291,8 @@ large_stack_arrays = "allow"
 #    and so moves when a side effect such as a map insert happens.
 #
 # THE CASE THAT LOOKS LIKE AN EXCEPTION, AND IS NOT: a trait this workspace owns whose
-# methods no impl awaits. `HandleQuerier` (crates/scp-runtime/src/discovery/addressing.rs)
-# and `ContextQuerier` (crates/scp-runtime/src/discovery/search.rs) are the two, and
+# methods no impl awaits. `HandleQuerier` (crates/scp-runtime-types/src/discovery/addressing.rs)
+# and `ContextQuerier` (crates/scp-runtime-types/src/discovery/search.rs) are the two, and
 # de-asyncing either would be the wrong edit. Both declare methods that perform network
 # I/O — `lookup_domain_handle` fetches `.well-known/scp`, `query_context` queries a remote
 # context's `agent_search` outlet. No impl awaits because the implementations that would

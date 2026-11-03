@@ -43,8 +43,8 @@ use scp_protocol::trust::{
     ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
     classify_action, enforce_category_a,
 };
-use scp_runtime::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_runtime::envelope::inner::sign::create_inner_envelope;
+use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -54,12 +54,16 @@ use crate::context::actor::CommandSigner;
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
-use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_snapshot};
 use crate::context::persistence::ContextPersistence;
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
 use crate::crypto::mls::provider::NodeMlsFactory;
-use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use scp_runtime_types::context::invitation_helpers::{
+    SnapshotRuntimeFacts, build_metadata_snapshot,
+};
+use scp_runtime_types::crypto::mls::storage_adapter::{
+    OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
+};
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
@@ -103,7 +107,7 @@ fn mallory_signing_key() -> SigningKey {
 /// resolving the extra DID is inert on the joiner path (only
 /// `bundle.creator_did` is ever resolved there).
 fn pair_resolver() -> KeyResolver {
-    crate::crypto::mls::test_support::role_resolver(&[
+    scp_runtime_types::crypto::mls::test_support::role_resolver(&[
         (DID::from(ALICE_DID), alice_signing_key()),
         (DID::from(BOB_DID), bob_signing_key()),
     ])
@@ -312,7 +316,7 @@ fn alice_welcome_for_bob(
 /// MALLORY_DID`) — proving the rejection is the §5.13.3 rule-8 creator binding,
 /// not a signature failure.
 fn trio_resolver() -> KeyResolver {
-    crate::crypto::mls::test_support::role_resolver(&[
+    scp_runtime_types::crypto::mls::test_support::role_resolver(&[
         (DID::from(ALICE_DID), alice_signing_key()),
         (DID::from(BOB_DID), bob_signing_key()),
         (DID::from(MALLORY_DID), mallory_signing_key()),
@@ -457,7 +461,7 @@ struct Joined {
     /// The joiner's MLS storage, which holds its wrapping key record.
     mls_storage: Arc<dyn OpenMlsStorageAdapter>,
     /// The wrapping custody a [`WrappingKeyLoss`] join installed.
-    loss_custody: Option<Arc<crate::crypto::key_loss_custody::KeyLossCustody>>,
+    loss_custody: Option<Arc<scp_runtime_types::crypto::key_loss_custody::KeyLossCustody>>,
 }
 
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
@@ -545,14 +549,16 @@ async fn run_join_with_wrapping_key_loss(
     // spawn below, so the realigned tests assert reachable joiner state through
     // `sup`, not the provider — it is not retained in `Joined`.
     let loss_custody = loss.map(|loss| {
-        Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
-            match loss {
-                WrappingKeyLoss::CannotAgree => crate::crypto::key_loss_custody::KeyLoss::OnDhAgree,
-                WrappingKeyLoss::AfterAgree => {
-                    crate::crypto::key_loss_custody::KeyLoss::AfterDhAgree
+        Arc::new(
+            scp_runtime_types::crypto::key_loss_custody::KeyLossCustody::new(match loss {
+                WrappingKeyLoss::CannotAgree => {
+                    scp_runtime_types::crypto::key_loss_custody::KeyLoss::OnDhAgree
                 }
-            },
-        ))
+                WrappingKeyLoss::AfterAgree => {
+                    scp_runtime_types::crypto::key_loss_custody::KeyLoss::AfterDhAgree
+                }
+            }),
+        )
     });
     let mls_storage = fresh_mls_storage();
     let sup = if let Some(custody) = &loss_custody {
@@ -4465,7 +4471,7 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     let alice_signing = alice_signing_key();
     let custody = InMemoryKeyCustody::new();
     let alice_signing_handle = custody.import_ed25519_key(&alice_signing.to_bytes()).await;
-    let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
+    let request = scp_runtime_types::crypto::sender_keys::key_protocol::request_sender_key(
         &custody,
         &alice_signing_handle,
         ALICE_DID,
@@ -4883,8 +4889,8 @@ fn unattested_key_package_for_bob(mallory_wrap: &[u8; 65]) -> Vec<u8> {
 /// Mallory's `KeyPackage` in Bob's name, with Mallory's wrapping key in `0xFF01`
 /// and an `0xFF03` that names Bob but is signed by Mallory's `#active` key.
 async fn mallory_signed_key_package_for_bob(mallory_wrap: &[u8; 65]) -> Vec<u8> {
-    use crate::crypto::mls::test_support::MintAttestedForTest as _;
-    crate::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
+    use scp_runtime_types::crypto::mls::test_support::MintAttestedForTest as _;
+    scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
         scp_clock::SystemClock,
     ))
     .mint_attested_with_key_for_test(&bob_credential(), mallory_wrap, &mallory_signing_key())
@@ -5039,16 +5045,18 @@ async fn invite_member_rejects_a_substituted_key_package_before_any_seal() {
 /// Bob at `#agent`, so a verifier that resolved `#agent` would accept it.
 #[tokio::test]
 async fn invite_member_rejects_a_key_package_attested_by_the_invitee_agent_key() {
-    use crate::crypto::mls::test_support::MintAttestedForTest as _;
+    use scp_runtime_types::crypto::mls::test_support::MintAttestedForTest as _;
     let mallory_wrap = mallory_wrapping_public_key().await;
-    let agent_key = crate::crypto::mls::test_support::test_agent_key(&bob_signing_key());
-    let key_package = crate::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
-        scp_clock::SystemClock,
-    ))
-    .mint_attested_with_key_for_test(&bob_credential(), &mallory_wrap, &agent_key)
-    .await
-    .expect("bob's #agent key attests a KeyPackage")
-    .key_package_bytes;
+    let agent_key =
+        scp_runtime_types::crypto::mls::test_support::test_agent_key(&bob_signing_key());
+    let key_package =
+        scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
+            scp_clock::SystemClock,
+        ))
+        .mint_attested_with_key_for_test(&bob_credential(), &mallory_wrap, &agent_key)
+        .await
+        .expect("bob's #agent key attests a KeyPackage")
+        .key_package_bytes;
     let resolver = pair_resolver();
     assert_eq!(
         resolver(&DID::from(BOB_DID), SigningKeyId::Agent),
@@ -5069,18 +5077,19 @@ async fn invite_member_rejects_a_key_package_attested_by_the_invitee_agent_key()
 /// Mallory, not the invitee.
 #[tokio::test]
 async fn invite_member_rejects_another_identitys_valid_key_package_offered_as_the_invitee() {
-    use crate::crypto::mls::test_support::MintAttestedForTest as _;
+    use scp_runtime_types::crypto::mls::test_support::MintAttestedForTest as _;
     let mallory_wrap = mallory_wrapping_public_key().await;
     let mallory_credential =
         scp_mls::credential::ScpCredential::new(MALLORY_DID.to_owned(), None, SigningKeyId::Active)
             .expect("mallory's credential");
-    let key_package = crate::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
-        scp_clock::SystemClock,
-    ))
-    .mint_attested_with_key_for_test(&mallory_credential, &mallory_wrap, &mallory_signing_key())
-    .await
-    .expect("mallory attests her own KeyPackage")
-    .key_package_bytes;
+    let key_package =
+        scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
+            scp_clock::SystemClock,
+        ))
+        .mint_attested_with_key_for_test(&mallory_credential, &mallory_wrap, &mallory_signing_key())
+        .await
+        .expect("mallory attests her own KeyPackage")
+        .key_package_bytes;
 
     let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(trio_resolver());
     let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, 0xf7, key_package).await;
@@ -5193,11 +5202,11 @@ async fn a_reserve_after_an_active_key_rotation_invites_with_a_key_package_the_n
         !pooled.is_empty(),
         "the rotated key's refill pooled KeyPackages"
     );
-    let backend = crate::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
-        scp_clock::SystemClock,
-    ));
+    let backend = scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend::new(
+        Arc::new(scp_clock::SystemClock),
+    );
     for (kp_ref, bytes) in &pooled {
-        let validated = crate::crypto::mls::backend::MlsBackend::validate_key_package(
+        let validated = scp_runtime_types::crypto::mls::backend::MlsBackend::validate_key_package(
             &backend,
             bytes,
             &scp_clock::SystemClock,
@@ -5205,14 +5214,15 @@ async fn a_reserve_after_an_active_key_rotation_invites_with_a_key_package_the_n
         .await
         .expect("a pooled KeyPackage validates");
         let wrapping = validated.leaf.wrapping_key.expect("0xFF01");
-        let verified = crate::crypto::mls::attestation_verification::verify_add_attestation(
-            Arc::clone(&resolver),
-            &scp_clock::SystemClock,
-            &validated.leaf,
-            &wrapping,
-            validated.leaf.attestation.as_ref().expect("0xFF03"),
-        )
-        .await;
+        let verified =
+            scp_runtime_types::crypto::mls::attestation_verification::verify_add_attestation(
+                Arc::clone(&resolver),
+                &scp_clock::SystemClock,
+                &validated.leaf,
+                &wrapping,
+                validated.leaf.attestation.as_ref().expect("0xFF03"),
+            )
+            .await;
         assert!(
             verified.is_ok(),
             "pooled {kp_ref:?} does not verify under the rotated key: {verified:?}"
@@ -5249,8 +5259,8 @@ async fn a_reserve_after_an_active_key_rotation_invites_with_a_key_package_the_n
 /// Bob's DID document names another key (§9.12, rotation is revocation).
 #[tokio::test]
 async fn invite_member_rejects_a_key_package_signed_by_a_rotated_away_key() {
-    use crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
     use scp_mls::keypackage_attestation::AttestationVerifyError;
+    use scp_runtime_types::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (_reservation, bob_kp) = reserve_bob_kp(&bob_sup, &DID::from(BOB_DID)).await;
@@ -5284,7 +5294,7 @@ async fn invite_member_rejects_a_key_package_signed_by_a_rotated_away_key() {
 /// fail-closed (§9.7.1 "Resolution failure policy", Add).
 #[tokio::test]
 async fn invite_member_rejects_a_key_package_whose_key_does_not_resolve() {
-    use crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
+    use scp_runtime_types::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (_reservation, bob_kp) = reserve_bob_kp(&bob_sup, &DID::from(BOB_DID)).await;
@@ -5624,7 +5634,8 @@ async fn join_rejects_a_reservation_whose_wrapping_key_differs_from_the_custody_
 {
     let ctx_id = ctx_hex(0xe3);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
 
@@ -5639,7 +5650,7 @@ async fn join_rejects_a_reservation_whose_wrapping_key_differs_from_the_custody_
         .await
         .expect("its public key");
     custody.set_public_key_fault(Some(
-        crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(
+        scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Bytes(
             substitute_public.as_bytes().to_vec(),
         ),
     ));
@@ -5669,7 +5680,8 @@ async fn join_rejects_a_reservation_whose_wrapping_key_differs_from_the_custody_
 async fn join_rejects_a_reserved_wrapping_key_that_differs_from_the_recorded_key() {
     let ctx_id = ctx_hex(0xea);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
 
@@ -5717,7 +5729,8 @@ async fn join_rejects_a_reserved_wrapping_key_that_differs_from_the_recorded_key
 async fn join_rejects_a_custody_wrapping_public_key_that_is_not_a_p256_point() {
     let ctx_id = ctx_hex(0xeb);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
     let good = bob_sup
@@ -5726,7 +5739,7 @@ async fn join_rejects_a_custody_wrapping_public_key_that_is_not_a_p256_point() {
         .expect("bob's wrapping key");
 
     custody.set_public_key_fault(Some(
-        crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(good[..33].to_vec()),
+        scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Bytes(good[..33].to_vec()),
     ));
     let err = bob_sup
         .spawn_actor_from_welcome(bob.clone(), copy_request(&req))
@@ -5754,7 +5767,8 @@ enum HangingCall {
 async fn join_times_out_on_a_hanging_custody(call: HangingCall, seed: u8) {
     let ctx_id = ctx_hex(seed);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
 
@@ -5763,7 +5777,7 @@ async fn join_times_out_on_a_hanging_custody(call: HangingCall, seed: u8) {
     tokio::time::pause();
     match call {
         HangingCall::PublicKey => custody.set_public_key_fault(Some(
-            crate::crypto::dh_counting_custody::PublicKeyFault::Hang,
+            scp_runtime_types::crypto::dh_counting_custody::PublicKeyFault::Hang,
         )),
         HangingCall::DhAgree => custody.set_dh_hang(true),
     }
@@ -5886,7 +5900,8 @@ async fn join_succeeds_when_custody_loses_the_wrapping_key_after_agree_and_a_rel
 async fn invite_then_restart_joiner_then_join_opens_with_the_reloaded_custody_handle() {
     let ctx_id = ctx_hex(0xe7);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let storage = fresh_mls_storage();
     let before = bob_supervisor_over(None, Arc::clone(&storage), &custody);
     let (_, _, req) = alice_invites_bob(&ctx_id, &before).await;
@@ -5927,7 +5942,7 @@ async fn join_after_restart_with_a_custody_that_lost_the_wrapping_key_fails_befo
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &before).await;
     drop(before);
 
-    let lost = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let lost = Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let after = bob_supervisor_over(None, Arc::clone(&storage), &lost);
     let err = after
         .spawn_actor_from_welcome(bob.clone(), req)
@@ -5962,7 +5977,8 @@ async fn join_after_restart_with_a_custody_that_lost_the_wrapping_key_fails_befo
 async fn join_rejects_a_malformed_enc_before_keypackage_consumption() {
     let ctx_id = ctx_hex(0xe9);
     let bob = DID::from(BOB_DID);
-    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let custody =
+        Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
     let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
     let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
     let good: [u8; 65] = req
@@ -6033,11 +6049,13 @@ async fn a_join_confirms_under_the_bootstrap_lock_while_a_mint_waits_on_custody(
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
     let signs = Arc::new(AtomicUsize::new(0));
-    let gated = CommandSigner::new(Arc::new(crate::crypto::mls::test_support::GatedSigner {
-        key: bob_signing_key(),
-        permits: Arc::clone(&permits),
-        signs: Arc::clone(&signs),
-    }));
+    let gated = CommandSigner::new(Arc::new(
+        scp_runtime_types::crypto::mls::test_support::GatedSigner {
+            key: bob_signing_key(),
+            permits: Arc::clone(&permits),
+            signs: Arc::clone(&signs),
+        },
+    ));
     let (_reservation_id, _kp, req) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         alice_invites_bob_reserving_with(&ctx_hex(0xc3), &bob_sup, &gated),

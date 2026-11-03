@@ -186,9 +186,7 @@ impl ProductionMlsBackend {
     ///
     /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
     /// not deserialize / validate as an SCP `KeyPackage`.
-    pub(crate) fn consumed_init_key_key(
-        key_package_public_bytes: &[u8],
-    ) -> Result<String, MlsError> {
+    pub fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
         Self::init_key_marker(key_package_public_bytes, |e| {
             MlsError::WelcomeProcessingFailed(format!("validating key package for init-key: {e}"))
         })

@@ -320,9 +320,9 @@ pub fn commit_fault(state: &PerContextState) -> Option<CommitFaultMarker> {
 /// convergent across honest members (§9.9.3).
 pub(super) fn payment_history(
     state: &PerContextState,
-    filter: Option<&crate::economy::receipt::ReceiptFilter>,
-) -> Vec<crate::economy::adapter::PaymentReceipt> {
-    crate::economy::receipt::payment_history(&state.payment_receipts, filter)
+    filter: Option<&scp_runtime_types::economy::receipt::ReceiptFilter>,
+) -> Vec<scp_runtime_types::economy::adapter::PaymentReceipt> {
+    scp_runtime_types::economy::receipt::payment_history(&state.payment_receipts, filter)
 }
 
 // ===========================================================================
@@ -916,12 +916,13 @@ mod equivocation_dedup_tests {
             Box::new(CountingEventLog { appends });
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
 
         let supervisor = Supervisor::with_providers(
             crypto,

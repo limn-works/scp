@@ -140,7 +140,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
     let actor_ids = supervisor.actor_ids();
-    crate::metrics::set_active_contexts(actor_ids.len());
+    scp_runtime_types::metrics::set_active_contexts(actor_ids.len());
 
     let mut total_buffered: usize = 0;
     for ctx_id in actor_ids {
@@ -163,7 +163,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
             total_buffered += len;
         }
     }
-    crate::metrics::set_buffer_occupancy(total_buffered);
+    scp_runtime_types::metrics::set_buffer_occupancy(total_buffered);
 }
 
 // ---------------------------------------------------------------------------

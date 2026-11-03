@@ -1175,7 +1175,7 @@ pub fn determine_inflight_handling(
 /// Implementations bridge to the relay's `send` and `subscribe` operations.
 ///
 /// Note: uses `async fn in trait` which is NOT object-safe. This matches the
-/// pattern of [`ReJoinExecutor`] and [`super::days_offline::SnapshotTransport`].
+/// pattern of [`ReJoinExecutor`] and `super::days_offline::SnapshotTransport`.
 ///
 /// See ADR-029 section 4 (Reset Protocol).
 #[allow(async_fn_in_trait)]

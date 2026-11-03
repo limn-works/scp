@@ -84,12 +84,12 @@ use crate::context::shared::outlets::OutletSettleRequest;
 use crate::context::snapshot::build_snapshot_for_persist;
 use crate::context::snapshot::persist_snapshot_fail_closed;
 use crate::context::snapshot::persist_state_best_effort;
-use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
     CommittedOutletInvocation, CommittedStreamingOutletInvocation,
     CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
     SagaPreparedState,
 };
+use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
 /// Runtime configuration ceiling for an interface's inbound §6.2.0.2 rate
 /// (`InboundPolicy::max_calls_per_minute`) — the highest inbound rate B will
@@ -1048,7 +1048,7 @@ fn consume_inbound_interface_rate_limit(
 /// [`SagaPhaseMessage::PrepareB`](crate::context::actor::commands::SagaPhaseMessage::PrepareB)
 /// payload (minus the reply channel).
 struct PrepareBRequest {
-    saga_id: crate::context::supervisor::saga_journal::SagaId,
+    saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
     caller_context_id: [u8; 32],
     target_context_id: [u8; 32],
     caller_did: DID,
@@ -2633,7 +2633,7 @@ async fn commit_b_stream_first_settle(
         // None`, so no in-memory `PumpEscrowGuard` fires; a crash-recovery close
         // over a truncated prefix settles at the prefix `billed_count`
         // identically. The FSM applies `refund` against the invoker's hold once.
-        let mut escrow = crate::context::outlets::stream::StreamEscrow::from_reserved(
+        let mut escrow = scp_runtime_types::context::outlets::stream::StreamEscrow::from_reserved(
             prepared.cost_per_chunk,
             prepared.reserved,
         );
@@ -3666,14 +3666,14 @@ mod tests {
     use scp_protocol::crypto::ucan::UcanToken;
     use tokio::sync::oneshot;
 
-    use crate::crypto::ucan::mint::{MintParams, mint_ucan};
+    use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
     use super::*;
     use crate::context::actor::deps::ActorDeps;
     use crate::context::actor::state::PerContextState;
     use crate::context::persistence::ContextPersistence;
-    use crate::context::supervisor::saga_journal::SagaId;
     use crate::context::supervisor::supervisor::Supervisor;
+    use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 
     const CALLER: &str = "did:dht:z6MkCallerPrincipalXX";
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
@@ -4159,12 +4159,13 @@ mod tests {
                 None
             }
         });
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -4206,12 +4207,13 @@ mod tests {
                 None
             }
         });
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -6496,7 +6498,7 @@ mod tests {
     async fn build_deps_with_payment(
         issuer_did: String,
         issuer_key: ed25519_dalek::VerifyingKey,
-        payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+        payment_adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>,
     ) -> ActorDeps {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestSagaActor".to_owned(),
@@ -6513,12 +6515,13 @@ mod tests {
                 None
             }
         });
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -6703,11 +6706,12 @@ mod tests {
         let mut st = target_state(0xD9, OTHER, CALLER).await;
         let caller = DID(CALLER.to_owned());
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
+        let adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn> = Arc::new(
+            scp_runtime_types::economy::adapter::CountingPaymentAdapter {
                 voided: Arc::clone(&voided),
                 ..Default::default()
-            });
+            },
+        );
         let deps =
             build_deps_with_payment(CALLER.to_owned(), issuer.verifying_key(), adapter).await;
 
@@ -6728,7 +6732,7 @@ mod tests {
             deducted_cost: None,
             needs_hard_rate_limit_refund: false,
             recorded_at_secs: now_secs,
-            escrow_authorization: Some(crate::economy::adapter::PaymentAuthorization {
+            escrow_authorization: Some(scp_runtime_types::economy::adapter::PaymentAuthorization {
                 auth_id: [3u8; 32],
                 payer: caller.clone(),
                 payee: DID("did:example:payee".to_owned()),

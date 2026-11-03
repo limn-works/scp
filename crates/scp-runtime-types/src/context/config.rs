@@ -2,7 +2,7 @@
 //!
 //! This module is the **options-object** entry that lowers into the existing
 //! protocol [`ContextParams`] and calls the existing creation engine
-//! ([`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context)).
+//! (`Supervisor::create_context`).
 //! It closes the documented Rust-SDK divergence: Python/TypeScript/Swift
 //! already pass an options object, while the Rust SDK previously exposed only
 //! the raw `ContextParams` entry. See `.docs/standards/construction.md`
@@ -53,7 +53,7 @@ pub enum ContextCreation {
     /// carried for the invitation step. The creation engine itself does not
     /// consume it (see [`ContextConfig::into_params`], which returns it
     /// alongside the lowered params). The engine entry
-    /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
+    /// `Supervisor::create`
     /// does **not** silently drop it: until the invitation/Welcome-delivery
     /// path is wired, supplying `peer: Some(_)` is a loud
     /// [`ContextCreationError::BilateralPeerNotSupported`](scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported),
@@ -71,7 +71,7 @@ pub enum ContextCreation {
     /// No template ID is attached. The caller specifies every governance-
     /// relevant parameter directly. `ceiling` is required and non-empty (M2
     /// per-variant): there is no over-broad default capability ceiling, and
-    /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
+    /// `Supervisor::create`
     /// rejects an empty one with
     /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired),
     /// as does every other create path. The check sits in the crate-private
@@ -104,14 +104,14 @@ pub enum ContextCreation {
 /// Carries the required [`ContextCreation`] choice plus the shared optional
 /// fields (`ttl`, `outlets`). Lower it into protocol [`ContextParams`] with
 /// [`ContextConfig::into_params`], or pass it directly to
-/// [`Supervisor::create`](crate::context::supervisor::Supervisor::create).
+/// `Supervisor::create`.
 ///
 /// Per M4, this struct does **not** implement a whole-struct `Default`: the
 /// `creation` field is a required security-critical choice. Use
 /// [`ContextConfig::defaults`] to obtain a base for the spread idiom:
 ///
 /// ```
-/// use scp_runtime::context::{ContextConfig, ContextCreation};
+/// use scp_runtime_types::context::config::{ContextConfig, ContextCreation};
 /// use scp_protocol::context::params::TemplateId;
 /// use std::time::Duration;
 ///

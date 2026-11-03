@@ -4,7 +4,7 @@
 //! # Why a trait
 //!
 //! The round-7 closure threaded an `Arc<ed25519_dalek::SigningKey>` through
-//! [`super::dispatch::OpenStreamParams`], [`super::dispatch::SharedSessionState`],
+//! `super::dispatch::OpenStreamParams`, `super::dispatch::SharedSessionState`,
 //! and both the dispatch and inner-invoke pumps, signing chunks synchronously.
 //! Holding the raw operator private key in runtime structs and signing
 //! synchronously is incompatible with the platform `KeyCustody` abstraction:

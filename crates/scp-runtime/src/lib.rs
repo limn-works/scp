@@ -34,17 +34,12 @@ compile_error!(
 
 pub mod context;
 pub mod crypto;
-pub mod discovery;
-pub mod economy;
 pub mod envelope;
 pub mod identity;
-pub mod metrics;
-pub mod provenance;
 pub mod push;
 pub mod store;
 pub mod sync;
 pub mod trust;
-pub mod well_known;
 
 // Re-export the MLS module's primary types at the crate level for convenience.
 pub use crypto::mls;

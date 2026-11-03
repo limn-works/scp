@@ -219,10 +219,12 @@ async fn member_deps(
 ) -> (ActorDeps, Arc<Supervisor>, Arc<Store>, Arc<Sent>) {
     let store = Arc::new(Store::default());
     let sent = Arc::new(Sent::default());
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
     );
     let supervisor = Supervisor::with_providers(
         crypto,

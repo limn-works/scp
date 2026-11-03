@@ -33,9 +33,9 @@
 use std::sync::Arc;
 
 use scp_platform::in_memory::InMemoryStorage;
-use scp_runtime::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaJournal, SagaState,
-    Supervisor, SupervisorConfig,
+use scp_runtime::context::supervisor::{RestoredContexts, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
 };
 
 struct NoOpPersistence;

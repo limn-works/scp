@@ -34,9 +34,10 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::supervisor::{
-    JournalEntry, JournalError, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaInput,
-    SagaJournal, SagaState, SagaTerminalState, Supervisor, SupervisorConfig,
+use scp_runtime::context::supervisor::{RestoredContexts, SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    JournalEntry, JournalError, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
+    SagaTerminalState,
 };
 
 // ---------------------------------------------------------------------------

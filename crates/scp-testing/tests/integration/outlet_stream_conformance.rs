@@ -44,8 +44,8 @@ use scp_runtime::context::ContextHandle;
 use scp_runtime::context::outlets::dispatch::{
     CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamSessionHandle, open_stream_session,
 };
-use scp_runtime::context::outlets::signer::InProcessStreamSigner;
-use scp_runtime::context::outlets::stream::{
+use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
+use scp_runtime_types::context::outlets::stream::{
     AdmissionCaps, OriginAdmissionTracker, StreamAdmissionTracker, StreamIdentity,
 };
 

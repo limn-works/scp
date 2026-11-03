@@ -144,12 +144,13 @@ fn supervisor_with_event_channel() -> (
     tokio::sync::broadcast::Sender<(String, ContextEvent)>,
 ) {
     let (event_tx, _seed_rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
-    let mls_storage: Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                scp_platform::in_memory::InMemoryStorage::new(),
-            )),
-        );
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
+    );
     let supervisor = Supervisor::with_providers(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),

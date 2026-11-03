@@ -26,7 +26,7 @@ use scp_protocol::trust::{
 };
 
 use super::*;
-use crate::crypto::mls::storage_adapter::OpenMlsStorageError;
+use scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageError;
 
 /// A protocol row: `Total(20)`, 9500, 2 retries, cooldown 300.
 const URI: &str = "scp:capability:schema-validation/v1";

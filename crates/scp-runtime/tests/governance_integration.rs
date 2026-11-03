@@ -55,10 +55,10 @@ use scp_runtime::context::actor::commands::{
     BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload, UnsubscribeBroadcastPayload,
 };
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
 use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_types::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 
 // ---------------------------------------------------------------------------
 // Mock providers
@@ -2346,7 +2346,7 @@ fn ac13_actions_conflict_mutual_removal() {
 
 #[test]
 fn ac14_threshold_deadlock_insufficient_active_signers() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -2383,7 +2383,7 @@ fn ac14_threshold_deadlock_insufficient_active_signers() {
 
 #[test]
 fn ac14_no_deadlock_when_sufficient_signers() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -2407,7 +2407,7 @@ fn ac14_no_deadlock_when_sufficient_signers() {
 
 #[test]
 fn ac14_majority_deadlock_unresponsive_voters() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let voters = vec![alice(), bob(), carol(), dave()];
     let engine = MajorityVoteEngine::new(voters, 300, 7500, mock_key_resolver()).unwrap();
@@ -2444,7 +2444,7 @@ fn ac14_majority_deadlock_unresponsive_voters() {
 
 #[test]
 fn ac14_unanimity_deadlock_voter_offline_7_days() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let voters = vec![alice(), bob(), carol()];
     let engine = UnanimityEngine::new(voters, 300, mock_key_resolver()).unwrap();
@@ -2486,7 +2486,7 @@ fn ac14_unanimity_deadlock_voter_offline_7_days() {
 
 #[test]
 fn ac14_single_admin_never_deadlocks() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let engine = SingleAdminEngine::new(alice(), mock_key_resolver());
     let ctx = GovernanceContext {
@@ -2860,7 +2860,7 @@ fn ac13_no_conflict_unrelated_actions() {
 
 #[test]
 fn ac14_deadlock_justification_from_conditions() {
-    use scp_runtime::context::governance::timeout::detect_deadlock;
+    use scp_runtime_types::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -2878,8 +2878,10 @@ fn ac14_deadlock_justification_from_conditions() {
     assert!(!conditions.is_empty());
 
     // Build justification from the conditions.
-    let justification =
-        scp_runtime::context::governance::timeout::build_justification(&conditions, 1_000_000);
+    let justification = scp_runtime_types::context::governance::timeout::build_justification(
+        &conditions,
+        1_000_000,
+    );
     assert!(justification.unavailable_dids.contains(&bob()));
     assert!(justification.unavailable_dids.contains(&carol()));
     assert_eq!(justification.detected_at, 1_000_000);

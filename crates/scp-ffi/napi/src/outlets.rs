@@ -1876,9 +1876,8 @@ mod tests {
     // TS wrapper reverses, which `common` does not exercise.
     // ------------------------------------------------------------------
 
-    use scp_core::context::supervisor::{
-        SagaAbortReason, SagaError as CoreSagaError, SagaId as CoreSagaId,
-    };
+    use scp_core::context::saga_journal::SagaId as CoreSagaId;
+    use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError};
 
     /// `Aborted` routes through `common` onto `ScpNapiError::SagaAborted` with
     /// the `SCP-SAGA-{code}` string and `retry_after_ms` carried structurally;

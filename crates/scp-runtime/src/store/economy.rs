@@ -20,8 +20,10 @@
 
 use scp_platform::traits::Storage;
 
-use crate::economy::credentials::{AdapterCredential, AdapterCredentialStore, CredentialError};
 use scp_did::DID;
+use scp_runtime_types::economy::credentials::{
+    AdapterCredential, AdapterCredentialStore, CredentialError,
+};
 
 use super::{ProtocolRepository, StoreError};
 
@@ -420,7 +422,7 @@ mod tests {
     use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
-    use crate::economy::credentials::EncryptedBlob;
+    use scp_runtime_types::economy::credentials::EncryptedBlob;
 
     fn test_did() -> DID {
         DID::from("did:dht:z6MkTestHuman")

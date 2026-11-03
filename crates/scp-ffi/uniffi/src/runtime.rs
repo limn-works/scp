@@ -2405,7 +2405,7 @@ mod tests {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             scp_ffi_common::streaming_saga::StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
-                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                saga_id: scp_core::context::saga_journal::SagaId(saga_id.to_owned()),
                 target_context_id: "ctx".to_owned(),
                 invoker_did: "invoker".to_owned(),
                 request_id: [0u8; 16],

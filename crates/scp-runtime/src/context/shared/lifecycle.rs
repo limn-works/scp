@@ -198,7 +198,7 @@ impl FirstStateRollbackInner {
             .await
         {
             Self::mark(&self.contact, RECORD_FAILED);
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::error!(
                 context_id,
                 error = %e,
@@ -212,7 +212,7 @@ impl FirstStateRollbackInner {
         Self::mark(&self.snapshot, RECORD_IN_FLIGHT);
         if let Err(e) = self.persistence.persist_context(context_id, snapshot).await {
             Self::mark(&self.snapshot, RECORD_FAILED);
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::error!(
                 context_id,
                 error = %e,
@@ -249,7 +249,7 @@ impl FirstStateRollbackInner {
             // sender lives in `self`, so the wait cannot see it closed.
             Ok(Ok(_) | Err(_)) => {}
             Err(_elapsed) => {
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 return Err(ContextError::PersistenceFailed(format!(
                     "the first-state writes of '{context_id}' did not finish within \
                      {FIRST_STATE_WRITES_DRAIN:?}; their records are kept"
@@ -307,7 +307,7 @@ impl FirstStateRollbackInner {
                 None => self.persistence.delete_context(context_id).await,
             };
             restored.map_err(|e| {
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 tracing::error!(
                     context_id,
                     error = %e,
@@ -330,7 +330,7 @@ impl FirstStateRollbackInner {
                 None => self.contacts.delete_last_relay_contact(context_id).await,
             };
             restored.map_err(|e| {
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 tracing::error!(
                     context_id,
                     error = %e,
@@ -591,7 +591,7 @@ impl Drop for FirstStateRollback {
             drained,
             move || inner.finish_deferred_undo(),
         ) {
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::error!(
                 context_id,
                 %error,
@@ -976,7 +976,7 @@ pub fn first_state_writes(
                 inner
                     .abandoned
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 tracing::error!(
                     context_id,
                     "shutdown abandoned the first-state writes before they finished; their \

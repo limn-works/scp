@@ -23,12 +23,12 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
 
-    use crate::crypto::ucan::mint::{MintParams, mint_ucan};
     use scp_protocol::crypto::ucan::UcanError;
     use scp_protocol::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryRevocationChecker,
         TokenNbCaveatResolver, ValidationContext,
     };
+    use scp_runtime_types::crypto::ucan::mint::{MintParams, mint_ucan};
 
     // -----------------------------------------------------------------------
     // Test helpers

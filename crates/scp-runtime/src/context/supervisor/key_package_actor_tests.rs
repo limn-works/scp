@@ -32,13 +32,6 @@ use crate::context::builder::{
 };
 use crate::context::supervisor::faulty_storage::FaultyStorage;
 use crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner;
-use crate::crypto::mls::backend::{
-    AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
-    ValidatedKeyPackage,
-};
-use crate::crypto::mls::production_backend::ProductionMlsBackend;
-use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
-use crate::crypto::mls::test_support::{MintAttestedForTest as _, role_resolver};
 use ed25519_dalek::SigningKey;
 use openmls::prelude::LeafNodeIndex;
 use scp_mls::attested_key_package::KeyPackageDraft;
@@ -49,6 +42,15 @@ use scp_mls::group::ScpMlsGroup;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
 use scp_protocol::context::governance::KeyResolver;
+use scp_runtime_types::crypto::mls::backend::{
+    AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
+    ValidatedKeyPackage,
+};
+use scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend;
+use scp_runtime_types::crypto::mls::storage_adapter::{
+    OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
+};
+use scp_runtime_types::crypto::mls::test_support::{MintAttestedForTest as _, role_resolver};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -3751,8 +3753,8 @@ fn kp_record_encodes_like_plain_fields() {
 /// point of the owner's wrapping key as custody holds it.
 #[tokio::test]
 async fn store_minted_key_packages_carry_a_verifying_attestation() {
-    use crate::crypto::mls::attestation_verification::verify_add_attestation;
     use scp_platform::traits::KeyCustody as _;
+    use scp_runtime_types::crypto::mls::attestation_verification::verify_add_attestation;
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let wrapping_key = crate::crypto::wrapping::test_wrapping_key(&custody)
         .await
@@ -3910,7 +3912,7 @@ fn alice_rotated_signer() -> Arc<KeyPackageAttestationSigner> {
 /// Verifies `public_bytes`' `0xFF03` against `active` as Alice's `#active`
 /// key.
 async fn attested_by(public_bytes: &[u8], active: &SigningKey) -> bool {
-    use crate::crypto::mls::attestation_verification::verify_add_attestation;
+    use scp_runtime_types::crypto::mls::attestation_verification::verify_add_attestation;
     let validated = real_backend()
         .validate_key_package(public_bytes, &SystemClock)
         .await
@@ -4066,11 +4068,13 @@ async fn confirm_consume_completes_while_a_mint_waits_on_custody() {
     let signs = Arc::new(AtomicUsize::new(0));
     let gated = Arc::new(KeyPackageAttestationSigner::for_test(
         alice(),
-        CommandSigner::new(Arc::new(crate::crypto::mls::test_support::GatedSigner {
-            key: alice_identity_key(),
-            permits: Arc::clone(&permits),
-            signs: Arc::clone(&signs),
-        })),
+        CommandSigner::new(Arc::new(
+            scp_runtime_types::crypto::mls::test_support::GatedSigner {
+                key: alice_identity_key(),
+                permits: Arc::clone(&permits),
+                signs: Arc::clone(&signs),
+            },
+        )),
         alice_identity_key().verifying_key(),
     ));
 

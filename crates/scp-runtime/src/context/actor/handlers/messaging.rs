@@ -41,12 +41,12 @@ use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
 use crate::context::ContextHandle;
-use crate::context::actor::SendSequenceTracker;
 use crate::context::actor::commands::MessagingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::sequence::SequenceReservation;
 use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
+use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
+use scp_runtime_types::context::actor::sequence::SequenceReservation;
 
 use crate::context::actor::handle::HANDLER_TIMEOUT;
 

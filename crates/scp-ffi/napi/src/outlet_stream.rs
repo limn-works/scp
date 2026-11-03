@@ -1744,7 +1744,7 @@ impl crate::scp::Scp {
             saga_id.to_owned(),
             StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
-                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                saga_id: scp_core::context::saga_journal::SagaId(saga_id.to_owned()),
                 target_context_id: target_context_id.to_owned(),
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],

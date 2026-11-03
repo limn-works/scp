@@ -72,7 +72,7 @@ pub enum AttestationRuntimeVerifyError {
 ///
 /// The [`tokio::task::JoinError`] when the resolver task panics or is
 /// cancelled; `Ok(None)` when the key does not resolve.
-pub(crate) async fn resolve_active_key(
+pub async fn resolve_active_key(
     key_resolver: KeyResolver,
     did: DID,
 ) -> Result<Option<VerifyingKey>, tokio::task::JoinError> {
@@ -102,7 +102,7 @@ pub(crate) async fn resolve_active_key(
 ///   when the resolver task fails.
 /// - [`AttestationRuntimeVerifyError::Verify`] for the first failing check
 ///   among 3–13.
-pub(crate) async fn verify_add_attestation(
+pub async fn verify_add_attestation(
     key_resolver: KeyResolver,
     clock: &dyn Clock,
     leaf: &KeyPackageLeafFacts,

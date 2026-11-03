@@ -1200,10 +1200,10 @@ pub(crate) async fn evaluate_governance_timeouts(
 
     use scp_did::DID;
 
-    use crate::context::governance::timeout::{
+    use crate::context::governance_helpers::build_governance_context;
+    use scp_runtime_types::context::governance::timeout::{
         collect_active_voters, process_pending_proposals, update_detection_state,
     };
-    use crate::context::governance_helpers::build_governance_context;
 
     let context_id = cell.handle.context_id().to_owned();
 
@@ -1263,8 +1263,9 @@ pub(crate) async fn evaluate_governance_timeouts(
         update_detection_state(&mut *deadlock, engine, &gov_ctx, &active_voters);
         // `detect_deadlock` reads both engine and deadlock; the same disjoint
         // borrows (now reborrowed shared) serve it.
-        conditions =
-            crate::context::governance::timeout::detect_deadlock(engine, &gov_ctx, deadlock);
+        conditions = scp_runtime_types::context::governance::timeout::detect_deadlock(
+            engine, &gov_ctx, deadlock,
+        );
     }
 
     // Phase 2: translate timeout events.
@@ -1556,12 +1557,13 @@ mod consequence_fail_closed_tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,

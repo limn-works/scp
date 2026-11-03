@@ -910,7 +910,7 @@ pub fn equivocation_alert_from_divergence(
 /// deals in raw bytes — serialization is handled by the engine.
 ///
 /// Note: uses `async fn in trait` which is NOT object-safe. This matches the
-/// pattern of [`DeltaSyncEngine`] and [`super::weeks_offline::ReJoinExecutor`].
+/// pattern of [`DeltaSyncEngine`] and [`scp_runtime_types::sync::weeks_offline::ReJoinExecutor`].
 ///
 /// See ADR-029 section 1 (Tier 2 strategy).
 #[allow(async_fn_in_trait)]

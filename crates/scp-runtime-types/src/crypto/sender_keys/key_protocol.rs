@@ -331,7 +331,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 ///
 /// [`SenderKeyError::SenderMismatch`] if `response.sender_did` is not
 /// `mls_sender`.
-pub(crate) fn check_response_sender(
+pub fn check_response_sender(
     mls_sender: &str,
     response: &SenderKeyResponse,
 ) -> Result<(), SenderKeyError> {
@@ -421,7 +421,7 @@ pub async fn open_sender_key_response(
 /// [`SenderKeyError::HpkeDecryptionFailed`] if the HPKE open fails (wrong
 /// key, `info` or `aad`, tampered `enc` or `ct`) or the recovered plaintext
 /// is not exactly 32 bytes.
-pub(crate) fn open_sender_key_response_with_dh(
+pub fn open_sender_key_response_with_dh(
     dh: &Zeroizing<[u8; 32]>,
     pk_rm: &[u8; hpke_p256::PUBLIC_KEY_LEN],
     context_id: &str,

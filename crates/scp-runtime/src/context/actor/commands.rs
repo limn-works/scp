@@ -1132,7 +1132,7 @@ pub enum LifecycleCommand {
     ///
     /// Reply replies `Ok(())` regardless of per-context persist outcome;
     /// persist failures log via `tracing::warn!` inside the handler and
-    /// increment `crate::metrics::record_persistence_failure()` so the
+    /// increment `scp_runtime_types::metrics::record_persistence_failure()` so the
     /// legacy `_legacy` body's observable side effects are preserved.
     FlushSnapshot {
         /// Oneshot reply channel. Always replies `Ok(())` — best-effort
@@ -1864,8 +1864,8 @@ pub enum BroadcastCommand {
 pub type VerifyPaymentReceiptsReply = oneshot::Sender<
     Vec<
         Result<
-            crate::economy::receipt::ReceiptVerification,
-            crate::economy::receipt::ReceiptVerificationError,
+            scp_runtime_types::economy::receipt::ReceiptVerification,
+            scp_runtime_types::economy::receipt::ReceiptVerificationError,
         >,
     >,
 >;
@@ -1890,13 +1890,13 @@ pub enum EconomyCommand {
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
     /// `mutated: false`. Verification results come back vector-indexed
     /// with the input receipts; each entry is either a
-    /// [`ReceiptVerification`](crate::economy::receipt::ReceiptVerification)
+    /// [`ReceiptVerification`](scp_runtime_types::economy::receipt::ReceiptVerification)
     /// or a
-    /// [`ReceiptVerificationError`](crate::economy::receipt::ReceiptVerificationError).
+    /// [`ReceiptVerificationError`](scp_runtime_types::economy::receipt::ReceiptVerificationError).
     VerifyPaymentReceipts {
         /// Receipts to verify. Boxed vector so the variant payload stays
         /// pointer-sized.
-        receipts: Box<Vec<crate::economy::adapter::PaymentReceipt>>,
+        receipts: Box<Vec<scp_runtime_types::economy::adapter::PaymentReceipt>>,
         /// Oneshot reply channel. See [`VerifyPaymentReceiptsReply`].
         reply: VerifyPaymentReceiptsReply,
     },
@@ -2617,7 +2617,7 @@ pub enum OutletsCommand {
         /// concurrent-double-settle race (the xctx path has no `stream_reservations`
         /// reconcile net). `None` for the same-context streaming pump (whose double
         /// -release guard is the `stream_reservations` record).
-        witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
+        witness_saga_id: Option<scp_runtime_types::context::supervisor::saga_journal::SagaId>,
         /// Oneshot reply carrying the captured receipt (`None` when nothing was
         /// billed / no adapter / capture failed / deferred on generation mismatch)
         /// plus `applied` — whether the owned-state settlement (refund + release +
@@ -2918,16 +2918,18 @@ pub enum QueriesCommand {
     /// Reads the actor-owned `state.payment_receipts` local buffer (NOT the
     /// durable Merkle log — `PaymentReceived` is per-payee, excluded from the
     /// canonical log per ADR-011 amendment exclusion taxonomy §2), applies the
-    /// optional [`ReceiptFilter`](crate::economy::receipt::ReceiptFilter), and
+    /// optional [`ReceiptFilter`](scp_runtime_types::economy::receipt::ReceiptFilter), and
     /// replies with the matching receipts. Empty `Vec` iff the context is
     /// unknown (soft default, matching the other read variants).
     PaymentHistory {
         /// Context identifier string.
         context_id: String,
         /// Optional filter (payer / payee / time range). `None` returns all.
-        filter: Option<crate::economy::receipt::ReceiptFilter>,
+        filter: Option<scp_runtime_types::economy::receipt::ReceiptFilter>,
         /// Oneshot reply channel carrying the matching receipts.
-        reply: oneshot::Sender<Result<Vec<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+        reply: oneshot::Sender<
+            Result<Vec<scp_runtime_types::economy::adapter::PaymentReceipt>, ContextError>,
+        >,
     },
 
     // -------------------------------------------------------------------
@@ -3315,7 +3317,7 @@ pub type CommitBStreamSettleReply =
 pub struct StreamSettleApplication {
     /// The §19.15.5 `PaymentReceipt` captured for the billed amount, or `None`
     /// (nothing billed / no adapter / capture failed / deferred).
-    pub receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    pub receipt: Option<scp_runtime_types::economy::adapter::PaymentReceipt>,
     /// `true` iff the matching-live-instance settlement applied — the escrow
     /// refund + §7.3.8 counter release landed AND (for a witness-bearing xctx
     /// settlement) `xctx_committed_stream_outputs[saga_id].settled` was flipped to
@@ -3446,7 +3448,7 @@ pub enum SagaPhaseMessage {
         /// so a `PreparingB`-window crash recovery (`Abort { None }`, keyed by
         /// the same `SagaId`) can reverse the reservation without the in-memory
         /// carrier (spec §6.2.4 "Reservation release on every terminal path").
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// Caller context id (raw 32-byte digest) — the actor's own context.
         caller_context_id: [u8; 32],
         /// Caller DID — the channel-authenticated initiator (spec §6.2.4
@@ -3469,7 +3471,7 @@ pub enum SagaPhaseMessage {
     /// prepared into `saga_pending`, persists Class-S fail-closed, and replies.
     PrepareB {
         /// Durable saga identifier (the `saga_pending` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// Caller context id (raw 32-byte digest).
         caller_context_id: [u8; 32],
         /// Target context id (raw 32-byte digest) — MUST equal B's own context
@@ -3524,7 +3526,7 @@ pub enum SagaPhaseMessage {
     /// Read-only — performs no mutation, so no Class-S persist here.
     CommitBReserve {
         /// Durable saga identifier (the `saga_pending` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// Oneshot reply channel. See [`CommitBReserveReply`].
         reply: CommitBReserveReply,
     },
@@ -3544,7 +3546,7 @@ pub enum SagaPhaseMessage {
     /// bytes verbatim and does NOT re-append or re-sign.
     CommitBSettle {
         /// Durable saga identifier.
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The outlet executor's captured output bytes (the FSM ran the executor
         /// supervisor-side between reserve and settle). Hashed into the
         /// receipt's `output_hash` and carried as the receipt's JCS output.
@@ -3565,7 +3567,7 @@ pub enum SagaPhaseMessage {
     /// a replay re-acks without re-settling or re-appending.
     CommitA {
         /// Durable saga identifier.
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The caller-side escrow + outbound-rate-limit reservation staged at
         /// Prepare-A and held by the FSM across the saga. Commit-A settles
         /// (captures) it. Boxed to keep the variant size uniform under
@@ -3602,7 +3604,7 @@ pub enum SagaPhaseMessage {
     /// its `CrossContextOutletInvoked` … as a no-op"; the witness IS that re-ack).
     CommitACheckWitness {
         /// Durable saga identifier (the `xctx_committed_invocations` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// Oneshot reply: `true` iff Commit-A is durably recorded for this saga.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
@@ -3613,7 +3615,7 @@ pub enum SagaPhaseMessage {
     /// no-op if the saga is already terminal (slot absent and no reservation).
     Abort {
         /// Durable saga identifier.
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// On the CALLER (A) side, the staged escrow + outbound-RL reservation
         /// the FSM holds, handed back so Abort can RAII-release it (rollback
         /// path). `None` on the TARGET (B) side, whose staged reservation lives
@@ -3631,7 +3633,7 @@ pub enum SagaPhaseMessage {
     /// per-call.
     EmitDivergenceMarker {
         /// Durable saga identifier.
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The 16-byte correlation nonce joining the two event-log records.
         nonce: [u8; 16],
         /// Which side committed (caller or target).
@@ -3669,7 +3671,7 @@ pub enum SagaPhaseMessage {
     /// the committed witness is present) or was aborted (slot absent).
     StreamCaptureAppend {
         /// Durable saga identifier (the `saga_pending` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The emitted operator-signed chunk to fold into the durable frontier.
         /// The seal task pushes exactly what B's pump emitted (already dropping
         /// above-cancel-ack `Data` chunks), so the unbounded-ceiling frontier
@@ -3704,7 +3706,7 @@ pub enum SagaPhaseMessage {
     /// bounded root (AC8).
     CommitBStreamSettle {
         /// Durable saga identifier.
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The stream's §5.4.5 terminal status, recorded into the B-side
         /// `OutletInvoked` event (Ok / Error / Cancelled).
         terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus,
@@ -3737,7 +3739,7 @@ pub enum SagaPhaseMessage {
     /// ([`Self::CommitBStreamSettle`]).
     PrepareBStreaming {
         /// Durable saga identifier (the `saga_pending` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The boxed §6.2.4 Prepare-B field set + the streaming escrow ledger
         /// inputs. BOXED to keep this variant small so `ContextCommand` and the
         /// actor dispatch future stay under the `clippy::large_enum_variant` /
@@ -3762,7 +3764,7 @@ pub enum SagaPhaseMessage {
     /// Active Signing Key, supplied at the key-bearing recovery surface).
     StreamSettleCheckWitness {
         /// Durable saga identifier (the `xctx_committed_stream_outputs` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// Oneshot reply: the durable witness recovery status (present / settled /
         /// rebuilt settlement / A-side leaf inputs), READ-ONLY.
         reply: oneshot::Sender<Result<StreamWitnessRecoveryStatus, ContextError>>,
@@ -3781,7 +3783,7 @@ pub enum SagaPhaseMessage {
     /// if the saga already sealed / aborted (slot gone).
     StreamStageCounterReserve {
         /// Durable saga identifier (the `saga_pending` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
         /// The §7.3.8 worst-case cumulative amount reserved at open.
         amount_cumulative_reserved: u64,
         /// The invoker-declared `estimated_chunk_count` (diagnostics only).

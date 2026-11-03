@@ -99,10 +99,10 @@ use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::handle::SupervisorHandle;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
-use crate::crypto::mls::backend::MlsBackend;
 use crate::crypto::mls::provider::NodeMlsFactory;
-use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
-use crate::economy::adapter::PaymentAdapterDyn;
+use scp_runtime_types::crypto::mls::backend::MlsBackend;
+use scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use scp_runtime_types::economy::adapter::PaymentAdapterDyn;
 
 // ---------------------------------------------------------------------------
 // ActorDeps

@@ -544,7 +544,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// [`ContextError::PersistenceFailed`]. When the Supervisor has dropped,
 /// nothing is persisted and the reply carries the floor export's error
 /// (ADR-049 Decision 16 item 4). Every failure is also logged and counted
-/// through `crate::metrics::record_persistence_failure()`.
+/// through `scp_runtime_types::metrics::record_persistence_failure()`.
 // `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
 // snapshot is built from `&PerContextState` in the synchronous prelude; the
 // returned future captures only the owned `context_id` / `snapshot` / `reply`
@@ -590,7 +590,7 @@ fn handle_flush_snapshot_actor<'d>(
     let (sender_epochs, recv_floors) = match floors {
         Ok(floors) => floors,
         Err(e) => {
-            crate::metrics::record_persistence_failure();
+            scp_runtime_types::metrics::record_persistence_failure();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -629,7 +629,7 @@ fn handle_flush_snapshot_actor<'d>(
             .persist_context(&context_id, &snapshot)
             .await
             .map_err(|e| {
-                crate::metrics::record_persistence_failure();
+                scp_runtime_types::metrics::record_persistence_failure();
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,

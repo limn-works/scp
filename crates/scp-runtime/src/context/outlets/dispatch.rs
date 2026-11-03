@@ -1,7 +1,7 @@
 //! Streaming dispatch wiring (SCP-OUT-034 follow-up).
 //!
 //! Glues together the four primitives from
-//! [`super::stream`] — [`CreditTracker`], [`StreamEscrow`],
+//! [`scp_runtime_types::context::outlets::stream`] — [`CreditTracker`], [`StreamEscrow`],
 //! [`CancelAckTracker`], and [`StreamAdmissionTracker`] — into the
 //! actual streaming dispatch path that the runtime runs at
 //! `OutletStreamOpen` acceptance time.
@@ -51,7 +51,7 @@
 //!      `OutletInvokedEvent` field; the event-local wire-invariant
 //!      `chunks_billed <= stream_chunk_count` is then enforced at the
 //!      event-log append boundary via
-//!      [`super::stream::verify_outlet_invoked_event_local`].
+//!      [`scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_local`].
 //!
 //! See `.docs/specs/05-contexts.md` §5.4.5 for the spec source.
 
@@ -87,9 +87,9 @@ use scp_protocol::context::outlets::stream::{
 };
 use scp_protocol::crypto::ucan::validate::RevocationChecker;
 
-use super::signer::{StreamSigner, StreamSignerError};
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
+use scp_runtime_types::context::outlets::signer::{StreamSigner, StreamSignerError};
 
 use tokio::sync::{Notify, mpsc};
 
@@ -101,7 +101,7 @@ use super::invoke::{
     accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
     release_stream_admission,
 };
-use super::stream::{
+use scp_runtime_types::context::outlets::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
     OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
     admission_outcome_to_slug, coerce_estimated_chunk_count, cumulative_reserve_amount,
@@ -452,7 +452,7 @@ pub struct OpenStreamParams {
     pub cost_per_chunk: Amount,
     /// Invoker's available balance at open. Retained for the legacy /
     /// test open paths that still gate via
-    /// [`crate::context::outlets::stream::StreamEscrow::reserve_at_open`].
+    /// [`scp_runtime_types::context::outlets::stream::StreamEscrow::reserve_at_open`].
     /// The production native-bridge path no longer consults this — the
     /// manager debits the hold under its own lock and passes the result
     /// in `reserved_escrow` (E2 remediation).
@@ -461,7 +461,7 @@ pub struct OpenStreamParams {
     /// against the invoker's `MemberBudgetTracker` via
     /// `outlet_stream_reserve_escrow`
     /// (E2 remediation). `reserve_escrow` builds the
-    /// [`crate::context::outlets::stream::StreamEscrow`] directly from this
+    /// [`scp_runtime_types::context::outlets::stream::StreamEscrow`] directly from this
     /// value (`reserved == reserved_escrow`, `billed == 0`) — the
     /// `InsufficientFunds` / `Overflow` balance decision lives entirely in the
     /// manager (the only lock holder), so the dispatch path no longer
@@ -997,7 +997,7 @@ impl StreamSessionHandle {
     /// # Errors
     ///
     /// Returns the `(slug, code)` pair for the rejection. The §5.4.5
-    /// slugs are routed via [`grant_error_to_slug`](crate::context::outlets::stream::grant_error_to_slug). A returned error
+    /// slugs are routed via [`grant_error_to_slug`](scp_runtime_types::context::outlets::stream::grant_error_to_slug). A returned error
     /// means NO escrow extension happened — the caller reverses its
     /// reserved top-up.
     pub fn apply_credit_grant(
@@ -1062,14 +1062,14 @@ impl StreamSessionHandle {
     ///    the pinned identity, snapshot `invoker_pk`. Drop the lock.
     /// 2. Validate the caller's [`CancelIdentity`] matches the pinned
     ///    `(context_id, outlet_id, caveats_binding)` triple — mismatch →
-    ///    [`super::stream::CancelError::SignatureInvalid`] (NO mutation).
+    ///    [`scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid`] (NO mutation).
     /// 3. Build the `SCP-OUTLET-CANCEL-V1:` preimage over
     ///    `(pinned ctx, pinned outlet, self.request_id, seq, pinned
     ///    binding)` — NO lock held — and `await` the signer.
     /// 4. Re-lock. If the cursor advanced (`next_emission_seq != seq`) and
     ///    the bounded retry budget (cap 4) remains, loop back to step 1
     ///    against the new cursor; on exhaustion →
-    ///    [`super::stream::CancelError::CursorAdvanced`] (retryable, NO
+    ///    [`scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced`] (retryable, NO
     ///    mutation). Otherwise self-verify the signature under
     ///    `invoker_pk`, record the cancel-ack at `seq`, arm the cancel-ack
     ///    timer, and wake the pump.
@@ -1082,21 +1082,21 @@ impl StreamSessionHandle {
     ///
     /// # Errors
     ///
-    /// - [`super::stream::CancelError::SignatureInvalid`] — the caller's
+    /// - [`scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid`] — the caller's
     ///   identity did not match the pinned triple, or the runtime's own
     ///   just-produced signature failed self-verification (an internal
     ///   invariant violation). No stream state is mutated.
-    /// - [`super::stream::CancelError::CursorAdvanced`] — the cursor moved
+    /// - [`scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced`] — the cursor moved
     ///   on every one of the bounded attempts. Retryable: the caller
     ///   re-issues and the runtime re-reads the now-current cursor. No
     ///   stream state is mutated.
-    /// - [`super::stream::CancelError::Signing`] — the [`StreamSigner`]
+    /// - [`scp_runtime_types::context::outlets::stream::CancelError::Signing`] — the [`StreamSigner`]
     ///   failed to produce a signature.
     pub async fn apply_outlet_cancel_signed(
         &self,
         signer: &dyn StreamSigner,
         identity: &CancelIdentity,
-    ) -> Result<Option<u64>, super::stream::CancelError> {
+    ) -> Result<Option<u64>, scp_runtime_types::context::outlets::stream::CancelError> {
         /// Maximum number of cursor-advance retries before returning the
         /// retryable [`CancelError::CursorAdvanced`]. A stream advances its
         /// cursor at most once per emitted chunk; four attempts comfortably
@@ -1128,7 +1128,9 @@ impl StreamSessionHandle {
                 || identity.outlet_id != pinned.outlet_id
                 || identity.caveats_binding != pinned.caveats_binding
             {
-                return Err(super::stream::CancelError::SignatureInvalid);
+                return Err(
+                    scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid,
+                );
             }
 
             // ---- build preimage + sign OFF-LOCK (no lock across await). --
@@ -1142,7 +1144,7 @@ impl StreamSessionHandle {
             let sig = signer
                 .sign(&preimage)
                 .await
-                .map_err(super::stream::CancelError::Signing)?;
+                .map_err(scp_runtime_types::context::outlets::stream::CancelError::Signing)?;
             let cancel = OutletStreamCancel {
                 request_id: self.request_id,
                 next_seq: seq,
@@ -1165,10 +1167,12 @@ impl StreamSessionHandle {
                 if attempts < MAX_CURSOR_RETRIES {
                     continue;
                 }
-                return Err(super::stream::CancelError::CursorAdvanced {
-                    signed: seq,
-                    current,
-                });
+                return Err(
+                    scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced {
+                        signed: seq,
+                        current,
+                    },
+                );
             }
             // Self-verify the signature we just produced under the pinned
             // invoker key. A failure here is an internal invariant
@@ -1182,7 +1186,9 @@ impl StreamSessionHandle {
                 &pinned.outlet_id,
                 &pinned.caveats_binding,
             ) {
-                return Err(super::stream::CancelError::SignatureInvalid);
+                return Err(
+                    scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid,
+                );
             }
             guard.cancel_ack.record_cancel(seq, now);
             let recorded = guard.cancel_ack.cancel_ack_seq();
@@ -1207,18 +1213,18 @@ impl StreamSessionHandle {
     /// per §5.4.5 a runtime that records `cancel.next_seq` verbatim without
     /// cross-checking its own cursor would absorb a forged cursor. A
     /// `next_seq` that does not match the live cursor is rejected as
-    /// [`super::stream::CancelError::CursorAdvanced`] (NO mutation) rather
+    /// [`scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced`] (NO mutation) rather
     /// than absorbed.
     ///
     /// On signature-verification failure, returns
-    /// [`super::stream::CancelError::SignatureInvalid`] and does NOT mutate
+    /// [`scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid`] and does NOT mutate
     /// stream state.
     ///
     /// # Errors
     ///
-    /// - [`super::stream::CancelError::SignatureInvalid`] — signature does
+    /// - [`scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid`] — signature does
     ///   not verify under the pinned key + triple.
-    /// - [`super::stream::CancelError::CursorAdvanced`] — `cancel.next_seq`
+    /// - [`scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced`] — `cancel.next_seq`
     ///   does not match the runtime's live next-to-emit cursor.
     // `allow` (not `expect`): the verbatim-apply path is the single
     // verify+record primitive for cross-context forwarding waves. Its caller —
@@ -1233,7 +1239,7 @@ impl StreamSessionHandle {
     pub(crate) fn apply_outlet_cancel_verbatim(
         &self,
         cancel: &OutletStreamCancel,
-    ) -> Result<Option<u64>, super::stream::CancelError> {
+    ) -> Result<Option<u64>, scp_runtime_types::context::outlets::stream::CancelError> {
         let now = Instant::now();
         let mut guard = self
             .state
@@ -1245,10 +1251,12 @@ impl StreamSessionHandle {
         // A verbatim-apply path MUST NOT absorb a `next_seq` that disagrees
         // with the runtime's own emission cursor.
         if cancel.next_seq != guard.next_emission_seq {
-            return Err(super::stream::CancelError::CursorAdvanced {
-                signed: cancel.next_seq,
-                current: guard.next_emission_seq,
-            });
+            return Err(
+                scp_runtime_types::context::outlets::stream::CancelError::CursorAdvanced {
+                    signed: cancel.next_seq,
+                    current: guard.next_emission_seq,
+                },
+            );
         }
         // Verify under the pinned key + identity. Per §5.4.5, an
         // unsigned-or-tampered cancel is `Authorization::AuthorizationFailed`
@@ -1260,7 +1268,7 @@ impl StreamSessionHandle {
             &identity.outlet_id,
             &identity.caveats_binding,
         ) {
-            return Err(super::stream::CancelError::SignatureInvalid);
+            return Err(scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid);
         }
         guard.cancel_ack.record_cancel(cancel.next_seq, now);
         let recorded = guard.cancel_ack.cancel_ack_seq();
@@ -1445,7 +1453,7 @@ fn release_admission(
 /// invoker-declared `estimated_chunk_count`, which the invoker can set as low
 /// as `1` while `max_calls = 50` to evade the cap cross-stream. The gate
 /// RESERVES
-/// [`super::stream::cumulative_reserve_amount`]
+/// [`scp_runtime_types::context::outlets::stream::cumulative_reserve_amount`]
 /// (`cost_per_chunk × effective_max_billable_chunks`, `<= cap` by construction)
 /// against the [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind::AmountCumulative) counter; close-time settlement
 /// releases the unspent `reserved − billed_count × cost_per_chunk` via
@@ -1464,7 +1472,7 @@ pub struct StreamCounterReservation {
 struct CounterCommitOutcome {
     /// The cumulative amount RESERVED against the `AmountCumulative` counter —
     /// the WORST-CASE billable spend from
-    /// [`super::stream::cumulative_reserve_amount`]
+    /// [`scp_runtime_types::context::outlets::stream::cumulative_reserve_amount`]
     /// (`cost_per_chunk × effective_max_billable_chunks`, `<= cap` by
     /// construction). Recorded so close-time settlement releases the unspent
     /// portion (`reserved − billed_count × cost_per_chunk`). `0` when the cap is
@@ -1492,7 +1500,7 @@ struct CounterCommitOutcome {
 ///
 /// Cumulative-cap reserve: the `AmountCumulative` charge is the WORST-CASE
 /// billable spend from
-/// [`super::stream::cumulative_reserve_amount`] —
+/// [`scp_runtime_types::context::outlets::stream::cumulative_reserve_amount`] —
 /// `cost_per_chunk × effective_max_billable_chunks` (the §5.4.5:758 ceiling
 /// AND-folded with `floor(cap / cost)`), `<= cap` by construction. It is
 /// deliberately INDEPENDENT of the invoker-declared `estimated_chunk_count`
@@ -1880,7 +1888,7 @@ pub(crate) struct PumpEventEmissionInputs {
 /// spend `amount_cumulative_reserved` (= `cost_per_chunk ×
 /// effective_max_billable_chunks`, `<= cap` by construction) against the
 /// cumulative counter ([`commit_counter_reservation`] via
-/// [`super::stream::cumulative_reserve_amount`]). At
+/// [`scp_runtime_types::context::outlets::stream::cumulative_reserve_amount`]). At
 /// close the stream billed only `billed_count` chunks, so
 /// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating) is
 /// given back to the counter — the cap ends up debited by exactly the billed
@@ -3695,8 +3703,8 @@ mod tests {
     ) -> Arc<RwLock<SharedSessionState>> {
         let key = fixed_signing_key();
         let signer: Arc<dyn StreamSigner> =
-            Arc::new(super::super::signer::InProcessStreamSigner::new(key));
-        let identity = super::super::stream::StreamIdentity {
+            Arc::new(scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(key));
+        let identity = scp_runtime_types::context::outlets::stream::StreamIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),
             stream_epoch: 1,
@@ -3717,7 +3725,7 @@ mod tests {
         );
         Arc::new(RwLock::new(SharedSessionState {
             credit,
-            escrow: super::super::stream::StreamEscrow::zero_escrow(),
+            escrow: scp_runtime_types::context::outlets::stream::StreamEscrow::zero_escrow(),
             cancel_ack,
             admission,
             origin_admission,
@@ -3838,8 +3846,10 @@ mod tests {
         // post-close grant.
         {
             let mut guard = state.write().unwrap();
-            guard.escrow =
-                super::super::stream::StreamEscrow::from_reserved(Amount::new(7), Amount::new(70));
+            guard.escrow = scp_runtime_types::context::outlets::stream::StreamEscrow::from_reserved(
+                Amount::new(7),
+                Amount::new(70),
+            );
             // Drive the stream to its terminal state.
             guard.pump_exited = true;
         }
@@ -3872,12 +3882,12 @@ mod tests {
             .expect_err("grant after close must reject");
         assert_eq!(err, GrantError::StreamClosed, "post-close grant slug");
         assert_eq!(
-            super::super::stream::grant_error_to_slug(err),
+            scp_runtime_types::context::outlets::stream::grant_error_to_slug(err),
             scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
             "StreamClosed routes to protocol.stream-already-closed",
         );
         assert_eq!(
-            super::super::stream::grant_error_to_code(err),
+            scp_runtime_types::context::outlets::stream::grant_error_to_code(err),
             scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
             "StreamClosed routes to the Protocol-class SCP-OUTLET-6101 code",
         );
@@ -3918,11 +3928,12 @@ mod tests {
             verifying_key: ed25519_dalek::VerifyingKey,
         }
         #[async_trait::async_trait]
-        impl super::super::signer::StreamSigner for PanickingSigner {
+        impl scp_runtime_types::context::outlets::signer::StreamSigner for PanickingSigner {
             async fn sign(
                 &self,
                 _preimage: &[u8],
-            ) -> Result<[u8; 64], super::super::signer::StreamSignerError> {
+            ) -> Result<[u8; 64], scp_runtime_types::context::outlets::signer::StreamSignerError>
+            {
                 panic!("injected pump-body panic for stranded-hold guard test");
             }
             fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
@@ -3966,7 +3977,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[0x42; 32]);
         let verifying_key = signing.verifying_key();
         let signer: Arc<dyn StreamSigner> = Arc::new(PanickingSigner { verifying_key });
-        let identity = super::super::stream::StreamIdentity {
+        let identity = scp_runtime_types::context::outlets::stream::StreamIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),
             stream_epoch: 1,
@@ -3981,7 +3992,7 @@ mod tests {
         );
         let state = Arc::new(RwLock::new(SharedSessionState {
             credit,
-            escrow: super::super::stream::StreamEscrow::from_reserved(
+            escrow: scp_runtime_types::context::outlets::stream::StreamEscrow::from_reserved(
                 Amount::new(7),
                 Amount::new(70),
             ),
@@ -4880,7 +4891,9 @@ mod tests {
 
         // Signer wrapping the same fixed key the fixture pinned as
         // invoker_pk (build_test_state uses fixed_signing_key() for both).
-        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+        let signer = scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
+            fixed_signing_key(),
+        );
 
         // Identity mismatch (wrong outlet_id) → SignatureInvalid, no mutation.
         let bad_id = CancelIdentity {
@@ -4892,7 +4905,7 @@ mod tests {
         assert!(
             matches!(
                 bad,
-                Err(super::super::stream::CancelError::SignatureInvalid)
+                Err(scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid)
             ),
             "identity mismatch must reject as SignatureInvalid, got {bad:?}"
         );
@@ -4970,13 +4983,15 @@ mod tests {
             // Signer wraps the correctly-pinned key — the ONLY thing wrong
             // here is the claimed identity, so the rejection comes from the
             // identity cross-check, not the self-verify.
-            let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+            let signer = scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
+                fixed_signing_key(),
+            );
 
             let res = handle.apply_outlet_cancel_signed(&signer, &bad_id).await;
             assert!(
                 matches!(
                     res,
-                    Err(super::super::stream::CancelError::SignatureInvalid)
+                    Err(scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid)
                 ),
                 "{dimension} mismatch must reject as SignatureInvalid, got {res:?}"
             );
@@ -5017,7 +5032,8 @@ mod tests {
             fixed_signing_key().verifying_key(),
             "test misconfigured: wrong key must differ from the pinned key"
         );
-        let signer = super::super::signer::InProcessStreamSigner::new(wrong_key);
+        let signer =
+            scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(wrong_key);
 
         // Identity triple is correct — the ONLY thing wrong is the key, so
         // the rejection is driven by the post-signing self-verify branch.
@@ -5031,7 +5047,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(super::super::stream::CancelError::SignatureInvalid)
+                Err(scp_runtime_types::context::outlets::stream::CancelError::SignatureInvalid)
             ),
             "wrong signer key must fail self-verify as SignatureInvalid, got {res:?}"
         );
@@ -5114,7 +5130,7 @@ mod tests {
         let mut g = state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.escrow = super::super::stream::StreamEscrow::from_reserved(
+        g.escrow = scp_runtime_types::context::outlets::stream::StreamEscrow::from_reserved(
             Amount::new(cost_per_chunk),
             Amount::new(reserved),
         );
@@ -5290,18 +5306,19 @@ mod tests {
     /// the pinned operator key on release (delegates to the inner signer), so
     /// the pump's just-signed `debug_assert!` self-verify still holds.
     struct BarrierSigner {
-        inner: super::super::signer::InProcessStreamSigner,
+        inner: scp_runtime_types::context::outlets::signer::InProcessStreamSigner,
         calls: std::sync::atomic::AtomicUsize,
         block_on_call: usize,
         sign_started: Arc<Notify>,
         release: Arc<Notify>,
     }
     #[async_trait::async_trait]
-    impl super::super::signer::StreamSigner for BarrierSigner {
+    impl scp_runtime_types::context::outlets::signer::StreamSigner for BarrierSigner {
         async fn sign(
             &self,
             preimage: &[u8],
-        ) -> Result<[u8; 64], super::super::signer::StreamSignerError> {
+        ) -> Result<[u8; 64], scp_runtime_types::context::outlets::signer::StreamSignerError>
+        {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if n == self.block_on_call {
                 // Announce the boundary chunk is mid-sign, then park until the
@@ -5338,7 +5355,9 @@ mod tests {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.operator_signer = Arc::new(BarrierSigner {
-                inner: super::super::signer::InProcessStreamSigner::new(fixed_signing_key()),
+                inner: scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
+                    fixed_signing_key(),
+                ),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 // seq 0..=4 sign non-blocking (calls 1..=5); the sixth Data
                 // (outer seq 5) blocks mid-sign.
@@ -5568,7 +5587,7 @@ mod tests {
         );
 
         // Pinned identity for signing grants (build_test_state fixture values).
-        let identity = super::super::stream::StreamIdentity {
+        let identity = scp_runtime_types::context::outlets::stream::StreamIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),
             stream_epoch: 1,
@@ -5690,7 +5709,9 @@ mod tests {
 
         // Apply a signed cancel at the live cursor (0 — no chunk emitted yet),
         // then stay silent so the executor never emits a terminal chunk.
-        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+        let signer = scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
+            fixed_signing_key(),
+        );
         let cancel_id = CancelIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),
@@ -5841,7 +5862,9 @@ mod tests {
         }
 
         // Cancel at the live cursor (5). The runtime reads its own cursor.
-        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+        let signer = scp_runtime_types::context::outlets::signer::InProcessStreamSigner::new(
+            fixed_signing_key(),
+        );
         let cancel_id = CancelIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),

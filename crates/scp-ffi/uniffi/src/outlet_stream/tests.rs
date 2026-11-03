@@ -1379,7 +1379,7 @@ async fn streaming_saga_registration_refused_after_shutdown_began() {
         let (_tx, rx) = mpsc::channel(1);
         StreamingSagaEntry {
             receiver: Arc::new(tokio::sync::Mutex::new(rx)),
-            saga_id: scp_core::context::supervisor::SagaId(id.to_owned()),
+            saga_id: scp_core::context::saga_journal::SagaId(id.to_owned()),
             target_context_id: "target-ctx-late".to_owned(),
             invoker_did: "did:scp:test-invoker".to_owned(),
             request_id: [0u8; 16],

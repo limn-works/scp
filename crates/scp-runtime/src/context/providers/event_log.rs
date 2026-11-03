@@ -855,10 +855,10 @@ impl MerkleEventLogProvider {
                 scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
             >(&payload.data)
         {
-            crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
+            scp_runtime_types::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
                 |err| {
                     let log_err =
-                        crate::context::outlets::stream::chunks_billed_error_to_event_log_error(
+                        scp_runtime_types::context::outlets::stream::chunks_billed_error_to_event_log_error(
                             err,
                         );
                     ContextCreationError::EventLogFailed(log_err.to_string())

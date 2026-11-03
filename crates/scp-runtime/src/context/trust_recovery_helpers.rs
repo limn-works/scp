@@ -370,8 +370,10 @@ pub async fn recovery_send_notification(
             &inner,
             aad_sequence,
         )?;
-        crate::context::actor::sequence::SequenceReservation::reserve(view.send_tracker_mut())
-            .commit();
+        scp_runtime_types::context::actor::sequence::SequenceReservation::reserve(
+            view.send_tracker_mut(),
+        )
+        .commit();
         encrypted
     };
 

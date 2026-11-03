@@ -29,12 +29,12 @@ use crate::context::outlets::invoke::InvocationCaveatBinding;
 use crate::context::outlets::invoke::{
     EconomicPolicySnapshot, MutableInvocation, OutletExecutor, OutletExecutorError,
 };
-use crate::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
-use crate::context::outlets::stream::{AdmissionCaps, StreamIdentity};
-use crate::context::supervisor::saga_journal::{
+use scp_runtime_types::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
+use scp_runtime_types::context::outlets::stream::{AdmissionCaps, StreamIdentity};
+use scp_runtime_types::context::supervisor::saga_journal::{
     ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
 };
-use crate::economy::adapter::{CountingPaymentAdapter, PaymentAdapterDyn};
+use scp_runtime_types::economy::adapter::{CountingPaymentAdapter, PaymentAdapterDyn};
 
 const SS_NOW: u64 = 1_700_000_000;
 const SS_CALLER: [u8; 32] = [0x51u8; 32];
@@ -242,10 +242,12 @@ fn build_ss_supervisor(
     let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
         Box::new(crate::context::builder::NotConfiguredTransportProvider);
     let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ),
     );
     let payment_adapter: Arc<dyn PaymentAdapterDyn> = Arc::new(CountingPaymentAdapter {
         captured: Arc::clone(captured),

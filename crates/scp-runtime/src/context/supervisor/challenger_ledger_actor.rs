@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::context::actor::signer::CommandSigner;
-use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 
 // ---------------------------------------------------------------------------
 // Constants

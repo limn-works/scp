@@ -42,11 +42,15 @@ pub enum KeyLoss {
 /// [`InMemoryKeyCustody`] that loses a key at the step [`KeyLoss`] names and
 /// otherwise delegates every call unchanged.
 pub struct KeyLossCustody {
+    /// The custody every call delegates to.
     pub inner: InMemoryKeyCustody,
+    /// The step at which the key is lost.
     pub loss: KeyLoss,
 }
 
 impl KeyLossCustody {
+    /// A custody over a fresh [`InMemoryKeyCustody`] that loses a key at `loss`.
+    #[must_use]
     pub fn new(loss: KeyLoss) -> Self {
         Self {
             inner: InMemoryKeyCustody::new(),

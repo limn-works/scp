@@ -213,10 +213,12 @@ fn supervisor() -> Arc<Supervisor> {
         "did:dht:z6MkPushRegistrarNode".to_owned(),
         system_clock(),
     ));
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
     );
     Supervisor::with_providers(
         crypto,

@@ -666,7 +666,7 @@ mod broadcast_envelope {
 
 mod sender_key_types {
     use super::*;
-    use scp_runtime::crypto::sender_keys::key_protocol::{
+    use scp_runtime_types::crypto::sender_keys::key_protocol::{
         BlockNotification, SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse,
     };
 
@@ -990,7 +990,7 @@ mod context_params {
 
 mod access_key_types {
     use super::*;
-    use scp_runtime::crypto::access_keys::wire::{AccessKeyRequest, AccessKeyResponse};
+    use scp_runtime_types::crypto::access_keys::wire::{AccessKeyRequest, AccessKeyResponse};
 
     /// §13.9 item 3: `AccessKeyRequest` MUST ignore unknown fields.
     #[test]

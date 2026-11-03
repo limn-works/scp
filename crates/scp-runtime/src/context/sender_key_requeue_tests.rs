@@ -299,10 +299,12 @@ async fn alice_deps(
     store: &Arc<Store>,
     clock: &Arc<TestClock>,
 ) -> (ActorDeps, Arc<Supervisor>, EventRx) {
-    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
-        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )),
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
     );
     let clock: Arc<dyn Clock> = Arc::clone(clock) as Arc<dyn Clock>;
     let (event_tx, events) = tokio::sync::broadcast::channel(64);
@@ -1018,16 +1020,17 @@ mod operations {
     }
 
     fn resolver() -> scp_protocol::context::governance::KeyResolver {
-        crate::crypto::mls::test_support::role_resolver(
+        scp_runtime_types::crypto::mls::test_support::role_resolver(
             &[ALICE, BOB, CAROL].map(|d| (DID::from(d), key(d))),
         )
     }
 
-    fn mls_storage() -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+    fn mls_storage()
+    -> Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
         Arc::new(
-            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                scp_platform::in_memory::InMemoryStorage::new(),
-            )),
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+            ),
         )
     }
 
@@ -1416,7 +1419,7 @@ mod operations {
         node.relay.down.store(false, Ordering::SeqCst);
         tokio::time::pause();
         tokio::time::sleep(std::time::Duration::from_secs(
-            crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS + 1,
+            scp_runtime_types::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS + 1,
         ))
         .await;
         for _ in 0..200 {

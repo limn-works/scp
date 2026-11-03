@@ -14,10 +14,10 @@ pub use scp_protocol::serde_util;
 pub use scp_protocol::uri;
 
 // --- Modules that exist ONLY in scp-runtime (no conflict) ---
-pub use scp_runtime::metrics;
 pub use scp_runtime::push;
 pub use scp_runtime::store;
-pub use scp_runtime::well_known;
+pub use scp_runtime_types::metrics;
+pub use scp_runtime_types::well_known;
 
 // --- Modules split across both crates (explicit sub-module merging) ---
 
@@ -37,27 +37,26 @@ pub mod crypto {
             InMemoryMlsProvider, attested_key_package, credential, encrypt, epoch_grace, error,
             group, key_package, ratchet, wire, wrapping_extension,
         };
-        // Node-only async MLS backend and provider from scp-runtime.
-        pub use scp_runtime::crypto::mls::{
-            NodeMlsFactory, backend, production_backend, provider, storage_adapter,
-        };
+        // Node-only async MLS backend (scp-runtime-types) and provider (scp-runtime).
+        pub use scp_runtime::crypto::mls::{NodeMlsFactory, provider};
+        pub use scp_runtime_types::crypto::mls::{backend, production_backend, storage_adapter};
     }
     pub mod sender_keys {
         pub use scp_protocol::crypto::sender_keys::*;
-        pub use scp_runtime::crypto::sender_keys::key_protocol;
-        pub use scp_runtime::crypto::sender_keys::key_protocol::{
+        pub use scp_runtime_types::crypto::sender_keys::key_protocol;
+        pub use scp_runtime_types::crypto::sender_keys::key_protocol::{
             handle_sender_key_request, open_sender_key_response, publish_sender_key_epoch_advance,
             request_sender_key, send_block_notification,
         };
     }
     pub mod access_keys {
         pub use scp_protocol::crypto::access_keys::*;
-        pub use scp_runtime::crypto::access_keys::lifecycle;
-        pub use scp_runtime::crypto::access_keys::wire;
+        pub use scp_runtime_types::crypto::access_keys::lifecycle;
+        pub use scp_runtime_types::crypto::access_keys::wire;
     }
     pub mod ucan {
         pub use scp_protocol::crypto::ucan::*;
-        pub use scp_runtime::crypto::ucan::mint;
+        pub use scp_runtime_types::crypto::ucan::mint;
     }
 }
 
@@ -68,13 +67,13 @@ pub mod context {
     pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
-    pub use scp_runtime::context::invitation_helpers;
-    pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::ttl;
     pub use scp_runtime::context::ttl::{
         ExtensionConsentMode, TtlExtensionProposal, consent_mode_for_member_count,
     };
+    pub use scp_runtime_types::context::invitation_helpers;
+    pub use scp_runtime_types::context::policy;
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
         AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
@@ -113,6 +112,10 @@ pub mod context {
     /// can construct the commits-7-to-11 query shim. Shrinks back to an
     /// internal module in commit 12 when the shim is deleted.
     pub use scp_runtime::context::supervisor;
+    /// The saga journal types (`SagaId` and the rest) the FFI bridges name
+    /// when they drive a streaming saga (ADR-070: they live in
+    /// `scp-runtime-types`).
+    pub use scp_runtime_types::context::supervisor::saga_journal;
     // Broadcast content types (previously at context level).
     pub use scp_protocol::context::broadcast_content::{
         BROADCAST_CONTENT_MAGIC, BROADCAST_CONTENT_VERSION, BroadcastContent,
@@ -122,7 +125,7 @@ pub mod context {
     };
     pub mod governance {
         pub use scp_protocol::context::governance::*;
-        pub use scp_runtime::context::governance::timeout;
+        pub use scp_runtime_types::context::governance::timeout;
     }
     pub mod outlets {
         pub use scp_protocol::context::outlets::*;
@@ -155,10 +158,10 @@ pub mod context {
         pub use scp_runtime::context::outlets::invoke::{
             MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
         };
-        pub use scp_runtime::context::outlets::signer::{
+        pub use scp_runtime_types::context::outlets::signer::{
             StreamSigner, StreamSignerCustodyCategory, StreamSignerError,
         };
-        pub use scp_runtime::context::outlets::stream::{
+        pub use scp_runtime_types::context::outlets::stream::{
             AdmissionCaps, CancelError, GrantError, StreamIdentity, cancel_error_to_code,
             grant_error_to_code,
         };
@@ -218,11 +221,11 @@ pub mod trust {
 
 pub mod identity {
     pub use scp_protocol::identity::*;
-    pub use scp_runtime::identity::blocking;
-    pub use scp_runtime::identity::custody_migration;
     pub use scp_runtime::identity::recovery;
-    pub use scp_runtime::identity::scpid;
-    pub use scp_runtime::identity::scpid::{
+    pub use scp_runtime_types::identity::blocking;
+    pub use scp_runtime_types::identity::custody_migration;
+    pub use scp_runtime_types::identity::scpid;
+    pub use scp_runtime_types::identity::scpid::{
         ScpIdChallenge, ScpIdError, ScpIdResponse, scpid_challenge, scpid_sign, scpid_verify,
     };
 }
@@ -236,13 +239,13 @@ pub mod economy {
     pub use scp_protocol::economy::pricing::*;
     pub use scp_protocol::economy::types::*;
     // Async modules from scp-runtime.
-    pub use scp_runtime::economy::adapter;
-    pub use scp_runtime::economy::adapter::*;
-    pub use scp_runtime::economy::credentials;
-    pub use scp_runtime::economy::integration;
-    pub use scp_runtime::economy::integration::*;
-    pub use scp_runtime::economy::receipt;
-    pub use scp_runtime::economy::receipt::verification_results_to_json;
+    pub use scp_runtime_types::economy::adapter;
+    pub use scp_runtime_types::economy::adapter::*;
+    pub use scp_runtime_types::economy::credentials;
+    pub use scp_runtime_types::economy::integration;
+    pub use scp_runtime_types::economy::integration::*;
+    pub use scp_runtime_types::economy::receipt;
+    pub use scp_runtime_types::economy::receipt::verification_results_to_json;
 }
 
 pub mod discovery {
@@ -254,20 +257,20 @@ pub mod discovery {
     pub use scp_protocol::discovery::push::*;
     pub use scp_protocol::discovery::scope::*;
     // Async modules from scp-runtime.
-    pub use scp_runtime::discovery::addressing;
-    pub use scp_runtime::discovery::addressing::*;
-    pub use scp_runtime::discovery::bootstrap;
-    pub use scp_runtime::discovery::bootstrap::*;
-    pub use scp_runtime::discovery::dht_context;
-    pub use scp_runtime::discovery::dht_context::*;
-    pub use scp_runtime::discovery::did_capabilities;
-    pub use scp_runtime::discovery::search;
+    pub use scp_runtime_types::discovery::addressing;
+    pub use scp_runtime_types::discovery::addressing::*;
+    pub use scp_runtime_types::discovery::bootstrap;
+    pub use scp_runtime_types::discovery::bootstrap::*;
+    pub use scp_runtime_types::discovery::dht_context;
+    pub use scp_runtime_types::discovery::dht_context::*;
+    pub use scp_runtime_types::discovery::did_capabilities;
+    pub use scp_runtime_types::discovery::search;
 }
 
 pub mod envelope {
     pub use scp_protocol::envelope::*;
-    pub use scp_runtime::envelope::pseudonym;
-    pub use scp_runtime::envelope::pseudonym::derive_pseudonym;
+    pub use scp_runtime_types::envelope::pseudonym;
+    pub use scp_runtime_types::envelope::pseudonym::derive_pseudonym;
     pub mod inner {
         pub use scp_protocol::envelope::inner::*;
         pub use scp_runtime::envelope::inner::sign;
@@ -283,7 +286,7 @@ pub mod sync {
     pub use scp_protocol::sync::*;
     pub use scp_runtime::sync::days_offline;
     pub use scp_runtime::sync::hours_offline;
-    pub use scp_runtime::sync::weeks_offline;
+    pub use scp_runtime_types::sync::weeks_offline;
 }
 
 pub mod provenance {

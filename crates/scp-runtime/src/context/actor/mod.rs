@@ -17,10 +17,10 @@
 //! - [`outcome::Outcome`] — handler return type. Carries `mutated: bool`
 //!   so the actor knows when to mark its state dirty for coalesced
 //!   persistence.
-//! - [`sequence::SequenceReservation`] — RAII guard around a reserved
+//! - [`scp_runtime_types::context::actor::sequence::SequenceReservation`] — RAII guard around a reserved
 //!   send-sequence number. Drop rolls back; explicit `commit()` makes
 //!   the reservation durable.
-//! - [`sequence::SendSequenceTracker`] — minimal monotonic counter the
+//! - [`scp_runtime_types::context::actor::sequence::SendSequenceTracker`] — minimal monotonic counter the
 //!   reservation guards.
 //!
 //! # Commit-6 additions
@@ -43,7 +43,6 @@ pub mod handle;
 pub mod handlers;
 pub mod outcome;
 pub mod pseudonym_rotation;
-pub mod sequence;
 pub mod signer;
 pub mod state;
 
@@ -59,7 +58,6 @@ pub use handle::{ContextActorHandle, HANDLER_TIMEOUT, REPLY_TIMEOUT, SEND_TIMEOU
 // of `crate::context`) route through the single helper.
 pub(crate) use handle::{BoundedReplyError, bounded_reply_await};
 pub use outcome::Outcome;
-pub use sequence::{SendSequenceTracker, SequenceReservation};
 pub use signer::{CommandSigner, SIGN_TIMEOUT};
 pub use state::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
@@ -164,12 +162,12 @@ type RotationArmKey = (
 );
 
 /// Governance-timeout evaluation cadence (60 s). Re-exported from
-/// [`crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS`]
+/// [`scp_runtime_types::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS`]
 /// so the actor-owned `governance_timeout` interval fires on the exact
 /// cadence the retired supervisor-driven timer task used (ADR-049
 /// Decision-1 / finding A3 — the timer becomes an actor-owned arm).
 const GOVERNANCE_TIMEOUT_SECS: u64 =
-    crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
+    scp_runtime_types::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
 
 /// Fairness bound (ADR-049 §10 liveness defense-in-depth): the run loop's
 /// `select!` is `biased` (inbox first for shutdown determinism), so a
@@ -1511,12 +1509,13 @@ mod tests {
             Box::new(TestEventLog);
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
 
         let supervisor = Supervisor::with_providers(
             crypto,
@@ -2528,12 +2527,13 @@ mod tests {
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
 
         let supervisor = Supervisor::with_providers(
             crypto,

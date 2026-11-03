@@ -22,8 +22,8 @@ use scp_protocol::context::ContextError;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
-use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
-use crate::economy::integration::IntegrationError;
+use scp_runtime_types::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
+use scp_runtime_types::economy::integration::IntegrationError;
 
 // ---------------------------------------------------------------------------
 // Spending UCAN signature validation wiring (C1, PR #1606)

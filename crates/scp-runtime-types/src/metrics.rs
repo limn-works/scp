@@ -71,7 +71,7 @@ pub fn record_persistence_failure() {
 /// metric is intentionally rate-only (no `saga_id` label — that is an unbounded-
 /// cardinality anti-pattern); per-saga attribution comes from the structured
 /// `SCP-SAGA-RECOVERY` error log emitted alongside each increment.
-pub(crate) fn record_saga_repair_needed() {
+pub fn record_saga_repair_needed() {
     metrics::counter!("scp_saga_repair_needed_total").increment(1);
 }
 
@@ -89,7 +89,7 @@ pub(crate) fn record_saga_repair_needed() {
 /// that reversals are stranding — paired with a stable
 /// `event = "xctx_caller_reversal_outstanding"` structured warn at each site so
 /// log-based alerting can additionally attribute by `saga_id`.
-pub(crate) fn record_saga_caller_reversal_outstanding() {
+pub fn record_saga_caller_reversal_outstanding() {
     metrics::counter!("scp_saga_caller_reversal_outstanding_total").increment(1);
 }
 
@@ -100,7 +100,7 @@ pub(crate) fn record_saga_caller_reversal_outstanding() {
 /// RID-hijack attempt), uses a reserved routing ID value, or collides with a
 /// routing ID already claimed by a different member. A nonzero rate here
 /// signals either a misbehaving/forging peer or a routing-ID derivation bug.
-pub(crate) fn record_pseudonym_announcement_rejected() {
+pub fn record_pseudonym_announcement_rejected() {
     metrics::counter!("scp_pseudonym_announcements_rejected_total").increment(1);
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn record_pseudonym_announcement_rejected() {
 /// no-op and `#[must_use]` is silenced by an `_`-binding. A nonzero rate is a hard
 /// fault: an unconsumed token reached a production drop. Paired with the existing
 /// `tracing::error!` at the drop site for log-based alerting.
-pub(crate) fn record_class_s_token_dropped_uncommitted() {
+pub fn record_class_s_token_dropped_uncommitted() {
     metrics::counter!("scp_class_s_token_dropped_uncommitted_total").increment(1);
 }
 

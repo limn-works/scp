@@ -74,7 +74,7 @@ use crate::context::outlets::invoke::{
     self, InvocationError, OutletEconomyContext, economy_pre_check,
     post_outlet_invocation_bookkeeping,
 };
-use crate::economy::adapter::PaymentReceipt;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
 
 // ---------------------------------------------------------------------------
 // try_consume_hard_rate_limit (actor-handler entry point)
@@ -1360,7 +1360,7 @@ pub enum StreamSettleOutcome {
 ///    it does not maintain a capture-dedup ledger keyed by `request_id`. What the
 ///    runtime provides is the STABLE IDEMPOTENCY KEY — every capture flows through
 ///    [`authorize_and_capture_stream_billed`], which sets
-///    [`PaymentMetadata::idempotency_key`](crate::economy::adapter::PaymentMetadata::idempotency_key)
+///    [`PaymentMetadata::idempotency_key`](scp_runtime_types::economy::adapter::PaymentMetadata::idempotency_key)
 ///    to the stream `request_id` on `authorize`, and (because `capture` carries no
 ///    key of its own) lets capture idempotency ride the authorization identity
 ///    derived from that keyed authorize. The `request_id` is stable across the
@@ -1368,15 +1368,15 @@ pub enum StreamSettleOutcome {
 ///    so a crash-window re-run reconstructs the identical authorize key.
 ///
 ///    Whether that re-run actually bills ONCE therefore DEPENDS ENTIRELY on the
-///    INJECTED [`PaymentAdapter`](crate::economy::adapter::PaymentAdapter): exactly-once
+///    INJECTED [`PaymentAdapter`](scp_runtime_types::economy::adapter::PaymentAdapter): exactly-once
 ///    across a crash requires the adapter to (a) DEDUP `authorize` on
 ///    `idempotency_key` AND (b) be IDEMPOTENT on `capture` of an already-captured
 ///    authorization. An adapter that ignores the key WILL double-bill across a
 ///    crash and the runtime cannot detect or prevent it. This is the
 ///    MUST-honor adapter contract stated on the trait (see
-///    [`PaymentAdapter::authorize`](crate::economy::adapter::PaymentAdapter::authorize)
+///    [`PaymentAdapter::authorize`](scp_runtime_types::economy::adapter::PaymentAdapter::authorize)
 ///    /
-///    [`PaymentAdapter::capture`](crate::economy::adapter::PaymentAdapter::capture)).
+///    [`PaymentAdapter::capture`](scp_runtime_types::economy::adapter::PaymentAdapter::capture)).
 ///    A durable "captured" sub-flag would NOT help — capture is external and
 ///    non-transactional, so a sub-flag would only shrink, never close, the window.
 ///    The RUNTIME-ENFORCED root close is a runtime capture-dedup ledger keyed by
@@ -1405,7 +1405,7 @@ pub async fn settle_outlet_stream(
     // generation mismatch it instead DEFERS the entire settlement (no capture) so
     // crash recovery completes it exactly once against the restored instance
     // rather than double-billing.
-    witness_saga_id: Option<&crate::context::supervisor::saga_journal::SagaId>,
+    witness_saga_id: Option<&scp_runtime_types::context::supervisor::saga_journal::SagaId>,
 ) -> StreamSettleOutcome {
     // Destructure up front so the Fix-D generation-mismatch branch below can
     // read the settlement for its snapshot-policy capture. `reserved`
@@ -2402,13 +2402,13 @@ mod tests {
         use crate::context::actor::state::PerContextState;
         use crate::context::builder::ContextEventLogProvider;
         use crate::context::providers::MerkleEventLogProvider;
-        use crate::economy::adapter::PaymentMetadata;
-        use crate::economy::adapter::{
+        use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
+        use scp_runtime_types::economy::adapter::PaymentMetadata;
+        use scp_runtime_types::economy::adapter::{
             AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError,
             PaymentReceipt, RefundConfirmation, VerificationResult,
         };
-        use crate::economy::integration::{ActionEnvelope, PreparedAction};
-        use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
+        use scp_runtime_types::economy::integration::{ActionEnvelope, PreparedAction};
 
         const ADMIN: &str = "did:dht:z6MkAdminOutletSettle";
         const INVOKER: &str = "did:dht:z6MkInvokerOutletSettle";
@@ -2562,15 +2562,16 @@ mod tests {
                 Box::new(MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
                 Arc::new(|_, _| None);
-            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-                Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
+            let mls_storage: Arc<
+                dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                    Arc::new(InMemoryStorage::new()),
+                ),
+            );
             let clock: Arc<dyn scp_clock::Clock> =
                 Arc::new(scp_clock::TestClock::new(1_700_000_000));
-            let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            let payment_adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn> =
                 Arc::new(FailingCaptureAdapter);
             let supervisor = Supervisor::with_providers(
                 crypto,
@@ -3202,12 +3203,13 @@ mod tests {
                 Box::new(crate::context::providers::MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
                 Arc::new(|_, _| None);
-            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-                Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
+            let mls_storage: Arc<
+                dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                    Arc::new(InMemoryStorage::new()),
+                ),
+            );
             let clock: Arc<dyn scp_clock::Clock> =
                 Arc::new(scp_clock::TestClock::new(1_700_000_000));
             // No payment adapter: a free outlet (action_cost == 0) whose
@@ -3757,12 +3759,13 @@ mod tests {
             let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
                 Box::new(crate::context::providers::MerkleEventLogProvider::new());
             let key_resolver = mock_key_resolver();
-            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-                Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
+            let mls_storage: Arc<
+                dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                    Arc::new(InMemoryStorage::new()),
+                ),
+            );
             let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
             let supervisor = Supervisor::with_providers(
                 crypto,
@@ -4194,12 +4197,13 @@ mod tests {
                 Box::new(crate::context::providers::MerkleEventLogProvider::new());
             let key_resolver: scp_protocol::context::governance::KeyResolver =
                 Arc::new(|_, _| None);
-            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-                Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
+            let mls_storage: Arc<
+                dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                    Arc::new(InMemoryStorage::new()),
+                ),
+            );
             let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(NOW));
             let supervisor = Supervisor::with_providers(
                 crypto,

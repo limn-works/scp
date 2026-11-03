@@ -1301,11 +1301,13 @@ impl ConvergentDeadline {
 mod tests {
     use super::*;
     use crate::context::supervisor::key_package_actor::KeyPackageStoreActor;
-    use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
     use crate::crypto::wrapping::test_wrapping_key;
     use scp_platform::in_memory::InMemoryStorage;
     use scp_platform::testing::InMemoryKeyCustody;
+    use scp_runtime_types::context::supervisor::saga_journal::{
+        ProtocolRepositorySagaJournal, SagaJournal,
+    };
 
     struct TestPersistence;
     #[async_trait::async_trait]
@@ -1457,7 +1459,7 @@ mod tests {
     async fn my_key_package_store_returns_registered_handle() {
         use crate::context::supervisor::key_package_actor::KeyPackageStoreDeps;
         use crate::crypto::mls::provider::NodeMlsFactory;
-        use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
+        use scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
 
         let (sup, handle) = test_handle();
         let did = DID("did:dht:z6MkAliceKpStore".to_owned());
@@ -1465,10 +1467,11 @@ mod tests {
             did.0.clone(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
-                InMemoryStorage::new(),
-            )));
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            InMemoryStorage::new(),
+        )));
         let transport: Arc<dyn crate::context::builder::ContextTransportProvider> =
             Arc::new(crate::context::builder::NotConfiguredTransportProvider);
         let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);

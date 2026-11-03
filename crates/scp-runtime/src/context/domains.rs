@@ -61,7 +61,7 @@ use crate::context::state::{CommitOperation, ContextSnapshot, MigrationProposedR
 use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
 use crate::context::supervisor::{MessageSigner, Supervisor};
 use crate::context::ttl::CloseResult;
-use crate::economy::adapter::PaymentReceipt;
+use scp_runtime_types::economy::adapter::PaymentReceipt;
 
 /// The 13 domain handlers, one trait object per domain (ADR-070 §3).
 ///

@@ -42,8 +42,6 @@ use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::backend::MlsBackend;
-use super::production_backend::ProductionMlsBackend;
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_mls::validate_key_package_lifetime_for_add;
@@ -53,6 +51,8 @@ use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
     NonceDedup, SenderKey, SenderKeyResponse, SenderKeyStore, generate_sender_key,
 };
+use scp_runtime_types::crypto::mls::backend::MlsBackend;
+use scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend;
 
 // ---------------------------------------------------------------------------
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
@@ -380,10 +380,10 @@ pub struct OwnedMlsCryptoState {
     /// the restore seam (`build_restored_owned`) carries the persisted
     /// high-water value. There is NO provider `take` — the CREATE / WELCOME /
     /// restore caller seeds its actor-side
-    /// [`crate::context::actor::SendSequenceTracker`] from this value via
-    /// [`crate::context::actor::SendSequenceTracker::from_persisted`]
+    /// [`scp_runtime_types::context::actor::sequence::SendSequenceTracker`] from this value via
+    /// [`scp_runtime_types::context::actor::sequence::SendSequenceTracker::from_persisted`]
     /// (preserving AAD byte-identity — see
-    /// `crates/scp-runtime/src/context/actor/sequence.rs`
+    /// `crates/scp-runtime-types/src/context/actor/sequence.rs`
     /// §"Sequence numbering convention").
     pub send_sequence: u64,
     /// Sender-key distributions queued for publish. A fresh birth starts
@@ -940,7 +940,7 @@ impl NodeMlsFactory {
     /// `check_and_advance_sender_epoch` after the open and before the install
     /// (gate-before-install), which re-checks the window under the entry guard.
     ///
-    /// [`check_response_sender`]: crate::crypto::sender_keys::key_protocol::check_response_sender
+    /// [`check_response_sender`]: scp_runtime_types::crypto::sender_keys::key_protocol::check_response_sender
     /// [`admit_sender_epoch`]: crate::context::supervisor::admit_sender_epoch
     ///
     /// # Errors
@@ -956,8 +956,10 @@ impl NodeMlsFactory {
         response: &SenderKeyResponse,
         sender_epoch_floor: u64,
     ) -> Result<(SenderKey, u64), ContextError> {
-        crate::crypto::sender_keys::key_protocol::check_response_sender(mls_sender, response)
-            .map_err(|e| ContextError::CryptoFailed(format!("sender key distribution: {e}")))?;
+        scp_runtime_types::crypto::sender_keys::key_protocol::check_response_sender(
+            mls_sender, response,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("sender key distribution: {e}")))?;
         crate::context::supervisor::admit_sender_epoch(
             mls_sender,
             sender_epoch_floor,
@@ -967,7 +969,7 @@ impl NodeMlsFactory {
         let enc = scp_protocol::crypto::hpke::p256::ValidatedEnc::from(response.ephemeral_pubkey);
         let dh = wrapping.agree(&enc).await?;
         let sender_key =
-            crate::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
+            scp_runtime_types::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
                 &dh,
                 wrapping.public(),
                 &hex::encode(context_id),
@@ -1779,7 +1781,7 @@ mod tests {
         let wrapping_pk =
             scp_protocol::crypto::hpke::p256::P256Point::try_from(*wrapping.public()).unwrap();
         let (sealed_vec, ephemeral_pub) =
-            crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+            scp_runtime_types::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
                 &wrapping_pk,
                 &hex::encode(ctx_id),
@@ -1807,7 +1809,8 @@ mod tests {
         use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
 
         let ctx_id = make_context_id();
-        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let custody =
+            Arc::new(scp_runtime_types::crypto::dh_counting_custody::DhCountingCustody::new());
         let wrapping = crate::crypto::wrapping::test_wrapping_key(&custody)
             .await
             .unwrap();

@@ -41,7 +41,7 @@ use scp_protocol::economy::EconomicPolicy;
 /// what remains. The `structural` half of the snapshot is derived entirely from
 /// `params` and is never affected by these facts.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SnapshotRuntimeFacts {
+pub struct SnapshotRuntimeFacts {
     /// Current member count (from `Supervisor::member_count`).
     pub member_count: Option<u64>,
     /// Context age in seconds since creation.
@@ -103,11 +103,13 @@ fn summarize_economic_policy(policy: &EconomicPolicy) -> String {
     )
 }
 
-/// Projects genesis [`ContextParams`] + runtime `facts` into the
-/// visibility-filtered [`MetadataSnapshot`] carried in the invitation bundle
-/// (spec §5.12.3.1). Structural fields are always present (copied from
-/// `params`); operational fields are filtered per `params.metadata_visibility`.
-pub(crate) fn build_metadata_snapshot(
+/// Projects genesis [`ContextParams`] + runtime `facts` into a metadata snapshot.
+///
+/// The result is the visibility-filtered [`MetadataSnapshot`] carried in the
+/// invitation bundle (spec §5.12.3.1). Structural fields are always present
+/// (copied from `params`); operational fields are filtered per
+/// `params.metadata_visibility`.
+pub fn build_metadata_snapshot(
     params: &ContextParams,
     facts: SnapshotRuntimeFacts,
 ) -> MetadataSnapshot {
