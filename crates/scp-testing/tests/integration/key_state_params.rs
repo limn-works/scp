@@ -180,6 +180,48 @@ const ALLOWLIST: &[Allowed] = &[
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
+        "crates/scp-kel/src/retained.rs",
+        "use",
+        "e62413cd52a029aec6fb629dc3cafd3ea4457da3135f9c18ad02a21da11bbd27",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "use",
+        "de5c69699d04b2b6f051b124f5d254ce9f9a01f9a250c1d70f9a7e1206625216",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "struct RetainedChain",
+        "bc10e8e0958923af5e06afddc172e9377410af4fbbc723d0fcc13aa4c9f0b5bb",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "impl RetainedChain",
+        "1fe2c76859289cb772e2acad9411c9284da9280e979ef49cad3a98f538573898",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "trait KeyStateSource",
+        "c9d03a224ab5bc9444c98f06964bef399a4ba238f24842fe4f0a21a362ec3562",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "impl KeyStateSource for ResolvedState",
+        "abb1df8fc9bbcb65d81ce5f20a759fc366acb1fbee25791d1d518f7f83fb32d5",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
+        "crates/scp-kel/src/retained.rs",
+        "impl KeyStateSource for RetainedChain",
+        "77710dbd764fb1eaf08b7a7862351a329f8f15583220856af9b13d30b76774ee",
+        "store admission over chains retained under R9 (§9.10.12); availability only, never a party's trust decision",
+    ),
+    allow(
         "crates/scp-kel/src/validate/content.rs",
         "fn check_sentinels",
         "7611bc6798af661e56f249f77e6c4b1353f22bff93838fd5e93c158654d3364b",
