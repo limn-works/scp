@@ -2562,8 +2562,8 @@
       "evidence": {
         "pipeline_wiring_test": "governance_enforces_economic_policy",
         "code_sites": [
-          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy → economy_logic::enforce_economy",
-          "crates/scp-runtime/src/context/economy_logic.rs:313 enforce_economy definition"
+          "crates/scp-runtime-messaging/src/helpers.rs:124 enforce_send_economy → deps.domains.economy.enforce_economy",
+          "crates/scp-runtime-economy/src/logic.rs:108 enforce_economy definition"
         ]
       }
     },
@@ -2581,8 +2581,8 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context → validate_export_for_import",
-          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context → validate_export_for_import (public API boundary, verify-before-dispatch)"
+          "crates/scp-runtime-lifecycle/src/helpers.rs:2071 import_context → validate_export_for_import",
+          "crates/scp-runtime-core/src/context/supervisor/supervisor.rs:12178 import_context → validate_export_for_import (public API boundary, verify-before-dispatch)"
         ]
       }
     },
@@ -2616,14 +2616,14 @@
         "uniffi"
       ],
       "pattern": {
-        "caller_matches": "^(build_key_custody|decide_custody_for_create)$",
+        "caller_matches": "^(callback_custody|decide_custody_for_create)$",
         "required_callee": "create_records",
         "scope": "same-function-or-direct-callee",
         "min_occurrences": 1
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs build_key_custody → callback_registry → create_records",
+          "crates/scp-ffi/src/identity.rs callback_custody → callback_registry → create_records",
           "crates/scp-ffi/uniffi/src/bridge.rs decide_custody_for_create → create_records"
         ]
       }

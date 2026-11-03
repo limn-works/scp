@@ -600,6 +600,8 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-relay-client/**'
               - 'crates/scp-runtime/**'
+              - 'crates/scp-runtime-core/**'
+              - 'crates/scp-runtime-types/**'
               # scp-platform's sqlite and apple features pull in scp-sqlite-pools.
               - 'crates/scp-sqlite-pools/**'
               # Every crate above is a member of the root workspace and reads
@@ -1469,6 +1471,8 @@ jobs:
       - run: bash scripts/check-deleted-primitives.sh
       - name: Run deleted-primitives fixture tests
         run: bash scripts/tests/deleted-primitives/run-tests.sh
+      - run: bash scripts/check-runtime-clippy-config.sh --self-test
+      - run: bash scripts/check-runtime-clippy-config.sh
 
   handler-no-panic:
     needs: check-draft
@@ -2000,7 +2004,7 @@ jobs:
       - name: Run scp-runtime and scp-core tests
         if: matrix.leg == 'runtime'
         run: |
-          cargo nextest run --no-tests=fail -p scp-runtime -p scp-core --features scp-core/testing,scp-core/allow_unencrypted_storage,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io
+          cargo nextest run --no-tests=fail -p scp-runtime -p scp-runtime-types -p scp-runtime-core -p scp-runtime-broadcast -p scp-runtime-economy -p scp-runtime-governance -p scp-runtime-lifecycle -p scp-runtime-lifecycle-control -p scp-runtime-messaging -p scp-runtime-outlets -p scp-runtime-push -p scp-runtime-queries -p scp-runtime-saga -p scp-runtime-standing -p scp-runtime-trust-recovery -p scp-runtime-ttl-close -p scp-core --features scp-core/testing,scp-core/allow_unencrypted_storage,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io
       - name: Run scp-testing and scp-platform tests
         if: matrix.leg == 'testing'
         run: |

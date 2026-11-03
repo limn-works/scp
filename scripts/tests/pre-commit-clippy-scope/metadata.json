@@ -25,6 +25,7 @@
   "scp-relay-client",
   "scp-relay-mock",
   "scp-runtime",
+  "scp-runtime-governance",
   "scp-testing",
   "scp-transport"
  ],
@@ -950,6 +951,28 @@
      "name": "scp-testing",
      "kind": "dev",
      "path": "@ROOT@/crates/scp-testing"
+    },
+    {
+     "name": "scp-runtime-governance",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-runtime-governance"
+    }
+   ]
+  },
+  {
+   "name": "scp-runtime-governance",
+   "id": "scp-runtime-governance",
+   "manifest_path": "@ROOT@/crates/scp-runtime-governance/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-runtime-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-runtime-core"
+    },
+    {
+     "name": "scp-runtime-types",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-runtime-types"
     }
    ]
   },

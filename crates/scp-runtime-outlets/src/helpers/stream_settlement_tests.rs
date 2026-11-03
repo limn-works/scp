@@ -1,6 +1,7 @@
 //! Stream-settlement tests for the outlets domain (moved from `scp-runtime-core`
 //! `context::outlets::stream_settlement_adapter`, ADR-070 §6.1): they drive the
 //! outlets-private settlement functions against a `Supervisor`.
+#![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;

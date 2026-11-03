@@ -102,11 +102,30 @@ PIPELINE_WIRING_PATH = (
 )
 
 # Where each applies_to key maps in the repo. Keep in sync with the matrix.
-BRIDGE_ROOTS: dict[str, str] = {
-    "pyo3": "crates/scp-ffi/src",
-    "napi": "crates/scp-ffi/napi/src",
-    "uniffi": "crates/scp-ffi/uniffi/src",
-    "runtime": "crates/scp-runtime/src",
+# "runtime" spans the assembly crate, types, core and the 13 domain crates
+# (ADR-070), so each key maps to a list of source roots.
+BRIDGE_ROOTS: dict[str, list[str]] = {
+    "pyo3": ["crates/scp-ffi/src"],
+    "napi": ["crates/scp-ffi/napi/src"],
+    "uniffi": ["crates/scp-ffi/uniffi/src"],
+    "runtime": [
+        "crates/scp-runtime/src",
+        "crates/scp-runtime-types/src",
+        "crates/scp-runtime-core/src",
+        "crates/scp-runtime-broadcast/src",
+        "crates/scp-runtime-economy/src",
+        "crates/scp-runtime-governance/src",
+        "crates/scp-runtime-lifecycle/src",
+        "crates/scp-runtime-lifecycle-control/src",
+        "crates/scp-runtime-messaging/src",
+        "crates/scp-runtime-outlets/src",
+        "crates/scp-runtime-push/src",
+        "crates/scp-runtime-queries/src",
+        "crates/scp-runtime-saga/src",
+        "crates/scp-runtime-standing/src",
+        "crates/scp-runtime-trust-recovery/src",
+        "crates/scp-runtime-ttl-close/src",
+    ],
 }
 
 VALID_SCOPES = {"same-function", "same-function-or-direct-callee"}
@@ -115,7 +134,7 @@ VALID_SCOPES = {"same-function", "same-function-or-direct-callee"}
 # historical members were three wasm-bindgen `extern "C" { pub type X; }`
 # opaque-type files, removed with the WASM bridge (ADR-055). Each entry MUST:
 #
-#  1. Be a path under a bridge root (BRIDGE_ROOTS), relative to REPO_ROOT.
+#  1. Be a path under one of a bridge's roots (BRIDGE_ROOTS), relative to REPO_ROOT.
 #  2. Come with a short comment explaining *why* tree-sitter fails on it,
 #     so future reviewers can judge whether a new exemption is justified.
 #
@@ -818,7 +837,7 @@ def _load_bridge_functions(
     bridge: str,
     parse_error_paths: list[str],
 ) -> list[FnRecord]:
-    """Parse every .rs file under the bridge root; return production fns.
+    """Parse every .rs file under each of the bridge's roots; return production fns.
 
     ``parse_error_paths`` is populated with any file whose parse tree
     contains error nodes — the caller is responsible for turning that list
@@ -826,11 +845,14 @@ def _load_bridge_functions(
 
     Raises :class:`UnreadableSourceError` if any file cannot be read.
     """
-    root_dir = REPO_ROOT / BRIDGE_ROOTS[bridge]
-    if not root_dir.is_dir():
-        return []
+    paths = sorted(
+        path
+        for root in BRIDGE_ROOTS[bridge]
+        if (REPO_ROOT / root).is_dir()
+        for path in (REPO_ROOT / root).rglob("*.rs")
+    )
     records: list[FnRecord] = []
-    for path in sorted(root_dir.rglob("*.rs")):
+    for path in paths:
         # Unreadable sources are a hard fail: wrap OSError in a clean
         # domain error so the entrypoint can emit a clear stderr message
         # instead of a raw stack trace.
@@ -853,6 +875,30 @@ def _load_bridge_functions(
             parse_error_paths.append(rel_str)
         records.extend(_walk_functions(tree.root_node, source, path))
     return records
+
+
+def _rules_matching_no_caller(
+    rules: list[dict],
+    bridge_fns: dict[str, list[FnRecord]],
+) -> list[str]:
+    """Return one error per (rule, bridge) whose caller pattern names no function.
+
+    A rule whose ``caller_matches`` fullmatches no production function under a
+    bridge checks nothing there: a renamed or moved caller would otherwise
+    turn the rule into a silent pass.
+    """
+    errors: list[str] = []
+    for rule in rules:
+        caller = rule["pattern"]["caller_matches"]
+        caller_re = re.compile(caller)
+        for bridge in rule["applies_to"]:
+            if not any(caller_re.fullmatch(fn.name) for fn in bridge_fns[bridge]):
+                errors.append(
+                    f"{rule['rule_id']}: caller pattern {caller!r} matches no "
+                    f"production function under {BRIDGE_ROOTS[bridge]}; the rule "
+                    "checks nothing"
+                )
+    return errors
 
 
 def _check_rule_in_bridge(
@@ -1211,6 +1257,16 @@ def _run() -> int:
                 f"incomplete for items defined after the first error node.",
                 file=sys.stderr,
             )
+
+    no_caller = _rules_matching_no_caller(rules, bridge_fns)
+    if no_caller:
+        print(
+            f"ERROR: {len(no_caller)} rule(s) whose caller pattern matches no function:",
+            file=sys.stderr,
+        )
+        for err in no_caller:
+            print(f"  {err}", file=sys.stderr)
+        return 1
 
     all_violations: list[Violation] = []
     for rule in rules:

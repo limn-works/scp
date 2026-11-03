@@ -33,7 +33,7 @@
 # exist by name so they cannot be silently deleted.
 #
 # ---------------------------------------------------------------------------
-# WHAT THIS CHECKS (on crates/scp-runtime/src/context/supervisor/supervisor.rs)
+# WHAT THIS CHECKS (on crates/scp-runtime-core/src/context/supervisor/supervisor.rs)
 # ---------------------------------------------------------------------------
 # NEGATIVE assertion — FAIL if a saga-concurrency `Supervisor` field of an
 #   instance-wide SCALAR type exists. Match the product of
@@ -130,7 +130,7 @@ else
     C_RESET=""
 fi
 
-SUPERVISOR_REL="crates/scp-runtime/src/context/supervisor/supervisor.rs"
+SUPERVISOR_REL="crates/scp-runtime-core/src/context/supervisor/supervisor.rs"
 FFI_DIR="crates/scp-ffi"
 TESTS_REL="crates/scp-runtime/tests/actor_saga_concurrent.rs"
 

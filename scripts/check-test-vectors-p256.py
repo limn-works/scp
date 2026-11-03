@@ -187,11 +187,11 @@ FOREIGN: dict[str, tuple[str, frozenset[str]]] = {
             }
         ),
     ),
-    "crates/scp-runtime/src/context/pseudonym_rotation_runtime_tests.rs": (
+    "crates/scp-runtime-messaging/src/pseudonym_rotation_runtime_tests.rs": (
         "Vector 58's pseudonym preimages, which spec 25 states no script generates",
         frozenset({"4d61919cc6c61257", "66d11a29cd90b328"}),
     ),
-    "crates/scp-runtime/src/crypto/access_keys/wire.rs": (
+    "crates/scp-runtime-types/src/crypto/access_keys/wire.rs": (
         "the access-key request JSON golden",
         frozenset({"36a9c4c54034fcef"}),
     ),
