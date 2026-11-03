@@ -903,8 +903,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id: *routing_id,
             recipient_hint: None,
-            blob_ttl: Some(blob_ttl),
-            retain: None,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(blob_ttl),
             blob,
         };
 
@@ -1293,8 +1292,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(60),
             blob: payload,
         };
 
@@ -1339,8 +1337,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
             blob: vec![0x01],
         };
         assign_ref_id(&mut msg, "test-1");
@@ -1861,8 +1858,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
             blob: vec![0x01],
         };
 
@@ -1895,8 +1891,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [i; 32],
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
                 blob: vec![i],
             };
 
@@ -1947,8 +1942,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: scp_relay_client::BlobLifetime::Ttl(3600),
             blob: vec![0xDE, 0xAD],
         };
 

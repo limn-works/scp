@@ -37,7 +37,7 @@ use scp_protocol::node::{
     encode_service_record_frame, node_url_hash, service_record_fields,
     service_record_signing_digest,
 };
-use scp_relay_client::{ClientMessage, RelayMessage, code};
+use scp_relay_client::{BlobLifetime, ClientMessage, RelayMessage, code};
 use scp_transport::native::storage::BlobStorageBackend;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -425,8 +425,7 @@ impl Client {
     async fn publish_with(
         &mut self,
         routing_id: [u8; 32],
-        retain: Option<bool>,
-        blob_ttl: Option<u32>,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Reply {
         let reference = self.reference();
@@ -434,20 +433,43 @@ impl Client {
             ref_id: Some(reference.clone()),
             routing_id,
             recipient_hint: None,
-            blob_ttl,
-            retain,
+            lifetime,
             blob,
         })
         .await;
         self.reply(&reference).await
     }
 
+    /// A PUBLISH carrying both `retain: true` and `blob_ttl: 3600`, which no
+    /// `ClientMessage` can hold: the encoding of a retained PUBLISH with the
+    /// `blob_ttl` pair appended and the map header raised by one.
+    async fn publish_retain_and_ttl(&mut self, routing_id: [u8; 32], blob: Vec<u8>) -> Reply {
+        let reference = self.reference();
+        let mut bytes = ClientMessage::Publish {
+            ref_id: Some(reference.clone()),
+            routing_id,
+            recipient_hint: None,
+            lifetime: BlobLifetime::Retained,
+            blob,
+        }
+        .to_bytes()
+        .unwrap();
+        // fixmap of five entries: op, ref, routing_id, retain, blob.
+        assert_eq!(bytes[0], 0x85);
+        bytes[0] = 0x86;
+        bytes.extend_from_slice(b"\xa8blob_ttl\xcd\x0e\x10");
+        self.ws.send(Message::Binary(bytes)).await.unwrap();
+        self.reply(&reference).await
+    }
+
     async fn retain(&mut self, routing_id: [u8; 32], blob: Vec<u8>) -> Reply {
-        self.publish_with(routing_id, Some(true), None, blob).await
+        self.publish_with(routing_id, BlobLifetime::Retained, blob)
+            .await
     }
 
     async fn ttl(&mut self, routing_id: [u8; 32], blob: Vec<u8>) -> Reply {
-        self.publish_with(routing_id, None, Some(3600), blob).await
+        self.publish_with(routing_id, BlobLifetime::Ttl(3600), blob)
+            .await
     }
 
     /// The blobs a QUERY at `routing_id` is served, in served order.
@@ -944,8 +966,8 @@ async fn retain_on_another_kind_is_refused_with_4003() {
     assert!(client.query([0x42; 32]).await.is_empty());
 }
 
-/// `retain` together with `blob_ttl` is refused with `4003`, on a retained
-/// kind as on any other.
+/// `retain` together with `blob_ttl` is refused with `4003` when the frame
+/// decodes, echoing the PUBLISH's `ref`, and nothing is stored.
 #[tokio::test]
 async fn retain_with_blob_ttl_is_refused_with_4003() {
     let world = World::new();
@@ -954,12 +976,7 @@ async fn retain_with_blob_ttl_is_refused_with_4003() {
     let subject = &world.subject;
     assert_eq!(
         client
-            .publish_with(
-                subject.did_routing(),
-                Some(true),
-                Some(3600),
-                subject.frame(&[&subject.inception])
-            )
+            .publish_retain_and_ttl(subject.did_routing(), subject.frame(&[&subject.inception]))
             .await,
         Reply::Err(code::INVALID_FIELD)
     );

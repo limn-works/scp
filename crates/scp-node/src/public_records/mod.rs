@@ -30,7 +30,7 @@ use scp_relay_client::code;
 use scp_transport::native::public_records::{
     PublicRecordRefusal, PublicRecordStore, RetainedPublish, TtlPublish, refuse_retained_copy,
 };
-use scp_transport::native::storage::{BlobLifetime, BlobStorage, StoredBlob};
+use scp_transport::native::storage::{BlobStorage, StoredBlob, StoredLifetime};
 use tokio::sync::Mutex;
 
 pub use quota::{QuotaClass, QuotaLimit, QuotaLimits};
@@ -155,7 +155,7 @@ impl NodePublicRecords {
                 publish.routing_id,
                 publish.blob_id,
                 publish.recipient_hint,
-                BlobLifetime::Retained,
+                StoredLifetime::Retained,
                 publish.blob,
             )
             .await
@@ -263,7 +263,7 @@ impl PublicRecordStore for NodePublicRecords {
                 publish.routing_id,
                 publish.blob_id,
                 publish.recipient_hint,
-                BlobLifetime::Ttl(publish.ttl),
+                StoredLifetime::Ttl(publish.ttl),
                 publish.blob,
             )
             .await

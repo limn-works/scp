@@ -17,7 +17,7 @@ use scp_platform::{PlatformError, Storage};
 use zeroize::Zeroize;
 
 use super::sql_blob;
-use super::storage::{BlobLifetime, BlobStorage, QueryCursor, StorageError, StoredBlob};
+use super::storage::{BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime};
 
 // ---------------------------------------------------------------------------
 // Clock function for testability
@@ -398,7 +398,7 @@ impl BlobStorage for CombinedNodeStorage {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        lifetime: BlobLifetime,
+        lifetime: StoredLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored = StoredBlob {
@@ -685,7 +685,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             blob_data.clone(),
         )
         .await
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
+        assert_eq!(stored.lifetime, StoredLifetime::Ttl(3600));
         assert_eq!(stored.stored_at, 1_000_000);
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
@@ -726,7 +726,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             blob_data,
         )
         .await
@@ -766,7 +766,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                BlobLifetime::Ttl(3600),
+                StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -796,7 +796,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                BlobLifetime::Ttl(3600),
+                StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -826,7 +826,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                BlobLifetime::Ttl(3600),
+                StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -857,7 +857,7 @@ mod tests {
             routing_id_a,
             blob_id,
             None,
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             data,
         )
         .await
@@ -885,7 +885,7 @@ mod tests {
             routing_id,
             blob_id,
             Some(hint),
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             data,
         )
         .await
@@ -911,7 +911,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(100),
+            StoredLifetime::Ttl(100),
             data,
         )
         .await
@@ -941,7 +941,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             data,
         )
         .await
@@ -968,7 +968,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(100),
+            StoredLifetime::Ttl(100),
             data,
         )
         .await
@@ -1005,7 +1005,7 @@ mod tests {
             routing_id,
             blob_id,
             None,
-            BlobLifetime::Ttl(3600),
+            StoredLifetime::Ttl(3600),
             blob_data.clone(),
         )
         .await
@@ -1041,7 +1041,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                BlobLifetime::Ttl(86400),
+                StoredLifetime::Ttl(86400),
                 blob_data,
             )
             .await

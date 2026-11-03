@@ -31,7 +31,7 @@ use crate::relay::rate_limit::{PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
 use scp_relay_client::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_QUERY_LIMIT, RelayMessage,
+    BlobLifetime, ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_QUERY_LIMIT, RelayMessage,
 };
 
 // ---------------------------------------------------------------------------
@@ -325,8 +325,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                 ref_id,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
-                retain,
+                lifetime,
                 blob,
             } => {
                 let response = self
@@ -334,8 +333,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                         ref_id.clone(),
                         *routing_id,
                         *recipient_hint,
-                        *blob_ttl,
-                        *retain,
+                        *lifetime,
                         blob,
                     )
                     .await?;
@@ -396,8 +394,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         ref_id: Option<String>,
         routing_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: Option<u32>,
-        retain: Option<bool>,
+        lifetime: BlobLifetime,
         blob: &[u8],
     ) -> Result<RelayMessage, WebTransportSessionError> {
         // Check publish rate limit (shared per-IP across transports).
@@ -426,15 +423,6 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                 ),
             });
         }
-
-        // `retain`, or a `blob_ttl` under the protocol ceiling.
-        let lifetime = match public_records::publish_lifetime(retain, blob_ttl) {
-            Ok(lifetime) => lifetime,
-            Err(refusal) => {
-                let (code, msg) = refusal.into_parts();
-                return Ok(RelayMessage::Err { ref_id, code, msg });
-            }
-        };
 
         // Push interception (§10.7.1, ADR-004 "Push registration interception"),
         // the same gate every relay transport runs: a PUBLISH to the reserved
@@ -1124,8 +1112,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                blob_ttl: Some(60),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(60),
                 blob: vec![],
             })
             .await;
@@ -1141,8 +1128,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                blob_ttl: Some(60),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(60),
                 blob: vec![0u8; MAX_BLOB_SIZE + 1],
             })
             .await;
@@ -1164,8 +1150,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                blob_ttl: Some(0),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(0),
                 blob: vec![1, 2, 3],
             })
             .await;
@@ -1181,8 +1166,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                blob_ttl: Some(MAX_BLOB_TTL + 1),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
                 blob: vec![1, 2, 3],
             })
             .await;
@@ -1213,8 +1197,7 @@ mod tests {
                 ref_id: Some("test-ref".to_owned()),
                 routing_id: [0x11; 32],
                 recipient_hint: None,
-                blob_ttl: Some(60),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(60),
                 blob: blob_data,
             })
             .await;
@@ -1374,7 +1357,7 @@ mod tests {
                 routing_id,
                 [0xAA; 32],
                 None,
-                crate::native::storage::BlobLifetime::Ttl(60),
+                crate::native::storage::StoredLifetime::Ttl(60),
                 b"blob-data".to_vec(),
             )
             .await;
@@ -1457,8 +1440,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(60),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(60),
                 blob: b"published-blob".to_vec(),
             })
             .await;
@@ -1531,8 +1513,7 @@ mod tests {
                 ref_id: Some("push".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: Some(60),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(60),
                 blob: vec![0x42; 64],
             })
             .await
@@ -1582,8 +1563,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: Some(3600),
-                    retain: None,
+                    lifetime: BlobLifetime::Ttl(3600),
                     blob,
                 })
                 .await

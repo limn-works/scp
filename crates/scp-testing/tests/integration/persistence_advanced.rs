@@ -24,10 +24,12 @@ use std::collections::HashSet;
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
-use scp_transport::native::storage::{BlobLifetime, BlobStorage, InMemoryBlobStorage, QueryCursor};
+use scp_transport::native::storage::{
+    BlobStorage, InMemoryBlobStorage, QueryCursor, StoredLifetime,
+};
 
 /// The TTL the relay-side test blobs are stored under.
-const HOUR: BlobLifetime = BlobLifetime::Ttl(3600);
+const HOUR: StoredLifetime = StoredLifetime::Ttl(3600);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -319,7 +321,7 @@ async fn combined_node_client_and_relay_data_coexist() {
             routing_id,
             blob_id_2,
             Some([0xEE; 32]),
-            BlobLifetime::Ttl(7200),
+            StoredLifetime::Ttl(7200),
             blob_data_2.clone(),
         )
         .await
@@ -775,7 +777,7 @@ async fn combined_node_storage_both_traits_roundtrip() {
         routing_id,
         blob_id,
         None,
-        3600,
+        HOUR,
         blob_data.clone(),
     )
     .await

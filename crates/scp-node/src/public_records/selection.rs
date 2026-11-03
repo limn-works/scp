@@ -21,7 +21,7 @@ use scp_protocol::node::{
 use scp_relay_client::code;
 use scp_transport::native::public_records::PublicRecordRefusal;
 use scp_transport::native::storage::{
-    BlobLifetime, BlobStorage, QueryCursor, StorageError, StoredBlob,
+    BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime,
 };
 
 /// One stored conflict frame: its `blob_id` and the statements it carries.
@@ -74,7 +74,7 @@ pub(super) async fn load_retained(
         let full = page.len() >= usize::try_from(LOAD_PAGE).unwrap_or(usize::MAX);
         held.extend(
             page.into_iter()
-                .filter(|stored| stored.lifetime == BlobLifetime::Retained),
+                .filter(|stored| stored.lifetime == StoredLifetime::Retained),
         );
         if !full {
             break;
@@ -111,7 +111,7 @@ pub(super) async fn count_ttl(
         let full = page.len() >= usize::try_from(LOAD_PAGE).unwrap_or(usize::MAX);
         counted = counted.saturating_add(
             page.iter()
-                .filter(|stored| matches!(stored.lifetime, BlobLifetime::Ttl(_)))
+                .filter(|stored| matches!(stored.lifetime, StoredLifetime::Ttl(_)))
                 .count(),
         );
         if !full {

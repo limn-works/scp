@@ -101,7 +101,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         Some(hint),
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         blob_data.clone(),
                     )
                     .await
@@ -112,7 +112,7 @@ macro_rules! blob_store_conformance {
                 assert_eq!(stored.blob, blob_data, "blob content mismatch");
                 assert_eq!(
                     stored.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    scp_transport::native::storage::StoredLifetime::Ttl(3600),
                     "blob_ttl mismatch"
                 );
                 assert_eq!(stored.recipient_hint, Some(hint), "recipient_hint mismatch");
@@ -137,7 +137,7 @@ macro_rules! blob_store_conformance {
                 );
                 assert_eq!(
                     retrieved.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    scp_transport::native::storage::StoredLifetime::Ttl(3600),
                     "retrieved blob_ttl mismatch"
                 );
                 assert_eq!(
@@ -167,7 +167,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(60),
+                        scp_transport::native::storage::StoredLifetime::Ttl(60),
                         blob_data,
                     )
                     .await
@@ -200,7 +200,7 @@ macro_rules! blob_store_conformance {
                             routing_id,
                             blob_id,
                             None,
-                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            scp_transport::native::storage::StoredLifetime::Ttl(3600),
                             data,
                         )
                         .await
@@ -249,7 +249,7 @@ macro_rules! blob_store_conformance {
                             routing_id,
                             blob_id,
                             None,
-                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            scp_transport::native::storage::StoredLifetime::Ttl(3600),
                             data,
                         )
                         .await
@@ -294,7 +294,7 @@ macro_rules! blob_store_conformance {
                             routing_id,
                             blob_id,
                             None,
-                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            scp_transport::native::storage::StoredLifetime::Ttl(3600),
                             data,
                         )
                         .await
@@ -328,7 +328,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         blob_data,
                     )
                     .await
@@ -376,7 +376,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         expected_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         blob_data,
                     )
                     .await
@@ -402,7 +402,7 @@ macro_rules! blob_store_conformance {
                             routing_id,
                             blob_id,
                             None,
-                            scp_transport::native::storage::BlobLifetime::Ttl(10),
+                            scp_transport::native::storage::StoredLifetime::Ttl(10),
                             data,
                         )
                         .await
@@ -427,7 +427,7 @@ macro_rules! blob_store_conformance {
                             routing_id,
                             blob_id,
                             None,
-                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            scp_transport::native::storage::StoredLifetime::Ttl(3600),
                             data,
                         )
                         .await
@@ -475,7 +475,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         short_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(10),
+                        scp_transport::native::storage::StoredLifetime::Ttl(10),
                         short_data,
                     )
                     .await
@@ -489,7 +489,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         long_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         long_data.clone(),
                     )
                     .await
@@ -552,7 +552,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         Some([0xBB; 32]),
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         Some(5),
                         body,
                     )
@@ -563,7 +563,7 @@ macro_rules! blob_store_conformance {
                 assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
                 assert_eq!(
                     meta.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    scp_transport::native::storage::StoredLifetime::Ttl(3600),
                     "blob_ttl mismatch"
                 );
                 assert_eq!(
@@ -596,7 +596,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         blob_data.clone(),
                     )
                     .await
@@ -613,7 +613,7 @@ macro_rules! blob_store_conformance {
                 assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
                 assert_eq!(
                     meta.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    scp_transport::native::storage::StoredLifetime::Ttl(3600),
                     "blob_ttl mismatch"
                 );
                 assert_eq!(meta.content_length, Some(5), "content_length mismatch");
@@ -640,7 +640,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         Some(5),
                         body,
                     )
@@ -676,7 +676,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         Some(0),
                         body,
                     )
@@ -713,7 +713,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         Some(100),
                         body,
                     )
@@ -758,7 +758,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         Some(3),
                         body,
                     )
@@ -796,7 +796,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(60),
+                        scp_transport::native::storage::StoredLifetime::Ttl(60),
                         blob_data,
                     )
                     .await
@@ -833,7 +833,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         blob_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        scp_transport::native::storage::StoredLifetime::Ttl(3600),
                         data,
                     )
                     .await
@@ -869,14 +869,14 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         retained_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Retained,
+                        scp_transport::native::storage::StoredLifetime::Retained,
                         retained.clone(),
                     )
                     .await
                     .expect("retained store should succeed");
                 assert_eq!(
                     stored.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Retained
+                    scp_transport::native::storage::StoredLifetime::Retained
                 );
                 let ttl_data = vec![0x54; 16];
                 let ttl_id = sha256_blob_id(&ttl_data);
@@ -885,7 +885,7 @@ macro_rules! blob_store_conformance {
                         routing_id,
                         ttl_id,
                         None,
-                        scp_transport::native::storage::BlobLifetime::Ttl(10),
+                        scp_transport::native::storage::StoredLifetime::Ttl(10),
                         ttl_data,
                     )
                     .await
@@ -909,7 +909,7 @@ macro_rules! blob_store_conformance {
                 assert_eq!(held.blob, retained);
                 assert_eq!(
                     held.lifetime,
-                    scp_transport::native::storage::BlobLifetime::Retained
+                    scp_transport::native::storage::StoredLifetime::Retained
                 );
                 assert!(
                     store

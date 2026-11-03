@@ -436,7 +436,7 @@ async fn sqlite_blob_persistence_across_reopens() {
                 routing_id,
                 blob_id,
                 None,
-                scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                scp_transport::native::storage::StoredLifetime::Ttl(3600),
                 blob_data.clone(),
             )
             .await

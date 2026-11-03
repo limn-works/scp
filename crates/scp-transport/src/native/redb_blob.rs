@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::storage::{
-    BlobLifetime, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, sort_query_order,
+    BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, StoredLifetime, sort_query_order,
     system_clock,
 };
 
@@ -59,7 +59,7 @@ impl SerializedBlob {
             routing_id: self.routing_id,
             blob_id: self.blob_id,
             recipient_hint: self.recipient_hint,
-            lifetime: BlobLifetime::from_ttl(self.blob_ttl),
+            lifetime: StoredLifetime::from_ttl(self.blob_ttl),
             stored_at: self.stored_at,
             blob: self.blob.clone(),
         }
@@ -172,7 +172,7 @@ impl BlobStorage for RedbBlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        lifetime: BlobLifetime,
+        lifetime: StoredLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = (self.clock)();

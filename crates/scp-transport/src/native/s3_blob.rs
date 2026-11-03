@@ -67,8 +67,8 @@ use aws_smithy_http_client::tls;
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 
 use super::storage::{
-    BlobBodyStream, BlobLifetime, BlobMetadata, BlobStorage, ClockFn, QueryCursor, StorageError,
-    StoredBlob, sort_query_order, system_clock,
+    BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob,
+    StoredLifetime, sort_query_order, system_clock,
 };
 
 /// The metadata value that marks a retained record, under [`RETAIN_KEY`].
@@ -80,18 +80,18 @@ const RETAIN_KEY: &str = "retain";
 /// `expires_at` for a TTL blob, `retain` for a retained record.
 fn insert_lifetime_metadata(
     metadata: &mut HashMap<String, String>,
-    lifetime: BlobLifetime,
+    lifetime: StoredLifetime,
     stored_at: u64,
 ) {
     match lifetime {
-        BlobLifetime::Ttl(ttl) => {
+        StoredLifetime::Ttl(ttl) => {
             metadata.insert("blob_ttl".to_owned(), ttl.to_string());
             metadata.insert(
                 "expires_at".to_owned(),
                 stored_at.saturating_add(u64::from(ttl)).to_string(),
             );
         }
-        BlobLifetime::Retained => {
+        StoredLifetime::Retained => {
             metadata.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
         }
     }
@@ -104,10 +104,10 @@ fn insert_lifetime_metadata(
 /// damaged object never reads as a record TTL purge must keep.
 fn lifetime_from_metadata(
     metadata: &HashMap<String, String>,
-) -> Result<BlobLifetime, StorageError> {
+) -> Result<StoredLifetime, StorageError> {
     match (metadata.get("blob_ttl"), metadata.get(RETAIN_KEY)) {
-        (Some(ttl), None) => Ok(BlobLifetime::Ttl(S3BlobStore::parse_u32(ttl)?)),
-        (None, Some(retain)) if retain == RETAIN_VALUE => Ok(BlobLifetime::Retained),
+        (Some(ttl), None) => Ok(StoredLifetime::Ttl(S3BlobStore::parse_u32(ttl)?)),
+        (None, Some(retain)) if retain == RETAIN_VALUE => Ok(StoredLifetime::Retained),
         (None, Some(_)) => Err(StorageError::Internal(
             "invalid retain value in metadata".to_owned(),
         )),
@@ -462,7 +462,7 @@ impl BlobStorage for S3BlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        lifetime: BlobLifetime,
+        lifetime: StoredLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = self.now();
@@ -869,7 +869,7 @@ impl BlobStorage for S3BlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        lifetime: BlobLifetime,
+        lifetime: StoredLifetime,
         content_length: Option<u64>,
         body: BlobBodyStream,
     ) -> Result<BlobMetadata, StorageError> {
@@ -1069,7 +1069,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn lifetime_round_trip(lifetime: BlobLifetime) -> HashMap<String, String> {
+    fn lifetime_round_trip(lifetime: StoredLifetime) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         insert_lifetime_metadata(&mut metadata, lifetime, 1_000);
         assert_eq!(lifetime_from_metadata(&metadata).unwrap(), lifetime);
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn ttl_lifetime_writes_ttl_and_expiry_metadata() {
-        let metadata = lifetime_round_trip(BlobLifetime::Ttl(60));
+        let metadata = lifetime_round_trip(StoredLifetime::Ttl(60));
         assert_eq!(metadata.get("blob_ttl").map(String::as_str), Some("60"));
         assert_eq!(metadata.get("expires_at").map(String::as_str), Some("1060"));
         assert!(!metadata.contains_key(RETAIN_KEY));
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn retained_lifetime_writes_retain_and_no_expiry() {
-        let metadata = lifetime_round_trip(BlobLifetime::Retained);
+        let metadata = lifetime_round_trip(StoredLifetime::Retained);
         assert_eq!(metadata.get(RETAIN_KEY).map(String::as_str), Some("true"));
         assert!(!metadata.contains_key("blob_ttl"));
         assert!(!metadata.contains_key("expires_at"));
@@ -1157,7 +1157,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 blob_data.clone(),
             )
             .await
@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
+        assert_eq!(stored.lifetime, StoredLifetime::Ttl(3600));
         assert_eq!(stored.stored_at, 1_000_000);
 
         let retrieved = store.get(&blob_id).await.unwrap().unwrap();
@@ -1188,7 +1188,7 @@ mod tests {
                 routing_id,
                 retained_id,
                 None,
-                crate::native::storage::BlobLifetime::Retained,
+                crate::native::storage::StoredLifetime::Retained,
                 retained.clone(),
             )
             .await
@@ -1200,7 +1200,7 @@ mod tests {
                 routing_id,
                 ttl_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(10),
+                crate::native::storage::StoredLifetime::Ttl(10),
                 ttl_data,
             )
             .await
@@ -1219,7 +1219,7 @@ mod tests {
         assert_eq!(held.blob, retained);
         assert_eq!(
             held.lifetime,
-            crate::native::storage::BlobLifetime::Retained
+            crate::native::storage::StoredLifetime::Retained
         );
         assert!(storage.get(&ttl_id).await.unwrap().is_none());
     }
@@ -1248,7 +1248,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 blob_data,
             )
             .await
@@ -1286,7 +1286,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    crate::native::storage::StoredLifetime::Ttl(3600),
                     data,
                 )
                 .await
@@ -1315,7 +1315,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    crate::native::storage::StoredLifetime::Ttl(3600),
                     data,
                 )
                 .await
@@ -1344,7 +1344,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    crate::native::storage::StoredLifetime::Ttl(3600),
                     data,
                 )
                 .await
@@ -1374,7 +1374,7 @@ mod tests {
                 routing_id_a,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -1401,7 +1401,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 Some(hint),
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -1427,7 +1427,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(100),
+                crate::native::storage::StoredLifetime::Ttl(100),
                 data,
             )
             .await
@@ -1456,7 +1456,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -1482,7 +1482,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 data,
             )
             .await
@@ -1514,7 +1514,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(36_000),
+                    crate::native::storage::StoredLifetime::Ttl(36_000),
                     data,
                 )
                 .await
@@ -1547,7 +1547,7 @@ mod tests {
                 routing_id,
                 expected_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 blob_data,
             )
             .await
@@ -1572,7 +1572,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(10),
+                    crate::native::storage::StoredLifetime::Ttl(10),
                     data,
                 )
                 .await
@@ -1596,7 +1596,7 @@ mod tests {
                     routing_id,
                     blob_id,
                     None,
-                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    crate::native::storage::StoredLifetime::Ttl(3600),
                     data,
                 )
                 .await
@@ -1630,7 +1630,7 @@ mod tests {
                 routing_id,
                 short_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(10),
+                crate::native::storage::StoredLifetime::Ttl(10),
                 short_data,
             )
             .await
@@ -1645,7 +1645,7 @@ mod tests {
                 routing_id,
                 long_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(3600),
+                crate::native::storage::StoredLifetime::Ttl(3600),
                 long_data.clone(),
             )
             .await
@@ -1680,7 +1680,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                crate::native::storage::BlobLifetime::Ttl(100),
+                crate::native::storage::StoredLifetime::Ttl(100),
                 data,
             )
             .await

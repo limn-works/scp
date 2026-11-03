@@ -550,8 +550,7 @@ impl TransportAdapter for NativeRelayAdapter {
                 ref_id: None,
                 routing_id,
                 recipient_hint,
-                blob_ttl: Some(blob_ttl),
-                retain: None,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(blob_ttl),
                 blob,
             };
 

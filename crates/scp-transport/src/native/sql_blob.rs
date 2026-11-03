@@ -1,17 +1,16 @@
-//! The `blobs` table both `SQLite` blob stores share: [`SqliteBlobStore`]
-//! and [`CombinedNodeStorage`] (spec §17.7, `SqliteBlobStore` Schema).
+//! The `blobs` table both `SQLite` blob stores share: `SqliteBlobStore`
+//! (feature `sqlite-blob`) and `CombinedNodeStorage` (feature `combined`)
+//! (spec §17.7, `SqliteBlobStore` Schema). The module compiles under either
+//! feature alone, so it links to neither type.
 //!
 //! A retained record (`09-security-model.md` §9.10.12) stores NULL in
 //! `blob_ttl` and `expires_at`: no live-row check expires it and TTL purge
 //! never deletes it. Queries return rows in ascending (`stored_at`,
 //! `blob_id`) order and resume after a [`QueryCursor`].
-//!
-//! [`SqliteBlobStore`]: super::sqlite_blob::SqliteBlobStore
-//! [`CombinedNodeStorage`]: super::combined::CombinedNodeStorage
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::storage::{BlobLifetime, QueryCursor, StorageError, StoredBlob};
+use super::storage::{QueryCursor, StorageError, StoredBlob, StoredLifetime};
 
 /// Creates the `blobs` table and its indexes.
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS blobs (
@@ -55,7 +54,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlob> {
         routing_id: column32(row, 0, "routing_id")?,
         blob_id: column32(row, 1, "blob_id")?,
         recipient_hint,
-        lifetime: BlobLifetime::from_ttl(row.get(3)?),
+        lifetime: StoredLifetime::from_ttl(row.get(3)?),
         stored_at: row.get(4)?,
         blob: row.get(5)?,
     })

@@ -221,7 +221,7 @@ async fn blob_storage_roundtrip() {
             routing_id,
             *blob_id.as_bytes(),
             None,
-            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+            scp_transport::native::storage::StoredLifetime::Ttl(3600),
             blob_data.clone(),
         )
         .await
@@ -232,7 +232,7 @@ async fn blob_storage_roundtrip() {
     assert_eq!(stored.blob, blob_data);
     assert_eq!(
         stored.lifetime,
-        scp_transport::native::storage::BlobLifetime::Ttl(3600)
+        scp_transport::native::storage::StoredLifetime::Ttl(3600)
     );
 
     // Get
@@ -292,7 +292,7 @@ async fn blob_expiry() {
             routing_id,
             *blob_id.as_bytes(),
             None,
-            scp_transport::native::storage::BlobLifetime::Ttl(10),
+            scp_transport::native::storage::StoredLifetime::Ttl(10),
             blob_data,
         )
         .await

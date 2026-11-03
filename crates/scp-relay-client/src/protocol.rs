@@ -28,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::error::RelayProtocolError;
+use super::error::{RelayProtocolError, code};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,6 +77,152 @@ pub const MAX_QUERY_LIMIT: u32 = 1000;
 /// Pre-deserialization guard against allocation bombs from malformed
 /// `MessagePack` input.
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+
+// ---------------------------------------------------------------------------
+// PUBLISH lifetime
+// ---------------------------------------------------------------------------
+
+/// How long a node keeps a published blob, the one choice a PUBLISH makes
+/// between the shared TTL and retention (`09-security-model.md` §9.10.12,
+/// ADR-004 operation 1).
+///
+/// On the wire it is the two §9.10.12 keys: `blob_ttl: <seconds>` for
+/// [`Ttl`](Self::Ttl), `retain: true` for [`Retained`](Self::Retained). A
+/// decoder refuses a PUBLISH that carries both keys, neither key, or
+/// `retain: false` ([`LifetimeError`]), so no decoded PUBLISH holds a
+/// combination §9.10.12 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "LifetimeFields", into = "LifetimeFields")]
+pub enum BlobLifetime {
+    /// Stored under the shared TTL for this many seconds,
+    /// `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+    Ttl(u32),
+    /// A record of a retained kind (`scp:did:`, `scp:svc:`, `scp:wit:`,
+    /// `scp:wcf:`, `scp:nls:`), kept with no TTL.
+    Retained,
+}
+
+impl BlobLifetime {
+    /// The lifetime a PUBLISH's `retain` and `blob_ttl` keys declare.
+    ///
+    /// # Errors
+    ///
+    /// [`LifetimeError`] for both keys, neither key, `retain: false`, or a
+    /// `blob_ttl` outside `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+    pub const fn from_fields(
+        retain: Option<bool>,
+        blob_ttl: Option<u32>,
+    ) -> Result<Self, LifetimeError> {
+        match (retain, blob_ttl) {
+            (Some(true), None) => Ok(Self::Retained),
+            (Some(true), Some(_)) => Err(LifetimeError::Both),
+            (Some(false), _) => Err(LifetimeError::RetainFalse),
+            (None, None) => Err(LifetimeError::Neither),
+            (None, Some(ttl)) => match check_blob_ttl(ttl) {
+                Ok(()) => Ok(Self::Ttl(ttl)),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    /// The TTL in seconds; `None` for a retained record.
+    #[must_use]
+    pub const fn ttl(self) -> Option<u32> {
+        match self {
+            Self::Ttl(ttl) => Some(ttl),
+            Self::Retained => None,
+        }
+    }
+}
+
+/// Why a PUBLISH's lifetime keys name no [`BlobLifetime`]
+/// (`09-security-model.md` §9.10.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LifetimeError {
+    /// `retain` and `blob_ttl` both present.
+    #[error("a PUBLISH carries retain or blob_ttl, never both")]
+    Both,
+    /// Neither `retain` nor `blob_ttl` present.
+    #[error("a PUBLISH carries retain or blob_ttl")]
+    Neither,
+    /// `retain: false`; the key is present only as `true`.
+    #[error("retain is true or absent")]
+    RetainFalse,
+    /// A `blob_ttl` outside `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+    #[error("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {0}")]
+    TtlOutOfRange(u32),
+}
+
+impl LifetimeError {
+    /// The ADR-004 error code a relay answers with: `4003` for both keys or
+    /// `retain: false`, `4002` for neither, `4011` for an out-of-range TTL.
+    #[must_use]
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::Both | Self::RetainFalse => code::INVALID_FIELD,
+            Self::Neither => code::MISSING_FIELD,
+            Self::TtlOutOfRange(_) => code::TTL_TOO_LONG,
+        }
+    }
+}
+
+/// The two wire keys [`BlobLifetime`] maps to; never a public value.
+#[derive(Serialize, Deserialize)]
+struct LifetimeFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blob_ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retain: Option<bool>,
+}
+
+impl TryFrom<LifetimeFields> for BlobLifetime {
+    type Error = LifetimeError;
+
+    fn try_from(fields: LifetimeFields) -> Result<Self, LifetimeError> {
+        Self::from_fields(fields.retain, fields.blob_ttl)
+    }
+}
+
+impl From<BlobLifetime> for LifetimeFields {
+    fn from(lifetime: BlobLifetime) -> Self {
+        match lifetime {
+            BlobLifetime::Ttl(ttl) => Self {
+                blob_ttl: Some(ttl),
+                retain: None,
+            },
+            BlobLifetime::Retained => Self {
+                blob_ttl: None,
+                retain: Some(true),
+            },
+        }
+    }
+}
+
+/// The lifetime refusal a PUBLISH that failed to decode carries, if that is
+/// why it failed: the frame decodes as a map with `op: "PUBLISH"` whose
+/// lifetime keys name no [`BlobLifetime`].
+fn lifetime_refusal(bytes: &[u8]) -> Option<RelayProtocolError> {
+    #[derive(Deserialize)]
+    struct Probe {
+        op: String,
+        #[serde(rename = "ref", default)]
+        ref_id: Option<String>,
+        #[serde(default)]
+        retain: Option<bool>,
+        #[serde(default)]
+        blob_ttl: Option<u32>,
+    }
+    let probe: Probe = rmp_serde::from_slice(bytes).ok()?;
+    if probe.op != "PUBLISH" {
+        return None;
+    }
+    let error = BlobLifetime::from_fields(probe.retain, probe.blob_ttl).err()?;
+    Some(RelayProtocolError::Lifetime {
+        // An over-long `ref` is not echoed; the reply carries none.
+        ref_id: probe.ref_id.filter(|id| id.len() <= MAX_REF_ID_LEN),
+        error,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Serde helper for Option<[u8; 32]> as MessagePack binary
@@ -171,18 +317,10 @@ pub enum ClientMessage {
         )]
         recipient_hint: Option<[u8; 32]>,
 
-        /// How long (seconds) the relay should store this blob.
-        /// Valid range: 1--604800 (7 days). Required on every PUBLISH but a
-        /// `retain` one, and absent on that one (ADR-004 constraints).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        blob_ttl: Option<u32>,
-
-        /// `Some(true)` on a PUBLISH of one of the five retained kinds,
-        /// `scp:did:`, `scp:svc:`, `scp:wit:`, `scp:wcf:` and `scp:nls:`,
-        /// which the node stores with no TTL; absent on every other kind
-        /// (`09-security-model.md` §9.10.12). `Some(false)` is refused.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retain: Option<bool>,
+        /// The shared TTL or retention, on the wire as `blob_ttl` or
+        /// `retain: true` (`09-security-model.md` §9.10.12).
+        #[serde(flatten)]
+        lifetime: BlobLifetime,
 
         /// The opaque blob content. 1--262144 bytes (256 KB).
         /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
@@ -393,8 +531,10 @@ impl ClientMessage {
                 max: MAX_MESSAGE_SIZE,
             });
         }
-        rmp_serde::from_slice(bytes)
-            .map_err(|e| RelayProtocolError::DeserializationFailed(e.to_string()))
+        rmp_serde::from_slice(bytes).map_err(|e| {
+            lifetime_refusal(bytes)
+                .unwrap_or_else(|| RelayProtocolError::DeserializationFailed(e.to_string()))
+        })
     }
 
     /// Validates this message against protocol constraints.
@@ -413,13 +553,17 @@ impl ClientMessage {
         match self {
             Self::Publish {
                 ref_id,
-                blob_ttl,
-                retain,
+                lifetime,
                 blob,
                 ..
             } => {
                 validate_ref_id(ref_id)?;
-                validate_lifetime(*blob_ttl, *retain)?;
+                if let BlobLifetime::Ttl(ttl) = lifetime {
+                    check_blob_ttl(*ttl).map_err(|error| RelayProtocolError::Lifetime {
+                        ref_id: ref_id.clone(),
+                        error,
+                    })?;
+                }
                 validate_blob(blob)?;
             }
             Self::Subscribe { ref_id, .. }
@@ -664,35 +808,10 @@ fn validate_ref_id(ref_id: &Option<String>) -> Result<(), RelayProtocolError> {
     Ok(())
 }
 
-/// Validates a PUBLISH's lifetime fields: `retain` is absent or `true`, a
-/// `retain` PUBLISH carries no `blob_ttl` (`4003`), and every other PUBLISH
-/// carries one in range (`4002` when absent) (ADR-004 constraints,
-/// `09-security-model.md` §9.10.12).
-fn validate_lifetime(
-    blob_ttl: Option<u32>,
-    retain: Option<bool>,
-) -> Result<(), RelayProtocolError> {
-    match (retain, blob_ttl) {
-        (Some(false), _) => Err(RelayProtocolError::ValidationFailed(
-            "retain is present only as true".into(),
-        )),
-        (Some(true), Some(_)) => Err(RelayProtocolError::ValidationFailed(
-            "a retain PUBLISH carries no blob_ttl".into(),
-        )),
-        (Some(true), None) => Ok(()),
-        (None, None) => Err(RelayProtocolError::ValidationFailed(
-            "blob_ttl is required on a PUBLISH without retain".into(),
-        )),
-        (None, Some(ttl)) => validate_blob_ttl(ttl),
-    }
-}
-
-/// Validates a `blob_ttl` value against the allowed range.
-fn validate_blob_ttl(ttl: u32) -> Result<(), RelayProtocolError> {
-    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&ttl) {
-        return Err(RelayProtocolError::ValidationFailed(format!(
-            "blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {ttl}"
-        )));
+/// Checks a `blob_ttl` against `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
+const fn check_blob_ttl(ttl: u32) -> Result<(), LifetimeError> {
+    if ttl < MIN_BLOB_TTL || ttl > MAX_BLOB_TTL {
+        return Err(LifetimeError::TtlOutOfRange(ttl));
     }
     Ok(())
 }
@@ -728,8 +847,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(ttl),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(ttl),
             blob: vec![0x01],
         };
         let decoded = ClientMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
@@ -746,8 +864,7 @@ mod tests {
             ref_id: Some("req-1".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: Some([0xBB; 32]),
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![0x01, 0x02, 0x03],
         };
 
@@ -762,8 +879,7 @@ mod tests {
             ref_id: None,
             routing_id: [0xCC; 32],
             recipient_hint: None,
-            blob_ttl: Some(1),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(1),
             blob: vec![0xFF],
         };
 
@@ -1129,6 +1245,169 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // PUBLISH lifetime (09-security-model.md §9.10.12)
+    // -----------------------------------------------------------------------
+
+    /// A PUBLISH map with the given lifetime keys, as a peer would send it.
+    fn raw_publish(retain: Option<rmpv::Value>, blob_ttl: Option<u32>) -> Vec<u8> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("PUBLISH".into()));
+        map.insert("ref".to_string(), rmpv::Value::String("life-1".into()));
+        map.insert("routing_id".to_string(), rmpv::Value::Binary(vec![7; 32]));
+        map.insert("blob".to_string(), rmpv::Value::Binary(vec![1, 2, 3]));
+        if let Some(retain) = retain {
+            map.insert("retain".to_string(), retain);
+        }
+        if let Some(ttl) = blob_ttl {
+            map.insert("blob_ttl".to_string(), rmpv::Value::Integer(ttl.into()));
+        }
+        rmp_serde::to_vec_named(&map).unwrap()
+    }
+
+    /// The keys an encoded message carries.
+    fn keys(bytes: &[u8]) -> Vec<String> {
+        let value: rmpv::Value = rmp_serde::from_slice(bytes).unwrap();
+        let mut keys: Vec<String> = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(key, _)| key.as_str().unwrap().to_owned())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn publish(lifetime: BlobLifetime) -> ClientMessage {
+        ClientMessage::Publish {
+            ref_id: None,
+            routing_id: [7; 32],
+            recipient_hint: None,
+            lifetime,
+            blob: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn each_lifetime_encodes_as_its_one_section_9_10_12_key() {
+        let retained = publish(BlobLifetime::Retained).to_bytes().unwrap();
+        let keys_retained = keys(&retained);
+        assert!(keys_retained.contains(&"retain".to_string()));
+        assert!(!keys_retained.contains(&"blob_ttl".to_string()));
+        assert_eq!(
+            ClientMessage::from_bytes(&retained).unwrap(),
+            publish(BlobLifetime::Retained)
+        );
+
+        let ttl = publish(BlobLifetime::Ttl(60)).to_bytes().unwrap();
+        let keys_ttl = keys(&ttl);
+        assert!(keys_ttl.contains(&"blob_ttl".to_string()));
+        assert!(!keys_ttl.contains(&"retain".to_string()));
+        assert_eq!(
+            ClientMessage::from_bytes(&ttl).unwrap(),
+            publish(BlobLifetime::Ttl(60))
+        );
+    }
+
+    #[test]
+    fn decoding_refuses_every_lifetime_combination_section_9_10_12_forbids() {
+        let cases = [
+            (
+                raw_publish(Some(rmpv::Value::Boolean(true)), Some(60)),
+                LifetimeError::Both,
+                code::INVALID_FIELD,
+            ),
+            (
+                raw_publish(None, None),
+                LifetimeError::Neither,
+                code::MISSING_FIELD,
+            ),
+            (
+                raw_publish(Some(rmpv::Value::Boolean(false)), None),
+                LifetimeError::RetainFalse,
+                code::INVALID_FIELD,
+            ),
+            (
+                raw_publish(Some(rmpv::Value::Boolean(false)), Some(60)),
+                LifetimeError::RetainFalse,
+                code::INVALID_FIELD,
+            ),
+            (
+                raw_publish(None, Some(MAX_BLOB_TTL + 1)),
+                LifetimeError::TtlOutOfRange(MAX_BLOB_TTL + 1),
+                code::TTL_TOO_LONG,
+            ),
+            (
+                raw_publish(None, Some(0)),
+                LifetimeError::TtlOutOfRange(0),
+                code::TTL_TOO_LONG,
+            ),
+        ];
+        for (bytes, expected, expected_code) in cases {
+            let err = ClientMessage::from_bytes(&bytes).unwrap_err();
+            let RelayProtocolError::Lifetime { ref_id, error } = &err else {
+                panic!("expected a lifetime refusal, got {err:?}");
+            };
+            assert_eq!(*error, expected);
+            assert_eq!(ref_id.as_deref(), Some("life-1"));
+            assert_eq!(err.code(), expected_code);
+        }
+    }
+
+    #[test]
+    fn decoding_accepts_each_lifetime_section_9_10_12_allows() {
+        let retained = raw_publish(Some(rmpv::Value::Boolean(true)), None);
+        assert!(matches!(
+            ClientMessage::from_bytes(&retained).unwrap(),
+            ClientMessage::Publish {
+                lifetime: BlobLifetime::Retained,
+                ..
+            }
+        ));
+        for ttl in [MIN_BLOB_TTL, MAX_BLOB_TTL] {
+            assert!(matches!(
+                ClientMessage::from_bytes(&raw_publish(None, Some(ttl))).unwrap(),
+                ClientMessage::Publish {
+                    lifetime: BlobLifetime::Ttl(t),
+                    ..
+                } if t == ttl
+            ));
+        }
+    }
+
+    #[test]
+    fn a_malformed_frame_of_any_other_cause_stays_invalid_message() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("PUBLISH".into()));
+        map.insert("blob_ttl".to_string(), rmpv::Value::Integer(60.into()));
+        let bytes = rmp_serde::to_vec_named(&map).unwrap();
+        let err = ClientMessage::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, RelayProtocolError::DeserializationFailed(_)));
+        assert_eq!(err.code(), code::INVALID_MESSAGE);
+        assert_eq!(err.ref_id(), None);
+    }
+
+    #[test]
+    fn an_over_long_ref_is_not_echoed_on_a_lifetime_refusal() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("PUBLISH".into()));
+        map.insert(
+            "ref".to_string(),
+            rmpv::Value::String("r".repeat(MAX_REF_ID_LEN + 1).into()),
+        );
+        map.insert("routing_id".to_string(), rmpv::Value::Binary(vec![7; 32]));
+        map.insert("blob".to_string(), rmpv::Value::Binary(vec![1]));
+        let bytes = rmp_serde::to_vec_named(&map).unwrap();
+        let err = ClientMessage::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            RelayProtocolError::Lifetime {
+                ref_id: None,
+                error: LifetimeError::Neither
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
     // Validation tests
     // -----------------------------------------------------------------------
 
@@ -1138,8 +1417,7 @@ mod tests {
             ref_id: Some("ok".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1151,8 +1429,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0x00; MAX_BLOB_SIZE + 1],
         };
         let err = msg.validate().unwrap_err();
@@ -1165,8 +1442,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![],
         };
         let err = msg.validate().unwrap_err();
@@ -1179,8 +1455,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(0),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(0),
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1193,8 +1468,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(MAX_BLOB_TTL + 1),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1208,8 +1482,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(MIN_BLOB_TTL),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(MIN_BLOB_TTL),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1219,8 +1492,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(MAX_BLOB_TTL),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1232,8 +1504,7 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN + 1)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1246,8 +1517,7 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1424,8 +1694,7 @@ mod tests {
                     ref_id: None,
                     routing_id: [0; 32],
                     recipient_hint: None,
-                    blob_ttl: Some(1),
-                    retain: None,
+                    lifetime: BlobLifetime::Ttl(1),
                     blob: vec![0x01],
                 },
                 "PUBLISH",
@@ -1573,8 +1842,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0xAB; MAX_BLOB_SIZE],
         };
 
@@ -1665,8 +1933,7 @@ mod tests {
             ref_id: Some("test-ref".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0x01],
         };
         let bytes = msg.to_bytes().unwrap();
@@ -1766,8 +2033,7 @@ mod tests {
                 ref_id: Some("r".into()),
                 routing_id: [0; 32],
                 recipient_hint: None,
-                blob_ttl: Some(1),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(1),
                 blob: vec![0x01],
             },
             ClientMessage::Subscribe {

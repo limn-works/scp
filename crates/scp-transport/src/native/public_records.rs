@@ -3,11 +3,11 @@
 //! validates public records").
 //!
 //! Every transport a node runs (WebSocket, QUIC, UDP/DTLS, WebTransport)
-//! reaches storage through the three operations here, so no transport can
-//! store a public record the node did not admit or delete one it retains:
+//! reaches storage through the operations here, so no transport can store a
+//! public record the node did not admit or delete one it retains. The
+//! PUBLISH's lifetime arrives as a decoded [`BlobLifetime`], whose decoder
+//! already refused both keys, neither key and `retain: false`.
 //!
-//! - [`publish_lifetime`] reads `retain` and `blob_ttl` off a PUBLISH and
-//!   makes the two field refusals of §9.10.12 (`4002`, `4003`, `4011`).
 //! - [`admit_publish`] classifies the blob by version byte and routing
 //!   derivation, makes the kind refusals of §9.10.12, and hands a retained
 //!   record to the node's [`PublicRecordStore`] and every other blob to its
@@ -27,9 +27,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use scp_protocol::node::{NodeRecordKind, classify_node_record};
-use scp_relay_client::{MAX_BLOB_TTL, MIN_BLOB_TTL, RelayMessage, code};
+use scp_relay_client::{BlobLifetime, RelayMessage, RelayProtocolError, code};
 
-use super::storage::{BlobLifetime, BlobStorage, QueryCursor, StorageError, StoredBlob};
+use super::storage::{BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime};
 use crate::relay::push_gate::LiveRelayUrl;
 use crate::relay::rate_limit::PublishRateLimiter;
 
@@ -129,7 +129,7 @@ pub struct TtlPublish {
 #[async_trait::async_trait]
 pub trait PublicRecordStore: Send + Sync {
     /// Admits a retained record under its kind's admission rule, stores it
-    /// with [`BlobLifetime::Retained`], and drops what its kind's selection
+    /// with [`StoredLifetime::Retained`], and drops what its kind's selection
     /// no longer keeps.
     ///
     /// # Errors
@@ -180,44 +180,7 @@ impl fmt::Debug for PublicRecords {
     }
 }
 
-/// The lifetime a PUBLISH's `retain` and `blob_ttl` fields declare
-/// (§9.10.12, ADR-004 operation 1).
-///
-/// # Errors
-///
-/// `4002` when neither field is present, `4003` for `retain` with
-/// `blob_ttl` or `retain` other than `true`, and `4011` for a `blob_ttl`
-/// outside `MIN_BLOB_TTL..=MAX_BLOB_TTL`.
-pub fn publish_lifetime(
-    retain: Option<bool>,
-    blob_ttl: Option<u32>,
-) -> Result<BlobLifetime, PublicRecordRefusal> {
-    match (retain, blob_ttl) {
-        (Some(true), None) => Ok(BlobLifetime::Retained),
-        (Some(true), Some(_)) => Err(PublicRecordRefusal::new(
-            code::INVALID_FIELD,
-            "a PUBLISH carries retain or blob_ttl, never both",
-        )),
-        (Some(false), _) => Err(PublicRecordRefusal::new(
-            code::INVALID_FIELD,
-            "retain is true or absent",
-        )),
-        (None, Some(ttl)) if (MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&ttl) => {
-            Ok(BlobLifetime::Ttl(ttl))
-        }
-        (None, Some(ttl)) => Err(PublicRecordRefusal::new(
-            code::TTL_TOO_LONG,
-            format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {ttl}"),
-        )),
-        (None, None) => Err(PublicRecordRefusal::new(
-            code::MISSING_FIELD,
-            "a PUBLISH carries retain or blob_ttl",
-        )),
-    }
-}
-
-/// Admits and stores one PUBLISH whose fields [`publish_lifetime`] read
-/// (§9.10.12).
+/// Admits and stores one PUBLISH (§9.10.12).
 ///
 /// The blob's kind is the kind whose version byte opens it and whose routing
 /// derivation yields `routing_id` ([`classify_node_record`]):
@@ -301,7 +264,7 @@ pub async fn admit_publish<S: BlobStorage>(
                             publish.routing_id,
                             publish.blob_id,
                             publish.recipient_hint,
-                            BlobLifetime::Ttl(publish.ttl),
+                            StoredLifetime::Ttl(publish.ttl),
                             publish.blob,
                         )
                         .await
@@ -309,6 +272,33 @@ pub async fn admit_publish<S: BlobStorage>(
                 }
             }
         }
+    }
+}
+
+/// The `ERR` every transport answers a client frame with when the frame did
+/// not decode (ADR-004 error codes, `09-security-model.md` §9.10.12).
+///
+/// A PUBLISH whose lifetime keys name no [`BlobLifetime`] gets its
+/// [`LifetimeError`](scp_relay_client::LifetimeError) code (`4002`, `4003`
+/// or `4011`) and its `ref`; any other frame gets `4000`. The `ERR` carries
+/// the code and the operation only, and the detail goes to the log. The log
+/// takes the error's `Debug` form, which escapes the control characters the
+/// text can quote from the attacker's bytes.
+#[must_use]
+pub fn decode_refusal(error: &RelayProtocolError) -> RelayMessage {
+    let code = error.code();
+    tracing::debug!(code, error = ?error, "client message did not decode");
+    let msg = match error {
+        RelayProtocolError::Lifetime { .. } => "PUBLISH",
+        RelayProtocolError::SerializationFailed(_)
+        | RelayProtocolError::DeserializationFailed(_)
+        | RelayProtocolError::ValidationFailed(_)
+        | RelayProtocolError::MessageTooLarge { .. } => "malformed request",
+    };
+    RelayMessage::Err {
+        ref_id: error.ref_id(),
+        code,
+        msg: msg.to_owned(),
     }
 }
 
@@ -331,7 +321,7 @@ pub async fn refuse_retained_copy<S: BlobStorage + ?Sized>(
         .get(blob_id)
         .await
         .map_err(|e| PublicRecordRefusal::storage("reading the blob", &e))?;
-    if held.is_some_and(|held| held.lifetime == BlobLifetime::Retained) {
+    if held.is_some_and(|held| held.lifetime == StoredLifetime::Retained) {
         return Err(PublicRecordRefusal::new(
             code::DID_RECORD_REJECTED,
             "the blob is a retained record",
@@ -397,7 +387,7 @@ pub async fn delete_blob<S: BlobStorage + ?Sized>(
         .get(blob_id)
         .await
         .map_err(|e| PublicRecordRefusal::storage("reading the blob", &e))?;
-    if held.is_some_and(|held| held.lifetime == BlobLifetime::Retained) {
+    if held.is_some_and(|held| held.lifetime == StoredLifetime::Retained) {
         return Err(PublicRecordRefusal::new(
             code::RETAINED_RECORD,
             "the blob is a retained record",
@@ -434,26 +424,6 @@ mod tests {
 
     fn code_of(result: Result<StoredBlob, PublicRecordRefusal>) -> Option<u16> {
         result.err().map(|refusal| refusal.code())
-    }
-
-    #[test]
-    fn publish_lifetime_reads_each_field_combination() {
-        assert_eq!(
-            publish_lifetime(Some(true), None),
-            Ok(BlobLifetime::Retained)
-        );
-        assert_eq!(
-            publish_lifetime(None, Some(MIN_BLOB_TTL)),
-            Ok(BlobLifetime::Ttl(MIN_BLOB_TTL))
-        );
-        let refused = |retain, ttl| publish_lifetime(retain, ttl).err().map(|r| r.code());
-        assert_eq!(refused(Some(true), Some(60)), Some(code::INVALID_FIELD));
-        assert_eq!(refused(Some(false), None), Some(code::INVALID_FIELD));
-        assert_eq!(refused(None, None), Some(code::MISSING_FIELD));
-        assert_eq!(
-            refused(None, Some(MAX_BLOB_TTL + 1)),
-            Some(code::TTL_TOO_LONG)
-        );
     }
 
     #[tokio::test]
@@ -527,7 +497,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                BlobLifetime::Retained,
+                StoredLifetime::Retained,
                 blob.clone(),
             )
             .await?;
@@ -551,7 +521,7 @@ mod tests {
         .await;
         assert_eq!(code_of(result), Some(code::DID_RECORD_REJECTED));
         let held = storage.get(&blob_id).await?.ok_or("the record is gone")?;
-        assert_eq!(held.lifetime, BlobLifetime::Retained);
+        assert_eq!(held.lifetime, StoredLifetime::Retained);
         assert_eq!(held.routing_id, routing_id);
         Ok(())
     }
@@ -568,7 +538,7 @@ mod tests {
             b"ciphertext",
         )
         .await?;
-        assert_eq!(stored.lifetime, BlobLifetime::Ttl(60));
+        assert_eq!(stored.lifetime, StoredLifetime::Ttl(60));
         assert_eq!(
             refuse_retained_copy(&storage, &stored.blob_id).await,
             Ok(())
@@ -598,12 +568,18 @@ mod tests {
                 [4; 32],
                 [5; 32],
                 None,
-                BlobLifetime::Retained,
+                StoredLifetime::Retained,
                 b"r".to_vec(),
             )
             .await?;
         storage
-            .store([4; 32], [6; 32], None, BlobLifetime::Ttl(60), b"t".to_vec())
+            .store(
+                [4; 32],
+                [6; 32],
+                None,
+                StoredLifetime::Ttl(60),
+                b"t".to_vec(),
+            )
             .await?;
 
         assert_eq!(

@@ -10,7 +10,7 @@
 
 use scp_relay_client::code;
 use scp_transport::native::public_records::PublicRecordRefusal;
-use scp_transport::native::storage::{BlobLifetime, StoredBlob};
+use scp_transport::native::storage::{StoredBlob, StoredLifetime};
 
 /// One of the four quota classes (§9.18.B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,8 +44,8 @@ impl QuotaClass {
     #[must_use]
     pub const fn of(stored: &StoredBlob) -> Self {
         match stored.lifetime {
-            BlobLifetime::Retained => Self::RetainedPublicRecords,
-            BlobLifetime::Ttl(_) => Self::TtlBlobs,
+            StoredLifetime::Retained => Self::RetainedPublicRecords,
+            StoredLifetime::Ttl(_) => Self::TtlBlobs,
         }
     }
 }

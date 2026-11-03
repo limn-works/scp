@@ -1133,8 +1133,7 @@ impl ScpClient {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(ttl.secs()),
-                retain: None,
+                lifetime: scp_relay_client::BlobLifetime::Ttl(ttl.secs()),
                 blob: blob.clone(),
             }
             .to_bytes()

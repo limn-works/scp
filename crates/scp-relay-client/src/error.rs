@@ -185,6 +185,45 @@ pub enum RelayProtocolError {
         /// Maximum allowed size in bytes.
         max: usize,
     },
+
+    /// A PUBLISH whose `retain` and `blob_ttl` keys name no lifetime
+    /// (`09-security-model.md` §9.10.12).
+    #[error("PUBLISH lifetime: {error}")]
+    Lifetime {
+        /// The PUBLISH's `ref`, when it fits `MAX_REF_ID_LEN`.
+        ref_id: Option<String>,
+        /// Which forbidden combination it carries.
+        error: crate::protocol::LifetimeError,
+    },
+}
+
+impl RelayProtocolError {
+    /// The ADR-004 code a relay answers this error with: the lifetime's own
+    /// code for [`Lifetime`](Self::Lifetime), `4000` `INVALID_MESSAGE` for a
+    /// frame that does not decode or exceeds the size cap, and `4003`
+    /// `INVALID_FIELD` for a decoded message that fails a constraint.
+    #[must_use]
+    pub const fn code(&self) -> u16 {
+        match self {
+            Self::Lifetime { error, .. } => error.code(),
+            Self::ValidationFailed(_) => code::INVALID_FIELD,
+            Self::SerializationFailed(_)
+            | Self::DeserializationFailed(_)
+            | Self::MessageTooLarge { .. } => code::INVALID_MESSAGE,
+        }
+    }
+
+    /// The `ref` a reply to this error echoes, when the error carries one.
+    #[must_use]
+    pub fn ref_id(&self) -> Option<String> {
+        match self {
+            Self::Lifetime { ref_id, .. } => ref_id.clone(),
+            Self::SerializationFailed(_)
+            | Self::DeserializationFailed(_)
+            | Self::ValidationFailed(_)
+            | Self::MessageTooLarge { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]

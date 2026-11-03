@@ -2489,8 +2489,8 @@ pub(crate) mod test_helpers {
     use super::*;
 
     /// The TTL every test blob is stored under.
-    pub const HOUR: scp_transport::native::storage::BlobLifetime =
-        scp_transport::native::storage::BlobLifetime::Ttl(3600);
+    pub const HOUR: scp_transport::native::storage::StoredLifetime =
+        scp_transport::native::storage::StoredLifetime::Ttl(3600);
     use ed25519_dalek::Signer;
     use scp_core::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
     use scp_core::crypto::sender_keys::{

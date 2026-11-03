@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use super::sql_blob;
 use super::storage::{
-    BlobLifetime, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, system_clock,
+    BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, StoredLifetime, system_clock,
 };
 
 /// `SQLite`-backed blob storage for relay-side encrypted message blobs.
@@ -157,7 +157,7 @@ impl BlobStorage for SqliteBlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        lifetime: BlobLifetime,
+        lifetime: StoredLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored = StoredBlob {

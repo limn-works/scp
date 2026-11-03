@@ -43,7 +43,7 @@ use crate::native::storage::BlobStorage;
 use crate::native::storage::QueryCursor;
 use crate::relay::push_gate;
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
-use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, RelayMessage};
+use scp_relay_client::{BlobLifetime, ClientMessage, DEFAULT_QUERY_LIMIT, RelayMessage};
 
 /// Configuration for the UDP/DTLS listener.
 ///
@@ -732,17 +732,14 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
         // Deserialize the client message.
         // `ClientMessage::from_bytes` rejects payloads exceeding `MAX_MESSAGE_SIZE`
         // before invoking the MessagePack deserializer, preventing allocation bombs.
-        let client_msg: ClientMessage = if let Ok(msg) = ClientMessage::from_bytes(&datagram) {
-            msg
-        } else {
-            debug!(remote = %remote_addr, "failed to deserialize UDP datagram");
-            let err = RelayMessage::Err {
-                ref_id: None,
-                code: 400,
-                msg: "malformed request".to_owned(),
-            };
-            send_dtls_response(&sessions, &remote_addr, &err).await;
-            continue;
+        let client_msg: ClientMessage = match ClientMessage::from_bytes(&datagram) {
+            Ok(msg) => msg,
+            Err(e) => {
+                debug!(remote = %remote_addr, "failed to deserialize UDP datagram");
+                let err = public_records::decode_refusal(&e);
+                send_dtls_response(&sessions, &remote_addr, &err).await;
+                continue;
+            }
         };
 
         // Validate the message.
@@ -750,7 +747,7 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
             debug!(remote = %remote_addr, error = %e, "ClientMessage validation failed");
             let err = RelayMessage::Err {
                 ref_id: extract_ref_id(&client_msg),
-                code: 400,
+                code: e.code(),
                 msg: "request validation failed".to_owned(),
             };
             send_dtls_response(&sessions, &remote_addr, &err).await;
@@ -785,16 +782,14 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
             ref_id,
             routing_id,
             recipient_hint,
-            blob_ttl,
-            retain,
+            lifetime,
             blob,
         } => {
             handle_udp_publish(
                 ref_id,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
-                retain,
+                lifetime,
                 &blob,
                 sessions,
                 &remote_addr,
@@ -881,8 +876,7 @@ async fn handle_udp_publish<S: BlobStorage>(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
-    blob_ttl: Option<u32>,
-    retain: Option<bool>,
+    lifetime: BlobLifetime,
     blob: &[u8],
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     remote_addr: &SocketAddr,
@@ -903,21 +897,6 @@ async fn handle_udp_publish<S: BlobStorage>(
         send_dtls_response(sessions, remote_addr, &err).await;
         return;
     }
-
-    // `retain`, or a `blob_ttl` under the protocol ceiling.
-    let lifetime = match public_records::publish_lifetime(retain, blob_ttl) {
-        Ok(lifetime) => lifetime,
-        Err(refusal) => {
-            let (code, msg) = refusal.into_parts();
-            send_dtls_response(
-                sessions,
-                remote_addr,
-                &RelayMessage::Err { ref_id, code, msg },
-            )
-            .await;
-            return;
-        }
-    };
 
     // Push interception (§10.7.1, ADR-004 "Push registration interception"),
     // the same gate every relay transport runs: a PUBLISH to the reserved push
@@ -1453,8 +1432,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data.clone(),
         };
 
@@ -1616,8 +1594,7 @@ mod tests {
             ref_id: Some("big-1".to_string()),
             routing_id: [0xEE; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: oversized_blob,
         };
 
@@ -1642,8 +1619,7 @@ mod tests {
             ref_id: Some("ttl-0".to_string()),
             routing_id: [0xFF; 32],
             recipient_hint: None,
-            blob_ttl: Some(0),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(0),
             blob: vec![0x01],
         };
 
@@ -1738,8 +1714,7 @@ mod tests {
             ref_id: Some("hint-1".to_string()),
             routing_id,
             recipient_hint: Some(hint),
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![0xAB, 0xCD],
         };
 
@@ -1794,8 +1769,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![0x99],
         };
         let pub_resp = send_and_recv(&client, &publish_msg).await;
@@ -1856,8 +1830,7 @@ mod tests {
                     ref_id: Some("push".to_string()),
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: Some(3600),
-                    retain: None,
+                    lifetime: BlobLifetime::Ttl(3600),
                     blob: vec![0x42; 64],
                 },
             )
@@ -1924,8 +1897,7 @@ mod tests {
                 ref_id: Some("p".to_string()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![0x42; 64],
             },
         )
@@ -1969,8 +1941,7 @@ mod tests {
             ref_id: Some("push".to_string()),
             routing_id: rid,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![0x42; 64],
         };
 
@@ -2048,8 +2019,7 @@ mod tests {
                 ref_id: Some("push".to_string()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![0x42; 64],
             };
             let response = send_and_recv(&client, &publish).await;
@@ -2096,8 +2066,7 @@ mod tests {
                     ref_id: None,
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: Some(3600),
-                    retain: None,
+                    lifetime: BlobLifetime::Ttl(3600),
                     blob,
                 },
             )

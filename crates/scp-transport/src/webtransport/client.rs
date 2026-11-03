@@ -891,8 +891,7 @@ impl TransportAdapter for WebTransportAdapter {
                         ref_id: Some(ref_id.clone()),
                         routing_id,
                         recipient_hint,
-                        blob_ttl: Some(envelope.blob_ttl),
-                        retain: None,
+                        lifetime: BlobLifetime::Ttl(envelope.blob_ttl),
                         blob,
                     };
 

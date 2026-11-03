@@ -60,7 +60,7 @@ use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, Subs
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
 use scp_relay_client::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_QUERY_LIMIT, RelayMessage,
+    BlobLifetime, ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_QUERY_LIMIT, RelayMessage,
 };
 
 /// Whether a relay brokers BRIDGE traffic for symmetric-NAT fallback
@@ -931,14 +931,12 @@ async fn handle_connection(
 
         match msg {
             Message::Binary(data) => {
-                let Ok(client_msg) = ClientMessage::from_bytes(&data) else {
-                    let err_msg = RelayMessage::Err {
-                        ref_id: None,
-                        code: code::INVALID_MESSAGE,
-                        msg: "failed to deserialize message".to_string(),
-                    };
-                    let _ = tx.send(err_msg).await;
-                    continue;
+                let client_msg = match ClientMessage::from_bytes(&data) {
+                    Ok(client_msg) => client_msg,
+                    Err(e) => {
+                        let _ = tx.send(public_records::decode_refusal(&e)).await;
+                        continue;
+                    }
                 };
 
                 handle_client_message(
@@ -1063,16 +1061,14 @@ async fn handle_client_message(
             ref_id,
             routing_id,
             recipient_hint,
-            blob_ttl,
-            retain,
+            lifetime,
             blob,
         } => {
             handle_publish(
                 ref_id.clone(),
                 *routing_id,
                 *recipient_hint,
-                *blob_ttl,
-                *retain,
+                *lifetime,
                 blob,
                 ip,
                 tx,
@@ -1194,8 +1190,7 @@ async fn handle_publish(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
-    blob_ttl: Option<u32>,
-    retain: Option<bool>,
+    lifetime: BlobLifetime,
     blob: &[u8],
     ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
@@ -1230,17 +1225,6 @@ async fn handle_publish(
         let _ = tx.send(err).await;
         return;
     }
-
-    // `retain`, or a `blob_ttl` under the protocol ceiling (spec 09
-    // §9.18.11, §9.10.12); no operator setting changes either.
-    let lifetime = match public_records::publish_lifetime(retain, blob_ttl) {
-        Ok(lifetime) => lifetime,
-        Err(refusal) => {
-            let (code, msg) = refusal.into_parts();
-            let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
-            return;
-        }
-    };
 
     // Push interception (§10.7.1, ADR-004 "Push registration interception"),
     // the same gate every relay transport runs: a PUBLISH to the reserved push
@@ -1937,8 +1921,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data,
         };
         send_msg(&mut sink, &publish).await;
@@ -1965,8 +1948,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink1, &publish).await;
@@ -2033,8 +2015,7 @@ mod tests {
             ref_id: Some("pub-1".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink2, &publish).await;
@@ -2084,8 +2065,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![99],
         };
         send_msg(&mut sink2, &publish).await;
@@ -2108,8 +2088,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2155,8 +2134,7 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink, &publish).await;
@@ -2224,8 +2202,7 @@ mod tests {
             ref_id: Some("big".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![0x00; MAX_BLOB_SIZE + 1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2248,8 +2225,7 @@ mod tests {
             ref_id: Some("empty".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(60),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(60),
             blob: vec![],
         };
         send_msg(&mut sink, &publish).await;
@@ -2272,8 +2248,7 @@ mod tests {
             ref_id: Some("ttl".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(MAX_BLOB_TTL + 1),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL + 1),
             blob: vec![1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2299,8 +2274,7 @@ mod tests {
             ref_id: Some("ttl-max".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(MAX_BLOB_TTL),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(MAX_BLOB_TTL),
             blob: vec![1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2320,8 +2294,7 @@ mod tests {
             ref_id: Some("ttl0".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: Some(0),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(0),
             blob: vec![1],
         };
         send_msg(&mut sink, &publish).await;
@@ -2365,8 +2338,7 @@ mod tests {
             ref_id: None,
             routing_id: routing_id_a,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![1],
         };
         send_msg(&mut sink2, &pub_a).await;
@@ -2377,8 +2349,7 @@ mod tests {
             ref_id: None,
             routing_id: routing_id_b,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![2],
         };
         send_msg(&mut sink2, &pub_b).await;
@@ -2424,8 +2395,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: data,
             };
             send_msg(&mut sink, &publish).await;
@@ -2487,8 +2457,7 @@ mod tests {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2559,8 +2528,8 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(1), // 1 second TTL
-            retain: None,
+            lifetime: BlobLifetime::Ttl(1), // 1 second TTL
+
             blob: vec![1, 2, 3],
         };
         send_msg(&mut sink, &publish).await;
@@ -2673,8 +2642,7 @@ mod tests {
                 ref_id: Some(format!("p-{i}")),
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2690,8 +2658,7 @@ mod tests {
             ref_id: Some("p-excess".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![99; 10],
         };
         send_msg(&mut sink, &publish).await;
@@ -2890,8 +2857,7 @@ mod tests {
                 ref_id: Some(format!("p-{i}")),
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![i; 10],
             };
             send_msg(&mut sink, &publish).await;
@@ -2907,8 +2873,7 @@ mod tests {
             ref_id: Some("p-full".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: vec![99; 10],
         };
         send_msg(&mut sink, &publish).await;
@@ -3080,8 +3045,7 @@ mod tests {
             ref_id: Some("pub-jitter".to_string()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: Some(3600),
-            retain: None,
+            lifetime: BlobLifetime::Ttl(3600),
             blob: blob_data.clone(),
         };
         send_msg(&mut sink3, &publish).await;
@@ -3603,8 +3567,7 @@ mod tests {
                 ref_id: Some("push".to_string()),
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob,
             },
         )
@@ -3675,8 +3638,7 @@ mod tests {
                 ref_id: None,
                 routing_id: [0xAB; 32],
                 recipient_hint: None,
-                blob_ttl: Some(3600),
-                retain: None,
+                lifetime: BlobLifetime::Ttl(3600),
                 blob: vec![1],
             },
         )
