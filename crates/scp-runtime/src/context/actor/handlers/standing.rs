@@ -20,8 +20,6 @@
 //! never lands on a per-context actor mailbox — see the routing-error
 //! arm in [`dispatch`].
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -29,9 +27,7 @@ use crate::context::actor::commands::StandingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 
-/// Per-call transport budget for standing handlers. Plan §"Transport
-/// timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`StandingCommand`] against actor-owned state and
 /// capability-reduced dependencies.
@@ -204,6 +200,21 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+/// The standing domain's [`StandingDomain`](crate::context::domains::StandingDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Standing;
+
+#[async_trait::async_trait]
+impl crate::context::domains::StandingDomain for Standing {
+    async fn dispatch(
+        &self,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::StandingCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(deps, cmd).await
     }
 }
 

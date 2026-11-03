@@ -2,11 +2,12 @@
 //! free-function logic hoisted out of the deleted `manager/` directory
 //! in ADR-049 §15.
 
+use crate::context::shared::governance::EnforceConsequencesCtx;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
-use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
+use scp_protocol::trust::consequence::TriggeredConsequence;
 
 use super::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut};
 // Re-export the consequence split (defined in `class_s`) for the consequence
@@ -103,30 +104,6 @@ async fn append_consequence_event(
 // the cell-holding caller persists any applied GROW / demotion FAIL-CLOSED before
 // acking — `enforce_triggered_consequences` returns the downward-auth flag it acts
 // on (RED-CS3).
-
-/// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
-/// providers, scope identifiers, and pre-evaluated rule data into one
-/// struct keeps the public function signature within the
-/// `clippy::too_many_arguments` budget while preserving the explicit
-/// names that callers (`messaging.rs`, `outlets.rs`, `governance.rs`,
-/// the periodic timer) need at construction time.
-pub struct EnforceConsequencesCtx<'a> {
-    pub context_id: &'a str,
-    pub member_did: &'a DID,
-    pub now: u64,
-    pub triggered: &'a [TriggeredConsequence],
-    pub rules: &'a [ConsequenceRule],
-    pub clock: &'a dyn scp_clock::Clock,
-    pub event_log: &'a dyn crate::context::builder::ContextEventLogProvider,
-    /// Optional broadcast channel for event propagation from free
-    /// functions that lack `&self` access to `ContextManager`.
-    pub event_tx: Option<
-        &'a tokio::sync::broadcast::Sender<(
-            String,
-            scp_protocol::context::membership::ContextEvent,
-        )>,
-    >,
-}
 
 /// Enforces a set of pre-evaluated triggered consequences.
 ///
@@ -912,10 +889,11 @@ mod convergence_tests {
     //! leaves (root changes). Keyed on the enum via `is_convergent_trigger`,
     //! never on a string.
 
-    use super::{ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences};
+    use super::{ConsequenceStateSplit, enforce_triggered_consequences};
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::providers::MerkleEventLogProvider;
+    use crate::context::shared::governance::EnforceConsequencesCtx;
     use scp_clock::SystemClock;
     use scp_did::DID;
     use scp_protocol::context::membership::ContextEvent;

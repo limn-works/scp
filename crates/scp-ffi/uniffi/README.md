@@ -14,7 +14,7 @@ zero-argument constructor. `Scp` wraps a `UniffiBridgeInstance` that holds a
 shared `Arc<Supervisor>` in its `BridgeInstanceCore.supervisor` slot; the
 Supervisor owns all context lifecycle, membership, governance, broadcast, and
 TTL state. It is built by `build_supervisor` in `runtime.rs` via
-`Supervisor::with_providers_and_journal(...)` (durable saga journal) and reached
+`Supervisor::with_providers_and_journal(..., scp_core::context::domain_handlers())` (durable saga journal) and reached
 through `self.core.try_supervisor()` / `has_supervisor()`. This replaced the
 previously-shared `Arc<ContextManager>`, now deleted (see
 [ADR-049](../../../.docs/adrs/ADR-049-actor-per-context.md)); there is no

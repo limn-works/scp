@@ -17,6 +17,7 @@
 
 #![allow(clippy::needless_pass_by_ref_mut)]
 
+use crate::context::shared::economy::{OwnedAuthInputs, record_payment_receipt};
 use std::sync::Arc;
 
 use scp_did::DID;
@@ -27,7 +28,7 @@ use scp_protocol::economy::types::PaidActionType;
 
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::economy_logic::PaidActionAuthorization;
+use crate::context::shared::economy::PaidActionAuthorization;
 use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use crate::economy::integration;
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
@@ -87,17 +88,6 @@ pub async fn verify_payment_receipts(
 // `OwnedAuthInputs` cross the boundary) and then awaits the hold with NO state
 // borrow live. Both the send (`messaging_helpers::authorize_send_payment_prepare`)
 // and join (`lifecycle_helpers::join_context`) paths drive the pair directly.
-
-/// Owned inputs that cross the sync→async boundary of the authorize split. All
-/// fields are owned / `Send`, so the async [`authorize_paid_action_hold`] future
-/// holds NO `&PerContextState` borrow (which would not be `Send`).
-#[allow(dead_code)]
-pub struct OwnedAuthInputs {
-    adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
-    policy: scp_protocol::economy::types::EconomicPolicy,
-    action_type: PaidActionType,
-    metrics: ObservableMetrics,
-}
 
 /// Sync half of the authorize split: READS per-context governance / membership
 /// state (clones the economic policy, counts members, samples the velocity
@@ -357,26 +347,6 @@ pub fn emit_payment_received_event(
     );
 }
 
-/// Record a verified receipt in the bounded `payment_receipts` ring (the
-/// buffer half of [`surface_paid_action_receipt`]). Takes only the
-/// `&mut VecDeque<PaymentReceipt>` field.
-///
-/// Spec §19.11: backs the `payment_history` query — NOT the durable Merkle log.
-/// Bounded oldest-evicted ring at the same capacity as the sibling
-/// `receive_buffer` so a long-lived paid context cannot grow this buffer without
-/// limit (memory-growth `DoS`). Evicts the oldest before pushing the newest once
-/// the buffer is full.
-#[allow(dead_code)]
-pub fn record_payment_receipt(
-    payment_receipts: &mut std::collections::VecDeque<PaymentReceipt>,
-    receipt: &PaymentReceipt,
-) {
-    if payment_receipts.len() >= scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY {
-        payment_receipts.pop_front();
-    }
-    payment_receipts.push_back(receipt.clone());
-}
-
 /// Maps a [`PaidActionType`] to the canonical action label carried in
 /// [`ContextEvent::PaymentReceived`] / [`ContextEvent::PaymentCaptureFailed`]
 /// (`"send_message"` / `"join_context"`; spec §19.6.1).
@@ -393,25 +363,3 @@ const fn paid_action_label(action_type: &PaidActionType) -> &'static str {
 // ---------------------------------------------------------------------------
 // void_paid_action (escrow rollback)
 // ---------------------------------------------------------------------------
-
-/// Voids a paid action authorization on failure (escrow rollback).
-///
-/// Calls `adapter.void` to release the escrow hold. Best-effort: logs
-/// but does not propagate void failures.
-// Transitional Phase 2A surface: messaging/lifecycle call the legacy
-// twins until those domains migrate to actor-owned state.
-//
-// ADR-049 §9 Class-S cell seam: takes NO per-context state — it touches only the
-// adapter on the authorization. The former `&mut PerContextState` parameter was
-// unused (`_state`); it is dropped rather than narrowed because this is an `async`
-// fn and a `&PerContextState` held across the void `.await` is not `Send`
-// (`PerContextState` is `!Sync`). Both callers (the join tail and the send path)
-// drop the now-removed argument — a mechanical, behaviour-neutral call-site edit.
-#[allow(dead_code)]
-pub async fn void_paid_action(_deps: &ActorDeps, auth: PaidActionAuthorization, context_id: &str) {
-    if let Some(ref authorization) = auth.prepared.envelope.authorization
-        && let Err(e) = auth.adapter.void_dyn(authorization).await
-    {
-        tracing::warn!(context_id, "failed to void payment authorization: {e}");
-    }
-}

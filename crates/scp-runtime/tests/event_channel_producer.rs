@@ -163,6 +163,7 @@ fn supervisor_with_event_channel() -> (
         Some(event_tx.clone()),
         None,
         mls_storage,
+        scp_runtime::domain_handlers(),
     );
     (supervisor, event_tx)
 }

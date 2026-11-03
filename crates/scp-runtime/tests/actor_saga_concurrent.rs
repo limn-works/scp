@@ -83,6 +83,7 @@ fn test_supervisor() -> Arc<Supervisor> {
         persistence,
         journal,
         SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
     ))
 }
 

@@ -292,7 +292,9 @@ use super::state::{
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::DeadlockDetectionState;
-use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
+
+use crate::context::snapshot::persist_state_best_effort;
+use crate::context::snapshot::persist_state_fail_closed;
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -443,10 +445,8 @@ impl<'a> ClassSMut<'a> {
     /// `pending_commits` retry entry survive a crash before the ≤50 ms persist
     /// tick. Each is a distinct field of the underlying `PerContextState`, so the
     /// simultaneous `&mut` is sound by construction.
-    pub(crate) const fn commit_broadcast_borrows(
-        &mut self,
-    ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
-        crate::context::governance_helpers::CommitBroadcastBorrows {
+    pub(crate) const fn commit_broadcast_borrows(&mut self) -> CommitBroadcastBorrows<'_> {
+        CommitBroadcastBorrows {
             pending_commits: &mut self.state.pending_commits,
             commit_fault: &mut self.state.commit_fault,
             receive_buffer: &mut self.state.receive_buffer,
@@ -565,7 +565,7 @@ impl<'a> SharedClassS<'a> {
 /// [`Self::split_class_c`] simply reborrows them into a [`ClassCSplit`] — all
 /// five live simultaneously (with the governance reference wrapped in a
 /// [`GovernanceClassCMut`] so it, too, cannot reach Class-S).
-pub(crate) struct ClassCMut<'a> {
+pub struct ClassCMut<'a> {
     /// `&mut` to the active-member DID set (Class-C / structural).
     members: &'a mut HashSet<DID>,
     /// `&mut` to the receive event buffer (Class-C / structural).
@@ -907,7 +907,7 @@ pub(crate) struct EconomyPreCheckBorrows<'a> {
 /// NOT rely on an example. (Per
 /// `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`, prefer
 /// the structural shape over a source-text/doctest signpost.)
-pub(crate) struct GovernanceClassCMut<'a> {
+pub struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
     velocity_tracker: &'a mut SenderVelocityTracker,
     /// `&mut` to the per-member cumulative budget tracker (§19.5).
@@ -2109,7 +2109,7 @@ impl<'a> ClassCSplit<'a> {
     dead_code,
     reason = "ADR-049 §9 / RED-CS3: the consequence-engine split; its `role_state` (GROW) is the live consequence path, the other fields drive event emission / cooldown. Some accessors are exercised by tests; the rest are production consequence callers."
 )]
-pub(crate) struct ConsequenceStateSplit<'a> {
+pub struct ConsequenceStateSplit<'a> {
     /// Field-granular Class-C governance view (no whole `&mut GovernanceState`,
     /// no `class_s` reach) — same as [`ClassCSplit::governance`].
     pub(crate) governance: GovernanceClassCMut<'a>,
@@ -2495,10 +2495,8 @@ impl<'a> ClassCMut<'a> {
     /// construction. This view supplies them COALESCED (best-effort); the
     /// safety-gated sites instead supply them from a `commit_class_s_keep`
     /// `rest_mut()` view for a fail-closed persist.
-    pub(crate) const fn commit_broadcast_borrows(
-        &mut self,
-    ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
-        crate::context::governance_helpers::CommitBroadcastBorrows {
+    pub(crate) const fn commit_broadcast_borrows(&mut self) -> CommitBroadcastBorrows<'_> {
+        CommitBroadcastBorrows {
             pending_commits: self.pending_commits,
             commit_fault: self.commit_fault,
             receive_buffer: self.receive_buffer,
@@ -2715,7 +2713,7 @@ pub(crate) struct AppendOutcomeError {
 /// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` /
 /// `_keep_compensating` / `_then_append` for fail-closed persist,
 /// [`Self::commit_class_c_best_effort`] for best-effort).
-pub(crate) struct ClassSCell {
+pub struct ClassSCell {
     /// The wrapped state. Private — the only mutable access is through the
     /// persist-on-commit combinators (or the single sanctioned no-persist
     /// [`Self::clear_committed_reservation_idempotent`]). There is no `state_mut`
@@ -3383,7 +3381,7 @@ impl ClassSCell {
     ///
     /// The `#[must_use]` attribute + the token's `Drop` guard (which
     /// `debug_assert!`s + `tracing::error!`s on an un-`commit`-ed drop, exactly
-    /// mirroring [`crate::context::economy_logic::EconomyTicket`]) are the
+    /// mirroring [`crate::context::shared::economy::EconomyTicket`]) are the
     /// backstop: a path that forgets to `commit` fails CI loudly rather than
     /// silently acknowledging an unpersisted Class-S consume.
     ///
@@ -3473,9 +3471,9 @@ impl ClassSCell {
 /// reversal (escrow void, economy-ticket rollback, sequence rollback) while the
 /// consume stays consumed.
 ///
-/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`](crate::context::shared::economy::EconomyTicket)
 ///
-/// Like [`crate::context::economy_logic::EconomyTicket`], this handle carries a
+/// Like [`crate::context::shared::economy::EconomyTicket`], this handle carries a
 /// `consumed` flag set true by [`Self::commit`], and a [`Drop`] guard that
 /// `debug_assert!`s + `tracing::error!`s if it is dropped un-`commit`-ed. The
 /// `#[must_use]` makes a dropped-without-commit path a compile-time warning and
@@ -3487,7 +3485,7 @@ impl ClassSCell {
 /// ACCEPTED RESIDUAL (ADR-049 §9): `std::mem::forget(token)` suppresses the `Drop`
 /// guard, so a deliberately-forgotten token would silently drop its owed
 /// fail-closed persist. This is the UNIVERSAL Rust escape on EVERY linear handle
-/// (it applies identically to [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// (it applies identically to [`EconomyTicket`](crate::context::shared::economy::EconomyTicket)
 /// and any `#[must_use]` + `Drop` type) and is NOT defendable at the type level —
 /// `mem::forget` is safe, stable, and intrinsic. It is an in-file-insider action in
 /// the same threat class as editing any enforcement, and is a code-review
@@ -3495,7 +3493,7 @@ impl ClassSCell {
 /// second persist" need (a redundant obligation covered by a sibling token) is
 /// served by the explicit, audited [`Self::subsume`] — NOT by `mem::forget`.
 #[must_use = "ClassSCommitToken must be committed — dropping leaves a Class-S consume (e.g. a burned spending nonce) unpersisted, re-opening a replay/re-spend window on crash"]
-pub(crate) struct ClassSCommitToken {
+pub struct ClassSCommitToken {
     /// The context whose state the deferred persist targets. Checked against the
     /// `context_id` passed to [`Self::commit`] via `debug_assert_eq!` so a token
     /// cannot be committed against the wrong context's state.
@@ -3876,6 +3874,28 @@ impl ClassSDischargeGuard<'_> {
         // snapshot off the await point, keeping the actor future `Send`.
         persist_state_fail_closed(self.state, deps, context_id).await
     }
+}
+
+/// The three disjoint Class-C `&mut` fields [`apply_broadcast_failure`] mutates,
+/// threaded as ONE struct so the caller holds all three at once (they are
+/// distinct fields of [`PerContextState`], so the borrow checker accepts the
+/// simultaneous `&mut`).
+///
+/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast-
+/// failure apply touches ONLY the MLS Commit retry queue (`pending_commits`), the
+/// queue-full fail-close marker (`commit_fault`), and the local receive buffer
+/// (`receive_buffer`). The borrow is field-granular and reaches no Class-S
+/// sub-struct; the DURABILITY class is the caller's choice — the safety-gated
+/// sites supply these from a `commit_class_s_keep` `rest_mut()` view (fail-closed
+/// persist of `pending_commits`/`commit_fault`), the best-effort sites from a
+/// coalesced `ClassCMut` view (see [`apply_broadcast_failure`]).
+pub struct CommitBroadcastBorrows<'a> {
+    /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
+    pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
+    /// `&mut` to the queue-full fail-close marker (Class-C / structural).
+    pub commit_fault: &'a mut Option<CommitFaultMarker>,
+    /// `&mut` to the local receive buffer (Class-C / structural).
+    pub receive_buffer: &'a mut ReceiveBuffer,
 }
 
 #[cfg(test)]
@@ -5526,6 +5546,7 @@ impl ClassSCell
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -5937,9 +5958,8 @@ impl ClassSCell
     /// coalesce-window crash and the denied capability is not silently re-granted.
     #[tokio::test]
     async fn consequence_suspension_persists_fail_closed_and_keeps_suspension() {
-        use crate::context::governance_logic::{
-            EnforceConsequencesCtx, enforce_triggered_consequences,
-        };
+        use crate::context::governance_logic::enforce_triggered_consequences;
+        use crate::context::shared::governance::EnforceConsequencesCtx;
         use scp_protocol::context::roles::Capability;
         use scp_protocol::trust::consequence::{
             ConsequenceAction, ConsequenceRule, EnforcementSeverity, TriggeredConsequence,
@@ -6216,9 +6236,8 @@ impl ClassSCell
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
-        use crate::context::governance_logic::{
-            EnforceConsequencesCtx, enforce_triggered_consequences,
-        };
+        use crate::context::governance_logic::enforce_triggered_consequences;
+        use crate::context::shared::governance::EnforceConsequencesCtx;
         use scp_protocol::context::roles::{Capability, RoleDefinition};
         use scp_protocol::trust::consequence::{
             ConsequenceAction, ConsequenceRule, TriggeredConsequence,
@@ -7823,8 +7842,8 @@ impl ClassSCell
         ClassSCell::new(state)
     }
 
-    fn ceiling_commit_meta() -> crate::context::governance_helpers::CommitMeta<'static> {
-        crate::context::governance_helpers::CommitMeta {
+    fn ceiling_commit_meta() -> crate::context::shared::governance::CommitMeta<'static> {
+        crate::context::shared::governance::CommitMeta {
             pid: [7u8; 32],
             actor_did: "did:example:admin",
             timestamp_secs: 1_700_000_000,

@@ -21,6 +21,11 @@
 //! timeouts are an ACTOR-OWNED interval arm — ADR-049 finding A3 — not a
 //! supervisor-spawned task.)
 
+use crate::context::actor::class_s::CommitBroadcastBorrows;
+use crate::context::shared::governance::conflicting_approved;
+use crate::context::shared::governance::{
+    BroadcastFailure, CommitMeta, MigrationBootstrap, check_commit_fault, migration_destination_id,
+};
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::broadcast::AuthorKeyRotation;
@@ -31,7 +36,7 @@ use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
     ProposalId, ProposalStatus, ProposeIntent, PruningPolicy, VoteIntent, VoteType, signed_vote,
 };
-use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
+use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
@@ -44,9 +49,10 @@ use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
-    EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
+    enforce_triggered_consequences, event_log_entries_for_consequences,
     event_log_entries_for_consequences_after_side_effect,
 };
+use crate::context::shared::governance::EnforceConsequencesCtx;
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
@@ -61,35 +67,6 @@ use crate::context::state::{
 // ---------------------------------------------------------------------------
 // check_commit_fault_marker (transitive helper, already actor-shape)
 // ---------------------------------------------------------------------------
-
-/// Field-disjoint variant of `check_commit_fault` used by both the
-/// legacy [`crate::context::state::PerContextState`] and the
-/// actor-shape
-/// [`crate::context::actor::state::PerContextState`].
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can drive the same fail-closed gate without going through the
-/// legacy state struct.
-///
-/// # Errors
-///
-/// Returns [`ContextError::CommitBroadcastFault`] if the marker is `Some`.
-pub fn check_commit_fault_marker(marker: Option<&CommitFaultMarker>) -> Result<(), ContextError> {
-    if let Some(marker) = marker {
-        return Err(ContextError::CommitBroadcastFault {
-            operation: marker.operation.label(),
-            reason: marker.reason.clone(),
-            attempts: marker.retry_count,
-        });
-    }
-    Ok(())
-}
-
-/// Returns `Err(CommitBroadcastFault)` if the actor-shape state has an
-/// active commit fault marker (PR #1606 C6), otherwise `Ok(())`.
-pub fn check_commit_fault(state: &PerContextState) -> Result<(), ContextError> {
-    check_commit_fault_marker(state.commit_fault.as_ref())
-}
 
 // ---------------------------------------------------------------------------
 // emit helpers — re-export for convenience
@@ -145,30 +122,6 @@ pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> G
 /// instant (`freeze_start + FREEZE_TIMEOUT_SECONDS`) is the convergent deadline
 /// recorded on the `GovernanceFreezeExpired` leaf (§7.3.1, §9.9.3).
 const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
-
-/// Commit-provenance for a governance-action leaf: the approved proposal id,
-/// the acting DID, and the committer-assigned leaf timestamp.
-///
-/// The timestamp is `proposal.created_at` — a value bound into the SIGNED
-/// proposal, so it is identical and tamper-evident for every member that
-/// processes the proposal (convergent-by-construction). The leaf carrying it,
-/// however, is currently appended ONLY by the committing member: the
-/// receive-side append path is dormant, so governance leaves are not yet
-/// replicated cross-member. Cross-member leaf replication is the forward step
-/// under ADR-051 (§7.3.1, §9.9.3).
-///
-/// Bundled so the per-action `execute_*` helpers carry one provenance value
-/// instead of three loose trailing parameters (keeps each helper within the
-/// argument budget and groups the "who/what/when committed this" triplet).
-#[derive(Clone, Copy)]
-pub struct CommitMeta<'a> {
-    /// The approved proposal whose execution mints this leaf.
-    pub pid: ProposalId,
-    /// The acting DID recorded as the leaf actor.
-    pub actor_did: &'a str,
-    /// The convergent committer-assigned leaf timestamp (Unix seconds).
-    pub timestamp_secs: u64,
-}
 
 /// Returns the [`scp_event_log::EventType`] for a [`GovernanceEvent`] variant.
 ///
@@ -1083,7 +1036,9 @@ pub async fn execute_revoke(
     // `seal` refuses until the governance timer lands it, and an event
     // reports it (spec 09 §9.16.9 "A rotation that fails").
     if needs_sender_key_rotation {
-        crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
+        deps.domains
+            .lifecycle
+            .rotate_sender_key_and_distribute(cell, deps, context_id)
             .await;
     }
 
@@ -1318,7 +1273,7 @@ pub async fn execute_add_member(
     // matching the prior provider disposition; the error propagates unchanged.
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            crate::context::lifecycle_helpers::add_member_and_queue_distribution(
+            crate::context::shared::lifecycle::add_member_and_queue_distribution(
                 v.rest_mut(),
                 deps,
                 did.as_ref(),
@@ -1447,13 +1402,15 @@ pub async fn execute_add_member(
     // `cfg(test)` no-crypto pipeline (the queue is empty —
     // `distribute_sender_key` was skipped above).
     {
-        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            &mut cell.class_c_view(),
-            context_id,
-            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
-        )
-        .await;
+        deps.domains
+            .lifecycle
+            .drain_and_deliver_sender_keys(
+                deps,
+                &mut cell.class_c_view(),
+                context_id,
+                crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+            )
+            .await;
     }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
@@ -1570,7 +1527,7 @@ pub async fn execute_remove_member(
             // which the rotate above advanced) in the authoritative floor registry
             // (fail-closed anti-replay backstop). Read-authority follows
             // write-authority.
-            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+            crate::context::shared::messaging::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
                 state.local_sender_key_epoch(),
@@ -1633,13 +1590,15 @@ pub async fn execute_remove_member(
         // ADR-049 PR-7: drain through the actor's crypto state (same one the
         // in-closure `rotate_sender_key` above populated). A failed publish
         // stays queued and is reported by event (spec 09 §9.16.9).
-        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            &mut cell.class_c_view(),
-            context_id,
-            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
-        )
-        .await;
+        deps.domains
+            .lifecycle
+            .drain_and_deliver_sender_keys(
+                deps,
+                &mut cell.class_c_view(),
+                context_id,
+                crate::context::shared::lifecycle::DistributionScope::NeverAttempted,
+            )
+            .await;
     }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
@@ -2200,21 +2159,23 @@ pub async fn execute_extend_ttl(
     // the combinator's paths (no convergent deadline, payload encode failure,
     // append failure) append no leaf, and an unconditional credit here would
     // run the §9.9.3 checkpoint position one leaf ahead of the log on each.
-    crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
-        cell,
-        deps.event_log.as_ref(),
-        &context_id_bytes,
-        actor_did,
-        additional_secs,
-        crate::context::ttl_close_helpers::ExtensionLeaf::Governance {
-            proposal_id,
-            committer_timestamp_secs: timestamp_secs,
-            consenting_members: consenting,
-        },
-    )
-    .await?;
+    deps.domains
+        .ttl_close
+        .extend_ttl_deadline_and_record(
+            cell,
+            deps.event_log.as_ref(),
+            &context_id_bytes,
+            actor_did,
+            additional_secs,
+            crate::context::shared::ttl_close::ExtensionLeaf::Governance {
+                proposal_id,
+                committer_timestamp_secs: timestamp_secs,
+                consenting_members: consenting,
+            },
+        )
+        .await?;
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
     Ok(())
 }
 
@@ -2813,7 +2774,9 @@ pub async fn execute_reset_member(
     // Rotate and publish, as leave and revoke do. The reset stands: a rotation
     // that fails stays pending, `seal` refuses until the governance timer
     // lands it, and an event reports it (spec 09 §9.16.9).
-    crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
+    deps.domains
+        .lifecycle
+        .rotate_sender_key_and_distribute(cell, deps, context_id)
         .await;
 
     deps.event_log
@@ -3110,10 +3073,7 @@ pub async fn execute_rotate_content_keys(
                 // the leaf (spec 09 §9.16.1); with none loaded it fails closed.
                 // Behavior otherwise unchanged (content-key rotation does not
                 // touch the `mls_epoch` mirror).
-                let wrapping_public_key = *deps
-                    .supervisor
-                    .my_wrapping_key(&deps.owned_identity)?
-                    .public();
+                let wrapping_public_key = *deps.my_wrapping_key()?.public();
                 let epoch_out = state.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
 
                 let member_dids: Vec<String> = state
@@ -3967,38 +3927,27 @@ pub fn execute_propose_context_migration<'a>(
         // handle returns to `Active`), so the proposal must stay retryable.
         // Nothing reads this cell during the await: the actor holds it `&mut`.
 
-        // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
-        // (bootstrap form — constructs fresh PerContextState, registers
-        // through SupervisorHandle).
+        // The lifecycle domain's `create_context` constructs fresh
+        // `PerContextState` and registers it through `SupervisorHandle`.
         //
-        // Type-erased `Pin<Box<dyn Future + Send>>` breaks the
-        // Send-inference auto-trait cycle: this helper is reachable from
-        // `ContextActor::run()` via the migrated governance dispatch, AND
-        // `create_context` (Phase 2A finalization owned-state spawn)
-        // spawns a `ContextActor::run()` task through
-        // `Supervisor::spawn_actor_with_state`. Erasing the inner
-        // future type here shields auto-trait propagation from chasing the
-        // cycle.
-        let create_fut: std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            crate::context::lifecycle_helpers::SpawnedContext,
-                            scp_protocol::context::builder::ContextCreationError,
-                        >,
-                    > + Send,
-            >,
-        > = Box::pin(crate::context::lifecycle_helpers::create_context(
+        // The trait method returns a type-erased `Pin<Box<dyn Future + Send>>`,
+        // which breaks the Send-inference auto-trait cycle: this helper is
+        // reachable from `ContextActor::run()` via the governance dispatch, AND
+        // `create_context` spawns a `ContextActor::run()` task through
+        // `Supervisor::spawn_actor_with_state`.
+        let create_fut = deps.domains.lifecycle.create_context(
             deps,
-            destination_context_id.clone(),
-            dest_params,
-            creator,
-            None,
-            // The destination is hosted on the source context's relays
-            // (§5.12.3.1, PUSH-025).
-            cell.relay_urls.clone(),
-            &first_state,
-        ));
+            crate::context::domains::CreateContextRequest {
+                context_id: destination_context_id.clone(),
+                params: dest_params,
+                creator_did: creator,
+                local_pseudonym: None,
+                // The destination is hosted on the source context's relays
+                // (§5.12.3.1, PUSH-025).
+                relay_urls: cell.relay_urls.clone(),
+                first_state: &first_state,
+            },
+        );
         let spawned = match create_fut.await {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -4021,7 +3970,7 @@ pub fn execute_propose_context_migration<'a>(
                     .rollback_with_guard(bootstrap_guard)
                     .await
                     .map_err(|rollback| {
-                        crate::context::lifecycle_helpers::fold_rollback_failure(
+                        crate::context::shared::lifecycle::fold_rollback_failure(
                             &format!("failed to create destination context: {e}"),
                             &rollback,
                         )
@@ -4069,8 +4018,7 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)
-            .await;
+        crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
         deps.event_log
             .append_context_event(
                 crate::context::builder::AppendMode::AfterSideEffect,
@@ -4147,7 +4095,7 @@ pub async fn execute_cancel_context_migration(
         original_proposal_id
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
     let cancel_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::ContextMigrationCancelledPayload {
             original_proposal_id,
@@ -4470,7 +4418,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -4575,7 +4523,7 @@ fn actor_check_proposer_eligibility(
 
     // Earned capacity enforcement (§9.3).
     if let Some(sybil_policy) = cell.handle.params().sybil_policy.as_ref() {
-        let assessment = crate::context::lifecycle_logic::build_identity_assessment(
+        let assessment = crate::context::shared::lifecycle::build_identity_assessment(
             proposer_did,
             &cell.governance,
             now,
@@ -4661,156 +4609,6 @@ pub async fn propose_governance_action_checked(
         status,
         execution_result,
     })
-}
-
-/// The destination context id of the migration that `proposal_id` proposes
-/// for `context_id`: the hex SHA-256 of `"SCP-MIGRATION-DEST:"`, the source
-/// context id and the proposal id.
-pub(in crate::context) fn migration_destination_id(
-    context_id: &str,
-    proposal_id: &ProposalId,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-MIGRATION-DEST:");
-    hasher.update(context_id.as_bytes());
-    hasher.update(proposal_id);
-    hex::encode(hasher.finalize())
-}
-
-/// What a context migration's destination create runs under:
-/// `bootstrap_spawn_lock` and the first-state claim of the destination id
-/// (ADR-049 Decision 9).
-///
-/// The governance call that executes the migration reserves both before its
-/// first record, so their retryable [`ContextError::ActorBusy`] leaves
-/// nothing behind and a retry of the same call can succeed. After that first
-/// record the call never returns `ActorBusy`: the migration holds the guard
-/// through its destination create and its rollback
-/// ([`execute_propose_context_migration`] takes this as a required argument).
-pub struct MigrationBootstrap {
-    guard: tokio::sync::OwnedMutexGuard<()>,
-    first_state: crate::context::lifecycle_helpers::FirstStateRollback,
-    destination_context_id: String,
-}
-
-impl MigrationBootstrap {
-    /// Try-locks `bootstrap_spawn_lock`, then claims the destination id of
-    /// `proposal_id`'s migration. The caller is an actor turn, and the
-    /// lock's holders wait on actor mailboxes, so it never waits for the
-    /// lock.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock,
-    ///   or another operation's first state of the destination is unsettled;
-    ///   both are retryable.
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub(in crate::context) fn reserve(
-        deps: &ActorDeps,
-        context_id: &str,
-        proposal_id: &ProposalId,
-    ) -> Result<Self, ContextError> {
-        let destination_context_id = migration_destination_id(context_id, proposal_id);
-        let guard = deps.supervisor.try_lock_bootstrap_spawn()?;
-        let first_state = crate::context::lifecycle_helpers::FirstStateRollback::new(
-            deps,
-            &destination_context_id,
-        )?;
-        Ok(Self {
-            guard,
-            first_state,
-            destination_context_id,
-        })
-    }
-
-    /// The bootstrap of `proposal`: `reserved` when the caller already
-    /// reserved it, else a new reservation when `proposal` is a context
-    /// migration, else `None`.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::reserve`].
-    fn for_migration(
-        reserved: Option<Self>,
-        deps: &ActorDeps,
-        context_id: &str,
-        proposal: &GovernanceProposal,
-    ) -> Result<Option<Self>, ContextError> {
-        if reserved.is_some() {
-            Ok(reserved)
-        } else if matches!(
-            proposal.action,
-            GovernanceAction::ProposeContextMigration { .. }
-        ) {
-            Self::reserve(deps, context_id, &proposal.proposal_id).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// The bootstrap of `proposal`, as the propose or vote call about to
-    /// record it would leave it, when that call goes on to execute it: the
-    /// action is a migration, the proposal is `Approved` and not yet
-    /// executed, no governance freeze stands, and no approved conflicting
-    /// proposal makes it lose or freezes governance
-    /// ([`detect_and_handle_conflicts`]). Decided with reads only, before
-    /// the call's first record. `freeze_expires` says the call clears the
-    /// standing freeze as expired before it records the proposal.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::reserve`].
-    fn if_executed(
-        cell: &crate::context::actor::class_s::ClassSCell,
-        deps: &ActorDeps,
-        context_id: &str,
-        proposal: &GovernanceProposal,
-        freeze_expires: bool,
-    ) -> Result<Option<Self>, ContextError> {
-        let governance = &cell.governance;
-        let cleared = governance
-            .freeze
-            .filter(|_| freeze_expires)
-            .map(|(a, b, _)| [a, b]);
-        let executes = proposal.status == ProposalStatus::Approved
-            && !governance
-                .class_s
-                .executed_proposals
-                .contains_key(&proposal.proposal_id)
-            && (governance.freeze.is_none() || freeze_expires)
-            // The new proposal takes `next_proposal_seq`: an equal sequence
-            // freezes governance and a greater one loses, so either skips the
-            // execution.
-            && !conflicting_approved(cell, proposal).any(|(id, (_, seq, _))| {
-                !cleared.is_some_and(|pair| pair.contains(id))
-                    && governance.next_proposal_seq >= *seq
-            });
-        if executes {
-            Self::for_migration(None, deps, context_id, proposal)
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-/// The approved proposals whose actions conflict with `proposal`'s
-/// (ADR-031 §7).
-fn conflicting_approved<'c>(
-    cell: &'c crate::context::actor::class_s::ClassSCell,
-    proposal: &'c GovernanceProposal,
-) -> impl Iterator<Item = (&'c ProposalId, &'c (GovernanceProposal, u64, u64))> + 'c {
-    cell.governance
-        .approved_proposals
-        .iter()
-        .filter(move |(_, (existing, _, _))| {
-            scp_protocol::context::governance::actions_conflict(
-                &proposal.action,
-                &proposal.proposer_did,
-                &existing.action,
-                &existing.proposer_did,
-            )
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -5034,7 +4832,7 @@ pub async fn vote_on_proposal_inner(
         drop(bootstrap);
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    crate::context::snapshot::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -6627,65 +6425,6 @@ async fn discharge_and_order_governance_action(
 // try_broadcast_commit / apply_broadcast_failure (transitive helpers, actor-shape)
 // ---------------------------------------------------------------------------
 
-/// The three disjoint Class-C `&mut` fields [`apply_broadcast_failure`] mutates,
-/// threaded as ONE struct so the caller holds all three at once (they are
-/// distinct fields of [`PerContextState`], so the borrow checker accepts the
-/// simultaneous `&mut`).
-///
-/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast-
-/// failure apply touches ONLY the MLS Commit retry queue (`pending_commits`), the
-/// queue-full fail-close marker (`commit_fault`), and the local receive buffer
-/// (`receive_buffer`). The borrow is field-granular and reaches no Class-S
-/// sub-struct; the DURABILITY class is the caller's choice — the safety-gated
-/// sites supply these from a `commit_class_s_keep` `rest_mut()` view (fail-closed
-/// persist of `pending_commits`/`commit_fault`), the best-effort sites from a
-/// coalesced `ClassCMut` view (see [`apply_broadcast_failure`]).
-pub struct CommitBroadcastBorrows<'a> {
-    /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
-    pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
-    /// `&mut` to the queue-full fail-close marker (Class-C / structural).
-    pub commit_fault: &'a mut Option<CommitFaultMarker>,
-    /// `&mut` to the local receive buffer (Class-C / structural).
-    pub receive_buffer: &'a mut ReceiveBuffer,
-}
-
-/// The retry-queue bookkeeping an MLS-Commit broadcast requires when its
-/// transport send FAILS, returned by [`try_broadcast_commit`] so the CALLER
-/// applies it (via [`apply_broadcast_failure`]) in the correct durability class.
-///
-/// Splitting the failure bookkeeping OUT of the async transport send is what
-/// lets the safety-gated Class-S sites — `execute_remove_member`,
-/// `execute_rotate_content_keys` (this module) and `leave_context`
-/// (`lifecycle_helpers`) — persist the `commit_fault` marker + `pending_commits`
-/// enqueue FAIL-CLOSED even though the broadcast itself, being async under
-/// ADR-049 Decision 7, cannot run inside their synchronous `commit_class_s_keep`
-/// closure. The best-effort sites (`execute_add_member`, `execute_reset_member`)
-/// apply the identical value coalesced through a `ClassCMut` view.
-///
-/// Why fail-closed matters here: `commit_fault` is a SAFETY GATE
-/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
-/// `pending_commits` entry is the ONLY re-delivery of the epoch-advancing
-/// Commit. If a crash lands between a broadcast failure and the ≤50 ms coalesced
-/// persist tick, a coalesced-only write loses BOTH — the context respawns
-/// "healthy" while members are stuck on a stale MLS epoch with no retry queued:
-/// silent, permanent group desync (ADR-049 §9 / §9.9.3).
-pub struct BroadcastFailure {
-    /// The retry record to enqueue (or, when the queue is full at apply time,
-    /// the source of the fail-close [`CommitFaultMarker`]).
-    pending: PendingCommit,
-    /// Operation label for the surfaced local `ContextEvent`.
-    label: String,
-    /// Transport error string for the surfaced local `ContextEvent`.
-    error: String,
-}
-
-impl BroadcastFailure {
-    /// The transport error the failed first publish returned.
-    pub(super) fn error(&self) -> &str {
-        &self.error
-    }
-}
-
 /// Attempts to broadcast an MLS Commit. Returns `None` on success (or an empty
 /// commit — the `cfg(test)` no-crypto pipeline); on a transport failure returns
 /// `Some(BroadcastFailure)` describing the retry-queue bookkeeping the caller
@@ -7149,11 +6888,9 @@ mod commit_broadcast_retry_tests {
     use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
     use scp_protocol::context::{ContextError, ContextParams};
 
-    use super::{
-        CommitBroadcastBorrows, apply_broadcast_failure, keep_broadcast_failure,
-        try_broadcast_commit,
-    };
+    use super::{apply_broadcast_failure, keep_broadcast_failure, try_broadcast_commit};
     use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::class_s::CommitBroadcastBorrows;
     use crate::context::actor::deps::ActorDeps;
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -7365,6 +7102,7 @@ mod commit_broadcast_retry_tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -7412,7 +7150,7 @@ mod commit_broadcast_retry_tests {
             &DID(TARGET.to_owned()),
             scp_protocol::economy::types::Amount::new(500),
             "test-purpose",
-            super::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [0x4e; 32],
                 actor_did: ADMIN,
                 timestamp_secs: 1_700_000_000,
@@ -7474,7 +7212,7 @@ mod commit_broadcast_retry_tests {
                 missed_windows: vec![(DID(TARGET.to_owned()), 3)],
                 detected_at: 1_700_000_000,
             },
-            super::CommitMeta {
+            crate::context::shared::governance::CommitMeta {
                 pid: [0x4d; 32],
                 actor_did: ADMIN,
                 timestamp_secs: 1_700_000_000,
@@ -7508,7 +7246,10 @@ mod commit_broadcast_retry_tests {
     /// Produce a real `BroadcastFailure` by driving `try_broadcast_commit`
     /// against a failing transport — the exact payload a failed broadcast hands
     /// the caller to apply.
-    async fn make_failure(deps: &ActorDeps, op: &CommitOperation) -> super::BroadcastFailure {
+    async fn make_failure(
+        deps: &ActorDeps,
+        op: &CommitOperation,
+    ) -> crate::context::shared::governance::BroadcastFailure {
         try_broadcast_commit(deps, &ctx_hex(), b"commit-bytes".to_vec(), op)
             .await
             .expect("failing transport yields Some(BroadcastFailure)")
@@ -8012,7 +7753,7 @@ mod commit_broadcast_retry_tests {
         state.ttl.timer.deadline_unix_secs = Some(1_700_000_500);
         let mut cell = ClassSCell::new(state);
 
-        let meta = super::CommitMeta {
+        let meta = crate::context::shared::governance::CommitMeta {
             pid: [0u8; 32],
             actor_did: ADMIN,
             timestamp_secs: 1_700_000_000,

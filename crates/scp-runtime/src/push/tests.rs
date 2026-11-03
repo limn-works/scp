@@ -228,6 +228,7 @@ fn supervisor() -> Arc<Supervisor> {
         Some(tokio::sync::broadcast::channel(256).0),
         None,
         mls_storage,
+        crate::domain_handlers(),
     )
 }
 

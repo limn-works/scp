@@ -258,7 +258,12 @@ fn test_supervisor() -> Supervisor {
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
     )));
-    Supervisor::new(persistence, journal, SupervisorConfig::default())
+    Supervisor::new(
+        persistence,
+        journal,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    )
 }
 
 /// ADR-049 §3a / spec §5.15.4: a saga reserves its participant-context SET

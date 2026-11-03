@@ -147,7 +147,7 @@ fn handle_prepare_for_replace(
     // reject-before-terminal barrier. `import_context` SEEDS the owned crypto
     // onto the fresh replacement actor after this actor is despawned; the floor
     // merge is idempotent, so running it here (gate) and there (seed) is safe.
-    if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+    if let Err(e) = crate::context::restored_crypto::restore_crypto_state_with_floor_guard(
         deps,
         &ctx_id_bytes,
         floors,
@@ -164,4 +164,20 @@ fn handle_prepare_for_replace(
     *cell.class_c_view().lifecycle_state_mut() = ContextLifecycleState::Closed;
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+/// The lifecycle-control domain's [`LifecycleControlDomain`](crate::context::domains::LifecycleControlDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct LifecycleControl;
+
+#[async_trait::async_trait]
+impl crate::context::domains::LifecycleControlDomain for LifecycleControl {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::LifecycleControlCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
 }

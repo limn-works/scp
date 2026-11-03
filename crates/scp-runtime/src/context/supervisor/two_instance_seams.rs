@@ -12,9 +12,9 @@ use scp_protocol::context::{ContextError, ContextParams};
 
 use super::Supervisor;
 use crate::context::actor::bounded_reply_await;
+use crate::context::actor::commands::DeliverOutcome;
 use crate::context::actor::commands::{MessagingCommand, QueriesCommand};
 use crate::context::builder::{ContextCreationError, ContextTransportProvider};
-use crate::context::messaging_helpers::DeliverOutcome;
 
 /// The payloads a supervisor has sent to its contexts, oldest first.
 ///

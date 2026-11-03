@@ -99,6 +99,9 @@ pub mod context {
     /// commit 12, replacing the legacy `attach_test_supervisor`).
     #[cfg(any(test, feature = "testing"))]
     pub use scp_runtime::context::test_supervisor;
+    /// The 13 domain handlers every `Supervisor` constructor takes last
+    /// (ADR-070 §3).
+    pub use scp_runtime::domain_handlers;
     // ContextManager type deleted in ADR-049 commit 12; consumers
     // build a `Supervisor` directly via `Supervisor::with_providers`
     // (re-exported through `scp_core::context::supervisor`).

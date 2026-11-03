@@ -4,7 +4,7 @@
 //! *live* scp-runtime message pipeline end to end — both halves of the wiring
 //! this story makes real:
 //!
-//! - **Send side (Part 2).** [`messaging_helpers::build_encrypted_envelope_actor`]
+//! - **Send side (Part 2).** [`crate::context::shared::messaging::build_encrypted_envelope_actor`]
 //!   — the production actor app-data seal the live `Supervisor::send_message` →
 //!   `messaging_helpers::send_message` → `encrypt_and_send` chain bottoms out in
 //!   — stamps the caller's chosen [`SigningKeyId`] into
@@ -79,7 +79,8 @@ use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
 use crate::context::actor::state::PerContextState;
-use crate::context::messaging_helpers::{build_encrypted_envelope_actor, verify_and_unwrap};
+use crate::context::messaging_helpers::verify_and_unwrap;
+use crate::context::shared::messaging::build_encrypted_envelope_actor;
 use crate::context::supervisor::MessageSigner;
 
 const ALICE_DID: &str = "did:dht:z6MkAgentBindingPipelineAliceAliceAliceA";

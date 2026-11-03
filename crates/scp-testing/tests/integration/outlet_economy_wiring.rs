@@ -134,6 +134,7 @@ fn build_supervisor(creator_did: &str, key_resolver: KeyResolver) -> Arc<Supervi
         None,                                   // event_tx
         Some(Arc::new(scp_clock::SystemClock)), // clock (required by invoke_outlet_with_economy)
         test_mls_storage(),
+        scp_core::context::domain_handlers(),
     )
 }
 

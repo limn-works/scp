@@ -875,7 +875,7 @@ mod tests {
     fn sup() -> Arc<Supervisor> {
         // The registry needs no providers, so the provider-free query shim is
         // the right lightweight constructor for these unit tests.
-        Arc::new(Supervisor::for_query_shim())
+        Arc::new(Supervisor::for_query_shim(crate::domain_handlers()))
     }
 
     // -- sender-epoch monotonicity + overshoot ----------------------------------

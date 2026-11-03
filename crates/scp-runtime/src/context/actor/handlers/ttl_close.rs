@@ -35,8 +35,6 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -45,9 +43,7 @@ use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 
-/// Per-call transport budget for TTL-close handlers. Plan §"Transport
-/// timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`TtlCloseCommand`] against actor-owned state and deps.
 ///
@@ -101,11 +97,11 @@ pub(crate) async fn dispatch(
 fn handle_start_ttl_timer(
     cell: &mut ClassSCell,
     params: &scp_protocol::context::params::ContextParams,
-    deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
+    deadline_override: Option<crate::context::supervisor::handle::ConvergentDeadline>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Resolve the ABSOLUTE convergent expiry deadline to record, as a
-    // [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+    // [`ConvergentDeadline`](crate::context::supervisor::handle::ConvergentDeadline)
     // (the arming-seam newtype). `Some` is the explicit deadline supplied by the
     // restore/import paths — derived from the SINGLE authoritative source (the
     // log) via `convergent_ttl_deadline`, so a prior extension survives and a
@@ -117,7 +113,7 @@ fn handle_start_ttl_timer(
     // §9.9.3). `creation_timestamp_secs` is the authentic creator-assigned value
     // on every path (verbatim from the creator-signed snapshot on import).
     let deadline = deadline_override.or_else(|| {
-        crate::context::ttl_close_helpers::convergent_ttl_deadline_secs(
+        crate::context::shared::ttl_close::convergent_ttl_deadline_secs(
             cell.creation_timestamp_secs,
             params.ttl.map(|ttl| ttl.as_secs()),
         )
@@ -303,7 +299,7 @@ async fn handle_execute_ttl_close(
 ///
 /// No forced `transition_to(Closing)` on a detached handle: per the documented
 /// FFI contract the context must ALREADY be in `Closing` (a prior
-/// `close_context`), and [`ttl_close_helpers::finalize_close`](crate::context::ttl_close_helpers::finalize_close) —
+/// `close_context`), and [`crate::context::shared::ttl_close::finalize_close`](crate::context::shared::ttl_close::finalize_close) —
 /// via [`ttl::finalize_close`](crate::context::ttl::finalize_close) — performs
 /// the `Closing → Closed` transition itself, returning `InvalidTransition` if
 /// the context is not in `Closing`, exactly the FFI error contract.
@@ -320,7 +316,7 @@ async fn handle_finalize_close(
     // so the `Closing → Closed` transition lands on the live context.
     let handle = cell.handle.clone();
 
-    let finalize_fut = crate::context::ttl_close_helpers::finalize_close(cell, deps, &handle);
+    let finalize_fut = crate::context::shared::ttl_close::finalize_close(cell, deps, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(attestation)) => {
@@ -381,6 +377,64 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
     }
 }
 
+/// The ttl-close domain's [`TtlCloseDomain`](crate::context::domains::TtlCloseDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct TtlClose;
+
+#[async_trait::async_trait]
+impl crate::context::domains::TtlCloseDomain for TtlClose {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::TtlCloseCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn extend_ttl_deadline_and_record(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+        context_id_bytes: &[u8; 32],
+        actor_did: &str,
+        additional_secs: u64,
+        leaf: crate::context::shared::ttl_close::ExtensionLeaf,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
+            cell,
+            event_log,
+            context_id_bytes,
+            actor_did,
+            additional_secs,
+            leaf,
+        )
+        .await
+    }
+
+    async fn handle_ttl_expiry(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        handle: &crate::context::ContextHandle,
+        prior_completed: u8,
+    ) -> crate::context::shared::ttl_close::TtlExpiryOutcome {
+        crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, handle, prior_completed)
+            .await
+    }
+
+    async fn reset_ttl_timer(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        new_duration: std::time::Duration,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        crate::context::ttl_close_helpers::reset_ttl_timer(cell, deps, context_id, new_duration)
+            .await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -429,6 +483,7 @@ mod tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -550,7 +605,7 @@ mod tests {
         let handle = cell.handle.clone();
 
         let attestation =
-            crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
+            crate::context::shared::ttl_close::finalize_close(&mut cell, &deps, &handle)
                 .await
                 .expect("finalize_close on a Closing Ephemeral context succeeds")
                 .expect("Ephemeral close with present crypto returns Some(attestation)");

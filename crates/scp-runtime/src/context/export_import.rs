@@ -3215,7 +3215,7 @@ mod tests {
     /// relies on.
     #[test]
     fn skewed_importers_derive_identical_ttl_deadline_from_snapshot() {
-        use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
+        use crate::context::shared::ttl_close::convergent_ttl_deadline_secs;
 
         let mut snapshot = test_snapshot("ctx-creation-ts-converge");
         snapshot.creation_timestamp_secs = 1_700_000_000;
@@ -3234,7 +3234,7 @@ mod tests {
             "importers reading the same convergent creation time must agree on the deadline"
         );
         assert_eq!(
-            alice_deadline.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
+            alice_deadline.map(crate::context::supervisor::handle::ConvergentDeadline::as_secs),
             Some(1_700_000_000 + 86_400),
             "the deadline must be creation_timestamp_secs + ttl, not a local-clock value"
         );
@@ -3249,7 +3249,7 @@ mod tests {
     /// so no clamp is needed here. This test pins ONLY the create-base primitive.
     #[test]
     fn create_base_primitive_is_verbatim() {
-        use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
+        use crate::context::shared::ttl_close::convergent_ttl_deadline_secs;
 
         let creation = 1_700_000_120_u64;
         let ttl = 86_400_u64;
@@ -3260,7 +3260,7 @@ mod tests {
         // Create-base primitive: `creation + ttl` verbatim, no clamp.
         let base = convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
         assert_eq!(
-            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
+            base.map(crate::context::supervisor::handle::ConvergentDeadline::as_secs),
             Some(creation + ttl),
             "the create-base primitive arms creation + ttl verbatim"
         );
@@ -3268,7 +3268,7 @@ mod tests {
         // Independent verbatim deadline math for the SAME field.
         let verbatim_deadline = creation.saturating_add(ttl);
         assert_eq!(
-            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
+            base.map(crate::context::supervisor::handle::ConvergentDeadline::as_secs),
             Some(verbatim_deadline),
             "every member computing the create base from the same convergent \
              creation time derives the IDENTICAL deadline"

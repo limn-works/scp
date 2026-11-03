@@ -3,75 +3,12 @@
 //! directory in ADR-049 §15; the helpers in
 //! [`crate::context::lifecycle_helpers`] call into these primitives.
 
+use crate::context::shared::lifecycle::build_identity_assessment;
 use std::collections::HashMap;
 
 use scp_protocol::context::ContextError;
 
 use scp_did::DID;
-
-/// Builds an [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) for a member in a context.
-///
-/// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
-/// (governance path). Populates trust signals from available context state:
-///
-/// - **`ParticipationHistory`** — participation duration from the member's
-///   cached `ParticipationRecord` (§9.3 trust signal table row 3).
-/// - **`ParticipationRecord`** — participation count from the same record
-///   (§9.3 row 4). Strength = number of events by the member.
-/// - **`EconomicActivity`** — total spend from the budget tracker (§9.3
-///   row 5 / §19). Only populated if the member has budget state.
-///
-/// External signals (social attestation, device attestation, endorsements)
-/// require DID document resolution and attestation verification, which
-/// are not yet wired at the `ContextManager` layer. Those categories remain
-/// empty until the trust signal provider infrastructure is built.
-pub(super) fn build_identity_assessment(
-    member_did: &DID,
-    governance: &super::state::GovernanceState,
-    now: u64,
-) -> scp_protocol::trust::sybil::IdentityDepthAssessment {
-    use scp_protocol::trust::sybil::{TrustSignal, TrustSignalCategory};
-
-    let mut signals = HashMap::new();
-
-    // Populate from participation cache if the member has a record.
-    if let Some(record) = governance.participation_cache.get(member_did.as_ref()) {
-        signals.insert(
-            TrustSignalCategory::ParticipationHistory,
-            TrustSignal {
-                category: TrustSignalCategory::ParticipationHistory,
-                verified_at: record.computed_at,
-                strength: record.participation_duration_seconds,
-                details: None,
-            },
-        );
-        signals.insert(
-            TrustSignalCategory::ParticipationRecord,
-            TrustSignal {
-                category: TrustSignalCategory::ParticipationRecord,
-                verified_at: record.computed_at,
-                strength: record.participation_count,
-                details: None,
-            },
-        );
-    }
-
-    // Populate economic activity from budget tracker.
-    let total_spent = governance.budget_tracker.total_spent(member_did).0;
-    if total_spent > 0 {
-        signals.insert(
-            TrustSignalCategory::EconomicActivity,
-            TrustSignal {
-                category: TrustSignalCategory::EconomicActivity,
-                verified_at: now,
-                strength: total_spent,
-                details: None,
-            },
-        );
-    }
-
-    scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now)
-}
 
 /// Maximum permitted future cooldown horizon, in seconds.
 ///
@@ -184,23 +121,6 @@ pub(super) fn validate_context_params_for_import(
 // sub-borrows directly — callers build them from the unified struct at
 // the call site. The legacy `&PerContextState` wrappers are gone.
 
-/// Returns the spec §19.7 default per-DID message pricing configuration.
-///
-/// Every context now uses the same baseline: per-DID escalating cost for
-/// `MessageSend`, `ContextJoin`, and `OutletInvoke`, plus the Matrix-style
-/// hard rate limit. The `_economic_policy` parameter is intentionally
-/// unused — it is kept in the signature so call-sites stay symmetrical
-/// with the old `derive_relay_pricing_config` while documenting that
-/// pricing is uniform across all contexts. Per-context pricing
-/// customization will land via governance in a follow-up PR.
-#[allow(clippy::unnecessary_wraps)] // Option return kept for forward compat
-// with per-context pricing customization landing via governance.
-pub fn derive_message_pricing(
-    _economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-) -> Option<scp_protocol::economy::antispam::ContextMessagePricingConfig> {
-    Some(scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default())
-}
-
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
 /// Reads the `sybil_policy` directly so callers may pass
@@ -251,17 +171,20 @@ pub fn post_join_bookkeeping(
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
     context_id: &str,
     member_did: &DID,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    deps: &crate::context::actor::deps::ActorDeps,
 ) {
+    let now = deps.clock.now_secs();
+    let event_log = deps.event_log.as_ref();
     let context_id_bytes = super::state::context_id_to_bytes(context_id);
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
     // Participation-record path consumes only the merged event set;
     // the consequence window anchor is not used here.
-    let (join_events, _convergent_now) =
-        super::governance_logic::event_log_entries_for_consequences_after_side_effect(
+    let (join_events, _convergent_now) = deps
+        .domains
+        .governance
+        .event_log_entries_for_consequences_after_side_effect(
             receive_buffer,
             context_id,
             now,
@@ -298,7 +221,6 @@ pub fn post_join_bookkeeping(
 ///
 /// Returns [`ContextError::PermissionDenied`] if the auto-accept guard
 /// rejects, or any error surfaced by `enforce_economy`.
-#[allow(clippy::too_many_arguments)]
 pub fn enforce_join_economy(
     governance: &mut super::state::GovernanceState,
     member_count: usize,
@@ -306,8 +228,7 @@ pub fn enforce_join_economy(
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     context_id: &str,
-    clock: &dyn scp_clock::Clock,
-    key_resolver: &scp_protocol::context::governance::KeyResolver,
+    deps: &crate::context::actor::deps::ActorDeps,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         governance.economic_policy.as_ref(),
@@ -322,21 +243,23 @@ pub fn enforce_join_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    super::economy_logic::enforce_economy(super::economy_logic::EnforceEconomyRequest {
-        economic_policy: governance.economic_policy.as_ref(),
-        budget_tracker: &mut governance.budget_tracker,
-        velocity_tracker: &governance.velocity_tracker,
-        member_count,
-        action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
-        actor_did: joiner_did,
-        now,
-        spending_ucan,
-        action_label: "context:join",
-        context_id,
-        clock,
-        pricing,
-        nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
-        revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-        key_resolver,
-    })
+    deps.domains
+        .economy
+        .enforce_economy(crate::context::shared::economy::EnforceEconomyRequest {
+            economic_policy: governance.economic_policy.as_ref(),
+            budget_tracker: &mut governance.budget_tracker,
+            velocity_tracker: &governance.velocity_tracker,
+            member_count,
+            action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+            actor_did: joiner_did,
+            now,
+            spending_ucan,
+            action_label: "context:join",
+            context_id,
+            clock: &*deps.clock,
+            pricing,
+            nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
+            revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+            key_resolver: &deps.key_resolver,
+        })
 }

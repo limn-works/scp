@@ -42,6 +42,19 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/snapshot.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/push_routes.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/messaging.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/outlets.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/governance.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/lifecycle.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/economy.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/queries.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/standing.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/trust_recovery.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/broadcast.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/shared/ttl_close.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/restored_crypto.rs"),
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
@@ -1145,12 +1158,16 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
 // `Supervisor::build_welcome_joiner_state`, after bundle verification.
 const LIFECYCLE_HELPERS_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+// ADR-070: `normalize_relay_urls`, the `FirstStateRollback` guard and the
+// first-state writes read and write only core state, so they live in core.
+const LIFECYCLE_CORE_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/shared/lifecycle.rs");
 
 #[test]
 fn relay_set_writes_store_canonical_relay_urls() {
     assert!(
         fn_body_contains(
-            LIFECYCLE_HELPERS_SRC,
+            LIFECYCLE_CORE_SRC,
             "normalize_relay_urls",
             "canonical_node_url("
         ),
@@ -1527,16 +1544,16 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
         "dispatch_push_command must send ContextCommand::Push through the actor mailbox"
     );
     assert!(
-        fn_body_contains(ACTOR_MOD_SRC, "dispatch_state", "handlers::push::dispatch("),
-        "the actor's dispatch_state must route ContextCommand::Push to handlers::push::dispatch"
+        fn_body_contains(ACTOR_MOD_SRC, "dispatch_state", "domains.push.dispatch("),
+        "the actor's dispatch_state must route ContextCommand::Push to the push domain's dispatch"
     );
     assert!(
         fn_body_contains(
             HANDLERS_PUSH_SRC,
             "dispatch",
-            "push_helpers::push_routes(state)"
+            "push_routes::push_routes(state)"
         ),
-        "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
+        "handlers::push::dispatch must answer PushCommand::Routes from push_routes::push_routes"
     );
 }
 
@@ -1554,28 +1571,28 @@ fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
         fn_body_contains(
             SUPERVISOR_SRC,
             "dispatch_lifecycle_direct",
-            "lifecycle_helpers::create_context("
+            "domains.lifecycle.create_context("
         ),
         "dispatch_lifecycle_direct CreateContext arm must delegate to the \
-         actor-shape lifecycle_helpers::create_context (spawns the per-context actor)"
+         lifecycle domain's create_context (spawns the per-context actor)"
     );
     assert!(
         fn_body_contains(
             SUPERVISOR_SRC,
             "dispatch_lifecycle_direct",
-            "lifecycle_helpers::import_context("
+            "domains.lifecycle.import_context_from_export("
         ),
         "dispatch_lifecycle_direct ImportContext arm must delegate to the \
-         actor-shape lifecycle_helpers::import_context (spawns the per-context actor)"
+         lifecycle domain's import_context_from_export (spawns the per-context actor)"
     );
     assert!(
         fn_body_contains(
             SUPERVISOR_SRC,
             "dispatch_lifecycle_direct",
-            "lifecycle_helpers::restore_context("
+            "domains.lifecycle.restore_context("
         ),
         "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
-         actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
+         lifecycle domain's restore_context (spawns the per-context actor)"
     );
 }
 
@@ -1796,7 +1813,7 @@ fn welcome_import_and_restore_run_the_committed_t0_binding_check() {
     let welcome = compact_body(SUPERVISOR_SRC, "spawn_actor_from_welcome");
     assert!(
         welcome.contains(
-            "letcommitted_t0=crate::context::lifecycle_helpers::verify_scp_context_binding("
+            "letcommitted_t0=crate::context::restored_crypto::verify_scp_context_binding("
         ),
         "spawn_actor_from_welcome must bind the binding check's result as committed_t0"
     );
@@ -4215,25 +4232,21 @@ fn last_relay_contact_writers_wired() {
 fn first_relay_contact_written_before_the_actor_spawns() {
     for (src, caller, callee) in [
         (
-            LIFECYCLE_HELPERS_SRC,
+            LIFECYCLE_CORE_SRC,
             "persist_first_state",
             "first_state_writes(",
         ),
         (
-            LIFECYCLE_HELPERS_SRC,
+            LIFECYCLE_CORE_SRC,
             "first_state_writes",
             "write_first_state(",
         ),
         (
-            LIFECYCLE_HELPERS_SRC,
+            LIFECYCLE_CORE_SRC,
             "write_first_state",
             "store_last_relay_contact(",
         ),
-        (
-            LIFECYCLE_HELPERS_SRC,
-            "write_first_state",
-            "persist_context(",
-        ),
+        (LIFECYCLE_CORE_SRC, "write_first_state", "persist_context("),
     ] {
         assert!(
             fn_body_contains(src, caller, callee),
@@ -4271,7 +4284,7 @@ fn first_relay_contact_written_before_the_actor_spawns() {
 /// refuse a running context's id before they write.
 #[test]
 fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "write_first_state")
+    let body = extract_fn_body(LIFECYCLE_CORE_SRC, "write_first_state")
         .expect("write_first_state not found");
     let contact = body
         .find("store_last_relay_contact(")
@@ -4331,12 +4344,19 @@ fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
         .find("lookup(&destination_context_id)")
         .expect("the migration must look up its destination");
     let create = body
-        .find("lifecycle_helpers::create_context(")
+        .find("domains.lifecycle.create_context(")
         .expect("the migration must create its destination");
     assert!(
         lock < lookup && lookup < create,
         "the migration must check its destination under the lock before it creates"
     );
+}
+
+/// The body of `MigrationBootstrap::reserve`, found inside its impl so a
+/// same-named function elsewhere in `MANAGER_SRC` cannot stand in for it.
+fn migration_bootstrap_reserve() -> Option<String> {
+    let bootstrap_impl = MANAGER_SRC.find("impl MigrationBootstrap ")?;
+    extract_fn_body(&MANAGER_SRC[bootstrap_impl..], "reserve")
 }
 
 /// ADR-049 Decision 9: a migration's busy `bootstrap_spawn_lock` or
@@ -4430,7 +4450,7 @@ fn a_migration_takes_the_bootstrap_lock_before_its_proposal_or_vote_is_recorded(
         reserved < marker,
         "the direct-execute path must reserve before its replay marker"
     );
-    let body = extract_fn_body(MANAGER_SRC, "reserve").expect("MigrationBootstrap::reserve");
+    let body = migration_bootstrap_reserve().expect("MigrationBootstrap::reserve");
     let lock = body
         .find("try_lock_bootstrap_spawn()")
         .expect("the reservation try-locks bootstrap_spawn_lock");
@@ -4513,7 +4533,7 @@ fn every_first_state_owner_rolls_back_after_releasing_the_bootstrap_lock() {
         "the migration must hold bootstrap_spawn_lock through its rollback"
     );
     assert!(
-        extract_fn_body(MANAGER_SRC, "reserve")
+        migration_bootstrap_reserve()
             .is_some_and(|reserve| reserve.contains("FirstStateRollback::new(")),
         "the migration's first-state guard is built by its reservation"
     );
@@ -4526,7 +4546,7 @@ fn every_first_state_owner_rolls_back_after_releasing_the_bootstrap_lock() {
 /// lock.
 #[test]
 fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "persist_first_state")
+    let body = extract_fn_body(LIFECYCLE_CORE_SRC, "persist_first_state")
         .expect("persist_first_state not found");
     let busy = body
         .find("writes_idle.send_replace(false)")
@@ -4544,7 +4564,7 @@ fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
     // The idle guard is built before the future, so a task dropped before its
     // first poll still marks the writes idle, and the writes select on the
     // shutdown token, so a hung write cannot hold shutdown's task drain.
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "first_state_writes")
+    let body = extract_fn_body(LIFECYCLE_CORE_SRC, "first_state_writes")
         .expect("first_state_writes not found");
     let idle_guard = body
         .find("WritesIdleOnDrop(")
@@ -4602,7 +4622,7 @@ fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
 #[test]
 fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
     for entry in ["rollback", "rollback_with_guard"] {
-        let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, entry)
+        let body = extract_fn_body(LIFECYCLE_CORE_SRC, entry)
             .unwrap_or_else(|| panic!("{entry} not found"));
         let drain = body
             .find("drain_writes()")
@@ -4618,7 +4638,7 @@ fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
             "{entry} must wait for the writes task before it reads what was touched"
         );
     }
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "rollback").expect("rollback not found");
+    let body = extract_fn_body(LIFECYCLE_CORE_SRC, "rollback").expect("rollback not found");
     let drain = body.find("drain_writes()").expect("rollback drains");
     let relock = body
         .find("relock.await")
@@ -4628,7 +4648,7 @@ fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
         drain < relock && relock < undo,
         "rollback must drain with the lock released and undo under it"
     );
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "rollback_with_guard")
+    let body = extract_fn_body(LIFECYCLE_CORE_SRC, "rollback_with_guard")
         .expect("rollback_with_guard not found");
     assert!(
         !body.contains("try_lock_bootstrap_spawn()")
@@ -4649,10 +4669,10 @@ fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
         undo < released && released < unclaimed,
         "the in-turn rollback must undo before it releases the lock, then the claim"
     );
-    let guard_drop = LIFECYCLE_HELPERS_SRC
+    let guard_drop = LIFECYCLE_CORE_SRC
         .find("impl Drop for FirstStateRollback ")
         .expect("FirstStateRollback must implement Drop");
-    let body = extract_fn_body(&LIFECYCLE_HELPERS_SRC[guard_drop..], "drop")
+    let body = extract_fn_body(&LIFECYCLE_CORE_SRC[guard_drop..], "drop")
         .expect("FirstStateRollback::drop not found");
     let drain = body
         .find("drain_writes()")
@@ -8925,6 +8945,13 @@ mod syn_scan {
         /// (`name(..)`, `crate::module::name(..)`): each names a free
         /// function, never a method.
         pub free_calls: BTreeSet<String>,
+        /// Methods called through a `DomainHandlers` field
+        /// (`deps.domains.lifecycle.name(..)`, `domains.governance.name(..)`):
+        /// each names a method of a domain trait impl (ADR-070), never a
+        /// Supervisor method or a free function. Kept out of `calls`.
+        pub domain_calls: BTreeSet<String>,
+        /// The function is a method of an `impl <Name>Domain for <Type>`.
+        pub domain_impl: bool,
         /// Field, path and macro-token identifiers.
         pub mentions: BTreeSet<String>,
     }
@@ -9057,13 +9084,30 @@ mod syn_scan {
         }
     }
 
+    /// `true` when `receiver` is a `DomainHandlers` field: `<expr>.domains.<d>`
+    /// or a `domains` binding's `domains.<d>`.
+    fn through_domain_handlers(receiver: &syn::Expr) -> bool {
+        let syn::Expr::Field(field) = receiver else {
+            return false;
+        };
+        match &*field.base {
+            syn::Expr::Field(base) => {
+                matches!(&base.member, syn::Member::Named(name) if name == "domains")
+            }
+            syn::Expr::Path(path) => path.path.is_ident("domains"),
+            _ => false,
+        }
+    }
+
     /// Records [`FnFacts`] for every non-test function in a file.
     #[derive(Default)]
     pub struct Collector {
         pub fns: Vec<FnFacts>,
         file: PathBuf,
         stack: Vec<usize>,
-        owners: Vec<String>,
+        /// The enclosing item's self type (empty for a free function), and
+        /// whether it is a domain trait impl.
+        owners: Vec<(String, bool)>,
     }
 
     impl Collector {
@@ -9079,7 +9123,12 @@ mod syn_scan {
         fn enter(&mut self, name: String, spawned: bool) {
             self.fns.push(FnFacts {
                 spawned,
-                owner: self.owners.last().cloned().unwrap_or_default(),
+                owner: self
+                    .owners
+                    .last()
+                    .map(|(owner, _)| owner.clone())
+                    .unwrap_or_default(),
+                domain_impl: self.owners.last().is_some_and(|(_, domain)| *domain),
                 name,
                 file: self.file.clone(),
                 ..FnFacts::default()
@@ -9089,6 +9138,12 @@ mod syn_scan {
 
         fn leave(&mut self) {
             self.stack.pop();
+        }
+
+        fn record_domain_call(&mut self, name: String) {
+            if let Some(&at) = self.stack.last() {
+                self.fns[at].domain_calls.insert(name);
+            }
         }
 
         fn record_free_call(&mut self, name: String) {
@@ -9166,7 +9221,12 @@ mod syn_scan {
             if gated_on_test(&node.attrs) {
                 return;
             }
-            self.owners.push(type_name(&node.self_ty));
+            let domain_impl = node.trait_.as_ref().is_some_and(|(_, path, _)| {
+                path.segments
+                    .last()
+                    .is_some_and(|s| s.ident.to_string().ends_with("Domain"))
+            });
+            self.owners.push((type_name(&node.self_ty), domain_impl));
             visit::visit_item_impl(self, node);
             self.owners.pop();
         }
@@ -9175,7 +9235,7 @@ mod syn_scan {
             if gated_on_test(&node.attrs) {
                 return;
             }
-            self.owners.push(node.ident.to_string());
+            self.owners.push((node.ident.to_string(), false));
             visit::visit_item_trait(self, node);
             self.owners.pop();
         }
@@ -9184,7 +9244,7 @@ mod syn_scan {
             if gated_on_test(&node.attrs) {
                 return;
             }
-            self.owners.push(String::new());
+            self.owners.push((String::new(), false));
             self.enter(node.sig.ident.to_string(), false);
             visit::visit_item_fn(self, node);
             self.leave();
@@ -9211,7 +9271,11 @@ mod syn_scan {
 
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
             let method = node.method.to_string();
-            self.record(true, method.clone());
+            if through_domain_handlers(&node.receiver) {
+                self.record_domain_call(method.clone());
+            } else {
+                self.record(true, method.clone());
+            }
             self.visit_expr(&node.receiver);
             if SPAWNS.contains(&method.as_str()) {
                 self.visit_spawned_args(node.args.iter());
@@ -9411,32 +9475,59 @@ fn actor_turn_entry(f: &syn_scan::FnFacts) -> bool {
 /// it calls, each with the call path that reaches the lock.
 ///
 /// A call through a bare or module path resolves to the free functions of
-/// its name; every other call resolves to every function of its name, so a
-/// method name shared with a lock taker counts as a call of it: the check
-/// over-approximates and never misses a path.
+/// its name, and a call through a `DomainHandlers` field resolves to the
+/// domain trait impl methods of its name (ADR-070); every other call resolves
+/// to every function of its name, so a method name shared with a lock taker
+/// counts as a call of it: the check over-approximates and never misses a
+/// path.
 fn handle_paths_to_the_bootstrap_lock(facts: &[syn_scan::FnFacts]) -> Vec<String> {
-    // Keyed by (is a free function, name).
-    let mut reach: std::collections::BTreeMap<(bool, String), String> = facts
+    /// What a call can resolve to.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Callee {
+        Free,
+        DomainMethod,
+        Method,
+    }
+    const fn kind(f: &syn_scan::FnFacts) -> Callee {
+        if f.owner.is_empty() {
+            Callee::Free
+        } else if f.domain_impl {
+            Callee::DomainMethod
+        } else {
+            Callee::Method
+        }
+    }
+    type Reach = std::collections::BTreeMap<(Callee, String), String>;
+    let mut reach: Reach = facts
         .iter()
         .filter(|f| !actor_turn_entry(f) && awaits_bootstrap_lock(f))
-        .map(|f| ((f.owner.is_empty(), f.name.clone()), f.name.clone()))
+        .map(|f| ((kind(f), f.name.clone()), f.name.clone()))
         .collect();
-    let reached = |reach: &std::collections::BTreeMap<(bool, String), String>,
-                   f: &syn_scan::FnFacts| {
-        f.calls.iter().find_map(|c| {
-            let free = reach.get(&(true, c.clone()));
-            if f.free_calls.contains(c) {
-                free.cloned()
-            } else {
-                free.or_else(|| reach.get(&(false, c.clone()))).cloned()
-            }
-        })
+    let reached = |reach: &Reach, f: &syn_scan::FnFacts| {
+        let get = |callee: Callee, name: &String| reach.get(&(callee, name.clone()));
+        f.calls
+            .iter()
+            .find_map(|c| {
+                let free = get(Callee::Free, c);
+                if f.free_calls.contains(c) {
+                    free.cloned()
+                } else {
+                    free.or_else(|| get(Callee::Method, c))
+                        .or_else(|| get(Callee::DomainMethod, c))
+                        .cloned()
+                }
+            })
+            .or_else(|| {
+                f.domain_calls
+                    .iter()
+                    .find_map(|c| get(Callee::DomainMethod, c).cloned())
+            })
     };
     loop {
         let mut grew = false;
         // A spawned task runs on its own task, never on its spawner's turn.
         for f in facts.iter().filter(|f| !f.spawned && !actor_turn_entry(f)) {
-            let key = (f.owner.is_empty(), f.name.clone());
+            let key = (kind(f), f.name.clone());
             if reach.contains_key(&key) {
                 continue;
             }
@@ -9522,10 +9613,11 @@ fn no_actor_turn_waits_on_the_bootstrap_spawn_lock() {
 }
 
 /// The lock scan flags a handle method, or an outlet stream adapter's
-/// function, that awaits the lock directly or through a Supervisor function,
-/// and passes a try-lock, a lock taken inside a spawned task, and a
-/// module-path call of a free function that shares a lock taker's method
-/// name.
+/// function, that awaits the lock directly or through a Supervisor function
+/// or a domain trait impl, and passes a try-lock, a lock taken inside a
+/// spawned task, a module-path call of a free function that shares a lock
+/// taker's method name, and a `DomainHandlers` call of a domain method that
+/// shares a lock taker's Supervisor method name.
 #[test]
 fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
     let file: syn::File = syn::parse_str(
@@ -9536,7 +9628,15 @@ fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
              fn spawned(&self) { spawn_tracked(async move { l.bootstrap_spawn_lock.lock().await; }); }\n\
              async fn via_free(&self) { crate::helpers::restore_y().await; }\n\
              async fn via_method(&self) { self.upgrade()?.restore_y().await; }\n\
+             async fn via_domain(&self) { deps.domains.lifecycle.restore_y().await; }\n\
+             async fn via_domain_locked(&self) { self.deps.domains.lifecycle.take_z().await; }\n\
+             async fn via_domains_binding(&self) { domains.governance.take_z().await; }\n\
          }\n\
+         impl LifecycleDomain for Lifecycle {\n\
+             async fn restore_y(&self) { crate::helpers::restore_y().await; }\n\
+             async fn take_z(&self) { crate::helpers::locked_z().await; }\n\
+         }\n\
+         async fn locked_z() { let _g = l.bootstrap_spawn_lock.lock().await; }\n\
          impl Supervisor {\n\
              async fn respawn_x(&self) { self.respawn_locked().await; }\n\
              async fn respawn_locked(&self) { let _g = self.bootstrap_spawn_lock.lock().await; }\n\
@@ -9566,6 +9666,8 @@ fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
             "SupervisorHandle::lock_bootstrap_spawn awaits the lock",
             "SupervisorHandle::via_supervisor -> respawn_x -> respawn_locked",
             "SupervisorHandle::via_method -> restore_y",
+            "SupervisorHandle::via_domain_locked -> take_z -> locked_z",
+            "SupervisorHandle::via_domains_binding -> take_z -> locked_z",
             "ActorStreamSettlementSink::settle -> respawn_x -> respawn_locked",
             "stream_settlement_adapter.rs::dispatch -> restore_y",
         ]

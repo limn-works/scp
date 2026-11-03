@@ -51,7 +51,11 @@
 //! 17. [`send_pseudonym_announcement`] — announcement, v1 or v2.
 //! 18. [`rotate_pseudonym`] — fail-closed pseudonym rotation, then announce.
 
-use std::sync::Arc;
+use crate::context::actor::commands::DeliverOutcome;
+use crate::context::shared::messaging::{
+    Dispatched, build_encrypted_envelope_actor, commit_send_nonce_token_on_abort,
+};
+use crate::context::snapshot::persist_state_best_effort;
 
 use sha2::Digest;
 use subtle::ConstantTimeEq;
@@ -66,11 +70,10 @@ use scp_protocol::context::pseudonym::{
     classify_pseudonym_announcement, is_pseudonym_announcement_payload,
 };
 use scp_protocol::context::roles::Capability;
-use scp_protocol::crypto::access_keys::wrapping::Recipient;
 use scp_protocol::crypto::access_keys::{AccessKey, WrappedContent};
 use scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope;
 use scp_protocol::crypto::ucan::UcanToken;
-use scp_protocol::envelope::inner::{InnerEnvelope, InnerEnvelopeParams, MessageType};
+use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 use scp_protocol::envelope::validation::SequenceCheck;
 use scp_protocol::provenance::attach::SourceContextInfo;
 use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rules};
@@ -78,8 +81,6 @@ use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rul
 use crate::context::ContextHandle;
 use crate::context::actor::class_s::{BroadcastContextClassCMut, ClassCMut};
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
-use crate::context::governance_helpers;
 use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into};
 use crate::context::supervisor::MessageSigner;
 
@@ -98,148 +99,6 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 // `ContextCryptoState`. The shared inner-envelope construction below
 // (`build_inner_wire`) is retained; the actor path bottoms out in it, so the
 // sealed wire stays byte-identical across the flip.
-
-/// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
-/// wrap → inner-envelope stamp+sign), returning it alongside the canonical
-/// 32-byte context-id digest.
-///
-/// Shared by both seal seams — the deleted pre-PR-7 provider path and the
-/// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
-/// driven from the Class-C view in [`encrypt_and_send`], via
-/// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
-/// inner-envelope construction and the sealed wire stays byte-identical across
-/// the flip (the 16 golden byte-identity tests continue to hold).
-#[allow(clippy::too_many_arguments)]
-pub(in crate::context) async fn build_inner_wire(
-    clock: &Arc<dyn Clock>,
-    context_id: &str,
-    sender_did: &DID,
-    payload: &[u8],
-    signer: MessageSigner<'_>,
-    recipients_data: &std::collections::HashMap<String, AccessKey>,
-    sequence: u64,
-    source_provenance: Option<&SourceContextInfo>,
-    message_type: MessageType,
-) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
-    // ADR-056: key the send-path crypto by the canonical digest (matches
-    // `state.context_id` and the MLS group keyed at creation), not a re-hash
-    // of the hex id.
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    let provenance = source_provenance.map(|source_info| {
-        let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
-        let dp = scp_protocol::provenance::attach::attach_provenance(
-            source_info,
-            &target_context,
-            None,
-            None,
-            None,
-        );
-        scp_protocol::envelope::inner::Provenance {
-            source: dp.source_context,
-            upstream_hash: None,
-        }
-    });
-
-    let recipients: Vec<Recipient<'_>> = recipients_data
-        .iter()
-        .map(|(did, key)| Recipient {
-            did: did.as_str(),
-            access_key: key,
-        })
-        .collect();
-
-    let wrapped = scp_protocol::crypto::access_keys::wrapping::wrap_content(
-        payload,
-        &recipients,
-        context_id,
-        sender_did.as_ref(),
-        0,
-        0,
-    )
-    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-    let wrapped_bytes = rmp_serde::to_vec_named(&wrapped)
-        .map_err(|e| ContextError::CryptoFailed(format!("wrapped content serialization: {e}")))?;
-
-    let timestamp = clock.now_millis();
-    let params = InnerEnvelopeParams {
-        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-        context_id,
-        sender_did: sender_did.as_ref(),
-        epoch: 0,
-        generation: 0,
-        sequence,
-        timestamp,
-        message_type,
-        payload: &wrapped_bytes,
-        provenance,
-        // ADR-039: stamp the verification method this message is signed under
-        // (`#active` or `#agent`) so the recipient resolves the matching public
-        // key from the sender's DID document. The stamped persona and the
-        // signing key both come from the single `MessageSigner` below, so they
-        // cannot disagree — no longer hardcoded to `#active`.
-        signing_key_id: signer.signing_key_id(),
-    };
-
-    // ADR-049 Decision 7a: the canonical hash is signed through custody
-    // within the signing budget; the actor holds no key material.
-    let inner =
-        crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer.signer())
-            .await?;
-
-    Ok((inner, context_id_bytes))
-}
-
-/// Builds and seals an application-data send through the ADR-049 PR-7 actor
-/// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
-/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the deleted
-/// pre-PR-7 provider seal path: it shares [`build_inner_wire`] and
-/// passes the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
-/// sequence — today `MembershipState::next_sequence_number`, matching what the
-/// provider's `seal` derived from the inner envelope). `local_did` is sourced
-/// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
-/// local identity the provider used.
-#[allow(clippy::too_many_arguments)]
-// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
-// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
-// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal
-// after the deleted provider twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
-// visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
-// `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
-// caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
-// carries no cross-layer bridge-export requirement. `redundant_pub_crate` is a
-// false positive here for the same reason as `Supervisor::build_actor_deps`: the
-// enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn build_encrypted_envelope_actor(
-    clock: &Arc<dyn Clock>,
-    crypto_state: &mut crate::context::actor::state::ContextCryptoState,
-    local_did: &str,
-    context_id: &str,
-    sender_did: &DID,
-    payload: &[u8],
-    signer: MessageSigner<'_>,
-    recipients_data: &std::collections::HashMap<String, AccessKey>,
-    aad_sequence: u64,
-    source_provenance: Option<&SourceContextInfo>,
-    message_type: MessageType,
-) -> Result<Vec<u8>, ContextError> {
-    let (inner, context_id_bytes) = build_inner_wire(
-        clock,
-        context_id,
-        sender_did,
-        payload,
-        signer,
-        recipients_data,
-        aad_sequence,
-        source_provenance,
-        message_type,
-    )
-    .await?;
-    // The serialized MLS message; the transport frames it once for each
-    // per-member pseudonym address it fans out to (ADR-002, spec 23 §23.4.1).
-    crypto_state.seal(&context_id_bytes, local_did, &inner, aad_sequence)
-}
 
 // ---------------------------------------------------------------------------
 // 2. enforce_send_economy
@@ -264,8 +123,7 @@ pub fn enforce_send_economy(
     now: u64,
     spending_ucan: Option<&UcanToken>,
     context_id: &str,
-    clock: &dyn Clock,
-    key_resolver: &KeyResolver,
+    deps: &crate::context::actor::deps::ActorDeps,
 ) -> Result<
     (
         Option<scp_protocol::economy::types::Amount>,
@@ -283,8 +141,8 @@ pub fn enforce_send_economy(
             .message_pricing
             .as_ref()
             .unwrap_or(&pricing_default);
-        let cost = crate::context::economy_logic::enforce_economy(
-            crate::context::economy_logic::EnforceEconomyRequest {
+        let cost = deps.domains.economy.enforce_economy(
+            crate::context::shared::economy::EnforceEconomyRequest {
                 economic_policy: governance.economic_policy.as_ref(),
                 budget_tracker: &mut governance.budget_tracker,
                 velocity_tracker: &governance.velocity_tracker,
@@ -295,11 +153,11 @@ pub fn enforce_send_economy(
                 spending_ucan,
                 action_label: "messages:write",
                 context_id,
-                clock,
+                clock: &*deps.clock,
                 pricing,
                 nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
                 revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-                key_resolver,
+                key_resolver: &deps.key_resolver,
             },
         )?;
         // A spending-UCAN nonce is burned (Class-S consume) iff `enforce_economy`
@@ -309,64 +167,6 @@ pub fn enforce_send_economy(
         let did_consume_nonce = cost.is_some() && spending_ucan.is_some();
         Ok((cost, did_consume_nonce))
     })
-}
-
-/// Discharge a deferred spending-nonce [`ClassSCommitToken`](crate::context::actor::class_s::ClassSCommitToken) on a `send_message`
-/// EARLY-ABORT path (ADR-049 §9, keep-direction) and return the error to
-/// propagate.
-///
-/// The early-abort paths in `send_message` occur AFTER `enforce_send_economy`
-/// burned the spending-UCAN nonce but BEFORE `finalize_send`. The burned nonce
-/// MUST be persisted fail-closed on these paths too (keep-direction: a crash in
-/// the coalesce window must not un-burn it and re-open replay), so each commits
-/// the token here BEFORE its existing escrow-void + economy-ticket rollback.
-///
-/// Returns the error the abort path should propagate:
-/// - token `None` (the consume did not happen — free / pre-consume abort) ⇒ the
-///   original `abort_err` unchanged;
-/// - token `Some` and its fail-closed persist SUCCEEDS ⇒ the original
-///   `abort_err` (the consume is now durable; the send still aborts for its own
-///   reason);
-/// - token `Some` and its fail-closed persist FAILS ⇒ the
-///   [`ContextError::PersistenceFailed`] (fail-closed: a durability failure of
-///   the burned nonce takes precedence, mirroring `finalize_send`'s persist-fail
-///   arm). The consume is KEPT in memory either way.
-///
-/// The caller runs its existing Class-C reversal (escrow void, ticket rollback,
-/// sequence rollback) AFTER this returns, regardless of which error comes back.
-///
-/// Shared with the join path (`lifecycle_helpers::join_context`), whose
-/// pre-finalize abort paths have the identical keep-direction obligation.
-///
-/// Internal cross-module helper — `pub` only so the sibling `crate::context`
-/// dispatch modules can call it; not part of the SDK surface.
-///
-/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
-///
-/// SYNC fn returning a future: [`ClassSCommitToken::commit`](crate::context::actor::class_s::ClassSCommitToken::commit) is itself a
-/// sync-returns-future that consumes the `&PerContextState` in its prelude, so
-/// the returned future here captures only the (already state-free) commit future
-/// plus the owned `abort_err`. An `async fn` would keep the `&PerContextState`
-/// parameter across the await and make the awaiting handler `!Send`.
-pub fn commit_send_nonce_token_on_abort<'d, 'c>(
-    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
-    state: &PerContextState,
-    deps: &'d ActorDeps,
-    context_id: &'c str,
-    abort_err: ContextError,
-) -> impl std::future::Future<Output = ContextError> + Send + use<'d, 'c> {
-    // `t.commit(...)` runs its snapshot-building prelude synchronously here
-    // (consuming the `&PerContextState`) and yields a state-free `Send` future.
-    let commit_fut = token.map(|t| t.commit(state, deps, context_id));
-    async move {
-        match commit_fut {
-            None => abort_err,
-            Some(fut) => match fut.await {
-                Ok(()) => abort_err,
-                Err(persist_err) => persist_err,
-            },
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +605,7 @@ pub async fn run_buffered_post_delivery(
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
+    domains: &crate::context::domains::DomainHandlers,
 ) -> bool {
     let now = clock.now_secs();
 
@@ -845,8 +646,9 @@ pub async fn run_buffered_post_delivery(
     let downward_auth_applied = if consequence_rules.is_empty() {
         false
     } else {
-        let (events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+        let (events, convergent_now) = domains
+            .governance
+            .event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -863,21 +665,23 @@ pub async fn run_buffered_post_delivery(
         // The `receive_buffer` read above has ended (NLL) before `consequence_split`
         // reborrows the disjoint consequence fields (incl. the GROW role view).
         let mut split = view.consequence_split();
-        crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &member_did,
-                now,
-                triggered: &triggered,
-                rules: &consequence_rules,
-                clock,
-                event_log,
-                event_tx,
-            },
-            obligation,
-        )
-        .await
+        domains
+            .governance
+            .enforce_triggered_consequences(
+                &mut split,
+                &crate::context::shared::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: &member_did,
+                    now,
+                    triggered: &triggered,
+                    rules: &consequence_rules,
+                    clock,
+                    event_log,
+                    event_tx,
+                },
+                obligation,
+            )
+            .await
     };
 
     *view.checkpoint_events_since_mut() += 1;
@@ -905,11 +709,11 @@ async fn discharge_send_abort(
     deps: &ActorDeps,
     context_id: &str,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
-    ticket: crate::context::economy_logic::EconomyTicket,
+    ticket: crate::context::shared::economy::EconomyTicket,
     abort_err: ContextError,
 ) -> Result<(), ContextError> {
     let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err).await;
-    crate::context::economy_logic::rollback_economy_ticket_inline_view(
+    crate::context::shared::economy::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
     );
@@ -926,7 +730,7 @@ async fn discharge_send_abort(
 /// 1. Capability + commit-fault gate, hard-rate-limit consume, velocity
 ///    record, economy enforcement, broadcast-envelope build (broadcast)
 ///    OR sequence assignment + routing-ID list (encrypted) — produces
-///    an [`EconomyTicket`](crate::context::economy_logic::EconomyTicket).
+///    an [`EconomyTicket`](crate::context::shared::economy::EconomyTicket).
 /// 2. Payment authorization (escrow hold).
 /// 3. Encrypt + transport fan-out.
 /// 4. On failure: void escrow, drain ticket, rollback sequence.
@@ -958,7 +762,9 @@ pub async fn send_message(
         let mut view = cell.class_c_view();
         state::require_active(view.handle_mut())?;
         // Fail-close on commit fault.
-        governance_helpers::check_commit_fault_marker(view.commit_fault_mut().as_ref())?;
+        crate::context::shared::governance::check_commit_fault_marker(
+            view.commit_fault_mut().as_ref(),
+        )?;
     }
 
     // ADR-039: pair the signer with its persona into a single
@@ -1024,31 +830,24 @@ pub async fn send_message(
     // branch. That token's fail-closed persist is owed on EVERY terminal path
     // below (keep-direction) — the Err arm here issues NO token (nothing was
     // consumed), so it is unchanged.
-    let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
-        cell,
-        sender_did,
-        now_secs,
-        spending_ucan,
-        &context_id,
-        &*deps.clock,
-        &deps.key_resolver,
-    ) {
-        Ok(cost_and_token) => cost_and_token,
-        Err(e) => {
-            // Roll back velocity + hard-rate-limit. No EconomyTicket exists yet;
-            // rollback inline through the non-persisting Class-C governance view.
-            // No token was issued (the consume did not happen), so nothing to
-            // commit.
-            let mut view = cell.class_c_view();
-            let gov = view.governance_class_c_mut();
-            gov.velocity_tracker_mut()
-                .rollback(sender_did, velocity_token);
-            gov.hard_rate_limit_mut().refund(sender_did);
-            return Err(e);
-        }
-    };
+    let (deducted_cost, mut spending_nonce_token) =
+        match enforce_send_economy(cell, sender_did, now_secs, spending_ucan, &context_id, deps) {
+            Ok(cost_and_token) => cost_and_token,
+            Err(e) => {
+                // Roll back velocity + hard-rate-limit. No EconomyTicket exists yet;
+                // rollback inline through the non-persisting Class-C governance view.
+                // No token was issued (the consume did not happen), so nothing to
+                // commit.
+                let mut view = cell.class_c_view();
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(sender_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(sender_did);
+                return Err(e);
+            }
+        };
     // F4: wrap Phase 1 economy state in an EconomyTicket.
-    let ticket = crate::context::economy_logic::EconomyTicket {
+    let ticket = crate::context::shared::economy::EconomyTicket {
         actor_did: sender_did.clone(),
         deducted_cost,
         velocity_token,
@@ -1248,7 +1047,7 @@ pub async fn send_message(
             Some(t) => t.commit(cell, deps, &context_id).await,
             None => Ok(()),
         };
-        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        crate::context::shared::economy::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
@@ -1265,12 +1064,11 @@ pub async fn send_message(
     // so a `&ClassSCell` held across the await would poison it).
     let auth = match authorize_send_payment_prepare(&*cell, deps, sender_did) {
         None => None,
-        Some(inputs) => match crate::context::economy_helpers::authorize_paid_action_hold(
-            inputs,
-            sender_did,
-            &context_id,
-        )
-        .await
+        Some(inputs) => match deps
+            .domains
+            .economy
+            .authorize_paid_action_hold(inputs, sender_did, &context_id)
+            .await
         {
             Ok(auth) => auth,
             Err(e) => {
@@ -1284,7 +1082,7 @@ pub async fn send_message(
                     e,
                 )
                 .await;
-                crate::context::economy_logic::rollback_economy_ticket_inline_view(
+                crate::context::shared::economy::rollback_economy_ticket_inline_view(
                     cell.class_c_view().governance_class_c_mut(),
                     ticket,
                 );
@@ -1342,9 +1140,9 @@ pub async fn send_message(
         .await;
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        crate::context::shared::economy::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
@@ -1412,16 +1210,16 @@ pub async fn send_message(
         // counter one below correct. The consumed nonce is intentionally left
         // consumed (the fail-closed direction).
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        crate::context::shared::economy::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
         return Err(e);
     }
 
-    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
+    let deducted_cost = crate::context::shared::economy::commit_economy_ticket(ticket);
     capture_send_payment(cell, deps, auth, sender_did, &context_id, deducted_cost).await;
     Ok(())
 }
@@ -1429,33 +1227,6 @@ pub async fn send_message(
 // ---------------------------------------------------------------------------
 // 8. deliver_incoming (top-level, actor-shape)
 // ---------------------------------------------------------------------------
-
-/// Classified result of delivering one incoming envelope (§9.9.2).
-///
-/// Replaces the prior `Option<(Vec<u8>, String)>` return so the receive path
-/// can distinguish three outcomes that callers must treat differently:
-///
-/// - [`DeliverOutcome::Application`] — a decrypted user message; the bridge
-///   forwards `(plaintext, sender_did)` to the language binding's receive
-///   channel.
-/// - [`DeliverOutcome::Heartbeat`] — a suppression-detection heartbeat
-///   (§9.9.2); processed internally, never surfaced as content, and the
-///   bridge records it against the transport-layer `HeartbeatMonitor` to keep
-///   the gap-detection baseline fresh. Distinct from `Handled` precisely so
-///   the bridge knows to call `record_heartbeat_received`.
-/// - [`DeliverOutcome::Handled`] — any other internally-processed message
-///   (MLS Commit/Proposal, consistency checkpoint, pseudonym announcement, or
-///   an out-of-order arrival buffered for later); no plaintext to surface and
-///   nothing for the bridge to do.
-#[derive(Debug)]
-pub enum DeliverOutcome {
-    /// Decrypted application message: `(plaintext, sender_did)`.
-    Application((Vec<u8>, String)),
-    /// A suppression-detection heartbeat was received and processed (§9.9.2).
-    Heartbeat,
-    /// An internal protocol message was processed; nothing to surface.
-    Handled,
-}
 
 /// Delivers an incoming encrypted message from the relay to a context
 /// (actor-shape). Returns a [`DeliverOutcome`] classifying the message:
@@ -1726,12 +1497,9 @@ fn deliver_checkpoint_message(
     // the receive buffer when divergent (tier (a) of §23.7). The receive path
     // now threads a `ClassCMut` view (from `deliver_incoming`), so it uses the
     // view entry rather than the bare-state sibling.
-    crate::context::queries_helpers::compare_remote_checkpoint(
-        view,
-        deps,
-        context_id,
-        &message.checkpoint,
-    )?;
+    deps.domains
+        .queries
+        .compare_remote_checkpoint(view, deps, context_id, &message.checkpoint)?;
 
     Ok(DeliverOutcome::Handled)
 }
@@ -2105,8 +1873,8 @@ pub fn authorize_send_payment_prepare(
     cell: &crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     sender_did: &DID,
-) -> Option<crate::context::economy_helpers::OwnedAuthInputs> {
-    crate::context::economy_helpers::authorize_paid_action_prepare(
+) -> Option<crate::context::shared::economy::OwnedAuthInputs> {
+    deps.domains.economy.authorize_paid_action_prepare(
         cell,
         deps,
         scp_protocol::economy::types::PaidActionType::MessageSend,
@@ -2125,7 +1893,7 @@ pub fn authorize_send_payment_prepare(
 pub async fn capture_send_payment(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
+    auth: Option<crate::context::shared::economy::PaidActionAuthorization>,
     sender_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
@@ -2138,19 +1906,19 @@ pub async fn capture_send_payment(
     // surfacing (`surface_paid_action_receipt`, supplied the two Class-C fields
     // from a non-persisting `ClassCMut` view). The coalesced persist is driven by
     // the actor run loop on `Outcome::ok_mutated`.
-    match crate::context::economy_helpers::capture_and_verify_paid_action(a).await {
+    match deps.domains.economy.capture_and_verify_paid_action(a).await {
         Ok(Some(receipt)) => {
             let mut view = cell.class_c_view();
             // The two disjoint Class-C `&mut` fields are taken SEQUENTIALLY through
             // the view inside `surface_paid_action_receipt`'s own field-narrowed
             // sub-calls; pass them one at a time so no two view accessors overlap.
-            crate::context::economy_helpers::emit_payment_received_event(
+            deps.domains.economy.emit_payment_received_event(
                 view.receive_buffer_mut(),
                 deps,
                 &receipt,
                 context_id,
             );
-            crate::context::economy_helpers::record_payment_receipt(
+            crate::context::shared::economy::record_payment_receipt(
                 view.payment_receipts_mut(),
                 &receipt,
             );
@@ -2368,8 +2136,10 @@ pub async fn finalize_send(
         );
 
         // Consequence enforcement.
-        let (send_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+        let (send_events, convergent_now) = deps
+            .domains
+            .governance
+            .event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -2393,21 +2163,24 @@ pub async fn finalize_send(
             // replacement) ARMS `downward_auth_sink` via the GROW method itself.
             // When armed, the final persist below is upgraded to fail-closed so the
             // mutation is durable before this send acks.
-            let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                &mut split,
-                &crate::context::governance_logic::EnforceConsequencesCtx {
-                    context_id,
-                    member_did: sender_did,
-                    now,
-                    triggered: &send_triggered,
-                    rules: &consequence_rules,
-                    clock: &*deps.clock,
-                    event_log: &*deps.event_log,
-                    event_tx: deps.event_tx.as_ref(),
-                },
-                &mut downward_auth_sink,
-            )
-            .await;
+            let _ = deps
+                .domains
+                .governance
+                .enforce_triggered_consequences(
+                    &mut split,
+                    &crate::context::shared::governance::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: sender_did,
+                        now,
+                        triggered: &send_triggered,
+                        rules: &consequence_rules,
+                        clock: &*deps.clock,
+                        event_log: &*deps.event_log,
+                        event_tx: deps.event_tx.as_ref(),
+                    },
+                    &mut downward_auth_sink,
+                )
+                .await;
         }
 
         // Participation record (#1530).
@@ -2495,7 +2268,7 @@ async fn create_and_broadcast_checkpoint_if_due(
         let mut view = cell.class_c_view();
         let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
-        crate::context::queries_helpers::create_checkpoint_if_due_view(
+        crate::context::shared::queries::create_checkpoint_if_due_view(
             &mut view,
             context_id,
             broadcast_context_is_none,
@@ -2604,577 +2377,9 @@ async fn persist_finalized_send(
     Ok(())
 }
 
-/// Build the snapshot for `context_id` from owned actor state, threading in
-/// the supervisor-owned MLS crypto state. Shared by the best-effort and
-/// fail-closed persist paths. A crypto-export failure marks the snapshot
-/// `needs_reconnect` (so restore fires the §23.11 reconnection pipeline)
-/// rather than failing — the crypto state is Class M (crash-surviving), so a
-/// transient export failure does not lose security state.
-///
-/// `pub(crate)` so the `ClassSCommitToken` deferred-persist terminals
-/// (`commit` / `discharge_with`) can build the owned snapshot in their OWN
-/// frame and drop the `&PerContextState` borrow BEFORE awaiting
-/// [`persist_snapshot_fail_closed`]. `PerContextState` is `!Sync` (it holds a
-/// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the
-/// actor future `!Send` and fails `tokio::spawn`. Building the snapshot first
-/// keeps the borrow off the await point (ADR-049 Decision 7).
-///
-/// # Errors
-///
-/// Returns [`ContextError::SupervisorShutDown`] when the Supervisor has
-/// dropped, so no sender-epoch or receive-sequence floor export exists.
-pub fn build_snapshot_for_persist(
-    state: &PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-) -> Result<crate::context::state::ContextSnapshot, ContextError> {
-    let mut snapshot = build_snapshot_from_state(state);
-    // ADR-056: canonical digest, not a re-hash of the hex id.
-    let ctx_id_bytes = state::context_id_to_bytes(context_id);
-    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
-    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
-    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
-    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider), and the send sequence is read
-    // from `state.send_tracker` inside the twin. The blob carries no wrapping
-    // key: the identity's pair persists on its own (spec 09 §9.16.1).
-    //
-    // When the Supervisor has dropped (ADR-049 Decision 16) no floor export
-    // exists; the error propagates, because a snapshot written with empty
-    // floors would durably regress them.
-    let sender_epochs = deps.supervisor.export_sender_key_epochs(&ctx_id_bytes)?;
-    let recv_floors = deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes)?;
-    match state.export_crypto_state(sender_epochs, recv_floors) {
-        Ok(crypto_state) => {
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
-        }
-        Err(e) => {
-            snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to export MLS crypto state for persistence; \
-                 snapshot marked needs_reconnect=true so restore \
-                 fires the §23.11 reconnection pipeline"
-            );
-        }
-    }
-    Ok(snapshot)
-}
-
-/// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
-///
-/// [`build_snapshot_for_persist`] is deliberately FAIL-OPEN for existing
-/// members: on an `export_crypto_state` failure it writes an EMPTY crypto blob
-/// with `needs_reconnect = true` and the persist SUCCEEDS, so restore re-enters
-/// the §23.11 reconnection pipeline. A Welcome-JOINER cannot reconnect-derive
-/// (it would need a fresh Welcome), so for the spawn-from-Welcome entrypoint an
-/// empty / errored crypto export is FATAL — a keyless snapshot there means a
-/// live send-capable actor with no durable keys.
-///
-/// The persisted snapshot's crypto blob is a 1:1 copy of the
-/// `export_crypto_state` result, so re-reading the live export tells the
-/// entrypoint exactly what the snapshot carries WITHOUT depending on the
-/// persistence backend supporting read-back (the test-only `NoOpContextPersistence`
-/// and the `for_query_shim` path do not). Returns `true` only when the export
-/// succeeded AND carries a non-empty blob.
-///
-/// The sole caller is `Supervisor::spawn_actor_from_welcome`, which the FFI
-/// slice (pull request #2036) wired to production bridge consumers.
-#[must_use]
-pub(super) fn welcome_snapshot_crypto_is_durable(
-    export: &Result<zeroize::Zeroizing<Vec<u8>>, ContextError>,
-) -> bool {
-    matches!(export, Ok(blob) if !blob.is_empty())
-}
-
-/// Best-effort persist of the current actor state. Mirrors the legacy
-/// Phase 3 snapshot persistence path, but reads from actor-owned state.
-///
-/// Internal cross-module persistence helper — `pub` only so the sibling
-/// `crate::context` dispatch modules can call it; not part of the SDK surface.
-///
-/// **Persistence class.** Use this ONLY for state whose ≤50ms coalesce-window
-/// rollback is acceptable (ADR-049 §9 Class C — liveness/structural state and
-/// the accepted soft anti-spam residual: velocity / earned-capacity). For
-/// security-critical monotonic state that does NOT survive an actor crash
-/// (Class S — spending-nonce consume, executed-proposals, downward-authorization
-/// transitions), use [`persist_state_fail_closed`] so a persist failure returns
-/// an error instead of silently acknowledging an unpersisted mutation.
-///
-/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
-///
-/// This is a SYNC fn returning a future, NOT an `async fn`. The
-/// `&PerContextState` is consumed by [`build_snapshot_for_persist`] in the
-/// synchronous prelude and is NOT captured by the returned future (which holds
-/// only the owned snapshot + `deps` / `context_id`). `PerContextState` is
-/// `!Sync` (it holds a `dyn FnMut` sink), so an `async fn` — which keeps its
-/// `&PerContextState` parameter in the future for the whole future lifetime —
-/// would make every awaiting actor handler `!Send` and fail `tokio::spawn`.
-/// `use<'d, 'c>` precisely captures only the `deps` / `context_id` lifetimes
-/// (edition 2024), excluding the `state` borrow.
-pub fn persist_state_best_effort<'d, 'c>(
-    state: &PerContextState,
-    deps: &'d ActorDeps,
-    context_id: &'c str,
-) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
-    let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    async move {
-        // Bound by reference: a moved-out copy would give this future a second
-        // `ContextSnapshot`-sized slot (clippy `large_futures`).
-        let snapshot = match snapshot {
-            Ok(ref snapshot) => snapshot,
-            Err(e) => {
-                crate::metrics::record_persistence_failure();
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "context snapshot not persisted: no floor export"
-                );
-                return;
-            }
-        };
-        if let Err(e) = deps.persistence.persist_context(context_id, snapshot).await {
-            crate::metrics::record_persistence_failure();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to persist context snapshot"
-            );
-        }
-    }
-}
-
-/// Fail-closed persist of the current actor state (ADR-049 §9 Class S).
-///
-/// Persists and, on failure, returns
-/// [`ContextError::PersistenceFailed`] instead of swallowing the error — so a
-/// security-critical mutation (spending-nonce consume, executed-proposals,
-/// downward-authorization transition) is NEVER acknowledged to a caller unless
-/// it is durable. The respawn crash-safety invariant (ADR-049 §9) forbids
-/// returning `Ok` for such a mutation when the persist did not land: a coalesced
-/// (best-effort) acknowledgment would let an actor crash roll the mutation back,
-/// re-opening a replay / re-spend / re-grant window after the caller already
-/// observed success.
-///
-/// The failure metric is still recorded for observability.
-///
-/// Internal cross-module persistence helper — `pub` only so the sibling
-/// `crate::context` dispatch modules can call it; not part of the SDK surface.
-///
-/// # Errors
-///
-/// Returns [`ContextError::PersistenceFailed`] if the underlying
-/// `persist_context` write fails, and [`ContextError::SupervisorShutDown`] when
-/// [`build_snapshot_for_persist`] returns it.
-///
-/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
-///
-/// SYNC fn returning a future (see [`persist_state_best_effort`] for the full
-/// rationale): the `&PerContextState` is consumed in the synchronous prelude and
-/// is NOT captured by the returned future, so every awaiting actor handler stays
-/// `Send`.
-pub fn persist_state_fail_closed<'d, 'c>(
-    state: &PerContextState,
-    deps: &'d ActorDeps,
-    context_id: &'c str,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
-    // Build the owned snapshot FIRST so the `&PerContextState` borrow is dropped
-    // before the returned future — keeps this future `Send` (see
-    // [`build_snapshot_for_persist`]).
-    let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    // Matched by reference: `&snapshot?` would move the snapshot into a second
-    // slot of this future (clippy `large_futures`).
-    async move {
-        match snapshot {
-            Ok(ref snapshot) => persist_snapshot_fail_closed(snapshot, deps, context_id).await,
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// Fail-closed persist of an ALREADY-BUILT snapshot (ADR-049 §9 Class S).
-///
-/// The `&PerContextState`-holding half of [`persist_state_fail_closed`] split
-/// out so the `ClassSCommitToken` deferred-persist terminals can build the
-/// snapshot in their own frame (dropping the `!Send` `&PerContextState` borrow)
-/// and then await this owned-`&ContextSnapshot` persist. `ContextSnapshot` is
-/// `Send`, so a caller holding `&snapshot` across the await stays `Send`.
-///
-/// Records the failure metric and logs on error, identically to
-/// [`persist_state_fail_closed`].
-///
-/// # Errors
-///
-/// Returns [`ContextError::PersistenceFailed`] if the underlying
-/// `persist_context` write fails.
-pub async fn persist_snapshot_fail_closed(
-    snapshot: &crate::context::state::ContextSnapshot,
-    deps: &ActorDeps,
-    context_id: &str,
-) -> Result<(), ContextError> {
-    deps.persistence
-        .persist_context(context_id, snapshot)
-        .await
-        .map_err(|e| {
-            crate::metrics::record_persistence_failure();
-            tracing::error!(
-                context_id = %context_id,
-                error = %e,
-                "fail-closed persist of security-critical state failed; \
-                 operation rejected (ADR-049 §9 Class S)"
-            );
-            ContextError::PersistenceFailed(format!(
-                "fail-closed persist failed for context '{context_id}': {e}"
-            ))
-        })
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn build_snapshot_from_state(
-    state: &PerContextState,
-) -> crate::context::state::ContextSnapshot {
-    use crate::context::state::{GovernanceState, VelocityTrackerSnapshot};
-
-    // ADR-049 §9 (white-hat P2): exhaustively destructure `GovernanceState` so a
-    // NEW governance field forces a conscious persist decision AT COMPILE TIME.
-    // Without this bind, a freshly-added field is invisible to both this builder
-    // and the field-round-trip test — silently dropped from the snapshot and
-    // lost across an actor crash. Every field is bound below: persisted fields
-    // are threaded into the snapshot; genuinely-transient fields are `_`-prefixed
-    // WITH a justification. Adding a field to `GovernanceState` will fail to
-    // compile here until the author decides which bucket it belongs to.
-    let GovernanceState {
-        // --- Persisted: threaded into ContextSnapshot below. ---
-        // `engine` is persisted via `governance_model_config: Some(engine.model_config())`.
-        engine: _engine_persisted_as_model_config,
-        approved_proposals: _approved_proposals,
-        next_proposal_seq: _next_proposal_seq,
-        freeze: _freeze,
-        pending_ceiling_modification: _pending_ceiling_modification,
-        pending_economic_policy_change: _pending_economic_policy_change,
-        registered_outlets: _registered_outlets,
-        outlet_interfaces: _outlet_interfaces,
-        pruning_policy: _pruning_policy,
-        economic_policy: _economic_policy,
-        budget_tracker: _budget_tracker,
-        consequence_rules: _consequence_rules,
-        velocity_tracker: _velocity_tracker,
-        participation_cache: _participation_cache,
-        cooldown_until: _cooldown_until,
-        message_pricing: _message_pricing,
-        hard_rate_limit: _hard_rate_limit,
-        revoked_spending_ucan_cids: _revoked_spending_ucan_cids,
-        proposal_timestamps: _proposal_timestamps,
-        // Class-S governance subset (ADR-049 §9): exhaustively destructured so a
-        // NEW Class-S governance field forces a conscious persist decision here
-        // too. `executed_proposals` / `threshold_signers` / `threshold_value` /
-        // `spending_nonce_tracker` / `capability_requirements` are all persisted
-        // into the snapshot below.
-        class_s:
-            crate::context::state::GovernanceClassS {
-                executed_proposals: _executed_proposals,
-                threshold_signers: _threshold_signers,
-                threshold_value: _threshold_value,
-                spending_nonce_tracker: _spending_nonce_tracker,
-                capability_requirements: _capability_requirements,
-            },
-        // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
-        // `deadlock`: per-context deadlock-detection scratch state, recomputed
-        // from the live proposal set after restore.
-        deadlock: _deadlock_transient,
-        // `last_known_members`: departure-detection cache for the timeout loop;
-        // re-seeded from `membership` on the next tick.
-        last_known_members: _last_known_members_transient,
-        // `pending_epoch_resets`: drained each timeout tick; an in-flight reset
-        // is re-driven by the member, not replayed from a snapshot.
-        pending_epoch_resets: _pending_epoch_resets_transient,
-    } = &state.governance;
-
-    let context_state_value = state.handle.state();
-    // Persist the ABSOLUTE convergent deadline verbatim (ADR-049 §9): restore/
-    // import re-arm the SAME instant, so a create-window `None` re-derives from
-    // `creation + ttl` and a prior extension is not recomputed away (D1/D2).
-    let ttl_deadline_secs = state.ttl.timer.deadline_unix_secs;
-    let grace_entries = state.epoch.grace_store.to_grace_entries();
-
-    crate::context::state::ContextSnapshot {
-        context_id: state.handle.context_id().to_owned(),
-        creation_timestamp_secs: state.creation_timestamp_secs,
-        state: context_state_value,
-        context_params: state.handle.params().clone(),
-        membership: state.membership.clone(),
-        role_state: state.role_state.clone(),
-        event_log_merkle_root: [0u8; 32],
-        executed_proposals: state
-            .governance
-            .class_s
-            .executed_proposals
-            .keys()
-            .copied()
-            .collect(),
-        ttl_deadline_secs,
-        registered_outlets: state.governance.registered_outlets.clone(),
-        read_exclusion_list: state.access.read_exclusion_list.clone(),
-        outlet_interfaces: state.governance.outlet_interfaces.clone(),
-        threshold_signers: state.governance.class_s.threshold_signers.clone(),
-        threshold_value: state.governance.class_s.threshold_value,
-        capability_requirements: state.governance.class_s.capability_requirements.clone(),
-        pruning_policy: state.governance.pruning_policy.clone(),
-        governance_model_config: Some(state.governance.engine.model_config()),
-        economic_policy: state.governance.economic_policy.clone(),
-        budget_tracker: state.governance.budget_tracker.clone(),
-        approved_proposals: state.governance.approved_proposals.clone(),
-        next_proposal_seq: state.governance.next_proposal_seq,
-        governance_freeze: state.governance.freeze,
-        pending_ceiling_modification: state.governance.pending_ceiling_modification.clone(),
-        pending_economic_policy_change: state.governance.pending_economic_policy_change.clone(),
-        mls_epoch: state.epoch.mls_epoch,
-        epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
-        grace_entries,
-        needs_reconnect: state.epoch.needs_reconnect,
-        mls_crypto_state: crate::context::state::MlsCryptoState::default(),
-        migration_state: state.migration_state.clone(),
-        access_key_store: state.access.access_key_store.clone(),
-        consequence_rules: state.governance.consequence_rules.clone(),
-        participation_cache: state.governance.participation_cache.clone(),
-        velocity_tracker: Some(state.governance.velocity_tracker.window_secs()),
-        velocity_tracker_state: Some(VelocityTrackerSnapshot {
-            window_secs: state.governance.velocity_tracker.window_secs(),
-            entries: state.governance.velocity_tracker.snapshot_entries(),
-        }),
-        cooldown_until: state.governance.cooldown_until.clone(),
-        proposal_timestamps: state.governance.proposal_timestamps.clone(),
-        message_pricing: state.governance.message_pricing.clone(),
-        hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
-        hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state
-            .governance
-            .class_s
-            .spending_nonce_tracker
-            .snapshot_entries(),
-        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
-        pending_commits: state.pending_commits.clone(),
-        commit_fault: state.commit_fault.clone(),
-        checkpoint_events_since: state.checkpoint_events_since,
-        checkpoint_last_time_secs: state.checkpoint_last_time_secs,
-        generation: state.generation,
-        // §9.10.4: persist the routing axis verbatim. `ContextRouting` is the
-        // single shared type between live state and the serialized snapshot,
-        // so no field-by-field translation is needed.
-        routing: state.routing.clone(),
-        relay_urls: state.relay_urls.clone(),
-        // ADR-049 §9 Class S (line 144): persist the staged saga slot through
-        // its sanctioned serialization mirror so a Prepare's staged evidence
-        // survives an actor crash. See [`saga_pending_snapshot`].
-        saga_pending: saga_pending_snapshot(state),
-        xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
-        xctx_committed_stream_outputs: xctx_committed_stream_outputs_snapshot(state),
-        xctx_committed_invocations: xctx_committed_invocations_snapshot(state),
-        // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
-        // reservation reversal records so a `PreparingB`-window crash can reverse
-        // the caller deduction + void the escrow without the in-memory carrier.
-        xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
-        xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
-        // §7.3.8 Class S: persist the value-caveat counters so a consumed
-        // `max_calls` / `amount_max_cumulative` / `rate_window` cap survives an
-        // actor crash rather than un-consuming. See [`caveat_counters_snapshot`].
-        caveat_counters: caveat_counters_snapshot(state),
-        // Fix-D Class S: persist the streaming reservation recovery records so a
-        // crash-restore can RELEASE the escrow hold + cumulative counter reserve
-        // of any stream whose off-mailbox pump survived the crash. See
-        // [`stream_reservations_snapshot`].
-        stream_reservations: stream_reservations_snapshot(state),
-        // §9.10.4.1 Class S: persist the rotation state so a crash after the
-        // rotation's persist restores the new epoch with `announce_pending`.
-        pseudonym_rotation: state.class_s.pseudonym_rotation.clone(),
-        // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
-        // security + roster state (per-author key epochs, block lists, subscriber
-        // registry) into the fail-closed snapshot so a block / governance ban /
-        // key-epoch advance is durable BEFORE the operation acks. `None` for
-        // non-broadcast contexts.
-        broadcast: state
-            .broadcast_context
-            .as_ref()
-            .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot),
-    }
-}
-
-/// Project the actor-side `saga_pending` map onto its serializable Class-S
-/// snapshot mirror (ADR-049 §9 line 144; spec §5.15.8 / §6.2.4 Prepare).
-///
-/// The live [`SagaPreparedState`](crate::context::supervisor::saga_prepared_state::SagaPreparedState)
-/// enum keeps the §9.4.3 non-derive barrier, so the snapshot carries the
-/// sanctioned
-/// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
-/// mirror instead. Every snapshot builder (the canonical one here plus the
-/// broadcast / ttl-close / trust-recovery / manager copies) routes through
-/// THIS one helper, so a saga in flight is dropped by none of them.
-#[must_use]
-pub(in crate::context) fn saga_pending_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
-> {
-    use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
-    state
-        .class_s
-        .saga_pending
-        .iter()
-        .map(|(id, prepared)| {
-            (
-                id.clone(),
-                SagaPreparedStateSnapshot::from_prepared(prepared),
-            )
-        })
-        .collect()
-}
-
-/// Build the Class-S snapshot projection of the actor's COMMITTED
-/// cross-context outlet-invocation captures (spec §6.2.4 "Exactly-once
-/// execution with durable output capture"; ADR-049 §9). The live
-/// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
-/// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
-/// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
-/// Used at every snapshot builder so a crash between Commit-B capture and the
-/// next coalesced write cannot lose the durable output (which would re-invoke
-/// the outlet on replay).
-pub(in crate::context) fn xctx_committed_outputs_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
-> {
-    state.class_s.xctx_committed_outputs.clone()
-}
-
-/// Build the Class-S snapshot projection of the actor's COMMITTED cross-context
-/// **streaming** outlet-invocation captures (ADR-061 seal phase; spec §6.2.5
-/// streaming saga; ADR-049 §9). The streaming sibling of
-/// [`xctx_committed_outputs_snapshot`]. The live
-/// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
-/// carries no §9.4.3 bearer bytes (public receipt + sealed root), so the snapshot
-/// stores it directly via `Clone`. Used at every snapshot builder so a crash
-/// between the seal-close capture and the next coalesced write cannot lose the
-/// durable witness (which would re-invoke the outlet on replay).
-pub(in crate::context) fn xctx_committed_stream_outputs_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
-> {
-    state.class_s.xctx_committed_stream_outputs.clone()
-}
-
-/// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
-/// COMMITTED cross-context outlet-invocation witness set (spec §6.2.4 "Commit",
-/// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations)
-/// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
-/// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
-/// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
-/// field through ONE helper, exactly like its siblings
-/// (`saga_pending_snapshot` / `xctx_committed_outputs_snapshot` /
-/// `xctx_caller_reservations_snapshot` / `xctx_nonce_dedup_snapshot`) — no
-/// Class-S saga field is centralized by convention alone. Without persisting it,
-/// a crash that rolled the witness back behind an acked Commit-A would
-/// double-settle the caller escrow on replay.
-pub(in crate::context) fn xctx_committed_invocations_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
-    state.class_s.xctx_committed_invocations.clone()
-}
-
-/// Build the Class-S snapshot projection of the actor's caller-side durable
-/// reservation reversal records (spec §6.2.4 "Reservation release on every
-/// terminal path"; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations)
-/// is a `{SagaId → CallerReservationRecord}` map whose values carry no §9.4.3
-/// bearer bytes (public economy metadata), so — like
-/// [`xctx_committed_invocations_snapshot`] — the snapshot stores it directly via
-/// `Clone`. Exists so EVERY snapshot builder projects this Class-S saga field
-/// through ONE helper, exactly like its siblings (`saga_pending_snapshot` /
-/// `xctx_committed_outputs_snapshot` / `xctx_committed_invocations_snapshot` /
-/// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by
-/// convention alone. Without persisting it, a `PreparingB`-window crash could
-/// never reverse the caller's deduction or void the escrow from the durable
-/// record, durably over-charging the caller.
-pub(in crate::context) fn xctx_caller_reservations_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<
-    crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
-> {
-    state.class_s.xctx_caller_reservations.clone()
-}
-
-/// Build the Class-S snapshot projection of the actor's B-owned cross-context
-/// nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"; ADR-049 §9). The
-/// live [`NonceDedup`](scp_protocol::crypto::sender_keys::NonceDedup) projects
-/// to a plain `{nonce → first-seen secs}` map via `entries()`. Persisting it at
-/// every snapshot builder makes the replay-protection cache CRASH-SURVIVING: a
-/// restart no longer reopens the 5-minute window for a fresh-`SagaId` replay of
-/// a `CrossContextOutletInvoke` (BLACK-624-01). Same-node restore rehydrates it;
-/// cross-node export/import drops it to empty (B's freshness state has no
-/// authority on a foreign node).
-pub(in crate::context) fn xctx_nonce_dedup_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<[u8; 16], u64> {
-    state.class_s.xctx_nonce_dedup.entries()
-}
-
-/// Build the Class-S snapshot projection of the actor's §7.3.8 value-caveat
-/// counters (ADR-049 §9). The live
-/// [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters) is a plain
-/// `Clone` serde value, so — like `xctx_committed_invocations_snapshot` — the
-/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
-/// this Class-S field through ONE helper, exactly like its siblings — no Class-S
-/// field is centralized by convention alone. Without persisting it, a crash that
-/// rolled a consumed cap back behind an acked invocation would re-open the
-/// spend/rate window the counter closes.
-pub(in crate::context) fn caveat_counters_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters> {
-    state.class_s.caveat_counters.clone()
-}
-
-/// Project [`ClassSState::stream_reservations`](crate::context::actor::state::ClassSState::stream_reservations)
-/// onto its snapshot map (Fix-D). The live
-/// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
-/// is a plain `Clone` serde value, so — like [`caveat_counters_snapshot`] — the
-/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
-/// this Class-S field through ONE helper, exactly like its siblings. Without
-/// persisting it, a crash while a stream's off-mailbox pump is mid-flight would
-/// strand the open-time escrow hold + cumulative counter reserve (the pump's
-/// close-time settle lands on the respawned generation and is dropped).
-pub(in crate::context) fn stream_reservations_snapshot(
-    state: &PerContextState,
-) -> std::collections::HashMap<String, crate::context::outlets::invoke::StreamReservationRecord> {
-    state.class_s.stream_reservations.clone()
-}
-
 // ---------------------------------------------------------------------------
 // 13. decrypt_and_dispatch
 // ---------------------------------------------------------------------------
-
-/// What [`decrypt_and_dispatch`] made of one inbound envelope.
-#[derive(Debug)]
-pub(super) enum Dispatched {
-    /// An application envelope for the caller to verify and classify.
-    Envelope(Box<scp_protocol::context::builder::OpenedEnvelope>),
-    /// A Commit another member committed, already admitted and merged. The
-    /// caller classifies its membership changes (spec 09 §9.10.4.1).
-    Commit {
-        /// The committer's DID from its MLS credential.
-        committer_did: String,
-        /// The DID of every occupied leaf before and after the Commit.
-        leaf_dids: scp_protocol::context::pseudonym::CommitLeafDids,
-    },
-    /// An MLS Proposal or a management message, processed here.
-    Handled,
-}
 
 /// Decrypts an incoming envelope and dispatches management/control
 /// messages.
@@ -3373,7 +2578,7 @@ async fn open_key_response(
         .supervisor
         .sender_epoch_floor(context_id_bytes, sender_did)?;
     let at_floor = floor > 0 && response.epoch == floor;
-    let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
+    let wrapping = deps.my_wrapping_key()?;
     let (sender_key, epoch) =
         crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key(
             &wrapping,
@@ -3464,45 +2669,6 @@ fn bind_sender_key_request(
     Ok((request_bytes, requester_pk))
 }
 
-/// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch
-/// floor in the authoritative Class-M registry after a local rotation.
-///
-/// Call AFTER a local `rotate_sender_key` succeeds, passing the post-rotation
-/// local epoch as `epoch`. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the epoch is now a
-/// CALLER-SUPPLIED parameter rather than re-read here: all call sites source it
-/// from the actor's
-/// [`PerContextState::local_sender_key_epoch`](crate::context::actor::state::PerContextState::local_sender_key_epoch)
-/// (read inside the same `commit_class_s_keep` closure that durably persisted the
-/// bump) — the read-authority follows the write-authority coherently.
-///
-/// The floor is advanced in the supervisor registry keyed by the local DID.
-/// FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
-/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates
-/// — this registry floor raise is the never-regressing anti-replay backstop, so
-/// it is NEVER swallowed even though the sender-key rotation + distribution around
-/// it is best-effort (M23). In practice a local rotation advances the scalar
-/// monotonically by +1, so this never fires; propagating it is the fail-closed
-/// default rather than a rollback the caller must orchestrate.
-///
-/// # Errors
-///
-/// Returns [`ContextError::CryptoFailed`] if the registry rejects the local
-/// epoch advance (non-monotonic or overshoot).
-pub(in crate::context) fn mirror_forward_local_sender_epoch(
-    deps: &ActorDeps,
-    ctx: &[u8; 32],
-    epoch: u64,
-) -> Result<(), ContextError> {
-    let local_did = deps.crypto.local_did();
-    deps.supervisor.check_and_advance_sender_epoch(
-        ctx,
-        local_did,
-        epoch,
-        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-    )?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // 14. validate_and_drain_timeouts
 // ---------------------------------------------------------------------------
@@ -3591,6 +2757,7 @@ pub async fn validate_and_drain_timeouts(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
+                &deps.domains,
             )
             .await;
         }
@@ -3690,6 +2857,7 @@ pub async fn buffer_ahead_message(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
+                &deps.domains,
             )
             .await;
         }
@@ -3827,6 +2995,7 @@ pub async fn deliver_message_and_drain_buffered(
                     &*deps.clock,
                     &*deps.event_log,
                     deps.event_tx.as_ref(),
+                    &deps.domains,
                 )
                 .await;
             }
@@ -3842,8 +3011,10 @@ pub async fn deliver_message_and_drain_buffered(
                 .consequence_rules_mut()
                 .clone();
             if !consequence_rules.is_empty() {
-                let (recv_events, convergent_now) =
-                    crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+                let (recv_events, convergent_now) = deps
+                    .domains
+                    .governance
+                    .event_log_entries_for_consequences_after_side_effect(
                         view.receive_buffer_mut(),
                         context_id,
                         now,
@@ -3859,21 +3030,24 @@ pub async fn deliver_message_and_drain_buffered(
                 let recv_member_did = DID(sender_did.to_owned());
                 let mut split = view.consequence_split();
                 // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-                let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                    &mut split,
-                    &crate::context::governance_logic::EnforceConsequencesCtx {
-                        context_id,
-                        member_did: &recv_member_did,
-                        now,
-                        triggered: &recv_triggered,
-                        rules: &consequence_rules,
-                        clock: &*deps.clock,
-                        event_log: &*deps.event_log,
-                        event_tx: deps.event_tx.as_ref(),
-                    },
-                    downward_auth_sink,
-                )
-                .await;
+                let _ = deps
+                    .domains
+                    .governance
+                    .enforce_triggered_consequences(
+                        &mut split,
+                        &crate::context::shared::governance::EnforceConsequencesCtx {
+                            context_id,
+                            member_did: &recv_member_did,
+                            now,
+                            triggered: &recv_triggered,
+                            rules: &consequence_rules,
+                            clock: &*deps.clock,
+                            event_log: &*deps.event_log,
+                            event_tx: deps.event_tx.as_ref(),
+                        },
+                        downward_auth_sink,
+                    )
+                    .await;
             }
             *view.checkpoint_events_since_mut() += 1;
 
@@ -3938,6 +3112,7 @@ pub async fn deliver_message_and_drain_buffered(
             &*deps.clock,
             &*deps.event_log,
             deps.event_tx.as_ref(),
+            &deps.domains,
         )
         .await;
     }
@@ -3961,8 +3136,10 @@ pub async fn deliver_message_and_drain_buffered(
         .consequence_rules_mut()
         .clone();
     if !consequence_rules.is_empty() {
-        let (recv_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+        let (recv_events, convergent_now) = deps
+            .domains
+            .governance
+            .event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -3978,21 +3155,24 @@ pub async fn deliver_message_and_drain_buffered(
         let recv_member_did = DID(sender_did.to_owned());
         let mut split = view.consequence_split();
         // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-        let _ = crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &recv_member_did,
-                now,
-                triggered: &recv_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_log: &*deps.event_log,
-                event_tx: deps.event_tx.as_ref(),
-            },
-            downward_auth_sink,
-        )
-        .await;
+        let _ = deps
+            .domains
+            .governance
+            .enforce_triggered_consequences(
+                &mut split,
+                &crate::context::shared::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: &recv_member_did,
+                    now,
+                    triggered: &recv_triggered,
+                    rules: &consequence_rules,
+                    clock: &*deps.clock,
+                    event_log: &*deps.event_log,
+                    event_tx: deps.event_tx.as_ref(),
+                },
+                downward_auth_sink,
+            )
+            .await;
     }
 
     *view.checkpoint_events_since_mut() += 1;
@@ -4973,6 +4153,7 @@ mod pseudonym_routing_tests {
             &clock,
             &event_log,
             None,
+            &crate::domain_handlers(),
         )
         .await;
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
@@ -5183,6 +4364,7 @@ mod pseudonym_routing_tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
@@ -5712,6 +4894,7 @@ pub mod dropped_supervisor_tests {
                 None,
                 Some(clock),
                 mls_storage,
+                crate::domain_handlers(),
             );
             let deps = supervisor
                 .build_actor_deps_loaded(&DID(OWNER.to_owned()))
@@ -5759,10 +4942,12 @@ pub mod dropped_supervisor_tests {
     async fn persist_paths_write_with_live_supervisor() {
         let f = Fixture::new().await;
         let st = state();
-        assert!(super::build_snapshot_for_persist(&st, &f.deps, &ctx_hex()).is_ok());
-        super::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
+        assert!(
+            crate::context::snapshot::build_snapshot_for_persist(&st, &f.deps, &ctx_hex()).is_ok()
+        );
+        crate::context::snapshot::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
         assert_eq!(f.persists.load(Ordering::SeqCst), 1);
-        super::persist_state_fail_closed(&st, &f.deps, &ctx_hex())
+        crate::context::snapshot::persist_state_fail_closed(&st, &f.deps, &ctx_hex())
             .await
             .expect("fail-closed persist with a live supervisor");
         assert_eq!(f.persists.load(Ordering::SeqCst), 2);
@@ -5772,9 +4957,15 @@ pub mod dropped_supervisor_tests {
     async fn persist_paths_write_nothing_after_supervisor_drops() {
         let f = Fixture::new().await.drop_supervisor();
         let st = state();
-        assert_shut_down(&super::build_snapshot_for_persist(&st, &f.deps, &ctx_hex()));
-        super::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
-        assert_shut_down(&super::persist_state_fail_closed(&st, &f.deps, &ctx_hex()).await);
+        assert_shut_down(&crate::context::snapshot::build_snapshot_for_persist(
+            &st,
+            &f.deps,
+            &ctx_hex(),
+        ));
+        crate::context::snapshot::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
+        assert_shut_down(
+            &crate::context::snapshot::persist_state_fail_closed(&st, &f.deps, &ctx_hex()).await,
+        );
         assert_eq!(
             f.persists.load(Ordering::SeqCst),
             0,

@@ -73,6 +73,10 @@
 
 #![allow(clippy::significant_drop_tightening)]
 
+use crate::context::shared::lifecycle::{
+    DistributionScope, FirstStateRollback, SpawnedContext, TtlArming,
+    add_member_and_queue_distribution, normalize_relay_urls, persist_first_state,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -93,7 +97,6 @@ use crate::context::actor::state::{
     RecvSequenceTracker,
 };
 use crate::context::governance::timeout::DeadlockDetectionState;
-use crate::context::governance_helpers;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
 };
@@ -110,26 +113,6 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
-
-/// Returns the stored form of a context's relay set (§5.12.3.1 `relay_urls`).
-/// Each URL that has a §9.18.2 canonical relay URL becomes that canonical URL,
-/// and every other URL stays exactly as written. The function then keeps each
-/// stored URL once, at its first position, so two spellings of one relay
-/// collapse to one entry whichever source supplied the set (the creator, an
-/// invitation bundle, or a snapshot). A URL with no canonical form never fails
-/// the caller.
-///
-/// Every write of `PerContextState::relay_urls` goes through this function.
-/// A Welcome joiner calls it after it verifies the bundle signature, which
-/// covers the URLs as the creator sent them.
-pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::with_capacity(relay_urls.len());
-    relay_urls
-        .into_iter()
-        .map(|url| scp_did::canonical_node_url(&url).unwrap_or(url))
-        .filter(|url| seen.insert(url.clone()))
-        .collect()
-}
 
 /// Builds the [`ContextRouting`] axis for a context from its broadcast flag
 /// and the FFI-derived local pseudonym (§9.10.4, §5.14).
@@ -197,7 +180,7 @@ pub fn export_context_blocks(
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
-    let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
+    let snapshot = crate::context::snapshot::build_snapshot_from_state(state);
 
     let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
 
@@ -260,7 +243,7 @@ pub async fn leave_context(
             let state = view.rest_mut();
 
             // PR #1606 C6: refuse if a commit fault marker is set.
-            governance_helpers::check_commit_fault(state)?;
+            crate::context::shared::governance::check_commit_fault(state)?;
 
             // Authorization: self-removal always allowed; otherwise MemberRemove
             // required.
@@ -402,17 +385,23 @@ pub async fn leave_context(
         // FAIL-CLOSED via `keep_broadcast_failure` (member departure is a
         // safety-gated site — see that helper's doc for why the second persist).
         if let Some(commit_bytes) = mls_commit_bytes
-            && let Some(failure) = governance_helpers::try_broadcast_commit(
-                deps,
-                &context_id,
-                commit_bytes,
-                &CommitOperation::LeaveContext {
-                    member_did: member_did.clone(),
-                },
-            )
-            .await
+            && let Some(failure) = deps
+                .domains
+                .governance
+                .try_broadcast_commit(
+                    deps,
+                    &context_id,
+                    commit_bytes,
+                    &CommitOperation::LeaveContext {
+                        member_did: member_did.clone(),
+                    },
+                )
+                .await
         {
-            governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
+            deps.domains
+                .governance
+                .keep_broadcast_failure(cell, deps, &context_id, failure)
+                .await?;
         }
 
         // A remaining member rotates the local sender key and publishes it to
@@ -469,46 +458,6 @@ pub async fn leave_context(
 // 3. drain_and_deliver_sender_keys (per-context, transitive of join / leave)
 // ---------------------------------------------------------------------------
 
-/// Adds `member_did` to the MLS group and queues its sender-key
-/// distribution, in the one Class-S step that records the Add (spec 09
-/// §9.16.9). The join and the governance `AddMember` both call it, so the two
-/// give one disposition.
-///
-/// The §9.10.4.1 membership trigger is recorded with the add. When the
-/// distribution cannot be built, the add stands and the distribution is
-/// reported as not built (`SenderKeyDistributionFailed`); the new member
-/// requests the key (§9.16.2). An add that produced no Welcome (the
-/// `testing` no-crypto pipeline, with no MLS group) queues nothing.
-///
-/// # Errors
-///
-/// The error of `PerContextState::add_member`; nothing is added then.
-pub(super) fn add_member_and_queue_distribution(
-    state: &mut crate::context::actor::state::PerContextState,
-    deps: &ActorDeps,
-    member_did: &str,
-    key_package: Option<&[u8]>,
-) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-    let local_did = deps.crypto.local_did();
-    let output = state.add_member(member_did, key_package, deps.clock.as_ref())?;
-    crate::context::actor::pseudonym_rotation::note_member_added(state, local_did, member_did);
-    if !output.welcome_bytes.is_empty()
-        && let Err(e) = state.distribute_sender_key(local_did, member_did, deps.event_tx.as_ref())
-    {
-        let context_id = state.handle.context_id().to_owned();
-        crate::context::actor::state::DistributionFault::NotBuilt {
-            target_did: member_did.to_owned(),
-            reason: e.to_string(),
-        }
-        .report(
-            &mut state.receive_buffer,
-            &context_id,
-            deps.event_tx.as_ref(),
-        );
-    }
-    Ok(output)
-}
-
 /// Rotates the local sender key after a membership or access change and
 /// publishes what the rotation queued (spec 09 §9.16.4: removal implies
 /// blocking, and a block is a sender-side rotation; §9.16.10 for a revoke).
@@ -548,7 +497,7 @@ pub(in crate::context) async fn rotate_sender_key_and_distribute(
         })
         .await;
     let failure = match persisted {
-        Ok(epoch) => crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+        Ok(epoch) => crate::context::shared::messaging::mirror_forward_local_sender_epoch(
             deps,
             &state::context_id_to_bytes(context_id),
             epoch,
@@ -599,29 +548,6 @@ pub(in crate::context) async fn retry_pending_sender_key_rotation(
 ) {
     if cell.sender_key_rotation_pending() {
         rotate_sender_key_and_distribute(cell, deps, context_id).await;
-    }
-}
-
-/// Which queued sender-key distributions one pass of
-/// [`drain_and_deliver_sender_keys`] publishes (spec 09 §9.16.9 step 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DistributionScope {
-    /// Only distributions never attempted: the publish right after a
-    /// rotation or an Add, and the one after a `Live` delivery. A failed
-    /// distribution waits for the governance timer or a full reconnection.
-    NeverAttempted,
-    /// Every queued distribution: the governance timer's tick and the
-    /// re-send a full reconnection asks for (ADR-029, offline and sync
-    /// strategy). A distribution restored with no attempt record is due here.
-    All,
-}
-
-impl DistributionScope {
-    const fn selects(self, entry: &crate::crypto::mls::provider::PendingDistribution) -> bool {
-        match self {
-            Self::NeverAttempted => entry.first_attempt_at.is_none(),
-            Self::All => true,
-        }
     }
 }
 
@@ -765,7 +691,7 @@ async fn final_close_checkpoint(
     // Takes the cell's two scalars, not `&ClassSCell`: the cell is not
     // `Sync`, and a reference to it held across the sign's await would make
     // the close future `!Send`.
-    match crate::context::queries_helpers::build_checkpoint(
+    match crate::context::shared::queries::build_checkpoint(
         context_id,
         broadcast_context_is_none,
         mls_epoch,
@@ -939,7 +865,7 @@ pub async fn close_context_with_key(
 
         // Record the final checkpoint signed above (§9.9.3).
         if let Some(cp) = final_checkpoint {
-            let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
+            let cp = crate::context::shared::queries::force_create_checkpoint_fields(
                 &context_id,
                 &mut state.checkpoint_events_since,
                 &mut state.checkpoint_last_time_secs,
@@ -1144,8 +1070,7 @@ pub async fn join_context(
                 now_secs,
                 spending_ucan,
                 &context_id,
-                &*deps.clock,
-                &deps.key_resolver,
+                deps,
             )?;
             // A spending-UCAN nonce is burned iff a non-zero cost was charged AND
             // a spending UCAN was presented — the same gating the Phase-5
@@ -1170,7 +1095,7 @@ pub async fn join_context(
     // downstream error path (adapter, MLS, sender-key) is forced
     // to roll back velocity + hard_rate_limit + budget, not just
     // the budget.
-    let ticket = crate::context::economy_logic::EconomyTicket {
+    let ticket = crate::context::shared::economy::EconomyTicket {
         actor_did: member_did.clone(),
         deducted_cost,
         velocity_token,
@@ -1187,19 +1112,18 @@ pub async fn join_context(
     // with NO state borrow live — so the actor future stays `Send`
     // (`PerContextState` is `!Sync`). `None` from `prepare` means no adapter / no
     // policy / zero cost, i.e. the legacy `Ok(None)` short-circuit.
-    let auth = match crate::context::economy_helpers::authorize_paid_action_prepare(
+    let auth = match deps.domains.economy.authorize_paid_action_prepare(
         &*cell,
         deps,
         scp_protocol::economy::types::PaidActionType::ContextJoin,
         &member_did,
     ) {
         None => None,
-        Some(inputs) => match crate::context::economy_helpers::authorize_paid_action_hold(
-            inputs,
-            &member_did,
-            &context_id,
-        )
-        .await
+        Some(inputs) => match deps
+            .domains
+            .economy
+            .authorize_paid_action_hold(inputs, &member_did, &context_id)
+            .await
         {
             Ok(auth) => auth,
             Err(payment_err) => {
@@ -1208,7 +1132,7 @@ pub async fn join_context(
                 // the ticket rollback go through `&*cell` / a `class_c_view()` (no
                 // `state_mut()`); the view inside `rollback_join_economy_ticket`
                 // drops before the return.
-                let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+                let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
                     spending_nonce_token.take(),
                     &*cell,
                     deps,
@@ -1259,7 +1183,7 @@ pub async fn join_context(
             // before the existing escrow-void + ticket rollback. Nonce-commit +
             // escrow-void run through `&*cell` (shared, no mutation); the ticket
             // rollback opens a `class_c_view()` that drops before the return.
-            let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
                 spending_nonce_token.take(),
                 &*cell,
                 deps,
@@ -1268,7 +1192,7 @@ pub async fn join_context(
             )
             .await;
             if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+                crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
             }
             rollback_join_economy_ticket(cell, ticket);
             return Err(err);
@@ -1318,7 +1242,7 @@ pub async fn join_context(
             .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+        let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
             spending_nonce_token.take(),
             &*cell,
             deps,
@@ -1327,7 +1251,7 @@ pub async fn join_context(
         )
         .await;
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
         }
         rollback_join_economy_ticket(cell, ticket);
         return Err(err);
@@ -1347,7 +1271,7 @@ pub async fn join_context(
     // the join event, THEN durably persist, THEN settle the external escrow.
     // Consume the ticket — commit returns the deducted cost and marks the
     // ticket committed so the Drop guard stays quiet.
-    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
+    let deducted_cost = crate::context::shared::economy::commit_economy_ticket(ticket);
 
     // Append MemberJoined event to event log.
     //
@@ -1397,7 +1321,7 @@ pub async fn join_context(
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before voiding the escrow hold (mirrors the money-ordering rule
         // below). The membership / MLS state already applied is NOT reversed.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+        let err = crate::context::shared::messaging::commit_send_nonce_token_on_abort(
             spending_nonce_token.take(),
             &*cell,
             deps,
@@ -1406,7 +1330,7 @@ pub async fn join_context(
         )
         .await;
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+            crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
         }
         return Err(err);
     }
@@ -1454,13 +1378,12 @@ pub async fn join_context(
         // shared `&PerContextState`, supplied via `&*cell`.
         if let Err(e) = t.commit(&*cell, deps, &context_id).await {
             if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+                crate::context::shared::economy::void_paid_action(deps, a, &context_id).await;
             }
             return Err(e);
         }
     } else {
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id)
-            .await;
+        crate::context::snapshot::persist_state_best_effort(&*cell, deps, &context_id).await;
     }
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
@@ -1510,8 +1433,7 @@ pub fn join_context_membership(
             split.receive_buffer,
             context_id,
             member_did,
-            deps.clock.now_secs(),
-            deps.event_log.as_ref(),
+            deps,
         );
     }
 
@@ -1605,14 +1527,14 @@ pub fn join_context_membership(
 pub async fn capture_join_payment(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
+    auth: Option<crate::context::shared::economy::PaidActionAuthorization>,
     member_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     let Some(a) = auth else { return };
     // Async capture + verify runs with NO state borrow held.
-    match crate::context::economy_helpers::capture_and_verify_paid_action(a).await {
+    match deps.domains.economy.capture_and_verify_paid_action(a).await {
         Ok(Some(receipt)) => {
             // Surface the verified receipt through the Class-C view: emit the
             // local `ContextEvent::PaymentReceived`, then record it in the bounded
@@ -1621,13 +1543,13 @@ pub async fn capture_join_payment(
             // hand out both simultaneously) — sequencing matches the wrapper's
             // emit-then-record order, behaviour-neutral.
             let mut view = cell.class_c_view();
-            crate::context::economy_helpers::emit_payment_received_event(
+            deps.domains.economy.emit_payment_received_event(
                 view.receive_buffer_mut(),
                 deps,
                 &receipt,
                 context_id,
             );
-            crate::context::economy_helpers::record_payment_receipt(
+            crate::context::shared::economy::record_payment_receipt(
                 view.payment_receipts_mut(),
                 &receipt,
             );
@@ -1686,25 +1608,25 @@ fn record_payment_capture_failure(
     state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
 }
 
-/// Reverses a Phase-1 [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// Reverses a Phase-1 [`EconomyTicket`](crate::context::shared::economy::EconomyTicket)
 /// for [`join_context`] through a `class_c_view()` borrow that drops before the
 /// caller's early return (so the cell is free for the subsequent `.await`s).
 ///
 /// Thin cell-holder wrapper over the shared
-/// [`crate::context::economy_logic::rollback_economy_ticket_inline_view`] (also
+/// [`crate::context::shared::economy::rollback_economy_ticket_inline_view`] (also
 /// driven by the send path): the velocity entry, hard-rate-limit token, and
 /// budget debit are all Class-C, so they reverse through the field-granular
 /// `GovernanceClassCMut` accessors with no whole-state borrow. Consumes the
 /// ticket so its `Drop` guard stays quiet.
 fn rollback_join_economy_ticket(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    ticket: crate::context::economy_logic::EconomyTicket,
+    ticket: crate::context::shared::economy::EconomyTicket,
 ) {
     // Shared with the send path: reverse the three Class-C governance fields
     // through the field-granular `GovernanceClassCMut` view. The `&mut view`
     // borrow drops before the caller's early return (so the cell is free for the
     // subsequent `.await`s).
-    crate::context::economy_logic::rollback_economy_ticket_inline_view(
+    crate::context::shared::economy::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
     );
@@ -1804,10 +1726,7 @@ pub(in crate::context) async fn create_context(
     let creation_timestamp_secs = deps.clock.now_secs();
     // The creator's leaf publishes the owning identity's wrapping key (spec 09
     // §9.16.1); with none loaded the creation fails closed before any group exists.
-    let wrapping_public_key = *deps
-        .supervisor
-        .my_wrapping_key(&deps.owned_identity)?
-        .public();
+    let wrapping_public_key = *deps.my_wrapping_key()?.public();
     let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
@@ -1959,7 +1878,7 @@ pub(in crate::context) async fn create_context(
             // local — a foreign saga must never drive local reversal).
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
@@ -2047,703 +1966,9 @@ pub(in crate::context) async fn create_context(
     Ok(SpawnedContext::at_create_base(handle))
 }
 
-/// Write progress of one first-state record, held in an `AtomicU8`.
-///
-/// A record is touched when its write was started: `IN_FLIGHT` (the write
-/// future was dropped or has not returned, so it may have landed) or
-/// `WRITTEN`. A rollback puts back only a touched record. `FAILED` means the
-/// write returned an error, so the record keeps whatever the store held.
-const RECORD_NOT_WRITTEN: u8 = 0;
-const RECORD_IN_FLIGHT: u8 = 1;
-const RECORD_FAILED: u8 = 2;
-const RECORD_WRITTEN: u8 = 3;
-
-const fn record_touched(state: u8) -> bool {
-    matches!(state, RECORD_IN_FLIGHT | RECORD_WRITTEN)
-}
-
-/// Sets a first-state guard's `writes_idle` when the writes future is
-/// dropped: when it returns, panics, is cancelled, or is dropped before its
-/// first poll. [`first_state_writes`] builds it before the future, so the
-/// last case holds too.
-struct WritesIdleOnDrop(Arc<FirstStateRollbackInner>);
-
-impl Drop for WritesIdleOnDrop {
-    fn drop(&mut self) {
-        self.0.writes_idle.send_replace(true);
-    }
-}
-
-/// The snapshot and `last_relay_contact` stored for a context before its
-/// first-state writes began.
-struct FirstStatePriors {
-    snapshot: Option<crate::context::state::ContextSnapshot>,
-    contact: Option<u64>,
-}
-
-struct FirstStateRollbackInner {
-    persistence: Arc<dyn crate::context::persistence::ContextPersistence>,
-    contacts: Arc<dyn crate::store::sync::RelayContactStore>,
-    supervisor: crate::context::supervisor::handle::SupervisorHandle,
-    context_id: String,
-    priors: std::sync::OnceLock<FirstStatePriors>,
-    contact: std::sync::atomic::AtomicU8,
-    snapshot: std::sync::atomic::AtomicU8,
-    /// `true` while no first-state writes task is running. The tracked task
-    /// [`persist_first_state`] starts sets it `false` before the task can run
-    /// and back to `true` when the task ends, by return, panic, runtime
-    /// shutdown or a drop before its first poll. A write the operation's
-    /// timeout abandoned keeps running, and [`Self::drain_writes`] waits for
-    /// this flag before a rollback reads what was touched.
-    writes_idle: tokio::sync::watch::Sender<bool>,
-    /// Set when Supervisor shutdown abandoned the writes before they
-    /// finished, so a write may still land and no rollback reads the
-    /// records.
-    abandoned: std::sync::atomic::AtomicBool,
-    /// `true` while this guard holds the `pending_first_state` claim of its
-    /// context id, which keeps every other bootstrap, restore and respawn of
-    /// the id out until the guard commits or rolls back.
-    claimed: std::sync::atomic::AtomicBool,
-    /// Set by [`FirstStateRollback::commit`] or by the first rollback, so a
-    /// guard rolls back at most once and never after its actor started.
-    settled: std::sync::atomic::AtomicBool,
-}
-
-/// How long a rollback waits for first-state writes its operation abandoned
-/// before it gives up and keeps the records, and how long the writes run
-/// after Supervisor shutdown begins before they are abandoned.
-const FIRST_STATE_WRITES_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
-
-impl FirstStateRollbackInner {
-    fn mark(record: &std::sync::atomic::AtomicU8, state: u8) {
-        record.store(state, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn touched(&self) -> (bool, bool) {
-        (
-            record_touched(self.snapshot.load(std::sync::atomic::Ordering::SeqCst)),
-            record_touched(self.contact.load(std::sync::atomic::Ordering::SeqCst)),
-        )
-    }
-
-    /// Releases the claim [`FirstStateRollback::new`] made, once.
-    fn release_claim(&self) {
-        if self
-            .claimed
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.supervisor.release_first_state(&self.context_id);
-        }
-    }
-
-    /// Writes the first `last_relay_contact`, then the first snapshot, and
-    /// records each write's progress. Runs inside [`first_state_writes`], the
-    /// tracked task [`persist_first_state`] starts, so it finishes even when
-    /// the operation's future is dropped.
-    async fn write_first_state(
-        &self,
-        now: u64,
-        snapshot: &crate::context::state::ContextSnapshot,
-    ) -> Result<(), ContextError> {
-        let context_id = self.context_id.as_str();
-        Self::mark(&self.contact, RECORD_IN_FLIGHT);
-        if let Err(e) = self
-            .contacts
-            .store_last_relay_contact(context_id, now)
-            .await
-        {
-            Self::mark(&self.contact, RECORD_FAILED);
-            crate::metrics::record_persistence_failure();
-            tracing::error!(
-                context_id,
-                error = %e,
-                "first last_relay_contact write failed; the context is not started"
-            );
-            return Err(ContextError::PersistenceFailed(format!(
-                "writing the first last_relay_contact of '{context_id}' failed: {e}"
-            )));
-        }
-        Self::mark(&self.contact, RECORD_WRITTEN);
-        Self::mark(&self.snapshot, RECORD_IN_FLIGHT);
-        if let Err(e) = self.persistence.persist_context(context_id, snapshot).await {
-            Self::mark(&self.snapshot, RECORD_FAILED);
-            crate::metrics::record_persistence_failure();
-            tracing::error!(
-                context_id,
-                error = %e,
-                "first snapshot write failed; the context is not started (ADR-049 §9 Class S)"
-            );
-            return Err(ContextError::PersistenceFailed(format!(
-                "fail-closed persist failed for context '{context_id}': {e}"
-            )));
-        }
-        Self::mark(&self.snapshot, RECORD_WRITTEN);
-        Ok(())
-    }
-
-    /// Waits for a first-state writes task the operation abandoned, so no
-    /// write lands after the rollback reads the records' progress.
-    /// [`FirstStateRollback::rollback`] runs it with `bootstrap_spawn_lock`
-    /// released, because the wait can last [`FIRST_STATE_WRITES_DRAIN`] and
-    /// every other bootstrap waits on that lock.
-    /// [`FirstStateRollback::rollback_with_guard`] runs it
-    /// under the guard its actor turn already holds, because releasing that
-    /// guard in a turn could not be undone without waiting on the lock.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::PersistenceFailed`] when the writes have not finished
-    /// within [`FIRST_STATE_WRITES_DRAIN`], or Supervisor shutdown abandoned
-    /// them: a write that may still land cannot be undone, so the records
-    /// are kept.
-    async fn drain_writes(&self) -> Result<(), ContextError> {
-        let context_id = self.context_id.as_str();
-        let mut idle = self.writes_idle.subscribe();
-        match tokio::time::timeout(FIRST_STATE_WRITES_DRAIN, idle.wait_for(|idle| *idle)).await {
-            // The writes' own result is in the record states read next. The
-            // sender lives in `self`, so the wait cannot see it closed.
-            Ok(Ok(_) | Err(_)) => {}
-            Err(_elapsed) => {
-                crate::metrics::record_persistence_failure();
-                return Err(ContextError::PersistenceFailed(format!(
-                    "the first-state writes of '{context_id}' did not finish within \
-                     {FIRST_STATE_WRITES_DRAIN:?}; their records are kept"
-                )));
-            }
-        }
-        if self.abandoned.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ContextError::PersistenceFailed(format!(
-                "shutdown abandoned the first-state writes of '{context_id}' before they \
-                 finished; their records are kept"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Puts back every touched record: the snapshot first, then the contact,
-    /// and the contact only once the snapshot step returned `Ok`, so no
-    /// stored snapshot is ever left without a contact (ADR-029
-    /// Implementation). The caller has drained the writes
-    /// ([`Self::drain_writes`]) and holds `bootstrap_spawn_lock`, so no
-    /// bootstrap writes between this `lookup` and the restores.
-    async fn undo_locked(&self) -> Result<(), ContextError> {
-        let context_id = self.context_id.as_str();
-        let (snapshot_touched, contact_touched) = self.touched();
-        if !snapshot_touched && !contact_touched {
-            return Ok(());
-        }
-        // `persist_first_state` saw no registered actor before the writes,
-        // and the claim this guard holds keeps every other bootstrap,
-        // restore and respawn of the id out, so an actor registered now is
-        // the one this operation spawned, and the records are its state. A
-        // dropped Supervisor runs no actor.
-        if let Ok(Some(_)) = self.supervisor.lookup(context_id) {
-            tracing::warn!(
-                context_id,
-                "first-state rollback skipped: the operation's actor is registered"
-            );
-            return Ok(());
-        }
-        let priors = self.priors.get().ok_or_else(|| {
-            ContextError::InvalidState(format!(
-                "first-state rollback of '{context_id}': a record was written before its \
-                 prior value was read"
-            ))
-        })?;
-        if snapshot_touched {
-            let restored = match &priors.snapshot {
-                Some(prior) => self.persistence.persist_context(context_id, prior).await,
-                None => self.persistence.delete_context(context_id).await,
-            };
-            restored.map_err(|e| {
-                crate::metrics::record_persistence_failure();
-                tracing::error!(
-                    context_id,
-                    error = %e,
-                    "first-state rollback could not put back the snapshot; the \
-                     last_relay_contact is kept"
-                );
-                ContextError::PersistenceFailed(format!(
-                    "rolling back the first snapshot of '{context_id}' failed, so its \
-                     last_relay_contact is kept: {e}"
-                ))
-            })?;
-        }
-        if contact_touched {
-            let restored = match priors.contact {
-                Some(prior) => {
-                    self.contacts
-                        .store_last_relay_contact(context_id, prior)
-                        .await
-                }
-                None => self.contacts.delete_last_relay_contact(context_id).await,
-            };
-            restored.map_err(|e| {
-                crate::metrics::record_persistence_failure();
-                tracing::error!(
-                    context_id,
-                    error = %e,
-                    "first-state rollback could not put back the last_relay_contact"
-                );
-                ContextError::PersistenceFailed(format!(
-                    "rolling back the first last_relay_contact of '{context_id}' failed: {e}"
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// The undo of a rollback that could not take `bootstrap_spawn_lock` in
-    /// its own turn, run by a tracked task that holds the lock: it logs a
-    /// failure, since no caller waits for it, then releases the claim.
-    async fn finish_deferred_undo(self: Arc<Self>) {
-        if let Err(error) = self.undo_locked().await {
-            tracing::error!(
-                context_id = self.context_id.as_str(),
-                %error,
-                "deferred first-state rollback failed; its records stay"
-            );
-        }
-        self.release_claim();
-    }
-}
-
-impl Drop for FirstStateRollbackInner {
-    /// A guard whose rollback did not finish, because its writes did not
-    /// drain, keeps the claim until the writes task and every rollback task
-    /// holding this state end; the last of them releases it here.
-    fn drop(&mut self) {
-        self.release_claim();
-    }
-}
-
-/// Puts back the first-state records of a create, Welcome join, import,
-/// standing-context create or migration create that fails or times out
-/// before its actor starts (ADR-029 Implementation; ADR-049 Decision 9).
-///
-/// The operation's owner builds it before the operation's future and keeps
-/// it outside any timeout, so a `LIFECYCLE_TIMEOUT` that drops the future
-/// still reaches it. [`Self::new`] claims the context id, and
-/// [`persist_first_state`] records the snapshot and contact stored before it
-/// writes and each write's progress. The owner calls [`Self::commit`] once the actor is
-/// registered, or on failure releases `bootstrap_spawn_lock` and calls
-/// [`Self::rollback`], which waits for the writes with the lock released and
-/// retakes it for the restores; the migration create, which runs in an
-/// actor turn that already holds the lock, calls
-/// [`Self::rollback_with_guard`]. A guard dropped unsettled with a touched
-/// record runs its rollback on a tracked task.
-///
-/// The writes run in a tracked task, and a rollback waits for that task
-/// before it reads which records were touched, so a write an operation's
-/// timeout abandoned, on a blocking thread or in a host callback, cannot
-/// land after the rollback. The claim keeps every other bootstrap, restore
-/// and respawn of the id out while the lock is released.
-pub(in crate::context) struct FirstStateRollback {
-    inner: Arc<FirstStateRollbackInner>,
-}
-
-impl FirstStateRollback {
-    /// A guard for the first-state writes of `context_id`, over the stores
-    /// `deps` writes to. It claims `context_id` in `pending_first_state`
-    /// until it commits or rolls back, so an operation over an id whose
-    /// earlier rollback is still running fails here, before any write.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ActorBusy`] while another operation's first state of
-    ///   `context_id` is unsettled; it is retryable.
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has
-    ///   dropped.
-    pub(in crate::context) fn new(
-        deps: &ActorDeps,
-        context_id: &str,
-    ) -> Result<Self, ContextError> {
-        deps.supervisor.claim_first_state(context_id)?;
-        Ok(Self {
-            inner: Arc::new(FirstStateRollbackInner {
-                persistence: Arc::clone(&deps.persistence),
-                contacts: deps.supervisor.relay_contact_store()?,
-                supervisor: deps.supervisor.clone(),
-                context_id: context_id.to_owned(),
-                priors: std::sync::OnceLock::new(),
-                contact: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
-                snapshot: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
-                writes_idle: tokio::sync::watch::Sender::new(true),
-                abandoned: std::sync::atomic::AtomicBool::new(false),
-                claimed: std::sync::atomic::AtomicBool::new(true),
-                settled: std::sync::atomic::AtomicBool::new(false),
-            }),
-        })
-    }
-
-    /// Keeps the written records and releases the claim: the operation's
-    /// actor is registered.
-    pub(in crate::context) fn commit(&self) {
-        self.inner
-            .settled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.inner.release_claim();
-    }
-
-    /// Puts back the records the operation touched; a no-op after
-    /// [`Self::commit`] or an earlier rollback.
-    ///
-    /// The owner calls it with `bootstrap_spawn_lock` released and passes
-    /// the lock's acquire as `relock`: the rollback waits for the writes
-    /// first, which can take [`FIRST_STATE_WRITES_DRAIN`], then awaits
-    /// `relock` and holds its guard through the `lookup` and the restores.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::PersistenceFailed`] when the writes did not finish or
-    /// putting back a record fails; a failed snapshot step keeps the
-    /// contact.
-    pub(in crate::context) async fn rollback<G>(
-        &self,
-        relock: impl std::future::Future<Output = G>,
-    ) -> Result<(), ContextError> {
-        if self
-            .inner
-            .settled
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Ok(());
-        }
-        // A failed drain keeps the claim: the writes may still land, and the
-        // writes task's drop of the state releases it.
-        self.inner.drain_writes().await?;
-        let result = if self.inner.touched() == (false, false) {
-            Ok(())
-        } else {
-            let _bootstrap_guard = relock.await;
-            self.inner.undo_locked().await
-        };
-        self.inner.release_claim();
-        result
-    }
-
-    /// The rollback of the migration create, which runs in the source
-    /// context's actor turn under the `bootstrap_spawn_lock` guard its
-    /// governance call reserved before its first record. It waits for the
-    /// writes, reads what was touched and puts it back while still holding
-    /// `guard`, then releases it, so it never waits for the lock and never
-    /// returns a retryable `ActorBusy` after the call recorded its proposal
-    /// or vote. The migration awaits its writes task to the end, so the wait
-    /// returns at once unless shutdown abandoned the writes.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::rollback`].
-    pub(in crate::context) async fn rollback_with_guard(
-        &self,
-        guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<(), ContextError> {
-        if self
-            .inner
-            .settled
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Ok(());
-        }
-        // A failed drain keeps the claim, as in `rollback`.
-        self.inner.drain_writes().await?;
-        let result = if self.inner.touched() == (false, false) {
-            Ok(())
-        } else {
-            self.inner.undo_locked().await
-        };
-        drop(guard);
-        self.inner.release_claim();
-        result
-    }
-
-    /// Reads the snapshot and contact stored before the first write.
-    async fn capture_priors(&self) -> Result<(), ContextError> {
-        let inner = &self.inner;
-        let context_id = inner.context_id.as_str();
-        let snapshot = inner
-            .persistence
-            .load_context(context_id)
-            .await
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!(
-                    "reading the stored snapshot of '{context_id}' before its first write \
-                 failed: {e}"
-                ))
-            })?;
-        let contact = inner
-            .contacts
-            .load_last_relay_contact(context_id)
-            .await
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!(
-                    "reading the stored last_relay_contact of '{context_id}' before its \
-                     first write failed: {e}"
-                ))
-            })?;
-        inner
-            .priors
-            .set(FirstStatePriors { snapshot, contact })
-            .map_err(|_| {
-                ContextError::InvalidState(format!(
-                    "the first state of '{context_id}' was already written under this guard"
-                ))
-            })
-    }
-}
-
-impl Drop for FirstStateRollback {
-    fn drop(&mut self) {
-        if self
-            .inner
-            .settled
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        let (snapshot_touched, contact_touched) = self.inner.touched();
-        if !snapshot_touched && !contact_touched {
-            self.inner.release_claim();
-            return;
-        }
-        let context_id = self.inner.context_id.clone();
-        // The task waits for the writes with the lock released, then takes
-        // `bootstrap_spawn_lock` before its `lookup` and holds it through both
-        // restores. The claim keeps every other bootstrap of the id out
-        // meanwhile.
-        let drained = {
-            let inner = Arc::clone(&self.inner);
-            async move {
-                match inner.drain_writes().await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::error!(
-                            context_id = inner.context_id.as_str(),
-                            %error,
-                            "first-state rollback of a dropped operation did not run; its \
-                             records stay"
-                        );
-                        false
-                    }
-                }
-            }
-        };
-        let inner = Arc::clone(&self.inner);
-        if let Err(error) = self.inner.supervisor.spawn_under_bootstrap_spawn_lock(
-            "first_state_rollback",
-            drained,
-            move || inner.finish_deferred_undo(),
-        ) {
-            crate::metrics::record_persistence_failure();
-            tracing::error!(
-                context_id,
-                %error,
-                "first-state rollback of a dropped operation could not start; its records stay"
-            );
-        }
-    }
-}
-
-/// Folds a failed rollback into the operation's own failure: the stores
-/// still hold records of a context with no actor, which the caller must see.
-pub(in crate::context) fn fold_rollback_failure(
-    failure: &dyn std::fmt::Display,
-    rollback: &ContextError,
-) -> ContextError {
-    ContextError::PersistenceFailed(format!("{failure}; {rollback}"))
-}
-
-/// The first-state writes task. Its [`WritesIdleOnDrop`] is built before the
-/// future, so a future dropped before its first poll still marks the writes
-/// idle. Once Supervisor shutdown begins the writes run at most
-/// [`FIRST_STATE_WRITES_DRAIN`] longer and are then abandoned, so shutdown,
-/// which awaits every tracked task, ends.
-fn first_state_writes(
-    inner: Arc<FirstStateRollbackInner>,
-    now: u64,
-    snapshot: Box<crate::context::state::ContextSnapshot>,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + 'static {
-    let idle_on_exit = WritesIdleOnDrop(Arc::clone(&inner));
-    async move {
-        let _idle_on_exit = idle_on_exit;
-        tokio::select! {
-            written = inner.write_first_state(now, &snapshot) => written,
-            () = async {
-                shutdown.cancelled().await;
-                tokio::time::sleep(FIRST_STATE_WRITES_DRAIN).await;
-            } => {
-                let context_id = inner.context_id.as_str();
-                inner
-                    .abandoned
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                crate::metrics::record_persistence_failure();
-                tracing::error!(
-                    context_id,
-                    "shutdown abandoned the first-state writes before they finished; their \
-                     records are kept"
-                );
-                Err(ContextError::PersistenceFailed(format!(
-                    "shutdown abandoned the first-state writes of '{context_id}' before they \
-                     finished"
-                )))
-            }
-        }
-    }
-}
-
-/// Writes the first `last_relay_contact` of a context whose actor is about
-/// to start, as the current time, then its first snapshot, both before the
-/// spawn.
-///
-/// Create, Welcome join and import call it, and the standing-context and
-/// migration creates reach it through `create_context`. The snapshot is
-/// Class S state (ADR-049 Decision 9), and the contact is the value a later
-/// full reconnection classifies the offline tier from (ADR-029
-/// Implementation). The contact goes first, so no stored snapshot lacks a
-/// contact. `rollback` records the values stored before and each write's
-/// progress; the caller rolls back on failure. The
-/// writes run in a tracked task `rollback` keeps, so a rollback after this
-/// future is dropped waits for them.
-///
-/// # Errors
-///
-/// - [`ContextError::CreationFailed`] when an actor is registered for
-///   `context_id`.
-/// - [`ContextError::PersistenceFailed`] when reading the stored values, the
-///   contact write, or the snapshot write fails, or the writes task ends
-///   without finishing.
-/// - [`ContextError::InvalidState`] when `rollback` guards another context
-///   or already recorded a write.
-/// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped or
-///   shutdown has begun.
-///
-/// # Not `async fn`
-///
-/// The `&PerContextState` is consumed in the synchronous prelude, as in
-/// [`crate::context::messaging_helpers::persist_state_fail_closed`], so the
-/// returned future is `Send`.
-pub(in crate::context) fn persist_first_state<'d, 'c, 'r>(
-    state: &PerContextState,
-    deps: &'d ActorDeps,
-    context_id: &'c str,
-    rollback: &'r FirstStateRollback,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c, 'r> {
-    let snapshot =
-        crate::context::messaging_helpers::build_snapshot_for_persist(state, deps, context_id)
-            .map(Box::new);
-    async move {
-        let inner = &rollback.inner;
-        if inner.context_id != context_id {
-            return Err(ContextError::InvalidState(format!(
-                "the first-state guard of '{}' cannot record the writes of '{context_id}'",
-                inner.context_id
-            )));
-        }
-        if deps.supervisor.lookup(context_id)?.is_some() {
-            return Err(ContextError::CreationFailed(format!(
-                "context '{context_id}' has a running actor; its state is not overwritten"
-            )));
-        }
-        let snapshot = snapshot?;
-        rollback.capture_priors().await?;
-        let shutdown = deps.supervisor.shutdown_signal()?;
-        let now = deps.clock.now_secs();
-        // The writes and the contact count as started from before the task
-        // can run, so a guard dropped before its first poll still waits for
-        // it and rolls back the write it goes on to make.
-        inner.writes_idle.send_replace(false);
-        FirstStateRollbackInner::mark(&inner.contact, RECORD_IN_FLIGHT);
-        let writes = first_state_writes(Arc::clone(inner), now, snapshot, shutdown);
-        // A refused spawn drops `writes`, whose idle guard marks the writes
-        // idle again.
-        let running = match deps.supervisor.spawn_tracked("first-state writes", writes) {
-            Ok(handle) => handle,
-            Err(e) => {
-                FirstStateRollbackInner::mark(&inner.contact, RECORD_NOT_WRITTEN);
-                return Err(e);
-            }
-        };
-        running.await.map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "the first-state writes of '{context_id}' ended without finishing: {e}"
-            ))
-        })?
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 10. SpawnedContext (post-spawn wiring of create, import and the Welcome join)
 // ---------------------------------------------------------------------------
-
-/// How a freshly spawned context's TTL timer is armed.
-#[derive(Debug)]
-enum TtlArming {
-    /// No TTL timer: the context has no finite TTL, or a promoted import.
-    Unarmed,
-    /// The actor derives the convergent `creation_timestamp_secs + params.ttl`
-    /// deadline (create, the Welcome join).
-    CreateBase,
-    /// The deadline derived from the imported event log (ADR-049 §9).
-    Deadline(crate::context::ttl_close_helpers::ConvergentDeadline),
-}
-
-/// A context whose actor is registered and whose post-spawn wiring, the gauge
-/// refresh and the TTL timer, has not run.
-///
-/// The handle is reachable only through [`Self::finalize`], so no bootstrap
-/// returns a context without its TTL timer. The owner runs `finalize` after
-/// it releases `bootstrap_spawn_lock`: the TTL install waits on the new
-/// actor's mailbox, and a mailbox wait under that lock waits on any actor
-/// whose turn waits for the lock, such as a migration source creating its
-/// destination. The governance-timeout interval is actor-owned (ADR-049
-/// Decision-1 / finding A3): the spawned actor's `reconcile_timers` arms it
-/// while `Active`, so no install is needed.
-#[derive(Debug)]
-#[must_use = "run `finalize` after releasing `bootstrap_spawn_lock`"]
-pub(in crate::context) struct SpawnedContext {
-    handle: ContextHandle,
-    ttl: TtlArming,
-}
-
-impl SpawnedContext {
-    /// A created or Welcome-joined context, whose TTL timer the actor arms
-    /// from its creation timestamp when `params.ttl` is finite.
-    pub(in crate::context) const fn at_create_base(handle: ContextHandle) -> Self {
-        let ttl = if handle.params().ttl.is_some() {
-            TtlArming::CreateBase
-        } else {
-            TtlArming::Unarmed
-        };
-        Self { handle, ttl }
-    }
-
-    /// Starts the gauge refresh, which no one awaits, and installs the TTL
-    /// timer by mailboxing the actor, a wait bounded by the send and reply
-    /// timeouts of
-    /// [`SupervisorHandle::dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer).
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
-    /// or shutdown has begun (ADR-049 Decision 16).
-    pub(in crate::context) async fn finalize(
-        self,
-        deps: &ActorDeps,
-    ) -> Result<ContextHandle, ContextError> {
-        let Self { handle, ttl } = self;
-        deps.supervisor.update_context_gauges()?;
-        let deadline = match ttl {
-            TtlArming::Unarmed => return Ok(handle),
-            TtlArming::CreateBase => None,
-            TtlArming::Deadline(deadline) => Some(deadline),
-        };
-        deps.supervisor
-            .dispatch_start_ttl_timer(handle.context_id(), handle.params().clone(), deadline)
-            .await?;
-        Ok(handle)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 11. generate_initial_access_key_store (transitive of create_context)
@@ -2765,193 +1990,6 @@ fn generate_initial_access_key_store(
 // ---------------------------------------------------------------------------
 // 12. import_context (bootstrap; constructs fresh PerContextState)
 // ---------------------------------------------------------------------------
-
-/// §23.17 Invariant 2/3/4 — the SINGLE floor-guarded crypto-restore path for
-/// import, `PrepareForReplace`, respawn, and restore. Merges the floors of a
-/// [`VerifiedRestoredCrypto`](crate::context::restored_crypto::VerifiedRestoredCrypto)
-/// INTO the authoritative Supervisor-owned Class-M registry (ADR-049 PR-6).
-/// EVERY crypto-restore site — the actor-side `PrepareForReplace` handler,
-/// `import_context`, and `restore_context` — routes through here so the replay
-/// (floor-regression) guard cannot be bypassed.
-///
-/// The input is [`VerifiedFloors`](crate::context::restored_crypto::VerifiedFloors),
-/// which only a `VerifiedRestoredCrypto` yields, so floors from a group whose
-/// `0xFF02` binding (spec 05 §5.13.3) was not verified cannot reach the
-/// registry.
-///
-/// The registry is the authoritative live floor home and is NOT torn down here,
-/// so there is no pre-teardown "capture" step: the snapshot floors are the merge
-/// INPUT (`incoming`) and the live registry floors are the merge target. The
-/// registry merge guards on `incoming.is_empty()` (NOT the live floors), so a
-/// COLD restart (empty live registry, non-empty snapshot) still POPULATES the
-/// registry — closing the cold-restart replay window (D2).
-///
-/// Import and restore reach it through
-/// [`VerifiedRestoredCrypto::merge_floors`](crate::context::restored_crypto::VerifiedRestoredCrypto::merge_floors),
-/// which returns the owned group for the seed only after this merge succeeds.
-/// The terminating `PrepareForReplace` actor calls it with the floors alone
-/// and seeds nothing (ADR-049 PR-7 C3 seed-vs-terminal resolution).
-///
-/// `trusted_local` selects the spec §23.17.2 merge semantics:
-///
-/// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
-///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
-///   (`restore_all_contexts`). A lower restored floor is the expected
-///   coalesce-lag case and is MAX-merged with the live registry floor; the
-///   restore PROCEEDS (never rejected for a regression). Only an overshoot
-///   beyond `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
-/// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
-///   per-sender floor regression is rejected (snapshot-mediated replay guard).
-///
-/// # Errors
-///
-/// Returns `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the
-/// §23.17 replay-protection rejection the registry's `validate_and_merge_*`
-/// sink returns) if a per-sender floor regresses (import path) or overshoots
-/// (both paths), and the registry is left unchanged (validate-before-apply
-/// across both axes).
-pub(in crate::context) fn restore_crypto_state_with_floor_guard(
-    deps: &ActorDeps,
-    ctx_id_bytes: &[u8; 32],
-    floors: &crate::context::restored_crypto::VerifiedFloors,
-    trusted_local: bool,
-) -> Result<(), ContextError> {
-    // #2148 (ADR-049 birth-into-actor): the crypto is ACTOR-owned end to end —
-    // the provider holds NO per-context state, so there is no provider-resident
-    // crypto to tear down first.
-
-    // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
-    // `MergePolicy`: a trusted-local respawn max-merges and tolerates the
-    // coalesce-lag regression (Inv-2); an untrusted import rejects any
-    // regression (Inv-3). BOTH enforce the epoch-poisoning overshoot ceiling.
-    let policy = if trusted_local {
-        scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
-    } else {
-        scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
-    };
-
-    // THE D2 sink: merge the snapshot floors (`incoming`) INTO the authoritative
-    // registry (`local` = the live, non-torn-down registry). ONE cross-axis
-    // validating merge — BOTH the epoch AND the recv-sequence floors are
-    // validated before EITHER is applied, so a rejection on either axis leaves
-    // the WHOLE registry entry UNCHANGED. The merge guards on
-    // `incoming.is_empty()` — NOT on the live floors — so on a COLD restart
-    // (empty live registry, NON-empty snapshot) it RUNS and POPULATES the
-    // registry, closing D2. FAIL-CLOSED via `?`; `From<FloorAdvanceError>` maps
-    // a rejection to `ContextError::CryptoFailed`. On rejection
-    // `VerifiedRestoredCrypto::merge_floors` drops the owned group at its `?`
-    // return (zeroizing on drop), so a rejected restore is never seeded onto an
-    // actor and writes no durable snapshot.
-    deps.supervisor.validate_and_merge_all_floors(
-        ctx_id_bytes,
-        floors.sender_epochs().to_vec(),
-        floors.recv_sequence().to_vec(),
-        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-        policy,
-    )?;
-
-    Ok(())
-}
-
-/// Verifies a joined or rehydrated MLS group's committed `scp_context_params`
-/// (`0xFF02`) group-context extension against the context's declared identity
-/// and parameters (spec §5.13.3, finding FFI-02).
-///
-/// This is the single binding check shared by every point where an SCP context
-/// group enters the live provider from a *caller-supplied* description of its
-/// parameters:
-///
-/// - **join** (`Supervisor::spawn_actor_from_welcome`) — the joiner reads the
-///   just-joined group's extension (before install) and verifies it against the
-///   `WelcomeJoinRequest.params` the (untrusted) inviter supplied;
-/// - **import** (`import_context`) and **restore / respawn** (`restore_context`)
-///   — the layer reads the *rehydrated* group's extension and verifies it
-///   against the snapshot's `context_params`.
-///
-/// It enforces validation **rule 1** (every SCP context group MUST carry the
-/// `0xFF02` extension) plus **rules 2–6** (`context_id`, governance / ceiling
-/// hashes, ceiling policy, mode, parent structure) and **rule 8** (the committed
-/// genesis `creator_did` MUST equal the presented `creator_did`) via
-/// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against).
-/// The extension is folded into the MLS key schedule at group creation, so it
-/// is the group's cryptographic attestation of its own parameters: a malicious
-/// inviter (or a forged / internally-inconsistent snapshot) that presents
-/// benign `params` while the real group commits divergent
-/// governance / ceiling / mode / `context_id` is refused here, *before* any
-/// authority (governance engine, ceiling, admin set) is built from those
-/// params.
-///
-/// `creator_did` is the genesis creator/admin the caller presents — the
-/// (untrusted) bundle's `creator_did` on a Welcome-based join, or the snapshot's
-/// `role_state.creator_did` on import/restore. Rule 8 refuses the group unless
-/// it equals the `creator_did` the group cryptographically committed at
-/// creation, so no authority is ever built for a substituted admin (the sole
-/// anchor for DID-less governance models such as `SingleAdmin`).
-///
-/// It also enforces **rule 9**: the committed `creation_timestamp_secs` must
-/// not exceed 2^53 − 1, must not lie later than `now_secs` plus the 5-minute
-/// future bound of `09-security-model.md` §9.8.2
-/// ([`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`](scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS)),
-/// and, on import and restore, must equal the creation timestamp the snapshot
-/// recorded (`snapshot_creation_timestamp_secs`; `None` on a Welcome join,
-/// which presents no snapshot). An extension that omits the field fails to
-/// decode, so it arrives here as an unreadable `read`.
-///
-/// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
-/// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
-/// `Err(msg)` = the group is unreadable / the `0xFF02` payload is malformed.
-/// On rejection the returned reason is prefixed with `site` so each caller can
-/// wrap it in its site-idiomatic [`ContextError`] variant while sharing this
-/// one check. Returns the committed `T0`, which the caller installs as the
-/// pseudonym-rotation base and the TTL base, only when the extension is
-/// present AND every binding rule holds.
-pub(in crate::context) fn verify_scp_context_binding(
-    read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
-    context_id: &str,
-    creator_did: &str,
-    params: &scp_protocol::context::ContextParams,
-    now_secs: u64,
-    snapshot_creation_timestamp_secs: Option<u64>,
-    site: &str,
-) -> Result<u64, String> {
-    match read {
-        Ok(Some(ext)) => {
-            ext.verify_against(
-                &context_id.to_owned(),
-                &scp_did::DID::from(creator_did.to_owned()),
-                params,
-            )
-            .map_err(|e| {
-                format!(
-                    "{site} refused: scp_context_params (0xFF02) binding mismatch \
-                     (§5.13.3 rules 2-6, 8): {e}"
-                )
-            })?;
-            let t0 = ext.committed_creation_timestamp(now_secs).map_err(|e| {
-                format!(
-                    "{site} refused: scp_context_params (0xFF02) creation timestamp \
-                     rejected (§5.13.3 rule 9): {e}"
-                )
-            })?;
-            match snapshot_creation_timestamp_secs {
-                Some(recorded) if recorded != t0 => Err(format!(
-                    "{site} refused: the snapshot records creation timestamp {recorded}, \
-                     the scp_context_params (0xFF02) extension commits {t0} \
-                     (§5.13.3 rules 7, 9)"
-                )),
-                _ => Ok(t0),
-            }
-        }
-        Ok(None) => Err(format!(
-            "{site} refused: the MLS group carries no scp_context_params (0xFF02) \
-             group-context extension — not an SCP context (§5.13.3 rule 1)"
-        )),
-        Err(e) => Err(format!(
-            "{site} refused: scp_context_params (0xFF02) group-context extension \
-             unreadable (§5.13.3): {e}"
-        )),
-    }
-}
 
 /// Persists an import's event-log data, if it carries any.
 ///
@@ -3384,9 +2422,7 @@ pub(in crate::context) async fn import_context(
         None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
     };
     let validated_message_pricing = export.snapshot.message_pricing.clone().or_else(|| {
-        crate::context::lifecycle_logic::derive_message_pricing(
-            export.snapshot.economic_policy.as_ref(),
-        )
+        crate::context::state::derive_message_pricing(export.snapshot.economic_policy.as_ref())
     });
     if let Some(ref pricing) = validated_message_pricing {
         pricing.validate().map_err(|e| {
@@ -3634,7 +2670,7 @@ pub(in crate::context) async fn import_context(
             // local — a foreign saga must never drive local reversal).
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
@@ -3737,7 +2773,7 @@ pub(in crate::context) async fn import_context(
     // recorded creation timestamp on a keyless import (see its definition).
     let import_log_entries: Vec<scp_event_log::Event> =
         rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
-    let ttl = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+    let ttl = crate::context::shared::ttl_close::convergent_ttl_deadline(
         &import_log_entries,
         ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
@@ -3935,9 +2971,10 @@ pub async fn restore_context(
 ) -> Result<(), ContextError> {
     use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
-        derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
+        sanitize_cooldown_until, validate_consequence_rules_for_import,
         validate_context_params_for_import,
     };
+    use crate::context::state::derive_message_pricing;
     use crate::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
         restore_grace_store_from_snapshot,
@@ -4103,7 +3140,7 @@ pub async fn restore_context(
             ))
         })?
         .unwrap_or_default();
-    let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+    let restore_ttl_deadline = crate::context::shared::ttl_close::convergent_ttl_deadline(
         &restore_log_entries,
         restore_ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
@@ -4371,7 +3408,7 @@ pub async fn restore_context(
             // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 ctx_snapshot.xctx_nonce_dedup,
-                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                crate::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
             // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
             // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
@@ -4603,100 +3640,6 @@ pub async fn restore_all_contexts(
         }
     }
     Ok(restored)
-}
-
-/// Sweep entry point: flushes every actor's snapshot to the configured
-/// persistence provider.
-///
-/// Relocates the legacy `flush_all_contexts_legacy` off the
-/// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
-/// registry and dispatches one
-/// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
-/// per actor. Every actor is flushed even after one fails. An actor that
-/// despawned between the listing and the lookup holds nothing to flush, and
-/// neither does one that left its `run()` loop on purpose between the lookup
-/// and its reply: it recorded a Shutdown, a claimed `PrepareForReplace` or a
-/// TTL expiry on its handle ([`ContextActorHandle::exited_deliberately`]),
-/// so the flush skips it. No-op if no persistence provider is configured.
-///
-/// # Errors
-///
-/// The first actor's failure, in registry order, when any flush did not land
-/// (ADR-049 Decision 9): the flush's own error; the mailbox send's error
-/// (a full mailbox, or an inbox that closed without a deliberate exit); or
-/// [`ContextError::ActorCrashed`] when the actor dropped its reply without a
-/// deliberate exit, as a panic does. Each failure is also logged.
-///
-/// [`ContextActorHandle::exited_deliberately`]: crate::context::actor::ContextActorHandle
-pub async fn flush_all_contexts(
-    supervisor: &crate::context::supervisor::Supervisor,
-) -> Result<(), ContextError> {
-    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
-
-    if !crate::context::manager_methods::has_persistence(supervisor) {
-        return Ok(());
-    }
-
-    let mut flushed = 0usize;
-    let mut first_error: Option<ContextError> = None;
-    for ctx_id in supervisor.actor_ids() {
-        let Some(actor) = supervisor.lookup(&ctx_id) else {
-            continue;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
-        // An unanswered flush is skipped only when the actor recorded a
-        // deliberate exit: a closed, replaced or expired context holds
-        // nothing this sweep must persist. A reply the actor dropped for any
-        // other reason, a panic included, is a flush that did not land.
-        let unanswered = |e: ContextError| match actor.exited_deliberately() {
-            Some(exit) => {
-                tracing::debug!(
-                    context_id = %ctx_id,
-                    ?exit,
-                    error = %e,
-                    "flush_all_contexts: the actor exited on purpose before it flushed; skipped"
-                );
-                None
-            }
-            None => Some(e),
-        };
-        let flushed_one = match actor
-            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-            .await
-        {
-            Ok(()) => match rx.await {
-                Ok(result) => result,
-                Err(_dropped) => match unanswered(ContextError::ActorCrashed(format!(
-                    "the actor of {ctx_id} dropped its flush reply"
-                ))) {
-                    Some(e) => Err(e),
-                    None => continue,
-                },
-            },
-            Err(e) => match unanswered(e) {
-                Some(e) => Err(e),
-                None => continue,
-            },
-        };
-        match flushed_one {
-            Ok(()) => flushed += 1,
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %ctx_id,
-                    error = %e,
-                    "flush_all_contexts: the flush did not land"
-                );
-                first_error.get_or_insert(e);
-            }
-        }
-    }
-    tracing::debug!(
-        flushed,
-        "flush_all_contexts: flushed {} context(s) via actor mailbox",
-        flushed,
-    );
-    first_error.map_or(Ok(()), Err)
 }
 
 /// Sweep entry point: shut down every actor (best-effort, local
@@ -5214,6 +4157,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         )
     }
 
@@ -5298,7 +4242,7 @@ mod restore_reconcile_tests {
             .expect("create_context should succeed");
 
         capture.contexts.lock().unwrap().remove(ctx_id);
-        crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
+        crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect("a working store persists");
         assert!(
@@ -5309,7 +4253,7 @@ mod restore_reconcile_tests {
         capture
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let err = crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
+        let err = crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect_err("a failed snapshot write must reach the caller");
         assert!(
@@ -5320,7 +4264,7 @@ mod restore_reconcile_tests {
         capture
             .fail
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
+        crate::context::shared::lifecycle::flush_all_contexts(&supervisor)
             .await
             .expect("the retry after the store recovers flushes");
     }
@@ -5370,12 +4314,12 @@ mod restore_reconcile_tests {
             1_700_000_000,
             owner,
         );
-        let snapshot =
-            crate::context::messaging_helpers::build_snapshot_for_persist(&state, &deps, &ctx_id)
-                .expect("snapshot");
-        let guard = lifecycle_helpers::FirstStateRollback::new(&deps, &ctx_id).expect("guard");
+        let snapshot = crate::context::snapshot::build_snapshot_for_persist(&state, &deps, &ctx_id)
+            .expect("snapshot");
+        let guard = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx_id)
+            .expect("guard");
         guard.inner.writes_idle.send_replace(false);
-        let writes = lifecycle_helpers::first_state_writes(
+        let writes = crate::context::shared::lifecycle::first_state_writes(
             Arc::clone(&guard.inner),
             1_700_000_000,
             Box::new(snapshot),
@@ -5401,19 +4345,20 @@ mod restore_reconcile_tests {
             .build_actor_deps_loaded(&DID("did:dht:z6MkFirstStateClaim".to_owned()))
             .await
             .expect("build_actor_deps");
-        let first = lifecycle_helpers::FirstStateRollback::new(&deps, "claimed").expect("guard");
-        let second = lifecycle_helpers::FirstStateRollback::new(&deps, "claimed");
+        let first = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
+            .expect("guard");
+        let second = crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed");
         assert!(
             matches!(&second, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
             "a second guard of a claimed id is refused"
         );
         first.commit();
         drop(
-            lifecycle_helpers::FirstStateRollback::new(&deps, "claimed")
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
                 .expect("the id is free once the first guard commits"),
         );
         drop(
-            lifecycle_helpers::FirstStateRollback::new(&deps, "claimed")
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "claimed")
                 .expect("an untouched guard releases its claim when dropped"),
         );
     }
@@ -5445,7 +4390,8 @@ mod restore_reconcile_tests {
                 supervisor.shutdown_all_contexts().await;
             }
             let first_state =
-                lifecycle_helpers::FirstStateRollback::new(&deps, ctx_id).expect("guard");
+                crate::context::shared::lifecycle::FirstStateRollback::new(&deps, ctx_id)
+                    .expect("guard");
             match lifecycle_helpers::create_context(
                 &deps,
                 ctx_id.to_owned(),
@@ -5535,7 +4481,8 @@ mod restore_reconcile_tests {
                 supervisor.shutdown_all_contexts().await;
             }
             let first_state =
-                lifecycle_helpers::FirstStateRollback::new(&deps, ctx_id).expect("guard");
+                crate::context::shared::lifecycle::FirstStateRollback::new(&deps, ctx_id)
+                    .expect("guard");
             match lifecycle_helpers::import_context(
                 &deps,
                 export,
@@ -5581,7 +4528,8 @@ mod restore_reconcile_tests {
             .await
             .expect("build_actor_deps");
         let first_state =
-            lifecycle_helpers::FirstStateRollback::new(&deps, "create-dup").expect("guard");
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "create-dup")
+                .expect("guard");
         lifecycle_helpers::create_context(
             &deps,
             "create-dup".to_owned(),
@@ -5614,7 +4562,8 @@ mod restore_reconcile_tests {
         };
         let snapshot_before = stored_snapshot();
         let second_state =
-            lifecycle_helpers::FirstStateRollback::new(&deps, "create-dup").expect("guard");
+            crate::context::shared::lifecycle::FirstStateRollback::new(&deps, "create-dup")
+                .expect("guard");
         let second = lifecycle_helpers::create_context(
             &deps,
             "create-dup".to_owned(),
@@ -5789,6 +4738,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         let deps = supervisor
             .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
@@ -5938,6 +4888,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         supervisor
             .create_context(
@@ -6009,6 +4960,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         supervisor
             .create_context(
@@ -6342,6 +5294,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
 
         let admin = DID("did:dht:z6MkJoinMoneyAdmin".to_owned());
@@ -6544,6 +5497,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
 
         let admin = DID("did:dht:z6MkFinalizeSendAdmin".to_owned());
@@ -6721,6 +5675,7 @@ mod restore_reconcile_tests {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         let deps = sup
             .build_actor_deps_loaded(&admin)
@@ -7349,7 +6304,7 @@ mod restore_reconcile_tests {
 mod relay_url_storage_tests {
     //! §5.12.3.1 `relay_urls` storage rule: canonical when possible.
 
-    use super::normalize_relay_urls;
+    use crate::context::shared::lifecycle::normalize_relay_urls;
 
     fn urls(list: &[&str]) -> Vec<String> {
         list.iter().map(|u| (*u).to_owned()).collect()
@@ -7390,10 +6345,10 @@ mod flush_sweep_tests {
 
     use std::sync::Arc;
 
-    use super::flush_all_contexts;
     use crate::context::actor::commands::LifecycleCommand;
     use crate::context::actor::handle::DeliberateExit;
     use crate::context::actor::{ContextActorHandle, ContextCommand};
+    use crate::context::shared::lifecycle::flush_all_contexts;
     use crate::context::supervisor::Supervisor;
 
     /// A Supervisor with a persistence provider, so the sweep runs.
@@ -7420,6 +6375,7 @@ mod flush_sweep_tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         )
     }
 

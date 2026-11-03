@@ -53,7 +53,7 @@ pub use commands::{
     StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
 };
 pub use deps::ActorDeps;
-pub use handle::{ContextActorHandle, REPLY_TIMEOUT, SEND_TIMEOUT};
+pub use handle::{ContextActorHandle, HANDLER_TIMEOUT, REPLY_TIMEOUT, SEND_TIMEOUT};
 // Bounded reply-await mechanics — `pub(crate)` so the supervisor reply-await
 // sites AND the `?Send` recovery path (`crate::identity::recovery`, a sibling
 // of `crate::context`) route through the single helper.
@@ -81,8 +81,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::time::{Interval, MissedTickBehavior, Sleep};
-
-use crate::context::push_helpers;
 
 /// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
 /// burst of mutations that all complete within this window collapse to
@@ -316,11 +314,11 @@ pub struct ContextActor {
     /// Consecutive signals the rotation arm sent for the current
     /// [`Self::rotation_armed_key`]; drives [`pseudonym_signal_backoff`].
     rotation_signals: u32,
-    /// The push routes ([`push_helpers::push_routes`]) last observed at the
+    /// The push routes ([`crate::context::push_routes::push_routes`]) last observed at the
     /// top of the run loop. A turn that changes them wakes the Supervisor's
     /// push-route watch (`10-infrastructure-and-self-hosting.md` §10.7.1
     /// **Re-registration**), whatever command or timer changed them.
-    push_routes_seen: Option<push_helpers::ContextPushRoutes>,
+    push_routes_seen: Option<crate::context::push_routes::ContextPushRoutes>,
 }
 
 impl ContextActor {
@@ -364,7 +362,7 @@ impl ContextActor {
         exit: handle::ExitRecord,
     ) -> Self {
         let context_id = state.handle.context_id().to_owned();
-        let push_routes_seen = push_helpers::push_routes(&state);
+        let push_routes_seen = crate::context::push_routes::push_routes(&state);
         Self {
             context_id,
             inbox,
@@ -688,7 +686,7 @@ impl ContextActor {
                 // lookup-miss error. The send-sequence tracker
                 // (`state.send_tracker`) is reserved internally inside
                 // the handler.
-                handlers::messaging::dispatch(cell, deps, sub).await
+                deps.domains.messaging.dispatch(cell, deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
                 // Phase 2A.9 — lifecycle domain migrated to actor-shape
@@ -702,7 +700,7 @@ impl ContextActor {
                 // actor exists; reaching this arm with one (an actor
                 // already registered — a re-create attempt) surfaces a
                 // typed `InvalidState` inside the handler.
-                Box::pin(handlers::lifecycle::dispatch(cell, deps, sub)).await
+                deps.domains.lifecycle.dispatch(cell, deps, sub).await
             }
             ContextCommand::Governance(sub) => {
                 // Phase 2A.8 — governance domain fully migrated to
@@ -711,14 +709,14 @@ impl ContextActor {
                 // `Supervisor::dispatch_governance_command` is
                 // mailbox-only (typed `ContextNotRegistered` when no
                 // actor is registered).
-                Box::pin(handlers::governance::dispatch(cell, deps, sub)).await
+                deps.domains.governance.dispatch(cell, deps, sub).await
             }
             ContextCommand::Broadcast(sub) => {
                 // Phase 2A.5 — broadcast domain migrated to the
                 // actor-shape handler for non-publish commands.
                 // Publish variants still require the custody-generic
                 // supervisor shim because `KeyCustody` is not dyn-safe.
-                Box::pin(handlers::broadcast::dispatch(cell, deps, sub)).await
+                deps.domains.broadcast.dispatch(cell, deps, sub).await
             }
             ContextCommand::Economy(sub) => {
                 // Phase 2A.3 — economy domain migrated to the
@@ -726,17 +724,17 @@ impl ContextActor {
                 // through to its supervisor-side
                 // `dispatch_economy_direct` when a receipt batch has
                 // no single owning context actor.
-                handlers::economy::dispatch(cell, deps, sub).await
+                deps.domains.economy.dispatch(cell, deps, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
                 // Phase 2A.1 — trust_recovery domain migrated to
                 // state-owning shape. Per-context variants flow through
-                // `handlers::trust_recovery::dispatch(state, deps, sub)`;
+                // `deps.domains.trust_recovery.dispatch(cell, deps, sub)`;
                 // the cross-context `RecoveryNotifyContact` variant is
                 // intercepted on the supervisor before this arm
                 // executes (it never reaches the per-context actor
                 // mailbox).
-                Box::pin(handlers::trust_recovery::dispatch(cell, deps, sub)).await
+                deps.domains.trust_recovery.dispatch(cell, deps, sub).await
             }
             ContextCommand::Standing(sub) => {
                 // Phase 2A.2 — standing domain migrated to the
@@ -744,7 +742,7 @@ impl ContextActor {
                 // commands with no registered target actor) route
                 // through the supervisor-side
                 // `dispatch_standing_direct` instead of this arm.
-                Box::pin(handlers::standing::dispatch(deps, sub)).await
+                deps.domains.standing.dispatch(deps, sub).await
             }
             ContextCommand::TtlClose(sub) => {
                 // Phase 2A.6 — TTL-close domain migrated to the
@@ -752,7 +750,7 @@ impl ContextActor {
                 // `Supervisor::dispatch_ttl_close_command` is
                 // mailbox-only: a missing actor surfaces a typed
                 // lookup-miss error.
-                handlers::ttl_close::dispatch(cell, deps, sub).await
+                deps.domains.ttl_close.dispatch(cell, deps, sub).await
             }
             ContextCommand::Outlets(sub) => {
                 // Phase 2A.4 -- outlets domain migrated to the
@@ -760,7 +758,7 @@ impl ContextActor {
                 // helpers. `Supervisor::dispatch_outlets_command` is
                 // mailbox-first: a missing actor surfaces a typed
                 // error on the command's reply oneshot.
-                handlers::outlets::dispatch(cell, deps, sub).await
+                deps.domains.outlets.dispatch(cell, deps, sub).await
             }
             // Phase 2A.10 — queries domain migrated to the actor-shape
             // handler. The actor's owned `state` + `deps.event_log` +
@@ -772,12 +770,12 @@ impl ContextActor {
             // [`Supervisor::dispatch_queries_direct`] when no actor
             // exists (the prior locked-DashMap shim was deleted in the
             // Phase 2A finalization queries+lifecycle session).
-            ContextCommand::Queries(sub) => handlers::queries::dispatch(cell, deps, sub).await,
+            ContextCommand::Queries(sub) => deps.domains.queries.dispatch(cell, deps, sub).await,
             // Push domain (§10.7.1): read-only, answered from owned state.
-            ContextCommand::Push(sub) => handlers::push::dispatch(cell, sub),
+            ContextCommand::Push(sub) => deps.domains.push.dispatch(cell, sub),
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
-            ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(cell, deps, msg).await,
+            ContextCommand::SagaPhase(msg) => deps.domains.saga.dispatch(cell, deps, msg).await,
             // Test-only fault injection (ADR-049 §10 watchdog tests). The
             // `panic!` lives here in `actor/mod.rs` — deliberately NOT in
             // any `handlers/*.rs` module — so the production handler
@@ -796,7 +794,10 @@ impl ContextActor {
                 }
             }
             ContextCommand::LifecycleControl(sub) => {
-                handlers::lifecycle_control::dispatch(cell, deps, sub).await
+                deps.domains
+                    .lifecycle_control
+                    .dispatch(cell, deps, sub)
+                    .await
             }
         }
     }
@@ -807,7 +808,7 @@ impl ContextActor {
     /// expiry or tombstone reaches the push registrar through this one check
     /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**).
     fn note_push_route_change(&mut self) {
-        let current = push_helpers::push_routes(&self.state);
+        let current = crate::context::push_routes::push_routes(&self.state);
         if current != self.push_routes_seen {
             self.push_routes_seen = current;
             self.deps.supervisor.note_push_routes_changed();
@@ -1025,13 +1026,17 @@ impl ContextActor {
         // fail-closed terminal persist runs OUTSIDE that bound (SEC-1), so NO
         // outer timeout here (an outer wrap would re-expose the persist to
         // relay-stall cancellation — the exact bug this pass fixes).
-        let outcome = crate::context::ttl_close_helpers::handle_ttl_expiry(
-            &mut self.state,
-            &self.deps,
-            &handle,
-            self.ttl_expiry_completed,
-        )
-        .await;
+        let outcome = self
+            .deps
+            .domains
+            .ttl_close
+            .handle_ttl_expiry(
+                &mut self.state,
+                &self.deps,
+                &handle,
+                self.ttl_expiry_completed,
+            )
+            .await;
 
         // Persist the running completed-steps bitmask so a retry re-runs only
         // the failed step.
@@ -1173,8 +1178,12 @@ impl ContextActor {
     /// re-arms it if the context returns to `Active`.
     async fn on_governance_timeout(&mut self) {
         // `state`/`deps` are disjoint fields — simultaneous borrows are ok.
-        let outcome =
-            handlers::governance::evaluate_governance_timeouts(&mut self.state, &self.deps).await;
+        let outcome = self
+            .deps
+            .domains
+            .governance
+            .evaluate_governance_timeouts(&mut self.state, &self.deps)
+            .await;
         if outcome.mutated {
             self.dirty = true;
         }
@@ -1204,7 +1213,7 @@ impl ContextActor {
     /// `&mut ContextActor` is (`&mut T: Send` needs only `T: Send`). This
     /// mirrors the actor's other borrow-then-await methods (`dispatch`).
     /// Delegates to
-    /// [`persist_state_fail_closed`](crate::context::messaging_helpers::persist_state_fail_closed):
+    /// [`persist_state_fail_closed`](crate::context::snapshot::persist_state_fail_closed):
     /// it builds the owned
     /// [`ContextSnapshot`](crate::context::state::ContextSnapshot) in a
     /// synchronous prelude BEFORE the `.await` (Decision-7 `Send`
@@ -1224,7 +1233,7 @@ impl ContextActor {
         let state: &state::PerContextState = &self.state;
         let deps: &deps::ActorDeps = &self.deps;
         let context_id: &str = &self.context_id;
-        crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id).await
+        crate::context::snapshot::persist_state_fail_closed(state, deps, context_id).await
     }
 }
 
@@ -1519,6 +1528,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
 
         // `build_actor_deps` self-sources crypto/transport/event_log/clock/
@@ -2535,6 +2545,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::domain_handlers(),
         );
 
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
@@ -2731,10 +2742,7 @@ mod tests {
         // times out. Post-fix: cleanup is incomplete ⇒ the actor keeps itself
         // alive and re-arms a retry (it does NOT despawn). Pre-fix: the actor
         // despawned here (mailbox closed).
-        tokio::time::advance(
-            handlers::ttl_close::HANDLER_TIMEOUT + std::time::Duration::from_secs(1),
-        )
-        .await;
+        tokio::time::advance(HANDLER_TIMEOUT + std::time::Duration::from_secs(1)).await;
 
         let state_after = handle
             .send(|reply| {

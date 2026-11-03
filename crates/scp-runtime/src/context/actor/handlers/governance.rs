@@ -37,8 +37,6 @@
 //! — that is a mutation regardless of whether any observable state
 //! changes beyond the marker slot.
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -51,9 +49,7 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
-/// Per-call transport budget for governance handlers. Plan
-/// §"Transport timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`GovernanceCommand`] against actor-owned state and deps.
 ///
@@ -799,8 +795,9 @@ async fn handle_evaluate_periodic_consequences_actor(
     use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
 
     use crate::context::governance_logic::{
-        EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
+        enforce_triggered_consequences, event_log_entries_for_consequences,
     };
+    use crate::context::shared::governance::EnforceConsequencesCtx;
 
     // Reads of the Class-C consequence config / membership go through the
     // cell's `Deref` (`&PerContextState`); no whole-state `&mut` is taken until
@@ -1324,17 +1321,156 @@ pub(crate) async fn evaluate_governance_timeouts(
     // it, MLS cannot seal it, or no TTL remains. The pass emits the Pending /
     // Failed events itself; the attempt record it updates is coalesced,
     // covered by the `mutated` outcome below.
-    crate::context::lifecycle_helpers::retry_pending_sender_key_rotation(cell, deps, &context_id)
+    deps.domains
+        .lifecycle
+        .retry_pending_sender_key_rotation(cell, deps, &context_id)
         .await;
-    crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        deps,
-        &mut cell.class_c_view(),
-        &context_id,
-        crate::context::lifecycle_helpers::DistributionScope::All,
-    )
-    .await;
+    deps.domains
+        .lifecycle
+        .drain_and_deliver_sender_keys(
+            deps,
+            &mut cell.class_c_view(),
+            &context_id,
+            crate::context::shared::lifecycle::DistributionScope::All,
+        )
+        .await;
 
     Outcome::ok_mutated(true)
+}
+
+/// The governance domain's [`GovernanceDomain`](crate::context::domains::GovernanceDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Governance;
+
+#[async_trait::async_trait]
+impl crate::context::domains::GovernanceDomain for Governance {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::GovernanceCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    async fn evaluate_governance_timeouts(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+    ) -> crate::context::actor::outcome::Outcome<bool> {
+        evaluate_governance_timeouts(cell, deps).await
+    }
+
+    async fn enforce_triggered_consequences(
+        &self,
+        state: &mut crate::context::actor::class_s::ConsequenceStateSplit<'_>,
+        args: &crate::context::shared::governance::EnforceConsequencesCtx<'_>,
+        obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    ) -> bool {
+        crate::context::governance_logic::enforce_triggered_consequences(state, args, obligation)
+            .await
+    }
+
+    fn event_log_entries_for_consequences(
+        &self,
+        receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+        context_id: &str,
+        now: u64,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    ) -> Result<(Vec<scp_event_log::Event>, u64), scp_protocol::context::ContextError> {
+        crate::context::governance_logic::event_log_entries_for_consequences(
+            receive_buffer,
+            context_id,
+            now,
+            event_log,
+        )
+    }
+
+    fn event_log_entries_for_consequences_after_side_effect(
+        &self,
+        receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+        context_id: &str,
+        now: u64,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    ) -> (Vec<scp_event_log::Event>, u64) {
+        crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+            receive_buffer,
+            context_id,
+            now,
+            event_log,
+        )
+    }
+
+    fn execute_propose_context_migration<'a>(
+        &'a self,
+        cell: &'a mut crate::context::actor::class_s::ClassSCell,
+        deps: &'a crate::context::actor::deps::ActorDeps,
+        proposal: crate::context::domains::ProposeMigrationRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        crate::context::state::MigrationProposedResult,
+                        scp_protocol::context::ContextError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        crate::context::governance_helpers::execute_propose_context_migration(
+            cell,
+            deps,
+            proposal.context_id,
+            proposal.new_context_params,
+            proposal.reason,
+            proposal.grace_period_secs,
+            proposal.auto_invite,
+            proposal.meta,
+            proposal.bootstrap,
+        )
+    }
+
+    async fn execute_revoke(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        did: &scp_did::DID,
+        access: scp_protocol::context::governance::AccessScope,
+        meta: crate::context::shared::governance::CommitMeta<'_>,
+    ) -> Result<usize, scp_protocol::context::ContextError> {
+        crate::context::governance_helpers::execute_revoke(
+            cell, deps, context_id, did, access, meta,
+        )
+        .await
+    }
+
+    async fn keep_broadcast_failure(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        failure: crate::context::shared::governance::BroadcastFailure,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        crate::context::governance_helpers::keep_broadcast_failure(cell, deps, context_id, failure)
+            .await
+    }
+
+    async fn try_broadcast_commit(
+        &self,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        commit_bytes: Vec<u8>,
+        operation: &crate::context::state::CommitOperation,
+    ) -> Option<crate::context::shared::governance::BroadcastFailure> {
+        crate::context::governance_helpers::try_broadcast_commit(
+            deps,
+            context_id,
+            commit_bytes,
+            operation,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1437,6 +1573,7 @@ mod consequence_fail_closed_tests {
             None,
             Some(clock),
             mls_storage,
+            crate::domain_handlers(),
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor

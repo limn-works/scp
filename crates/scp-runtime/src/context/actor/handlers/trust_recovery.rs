@@ -24,8 +24,6 @@
 //! Each per-call invocation is wrapped in a 30-second
 //! [`tokio::time::timeout`] budget per ADR-049 §7.
 
-use std::time::Duration;
-
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
@@ -38,9 +36,7 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
-/// Per-call transport budget for trust-recovery handlers. Plan
-/// §"Transport timeouts inside actor handlers": 30 seconds.
-pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::context::actor::handle::HANDLER_TIMEOUT;
 
 /// Dispatch a [`TrustRecoveryCommand`] against actor-owned state.
 ///
@@ -116,7 +112,7 @@ async fn handle_create_governance_checkpoint(
     // `async {}` so the 30s timeout still applies (event log pruning
     // could in principle do disk I/O via the provider).
     let create_fut = async {
-        crate::context::trust_recovery_helpers::create_governance_checkpoint(
+        crate::context::shared::trust_recovery::create_governance_checkpoint(
             cell,
             deps,
             &p.context_id,
@@ -350,6 +346,22 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+/// The trust-recovery domain's [`TrustRecoveryDomain`](crate::context::domains::TrustRecoveryDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct TrustRecovery;
+
+#[async_trait::async_trait]
+impl crate::context::domains::TrustRecoveryDomain for TrustRecovery {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::TrustRecoveryCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
     }
 }
 

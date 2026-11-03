@@ -227,7 +227,7 @@ pub fn init_broadcast_context(
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
     let state = ctx.handle.state();
     // Absolute convergent deadline persisted verbatim (ADR-049 §9) — see
-    // `messaging_helpers::build_snapshot_from_state`.
+    // `crate::context::snapshot::build_snapshot_from_state`.
     let ttl_deadline_secs = ctx.ttl.timer.deadline_unix_secs;
     // Capture grace entries for transactional persistence (§23.11).
     // On clock error, persist an empty vec — the recovery path will
@@ -302,21 +302,19 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         relay_urls: ctx.relay_urls.clone(),
         // ADR-049 §9 Class S (line 144): persist the staged saga slot through
         // its sanctioned mirror via the shared helper.
-        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(ctx),
-        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
+        saga_pending: crate::context::snapshot::saga_pending_snapshot(ctx),
+        xctx_committed_outputs: crate::context::snapshot::xctx_committed_outputs_snapshot(ctx),
+        xctx_committed_stream_outputs:
+            crate::context::snapshot::xctx_committed_stream_outputs_snapshot(ctx),
+        xctx_committed_invocations: crate::context::snapshot::xctx_committed_invocations_snapshot(
             ctx,
         ),
-        xctx_committed_stream_outputs:
-            crate::context::messaging_helpers::xctx_committed_stream_outputs_snapshot(ctx),
-        xctx_committed_invocations:
-            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(ctx),
-        xctx_caller_reservations:
-            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(ctx),
-        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
+        xctx_caller_reservations: crate::context::snapshot::xctx_caller_reservations_snapshot(ctx),
+        xctx_nonce_dedup: crate::context::snapshot::xctx_nonce_dedup_snapshot(ctx),
         // §7.3.8 Class S: persist the value-caveat counters (ADR-049 §9).
-        caveat_counters: crate::context::messaging_helpers::caveat_counters_snapshot(ctx),
+        caveat_counters: crate::context::snapshot::caveat_counters_snapshot(ctx),
         // Fix-D Class S: persist the streaming reservation recovery records.
-        stream_reservations: crate::context::messaging_helpers::stream_reservations_snapshot(ctx),
+        stream_reservations: crate::context::snapshot::stream_reservations_snapshot(ctx),
         pseudonym_rotation: ctx.class_s.pseudonym_rotation.clone(),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold broadcast security
         // + roster state into the snapshot so block / ban / key-epoch advance is

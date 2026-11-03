@@ -94,7 +94,12 @@ fn build_supervisor(storage: &Arc<InMemoryStorage>) -> Supervisor {
         Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(storage)));
-    Supervisor::new(persistence, journal, SupervisorConfig::default())
+    Supervisor::new(
+        persistence,
+        journal,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    )
 }
 
 /// Multiple saga states in the same journal — replay handles each per
@@ -251,6 +256,7 @@ async fn restore_on_startup_fails_closed_when_restore_leg_errors() {
         persistence,
         journal,
         SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
     ));
 
     // The bootstrap entry point — no manual replay_unresolved_sagas() call.

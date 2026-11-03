@@ -57,8 +57,9 @@ use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::{DistributionFault, PerContextState};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::lifecycle_helpers::{DistributionScope, drain_and_deliver_sender_keys};
+use crate::context::lifecycle_helpers::drain_and_deliver_sender_keys;
 use crate::context::persistence::ContextPersistence;
+use crate::context::shared::lifecycle::DistributionScope;
 use crate::context::state::ContextSnapshot;
 use crate::context::supervisor::supervisor::Supervisor;
 use crate::crypto::mls::provider::{NodeMlsFactory, PendingDistribution};
@@ -315,6 +316,7 @@ async fn alice_deps(
         Some(event_tx),
         Some(clock),
         mls_storage,
+        crate::domain_handlers(),
     );
     supervisor.register_local_did(DID::from(ALICE)).await;
     let deps = supervisor
@@ -486,12 +488,9 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     );
 
     // Persist exactly as the run loop does, then restore into a fresh actor.
-    let snapshot = crate::context::messaging_helpers::build_snapshot_for_persist(
-        &alice.cell,
-        &alice.deps,
-        ctx,
-    )
-    .expect("snapshot");
+    let snapshot =
+        crate::context::snapshot::build_snapshot_for_persist(&alice.cell, &alice.deps, ctx)
+            .expect("snapshot");
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx);
     let (owned, _floors) =
         NodeMlsFactory::build_restored_owned(&ctx_bytes, &snapshot.mls_crypto_state.0)
@@ -889,7 +888,7 @@ async fn a_read_revoked_requester_gets_no_answer() {
     .expect("the request is consumed");
     assert!(matches!(
         outcome,
-        crate::context::messaging_helpers::DeliverOutcome::Handled
+        crate::context::actor::commands::DeliverOutcome::Handled
     ));
     assert_eq!(
         answers_to_bob(&cell),
@@ -1079,6 +1078,7 @@ mod operations {
             Some(event_tx),
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         let ctx = format!("{seed:02x}").repeat(32);
         let handle = sup
@@ -1116,6 +1116,7 @@ mod operations {
             None,
             None,
             mls_storage(),
+            crate::domain_handlers(),
         );
         let (_reservation, kp) = sup
             .reserve_key_package(DID::from(did), &signer(did))

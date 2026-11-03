@@ -108,6 +108,7 @@ use scp_protocol::context::builder::{
 use scp_protocol::crypto::sender_keys::{
     SenderKeyDistributionMessage, SenderKeyResponse, generate_sender_key,
 };
+use scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS;
 use scp_protocol::envelope::inner::InnerEnvelope;
 
 // ---------------------------------------------------------------------------
@@ -1023,7 +1024,7 @@ pub struct ClassSState {
     /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
     /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
     /// guarantee holds only while the *TTL*
-    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS),
+    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](SAGA_NONCE_DEDUP_TTL_SECS),
     /// 600 s — 2× the freshness skew tolerance), not eviction, is what drops an
     /// entry. That requires the maximum number of distinct nonces a caller can
     /// land within the TTL window to stay safely below the capacity. The
@@ -1124,7 +1125,7 @@ pub struct ClassSState {
     /// deduction and the means to reverse it land atomically.
     ///
     /// **Why this exists.** The live
-    /// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
+    /// [`OutletEconomyReservation`](crate::context::shared::outlets::OutletEconomyReservation)
     /// RAII carrier that normally reverses a caller reservation lives ONLY in
     /// the supervisor's in-memory saga context and dies with an actor/process
     /// crash. A `PreparingB`-window crash drives a CLEAN abort
@@ -1522,7 +1523,7 @@ pub struct PerContextState {
     /// hosted"). Set once per instance: the creator's relays at create, the
     /// invitation bundle's `relay_urls` at Welcome join, and the persisted set
     /// at import and restore (PUSH-025). Every write passes the set through
-    /// `lifecycle_helpers::normalize_relay_urls`, which stores each URL's
+    /// `crate::context::shared::lifecycle::normalize_relay_urls`, which stores each URL's
     /// §9.18.2 canonical relay URL when it has one, keeps every other URL as
     /// written, and deduplicates in first-seen order. An
     /// empty set states that no relay hosts the context, as for a context
@@ -1820,9 +1821,7 @@ impl PerContextState {
                 // coterminous with the skew tolerance, the condition the spec
                 // FORBIDS, and would make test-window behaviour diverge from
                 // production.
-                xctx_nonce_dedup: NonceDedup::with_ttl(
-                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-                ),
+                xctx_nonce_dedup: NonceDedup::with_ttl(SAGA_NONCE_DEDUP_TTL_SECS),
                 xctx_committed_outputs: HashMap::new(),
                 xctx_committed_stream_outputs: HashMap::new(),
                 xctx_committed_invocations: std::collections::HashSet::new(),
@@ -3577,6 +3576,23 @@ fn peer_leaf_index(
         .map(|member| member.index))
 }
 
+/// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
+/// ([`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup)).
+///
+/// Set to **strictly more than** the §9.14 clock-skew tolerance the Prepare-B
+/// freshness check applies (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) — here exactly
+/// twice it. The two windows must NOT be coterminous: were the dedup TTL equal
+/// to the skew tolerance, a `nonce` recorded at the trailing edge of its
+/// freshness window could expire from the dedup cache while a replay carrying a
+/// *refreshed* `asserted_timestamp_ms` is still inside the freshness window —
+/// slipping past both gates (BLACK-XCTX-01). With the TTL strictly exceeding
+/// the skew tolerance, any envelope that passes the freshness check has its
+/// `nonce` still remembered by the dedup cache, closing the coterminous-window
+/// gap for the in-window case. See the *Freshness / anti-replay* clause of
+/// spec §6.2.4 for the forward obligation this leaves for an untrusted
+/// cross-node transport.
+pub const SAGA_NONCE_DEDUP_TTL_SECS: u64 = DEFAULT_CLOCK_SKEW_TOLERANCE_SECS * 2;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -4450,7 +4466,7 @@ mod tests {
         );
         assert_eq!(
             state.class_s.xctx_nonce_dedup.ttl_secs(),
-            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            SAGA_NONCE_DEDUP_TTL_SECS,
             "the dedup TTL survives the round-trip"
         );
         // committed outputs / invocations / reservations.

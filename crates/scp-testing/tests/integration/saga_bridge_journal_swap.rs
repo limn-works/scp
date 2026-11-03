@@ -191,6 +191,7 @@ fn journal_supervisor(
         // test-only `for_test` constructor — production sites use `from_handle`.
         scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
         scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
+        scp_core::context::domain_handlers(),
     )
 }
 

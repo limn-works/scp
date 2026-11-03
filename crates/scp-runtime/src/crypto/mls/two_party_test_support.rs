@@ -177,6 +177,7 @@ pub fn bob_supervisor(
         None,
         None,
         fresh_mls_storage(),
+        crate::domain_handlers(),
     );
     (sup, crypto)
 }

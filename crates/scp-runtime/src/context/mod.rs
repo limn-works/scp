@@ -38,6 +38,7 @@ pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
 pub mod config;
+pub mod domains;
 pub(crate) mod economy_helpers;
 pub(crate) mod economy_logic;
 pub mod export_import;
@@ -55,8 +56,11 @@ pub mod persistence;
 pub mod policy;
 pub mod providers;
 pub(crate) mod push_helpers;
+pub(crate) mod push_routes;
 pub(crate) mod queries_helpers;
 pub mod restored_crypto;
+pub mod shared;
+pub(crate) mod snapshot;
 pub(crate) mod standing_helpers;
 pub mod state;
 pub mod supervisor;
@@ -79,13 +83,13 @@ pub use config::{ContextConfig, ContextCreation};
 // enclosing `outlets_helpers` module is `pub(crate)`; this single type is the
 // only member the bridges must NAME, so it is re-exported here (and through
 // `scp_core::context::outlets`) while the rest of the helpers stay internal.
-pub use outlets_helpers::InvocationCaveatBinding;
+pub use crate::context::outlets::invoke::InvocationCaveatBinding;
 // §10.7.1: the per-context reply `PushCommand::Routes` carries. The enclosing
 // `push_helpers` module is `pub(crate)`; the public command enum names this type.
-pub use push_helpers::ContextPushRoutes;
+pub use crate::context::push_routes::ContextPushRoutes;
 // ADR-029 §2 push-wake pull mode: the per-context reply
 // `PushCommand::WakeTarget` carries.
-pub use push_helpers::ContextWakeTarget;
+pub use crate::context::push_routes::ContextWakeTarget;
 
 // ---------------------------------------------------------------------------
 // ContextHandle
@@ -310,6 +314,7 @@ pub fn test_supervisor(
         None,
         None,
         mls_storage,
+        crate::domain_handlers(),
     )
 }
 

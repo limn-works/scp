@@ -220,6 +220,9 @@ pub struct ActorDeps {
     /// `pub`, because `OwnedIdentityDid` itself is `pub(in crate::context)`
     /// and the capability must not escape the `context` module tree.
     pub(in crate::context) owned_identity: OwnedIdentityDid,
+    /// The 13 domain handlers (ADR-070 §3), shared with the supervisor's
+    /// `domains` field. A handler reaches another domain only through this.
+    pub domains: Arc<crate::context::domains::DomainHandlers>,
 }
 
 impl ActorDeps {
@@ -263,7 +266,24 @@ impl ActorDeps {
             // takes no `DID` parameter and possession of `&self` already
             // proves supervisor attestation. See `OwnedIdentityDid::reissue`.
             owned_identity: self.owned_identity.reissue(),
+            domains: Arc::clone(&self.domains),
         }
+    }
+
+    /// The owning identity's wrapping key (spec 09 §9.16.1), read through
+    /// this actor's capability token so a domain never handles the token.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `SupervisorHandle::my_wrapping_key`: the supervisor is
+    /// gone, it is shutting down, or no key is loaded for the owner.
+    pub fn my_wrapping_key(
+        &self,
+    ) -> Result<
+        Arc<crate::crypto::wrapping::IdentityWrappingKey>,
+        scp_protocol::context::ContextError,
+    > {
+        self.supervisor.my_wrapping_key(&self.owned_identity)
     }
 }
 

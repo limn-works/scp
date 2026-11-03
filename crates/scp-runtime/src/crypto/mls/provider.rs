@@ -3058,7 +3058,7 @@ mod tests {
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
+        let wire = crate::context::shared::messaging::build_encrypted_envelope_actor(
             &clock,
             actor_crypto_mut(&mut alice_actor),
             &alice_did,

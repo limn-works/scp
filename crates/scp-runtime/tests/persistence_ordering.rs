@@ -294,6 +294,7 @@ fn build_supervisor(persistence: RecordingPersistence) -> Arc<Supervisor> {
         None,
         None,
         mls_storage,
+        scp_runtime::domain_handlers(),
     )
 }
 

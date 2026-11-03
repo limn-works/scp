@@ -130,7 +130,12 @@ fn test_supervisor() -> Supervisor {
         Arc::new(NoOpPersistence);
     let (_, journal) = journal_with_shared_storage();
     let journal_dyn: Arc<dyn SagaJournal> = journal;
-    Supervisor::new(persistence, journal_dyn, SupervisorConfig::default())
+    Supervisor::new(
+        persistence,
+        journal_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    )
 }
 
 fn executorless_input() -> SagaInput {
@@ -181,7 +186,12 @@ async fn saga_journal_records_every_phase_transition_on_abort() {
         inner: prod_journal,
         appends: Arc::clone(&appends),
     });
-    let supervisor = Supervisor::new(persistence, recording, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        recording,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     let _ = supervisor.start_saga(executorless_input()).await;
 
@@ -284,7 +294,12 @@ async fn saga_journal_write_ordering_is_monotonic() {
         inner: prod_journal,
         appends: Arc::clone(&appends),
     });
-    let supervisor = Supervisor::new(persistence, recording, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        recording,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     let _ = supervisor.start_saga(executorless_input()).await;
 
@@ -349,7 +364,12 @@ async fn crash_recovery_initiated_state_is_discarded() {
         Arc::new(NoOpPersistence);
     let replayed_journal = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed_journal;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // `for_test` witness: this coordinator harness drives replay in isolation
     // (restore-then-replay ordering is type-enforced; the empty witness stands in
@@ -381,7 +401,12 @@ async fn crash_recovery_preparing_a_state_is_discarded() {
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // `for_test` witness: this coordinator harness drives replay in isolation
     // (restore-then-replay ordering is type-enforced; the empty witness stands in
@@ -411,7 +436,12 @@ async fn crash_recovery_preparing_b_state_is_rolled_back() {
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // `for_test` witness: this coordinator harness drives replay in isolation
     // (restore-then-replay ordering is type-enforced; the empty witness stands in
@@ -440,7 +470,12 @@ async fn crash_recovery_committing_state_triggers_needs_repair() {
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // `for_test` witness: this coordinator harness drives replay in isolation
     // (restore-then-replay ordering is type-enforced; the empty witness stands in
@@ -477,7 +512,12 @@ async fn crash_recovery_needs_repair_is_carryover() {
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // `for_test` witness: this coordinator harness drives replay in isolation
     // (restore-then-replay ordering is type-enforced; the empty witness stands in
@@ -519,7 +559,12 @@ async fn crash_recovery_terminal_states_are_noop() {
         Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
-    let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
+    let supervisor = Supervisor::new(
+        persistence,
+        j_dyn,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    );
 
     // Replay must succeed without adding any new state.
     // `for_test` witness: this coordinator harness drives replay in isolation

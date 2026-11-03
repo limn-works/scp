@@ -4587,6 +4587,7 @@ use scp_protocol::context::outlets::error_codes::{
 };
 use scp_protocol::context::outlets::registration::OutletRegistration;
 use scp_protocol::context::outlets::stream::{compute_chunk_manifest_root, verify_chunk_signature};
+use scp_protocol::trust::caveats::InvocationCaveats;
 
 /// The verification descriptor the cross-context bridge PINS at stream-open
 /// and consults for every forwarded chunk (§5.4.5 "Verification source at the
@@ -5786,7 +5787,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # §7.3.8 value-caveat enforcement
 ///
-/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
+/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`](InvocationCaveatBinding)
 /// (`effective_caveats` + `ucan_cid`) bound to the invocation UCAN. It is
 /// threaded verbatim into `open_outlet_stream`, where it drives the §7.3.8
 /// post-input hook AND the durable cross-invocation counter reservation
@@ -5834,7 +5835,7 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
     // B-side open; `None` ⇒ no value-caveat gate (parity with the non-streaming
     // free path). Distinct from `params.identity.caveats_binding`, the 32-byte
     // `[u8; 32]` chunk-signature binding.
-    caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+    caveat_binding: Option<InvocationCaveatBinding>,
     params: crate::context::outlets::dispatch::OpenStreamParams,
 ) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError>
 where
@@ -5980,6 +5981,31 @@ where
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// §7.3.8 fail-closed coupling of the validated-narrowed effective invocation
+/// caveats to the revocation CID of the delegation that carried them.
+///
+/// The counter-bearing consume ([`consume_caveat_counters`]) needs BOTH the
+/// caveat set (to know which caps to enforce) AND the `ucan_cid` (the
+/// per-delegation counter key). Bundling them into one value makes "caveats
+/// present ⟹ cid present" a COMPILE-TIME invariant rather than a three-bridge
+/// convention: a caveat set for which
+/// [`InvocationCaveats::has_counter_bearing_caveat`] is `true` can never reach
+/// the counter gate without its counter key, so the fail-closed contract on
+/// that method cannot be silently skipped by a `(Some(caveats), None)` pair.
+///
+/// Minted at the FFI bridge from the ONE validated invocation UCAN: the
+/// `caveats` come from that token's `nb` (via `TokenNbCaveatResolver`), the
+/// `ucan_cid` from `compute_revocation_cid` over the same token — the two are
+/// derived together, from the same token, or the whole binding is `None`.
+#[derive(Debug, Clone)]
+pub struct InvocationCaveatBinding {
+    /// The validated-narrowed effective invocation caveats (the leaf `nb`).
+    pub caveats: InvocationCaveats,
+    /// Revocation CID of the invocation UCAN — the per-delegation key for the
+    /// owned Class-S caveat counters.
+    pub ucan_cid: String,
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

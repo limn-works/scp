@@ -315,3 +315,30 @@ pub(crate) async fn dispatch(
         }
     }
 }
+
+/// The queries domain's [`QueriesDomain`](crate::context::domains::QueriesDomain)
+/// implementation, which the assembly's `domain_handlers()` installs.
+pub struct Queries;
+
+#[async_trait::async_trait]
+impl crate::context::domains::QueriesDomain for Queries {
+    async fn dispatch(
+        &self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        cmd: crate::context::actor::commands::QueriesCommand,
+    ) -> crate::context::actor::outcome::Outcome<()> {
+        dispatch(cell, deps, cmd).await
+    }
+
+    fn compare_remote_checkpoint(
+        &self,
+        view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    ) -> Result<scp_event_log::checkpoint::CheckpointComparison, scp_protocol::context::ContextError>
+    {
+        crate::context::queries_helpers::compare_remote_checkpoint(view, deps, context_id, remote)
+    }
+}
