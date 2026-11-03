@@ -4397,10 +4397,8 @@ def request_key(exporter_secret: bytes) -> bytes:
     return mls_exporter(exporter_secret, b"SCP request key", REQUEST_GROUP_ID, 32)
 
 
-def item_nonce(epoch_key: bytes, signer_key_hash: bytes, counter: int) -> bytes:
-    return expand_with_label(
-        epoch_key, b"SCP request nonce", signer_key_hash + u64(counter), 12
-    )
+def item_nonce(epoch_key: bytes, plaintext_hash: bytes) -> bytes:
+    return expand_with_label(epoch_key, b"SCP request nonce", plaintext_hash, 12)
 
 
 def item_key(epoch_key: bytes, nonce: bytes) -> bytes:
@@ -4491,22 +4489,21 @@ def emit_request_queue() -> None:
     epoch_key = request_key(REQUEST_EXPORTER_SECRET)
     assert len(epoch_key) == 32
     derived = expand_with_label(REQUEST_EXPORTER_SECRET, b"SCP request key", b"", 32)
-    nonce = item_nonce(epoch_key, signer_key_hash, REQUEST_COUNTER)
+    nonce = item_nonce(epoch_key, plaintext_hash)
     key = item_key(epoch_key, nonce)
     assert len(nonce) == 12 and len(key) == 16
-    # Another counter under the same signing key derives another nonce, so
-    # two items that enter never share an item key.
-    other_nonce = item_nonce(epoch_key, signer_key_hash, REQUEST_COUNTER + 1)
-    assert other_nonce != nonce
+    # Another plaintext derives another nonce, so two devices that sign under
+    # one shared key with one counter never seal two plaintexts under one
+    # item key and nonce.
+    other_plaintext = plaintext[:-1] + bytes([plaintext[-1] ^ 1])
+    assert item_nonce(epoch_key, sha256(other_plaintext)) != nonce
     emit_hex("vector_97.group_id", REQUEST_GROUP_ID)
     emit("vector_97.epoch", REQUEST_EPOCH)
     emit_hex("vector_97.exporter_secret", REQUEST_EXPORTER_SECRET)
     emit_hex("vector_97.derived_secret", derived)
     emit_hex("vector_97.request_key", epoch_key)
-    emit_hex("vector_97.signer_key_hash", signer_key_hash)
-    emit("vector_97.counter", REQUEST_COUNTER)
+    emit_hex("vector_97.plaintext_hash", plaintext_hash)
     emit_hex("vector_97.nonce", nonce)
-    emit_hex("vector_97.nonce_counter_4", other_nonce)
     emit_hex("vector_97.item_key", key)
 
     # Vector 98: the padded plaintext, the AAD and the sealed item.

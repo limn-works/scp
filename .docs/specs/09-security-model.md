@@ -3692,7 +3692,7 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"SCP-HEAD-RECORD-V1:"` | Signature preimage prefix of a head record, signed by the sender's current MLS leaf | §9.5.2, §9.9.2 |
 | `"SCP-REQUEST-ITEM-V1"` | AES-128-GCM AAD prefix of a sealed chain item, followed by the group's `group_id`, the item's `epoch` and its `class` | `05-contexts.md` §5.9.1.1 |
 | `"SCP request key"` | MLS exporter label of an epoch's 32-byte request key | `05-contexts.md` §5.9.1.1 |
-| `"SCP request nonce"` | RFC 9420 `ExpandWithLabel` label that derives a sealed item's 12-byte nonce from its epoch's request key, with the item's `signer_key_hash` ‖ `BE64(counter)` as context | `05-contexts.md` §5.9.1.1 |
+| `"SCP request nonce"` | RFC 9420 `ExpandWithLabel` label that derives a sealed item's 12-byte nonce from its epoch's request key, with the SHA-256 of the item's unpadded plaintext as context | `05-contexts.md` §5.9.1.1 |
 | `"SCP request item"` | RFC 9420 `ExpandWithLabel` label that derives a sealed item's 16-byte AES-128-GCM key from its epoch's request key, with the item's nonce as context | `05-contexts.md` §5.9.1.1 |
 | `"SCP-REQUEST-KEY-COMMIT"` | Hash prefix of the commitment to a retained epoch request key in `retained_request_keys`, followed by the epoch as BE64 and the key | `05-contexts.md` §5.9.1.1 |
 | `"SCP-KEY-CONTINUITY-V1:"` | Key continuity fingerprint hash | §9.11 |
