@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, FIPS 197 Appendix C.1 and the zero-key GCM test case for AES-128-GCM, RFC 8291 Appendix A for WebPush message encryption, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 25 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `definer`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
+**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 26 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `definer`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `re-seated member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer other than a platform signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -256,7 +256,7 @@ Domain: `"SCP-RESET-REQUEST-V1:"`
 
 ### Vector 8: Reset Request
 
-**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V2:"`, which adds `reset_counter` and `member_since`, and SCP-331 replaces this vector with the V2 form when it changes the code.
+**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V3:"`, which adds `reset_counter`, `member_since`, `key_package_hash` and `leaf_key_hash`, and SCP-331 replaces this vector with the V3 form when it changes the code.
 
 ```
 Input:
@@ -1509,71 +1509,13 @@ key_positions_hash with the resolved position in place of the contested one:
   0xfea7bb39f87590a3bad2a6711c540ad4b62ee24971dc268d31b3aa31872790fb
 ```
 
-### Vector 81: the `ReseatGroupInfo` answer and its seal (§5.12.3.4, §9.7.1, §9.18)
+### Vector 81: withdrawn
 
-Fixture: carol (`publisher_did`, §25.1) answers Vector 82's request for epoch 7 of `context-alpha`, with recipient Vector 80's identity. `group_info` is 300 fixed bytes and `wrap_key` 16 fixed bytes, each the leading bytes of SHA-256("SCP test vector " || label || " " || counter) blocks. `key_material` and `context_params` are bins holding these RFC 8785 forms:
+Withdrawn 2026-11-02. Vector 81 fixed the bytes of the `ReseatGroupInfo` answer and its seal. ADR-069 decision 8 replaces the external re-seat that the answer served with a re-seat request that members submit and execute (`05-contexts.md` §5.9.1.1, kind `0x06`), so no answer and no seal remain to test. The number is not reused.
 
-```
-key_material:   {"context_metadata_key":"b4b7bf6e0f36c5639bb30720427c522a9f5f26db0eef479a7d868223f070cc60","sender_key_seed":null}
-context_params: {"governance":"SingleAdmin","mode":"Encrypted","ttl":null}
-group_info:     0xd383e910f15bf87e232c2489e07705faf4489ebbdd127aaf5d35ae7e9872dd32f9669081e74663937c45146b08280fb60f4ba3b5fbc899c0f8f43ab1a1779fe426e176ac2774d89a3aeca507bd2720c29b4a9b5262a9f4093ebc2e6af3370fd2482dac42c141679e34289c5a3489895eff76e4a2c685482d513e0351242ba880109c1934a20f0fb3cc92cbaa96c66c4cdb47b234a0bd0178fcf1b657c6d3c26f92d519d252862a3d253aad3b9a507a1c67df5683f16171ea87c1959b580bc4d99bf695da08d4ed17f29410f7676438a5e2146b0c0ffb906b14ff9ec5be32290e60b582773ac4d892696431673ae04a2b647e1df586fcca257eba7bf8468426af70030a30ab676c133b9a7552bb3492caa93b06e7b32f48190a3ab5d3fdc91afbf9e50968f51b9eb4855cf129
-wrap_key:       0x67d8345a7b14a7621dfe1f4f47b462cc
+### Vector 82: withdrawn
 
-Signature preimage, 329 bytes:
-  "SCP-RESEAT-GROUPINFO-V1:" || BE32(13) || "context-alpha" || BE64(7) || request_digest
-  || BE32(56) || recipient || SHA-256(group_info) || SHA-256(wrap_key)
-  || SHA-256(key_material) || SHA-256(context_params) || BE32(56) || publisher_did
-  0x5343502d5245534541542d47524f5550494e464f2d56313a0000000d636f6e746578742d616c7068610000000000000007db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183000000387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a7180e13f471e14b27be01ec88f74e5420ac33f23980d22e2538cf2480a001c46ca7dde0f76af497a1c01df97c005ef887fe9e15c6074f021c1156fe1576fb65f51c9646c5ac83f54e73c0925fc633f039a614e960780e015ed684b2f0f4e0b44c2300c02ffdc6d8a419d258aa9bbb6d991e1b5e52b4f97fa8dd571323d2dbf6c47000000387363703a6d75336c656572706f70776c71693464613567363577677076356370346c6d7678667065626f746d6e7975677665647333377161
-canonical hash: 0x36c304491318635fd6cef85e6d5b194f9178d2f8a7d09debf2dabb95b3e1ac5e
-signature (reference key, RFC 6979): 0xf2a33f4cbfb8bebbd2a3eb3b7bddd7d90630985e025e21f9ba8450d0c67ca7d25097c0011a330f88a84f31e03be992678f0c19edf407432ee3ac1ac41dba4d01
-
-Answer: a nine-item MessagePack array (0x99), 671 bytes, with SHA-256
-  0x1d58becfe2cc3b24d9e6d47f65df4355d5c216dca94b09360b69823515400750
-item headers in order: ad 07 c420 c5012c c410 c472 c43a d938 c440
-```
-
-A `context_params` bin whose JSON reorders a member, `{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}`, is not the RFC 8785 form, and a receiver rejects the answer that carries it.
-
-**The seal.** The answer is sealed in RFC 9180 base mode under the suite of §5.12.3.1, to Vector 37's `wrapping_key`, with the §25.2 tertiary key as the fixed ephemeral key. `info` and `aad` are the label, BE32(13) || "context-alpha", and Vector 82's `request_digest`. The shared secret is `e3aca73e38b32533c7038dc86fedc10238bd9adbe67be8f21606d4427043bd3c`.
-
-| Seal | `info` label / `aad` label | key | base_nonce | ciphertext length, SHA-256 |
-|---|---|---|---|---|
-| `ReseatGroupInfo` | `scp-reseat-groupinfo-v1` / `scp-reseat-groupinfo-aad-v1` | `e0a54b675ca9b35d64cda901af309572` | `33d84d011ca57c55997b7e8d` | 687, `352cf0f6ecc8044a9cbc79ac85a0505409622cfa55eb40d082a1c96a0a7343ac` |
-
-```
-groupinfo info: 0x7363702d7265736561742d67726f7570696e666f2d76310000000d636f6e746578742d616c706861db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-groupinfo aad:  0x7363702d7265736561742d67726f7570696e666f2d6161642d76310000000d636f6e746578742d616c706861db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-```
-
-An opener that builds `info` or `aad` from an epoch in place of `request_digest` fails to open the seal.
-
-### Vector 82: the `ReseatRequest` (§5.12.3.5)
-
-Fixture: Vector 80's identity asks to re-seat in `context-alpha`, anchored at `anchor_seq` 11 and `head_seq` 12, and signs with its `#active` key, here the §25.2 secondary key. `request_nonce` is the first 16 bytes of SHA-256("SCP test vector re-seat request nonce"), `anchor_digest` and `head_digest` are fixture digests, and `key_package` is 96 fixed bytes.
-
-```
-request_nonce:    0x460274c83c92609d6b356df85b83dbb3
-anchor_digest:    0x74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979
-head_digest:      0x1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046
-key_package:      0xdaa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1c
-key_package_hash: 0x4a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
-
-Signature preimage, 227 bytes:
-  "SCP-RESEAT-REQUEST-V1:" || BE32(13) || "context-alpha" || BE32(56) || identifier
-  || request_nonce || BE64(11) || anchor_digest || BE64(12) || head_digest || key_package_hash
-  0x5343502d5245534541542d524551554553542d56313a0000000d636f6e746578742d616c706861000000387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a71460274c83c92609d6b356df85b83dbb3000000000000000b74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979000000000000000c1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c2820464a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
-request_digest = SHA-256(preimage): 0xdb620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-signature (secondary key, RFC 6979): 0x58024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf8
-
-Request: a nine-item MessagePack array (0x99), 325 bytes
-item headers in order: ad d938 c410 0b c420 0c c420 c460 c440
-  0x99ad636f6e746578742d616c706861d9387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a71c410460274c83c92609d6b356df85b83dbb30bc42074ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba667259790cc4201382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046c460daa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1cc44058024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf8
-
-HPKE info: 0x7363702d7265736561742d726571756573742d76310000000d636f6e746578742d616c706861
-HPKE aad:  0x7363702d7265736561742d726571756573742d6161642d76310000000d636f6e746578742d616c706861
-```
-
-Two encodings are rejected. A ten-item array (0x9a) with `epoch` 41 appended, 326 bytes, fails to decode; its last 67 bytes are `c44058024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf829`. A request whose `signature` item is the 65-byte bin `c44158024f886402a146757699ebbcaaa6dbfdb07d9786202274baf232fa175181ed12f807c18ed5262770b8660bb7f56175787707f890e2286717b86d5cbc18aaf800` is rejected.
+Withdrawn 2026-11-02. Vector 82 fixed the preimage and the bytes of a re-seat request that the member being re-seated signed itself. ADR-069 decision 8 replaces it with kind `0x06` of `05-contexts.md` §5.9.1.1, which a current member signs under its leaf with the `SCP-REQUEST-V1:` preimage every sealed item uses, so the withdrawn preimage has no use. The number is not reused. Vector 96 of §25.37 fixes the bytes of a kind `0x06` request.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
@@ -3339,3 +3281,223 @@ signature, tertiary key (context_key):
 ```
 
 A conforming implementation accepts Vectors 94 and 95 under Vector 92's binding. It refuses each under the operator's `#active` in place of `context_key`, after any one field changes, and with the signature's `s` replaced by `n − s`. It refuses Vector 94 with `previous_hash` replaced by `SHA-256(0x00)`, which only the entry at position 0 carries.
+
+## 25.37 Request Queue Vectors (`05-contexts.md` §5.9.1.1, `09-security-model.md` §9.5.2 and §9.9.2)
+
+These five vectors fix one re-seat request from its body to the sealed item the node orders, the joiner's `0xFF06` secrets, and one head record with its seal and one wrap. The context is Vector 92's, with `context_id` the string `6252cf4679eeb43e5d4f2456725ed5385ed95250d44e74e6c5adaead499d1343`. The signer is the reference key of §25.2 standing as a current member's leaf `signature_key`, so `signer_key_hash` is the SHA-256 of its 65-byte uncompressed point. The MLS `group_id` is the fixture `SHA-256("scp-25-request-queue-group-id")`. An MLS epoch's exporter secret exists only inside a group, so Vector 97 takes it as a fixture input and derives the request key from it by RFC 9420 §8.5's `MLS-Exporter` with SHA-256, the KDF of the P-256 suite. The KeyPackage the body carries is 64 fixture bytes, `SHA-256("scp-25-request-fixture-key-package-1") ‖ SHA-256("scp-25-request-fixture-key-package-2")`, standing for one: the KeyPackage checks of `09-security-model.md` §9.7.1 are outside these vectors.
+
+### Vector 96: a re-seat request
+
+Kind `0x06`, whose body is the MessagePack array of the re-seated member's identifier in text form, the fixture identifier of role `re-seated member` (§25.1), and the KeyPackage as `bin`. The preimage is `"SCP-REQUEST-V1:"` ‖ `BE32(64)` ‖ `context_id` ‖ `signer_key_hash` ‖ `BE64(counter)` ‖ `BE64(not_after)` ‖ `kind` ‖ `SHA-256(body)`, with `counter` 3 and `not_after` 1767229200. The plaintext is the six-member array `[kind, body, signer_key_hash, counter, not_after, signature]`, and its SHA-256 is the digest the governance state's `pending` holds for the item.
+
+```
+reseat_identifier: scp:rxnceo4dpave23evrr3bhifegsd2pucxbqtxuhu2ohqbur7npqwq
+key_package (fixture):
+  adb9ab76e4ecaa043694b297eb4e9972a9ca2f8c733b08792615d62db65c3ef7
+  2faf1825eaf5cd51eff25db1b8fe6a4eab9ee5d952932d4fdd6da631d6727b09
+body (125 bytes):
+  92d9387363703a72786e63656f34647061766532336576727233626869666567
+  7364327075637862717478756875326f6871627572376e70717771c440adb9ab
+  76e4ecaa043694b297eb4e9972a9ca2f8c733b08792615d62db65c3ef72faf18
+  25eaf5cd51eff25db1b8fe6a4eab9ee5d952932d4fdd6da631d6727b09
+SHA-256(body):
+  4b5a797d66bff00de1252cca7fc63273d981fa8294b36ca4e953a632d1f6c1c4
+signer_key_hash, SHA-256 of the reference uncompressed point:
+  c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612dd6ced2ad218
+preimage (164 bytes = 15-byte separator + 4 + 64 + 32 + 8 + 8 + 1 + 32):
+  5343502d524551554553542d56313a0000004036323532636634363739656562
+  3433653564346632343536373235656435333835656439353235306434346537
+  34653663356164616561643439396431333433c97cd5c4beb89d01e46bcbff6f
+  8dc519c6ea18ded0045d71a612dd6ced2ad21800000000000000030000000069
+  55c710064b5a797d66bff00de1252cca7fc63273d981fa8294b36ca4e953a632
+  d1f6c1c4
+digest:
+  afc4208068bec2d77d94b7dc489572705e00d9d28ce1409390650990c7bf0ccd
+signature, reference key:
+  a9bc3f1a0c91255235be9d65914658681db56f59c801c10f1c0a30af63b679de
+  2c21f4f8701e1971f5046ac80c02b4eba4d4017faf972d912ed64a23fc1cf4ea
+plaintext (235 bytes):
+  9606c47d92d9387363703a72786e63656f346470617665323365767272336268
+  696665677364327075637862717478756875326f6871627572376e70717771c4
+  40adb9ab76e4ecaa043694b297eb4e9972a9ca2f8c733b08792615d62db65c3e
+  f72faf1825eaf5cd51eff25db1b8fe6a4eab9ee5d952932d4fdd6da631d6727b
+  09c420c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612dd6ced
+  2ad21803ce6955c710c440a9bc3f1a0c91255235be9d65914658681db56f59c8
+  01c10f1c0a30af63b679de2c21f4f8701e1971f5046ac80c02b4eba4d4017faf
+  972d912ed64a23fc1cf4ea
+SHA-256(plaintext), the pending digest:
+  54c1c97d64d50139cb6d818ab3225a287654655e7cceab671ccfd47197c18ce3
+```
+
+A conforming implementation accepts the signature under the reference key. It refuses it under the secondary key, after any one preimage field changes, and with `s` replaced by `n − s`.
+
+### Vector 97: the request key, the nonce and an item key
+
+The item is sealed at epoch 6. `request_key_6 = MLS-Exporter("SCP request key", group_id, 32)` at epoch 6, which is `ExpandWithLabel(DeriveSecret(exporter_secret, "SCP request key"), "exported", SHA-256(group_id), 32)`. The nonce is `ExpandWithLabel(request_key_6, "SCP request nonce", SHA-256(plaintext), 12)`, over the SHA-256 of Vector 96's unpadded plaintext, its pending digest, and `item_key = ExpandWithLabel(request_key_6, "SCP request item", nonce, 16)`. `ExpandWithLabel` is RFC 9420 §8's, whose `KDFLabel` carries the 2-byte length, the label prefixed with `"MLS 1.0 "`, and the context, each vector with its RFC 9420 §2.1.2 variable-length prefix. The request key is 32 bytes, the hash length of SHA-256, because `ExpandWithLabel` is HKDF-Expand and RFC 5869 §2.3 requires a PRK of at least that length.
+
+```
+group_id:
+  9c88b1c5fef7c07079576f126532c77a7f9ee18235af6f6181309312f67278b9
+exporter_secret (fixture), epoch 6:
+  11e320174584da88c90088d0073467864954c6b708459c3e6f3f8ec39b24402c
+DeriveSecret(exporter_secret, "SCP request key"):
+  a9061702759705ce98460a4e2d960ed57eeac8d89eba1070385906d019c856bf
+request_key_6 (32 bytes):
+  fd0fc57e0c0dba3a2c5af9f51d4f981ed65e32b9b60d5390b282c3c02917939e
+SHA-256(plaintext) (Vector 96):
+  54c1c97d64d50139cb6d818ab3225a287654655e7cceab671ccfd47197c18ce3
+nonce:
+  e4750071966d8ad415dd890f
+item_key:
+  ab7d92f66a0f6dfbac330d09a1b5646e
+```
+
+### Vector 98: the sealed item
+
+The sender pads Vector 96's plaintext to the 256-byte bucket of `09-security-model.md` §9.10.3, whose last 4 bytes are the big-endian unpadded length, and seals it under Vector 97's item key and nonce. The AAD is `"SCP-REQUEST-ITEM-V1"` ‖ `BE32(32)` ‖ `group_id` ‖ `BE64(6)` ‖ class `0x01`, re-join. The sealed item is the MessagePack array `[epoch, class, nonce, ciphertext]`.
+
+```
+padded plaintext (256 bytes):
+  9606c47d92d9387363703a72786e63656f346470617665323365767272336268
+  696665677364327075637862717478756875326f6871627572376e70717771c4
+  40adb9ab76e4ecaa043694b297eb4e9972a9ca2f8c733b08792615d62db65c3e
+  f72faf1825eaf5cd51eff25db1b8fe6a4eab9ee5d952932d4fdd6da631d6727b
+  09c420c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612dd6ced
+  2ad21803ce6955c710c440a9bc3f1a0c91255235be9d65914658681db56f59c8
+  01c10f1c0a30af63b679de2c21f4f8701e1971f5046ac80c02b4eba4d4017faf
+  972d912ed64a23fc1cf4ea0000000000000000000000000000000000000000eb
+aad (64 bytes):
+  5343502d524551554553542d4954454d2d5631000000209c88b1c5fef7c07079
+  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000601
+ciphertext with tag (272 bytes):
+  4004b7231dcd78cca66a3e64235d2c893d6c42b27b64c4beab3df061f82efd96
+  fb5e6bdd2a95ca262b7e3e2a433c3be9f92b22795c53295a2b40b56df6d3d3bd
+  8c108096c5f01d8b1f1a56a5a3bbf78216c5d682732a1b5d105996ec52e8771c
+  d1c96d7230b1a9437a140351715843fa844e07a1af0594c251e108d251572d25
+  fa0fd8f47a2b2e2253ec2108b3ea279cc623eceb10edef68b0db76ea7cb36500
+  db30f7a7e5e139b935d704d0f55554f746b874f8db20487fd9a86ec705b9d08f
+  a9402d4222b4dfdd99bb985fb2c7038bd0a01b7f2b67d96186f51ed19167bd2d
+  2292ff39fdf725b37cafce6c1deb14ef48f830018f895329fc7a188fa6b5d930
+  31d9e3dd9dafaf9de10d34e265572c0b
+sealed item (292 bytes):
+  940601c40ce4750071966d8ad415dd890fc501104004b7231dcd78cca66a3e64
+  235d2c893d6c42b27b64c4beab3df061f82efd96fb5e6bdd2a95ca262b7e3e2a
+  433c3be9f92b22795c53295a2b40b56df6d3d3bd8c108096c5f01d8b1f1a56a5
+  a3bbf78216c5d682732a1b5d105996ec52e8771cd1c96d7230b1a9437a140351
+  715843fa844e07a1af0594c251e108d251572d25fa0fd8f47a2b2e2253ec2108
+  b3ea279cc623eceb10edef68b0db76ea7cb36500db30f7a7e5e139b935d704d0
+  f55554f746b874f8db20487fd9a86ec705b9d08fa9402d4222b4dfdd99bb985f
+  b2c7038bd0a01b7f2b67d96186f51ed19167bd2d2292ff39fdf725b37cafce6c
+  1deb14ef48f830018f895329fc7a188fa6b5d93031d9e3dd9dafaf9de10d34e2
+  65572c0b
+```
+
+A node that rewrites the class to `0x00` in the clear leaves the ciphertext unchanged, and the member's open then fails, because the AAD differs. The ciphertext the sender would have produced under class `0x00`, which differs from Vector 98's only in the tag:
+
+```
+aad, class 0x00:
+  5343502d524551554553542d4954454d2d5631000000209c88b1c5fef7c07079
+  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000600
+ciphertext with tag, class 0x00:
+  4004b7231dcd78cca66a3e64235d2c893d6c42b27b64c4beab3df061f82efd96
+  fb5e6bdd2a95ca262b7e3e2a433c3be9f92b22795c53295a2b40b56df6d3d3bd
+  8c108096c5f01d8b1f1a56a5a3bbf78216c5d682732a1b5d105996ec52e8771c
+  d1c96d7230b1a9437a140351715843fa844e07a1af0594c251e108d251572d25
+  fa0fd8f47a2b2e2253ec2108b3ea279cc623eceb10edef68b0db76ea7cb36500
+  db30f7a7e5e139b935d704d0f55554f746b874f8db20487fd9a86ec705b9d08f
+  a9402d4222b4dfdd99bb985fb2c7038bd0a01b7f2b67d96186f51ed19167bd2d
+  2292ff39fdf725b37cafce6c1deb14ef48f830018f895329fc7a188fa6b5d930
+  6e1f13119308591ff21f53d7e66eebe1
+```
+
+A conforming implementation opens the sealed item under Vector 97's item key and refuses it under `request_key_6` itself, under the item key of any other nonce, with the class or the epoch changed, and with any ciphertext byte changed. A member that opens the item checks that its clear nonce equals the nonce that the SHA-256 of its unpadded plaintext derives, and the item fails entry when it does not: another plaintext sealed under Vector 97's nonce and item key, one that differs from Vector 96's in any byte, its `counter` among them, opens and fails entry check 1 (`07-trust-validation-and-capabilities.md` §7.3.1.1).
+
+### Vector 99: retained-key commitments and the joiner's secrets
+
+The Commit that opens epoch 7 and adds the joiner is the Commit for epoch 6, with t_b 1767225600, so `05-contexts.md` §5.9.1.1, "Commitment", applies with N = 6. Its `retained_request_keys` lists epoch 6 with its own t_b as close time, and epoch 5, closed at 1767225000, inside `REQUEST_ENTRY_WINDOW` of that t_b, and no entry for epoch 7, whose key the joiner derives itself from its own epoch. Each entry is the triple `[epoch, close_time, commitment]`, with `commitment = SHA-256("SCP-REQUEST-KEY-COMMIT" ‖ BE64(epoch) ‖ request_key)` over the 32-byte key. The `0xFF06` body is the TLS presentation `ScpRequestSecrets{RetainedEpochKey epoch_keys<V>; PendingItemKey item_keys<V>}`, each vector with its RFC 9420 §2.1.2 variable-length prefix, carrying the two epoch keys and Vector 97's item key for the pending item at chain position 40, which the member sealed at epoch 6 before the Commit's cover position.
+
+```
+exporter_secret (fixture), epoch 5:
+  dada1b2f230541225309d45aefcd04e08116bc2ab691c606e8a12c423ceb62e2
+request_key_5:
+  d2c65f29abec089de2a751856b57bf99273115a81566e2c61cc0a4360749f1e3
+commitment, epoch 5:
+  7a67def3bc29dc9b6e44d60e2a72c52a53ba4ffc4b2454fc70603e8b9d6e6e53
+commitment, epoch 6:
+  95829b6c532efaae6d689bd928561978cbabc49482223e8be3fcf4dda06ddafc
+ScpRequestSecrets (123 bytes = 2-byte prefix + 2 × 48 + 1-byte prefix + 24):
+  40600000000000000005000000006955b6a8d2c65f29abec089de2a751856b57
+  bf99273115a81566e2c61cc0a4360749f1e30000000000000006000000006955
+  b900fd0fc57e0c0dba3a2c5af9f51d4f981ed65e32b9b60d5390b282c3c02917
+  939e180000000000000028ab7d92f66a0f6dfbac330d09a1b5646e
+```
+
+A conforming joiner accepts the body against the two commitments and refuses it with either key changed, with the entries out of epoch order, with an entry for epoch 7 added, or with a close time that differs from the governance state's.
+
+### Vector 100: a head record
+
+A head record at chain position 44 under Vector 92's binding, with `last_sent_seq` 12 and `time` 1767226000, signed by the reference key standing as the sender's leaf. The head hash is the fixture `SHA-256("scp-25-head-record-chain-entry-44")`. The record is the seven-member MessagePack array `[binding_hash, position, head_hash, last_sent_seq, time, leaf_key_hash, signature]`. The sender is the fixture identifier of role `sender`, `scp:hv6a3pfs4qcibthh3kaekzhfo2xxqlfnie7ups6hvcsqsmkipyla`, and `info` is `"scp-head-record-v1"` ‖ `BE32(64)` ‖ `context_id` ‖ `BE32(56)` ‖ the sender's identifier. The record is sealed with AES-128-GCM under a fixture record key, with the all-zero nonce and AAD `SHA-256(info)`, and the record key is wrapped to the recipient at leaf index 1, standing as the tertiary key of §25.2, by RFC 9180 base mode with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM, under `info` and an empty AAD, with the secondary key's scalar as the ephemeral. The published object is `[sender_leaf_index, [[recipient_leaf_index, enc, wrapped_key]], ciphertext]`.
+
+```
+binding_hash (Vector 92):
+  3e557b07e2fbeb0f814eeb206e1b68cd27d647c41887afc61a99208f6fc44bc9
+preimage (107 bytes = 19-byte separator + 32 + 8 + 32 + 8 + 8):
+  5343502d484541442d5245434f52442d56313a3e557b07e2fbeb0f814eeb206e
+  1b68cd27d647c41887afc61a99208f6fc44bc9000000000000002c9bc7a67739
+  3ab28ab7fa67ce65004f49e8b06feed30ec8454939836d4542ed4a0000000000
+  00000c000000006955ba90
+digest:
+  ca0326cf82c51ac5b9124279517f6f0457dc7af45ea99f2fb23911b8f5e87433
+signature, reference key:
+  94f7ab77b63215f2050fd3c05817a8401fcc05a090ee141528d78d9a04600a5d
+  2aa5f3d7416174bc1ff16588be446fafcc237be09734c8712d79cfd59e0ec235
+record:
+  97c4203e557b07e2fbeb0f814eeb206e1b68cd27d647c41887afc61a99208f6f
+  c44bc92cc4209bc7a677393ab28ab7fa67ce65004f49e8b06feed30ec8454939
+  836d4542ed4a0cce6955ba90c420c97cd5c4beb89d01e46bcbff6f8dc519c6ea
+  18ded0045d71a612dd6ced2ad218c44094f7ab77b63215f2050fd3c05817a840
+  1fcc05a090ee141528d78d9a04600a5d2aa5f3d7416174bc1ff16588be446faf
+  cc237be09734c8712d79cfd59e0ec235
+info:
+  7363702d686561642d7265636f72642d76310000004036323532636634363739
+  6565623433653564346632343536373235656435333835656439353235306434
+  34653734653663356164616561643439396431333433000000387363703a6876
+  3661337066733471636962746868336b61656b7a68666f327878716c666e6965
+  37757073366876637371736d6b6970796c61
+aad, SHA-256(info):
+  c832ae216dcdbe54a6ec37a296397f099c6de9cd8b143f926f36314394ea5247
+record_key (fixture):
+  712686065ab234a10742363c216bcd40
+record ciphertext with tag:
+  756553f5486fa6c733374a373b88fd4f05dd0630f3c4eb152f3e34b8267afeae
+  65fb81df26d9e06dad5941dc445a313566d26a5e2073c26aefb58d6304fc9cd7
+  eaad3b45baea4fbb51bf9f9ea86f212a46f4e284c589ef1c3c1807e94a520a34
+  03d9d46343dcc9cfab025e72fc2dadf01e0df58e06561043908219f4bb7e258d
+  4e086d9fb516f7bced0050b1c334b30d6eb2d339db2691a497da22856dc47232
+  0d26cd5122a3d5ca9adab2129f1e00b1c0e615f14edfc58862a03d5928d51653
+enc:
+  0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20a
+  ead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6d
+  a6
+wrapped_key:
+  4da3e0bca6a5d9db785e40051c0f28f251d3b2cd58dae3a00e1701561e91a0d8
+published object (300 bytes):
+  9300919301c4410423702a648232f2d00713de9289753c2fbd4c4efa7e1e3390
+  5e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b
+  52a8dbecb56d6da6c4204da3e0bca6a5d9db785e40051c0f28f251d3b2cd58da
+  e3a00e1701561e91a0d8c4c0756553f5486fa6c733374a373b88fd4f05dd0630
+  f3c4eb152f3e34b8267afeae65fb81df26d9e06dad5941dc445a313566d26a5e
+  2073c26aefb58d6304fc9cd7eaad3b45baea4fbb51bf9f9ea86f212a46f4e284
+  c589ef1c3c1807e94a520a3403d9d46343dcc9cfab025e72fc2dadf01e0df58e
+  06561043908219f4bb7e258d4e086d9fb516f7bced0050b1c334b30d6eb2d339
+  db2691a497da22856dc472320d26cd5122a3d5ca9adab2129f1e00b1c0e615f1
+  4edfc58862a03d5928d51653
+resubmission info, the same sender:
+  7363702d72657375626d697373696f6e2d763100000040363235326366343637
+  3965656234336535643466323435363732356564353338356564393532353064
+  3434653734653663356164616561643439396431333433000000387363703a68
+  763661337066733471636962746868336b61656b7a68666f327878716c666e69
+  6537757073366876637371736d6b6970796c61
+```
+
+A conforming reader opens the wrap with the tertiary key's scalar, opens the record, and accepts the signature under the reference key against Vector 92's binding. It refuses the record under a resubmission's `info`, with any field of the record changed, and with the signature's `s` replaced by `n − s`.

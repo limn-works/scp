@@ -3741,9 +3741,9 @@ def emit_participation_seed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.23 Vectors 80-82: key positions, the re-seat request and answer, and the
-# answer's seal (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
-# `05-contexts.md` §5.13.3 "Key positions", §5.12.3.4, §5.12.3.5;
+# §25.23 Vector 80: key positions
+# (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
+# `05-contexts.md` §5.13.3 "Key positions";
 # `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6).
 #
 # The two branch events of the Contested position are §25.29's Vector 53
@@ -3752,9 +3752,6 @@ def emit_participation_seed() -> None:
 # ---------------------------------------------------------------------------
 
 KEY_EVENT_FRAME_VERSION = 0x02
-RESEAT_CONTEXT_ID = "context-alpha"
-RESEAT_REQUEST_DOMAIN = "SCP-RESEAT-REQUEST-V1:"
-RESEAT_GROUPINFO_DOMAIN = "SCP-RESEAT-GROUPINFO-V1:"
 KEY_POSITION_NAMES = ("contested", "linear", "unheld", "displaced")
 
 
@@ -3861,67 +3858,8 @@ def fixture_digest(label: str) -> bytes:
     return sha256(f"SCP test vector {label}".encode())
 
 
-def fixture_bytes(label: str, length: int) -> bytes:
-    out = b""
-    counter = 0
-    while len(out) < length:
-        out += sha256(f"SCP test vector {label} {counter}".encode())
-        counter += 1
-    return out[:length]
-
-
-def mp_header(item: bytes) -> bytes:
-    """The MessagePack header of one encoded item: a fixint or nil is its own
-    header; a fixstr has one byte; str8 and bin8 two; bin16 three; a uint8 one."""
-    first = item[0]
-    if first < 0x80 or first == 0xC0:
-        return item[:1]
-    if 0xA0 <= first <= 0xBF or first == 0xCC:
-        return item[:1]
-    if first in (0xD9, 0xC4):
-        return item[:2]
-    if first in (0xDA, 0xC5):
-        return item[:3]
-    raise AssertionError(f"no header rule for 0x{first:02x}")
-
-
-def hpke_seal_base(
-    recipient: KeyPair, ephemeral: KeyPair, info: bytes, aad: bytes, plaintext: bytes
-) -> dict[str, bytes]:
-    """RFC 9180 single-shot Seal in mode base under DHKEM(P-256, HKDF-SHA256),
-    HKDF-SHA256 and AES-128-GCM, the suite §5.12.3.1 seals an `InvitationBundle`
-    under (§9.5). The ephemeral key is a fixture, so the bytes are reproducible."""
-    enc = ephemeral.uncompressed
-    dh = ecdh_p256(ephemeral.d, recipient.point)
-    assert dh == ecdh_p256(recipient.d, ephemeral.point)
-    eae_prk = hpke_labeled_extract(HPKE_SUITE_KEM, b"", b"eae_prk", dh)
-    shared_secret = hpke_labeled_expand(
-        HPKE_SUITE_KEM, eae_prk, b"shared_secret", enc + recipient.uncompressed, 32
-    )
-    psk_id_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"psk_id_hash", b"")
-    info_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"info_hash", info)
-    context = b"\x00" + psk_id_hash + info_hash
-    secret = hpke_labeled_extract(HPKE_SUITE, shared_secret, b"secret", b"")
-    key = hpke_labeled_expand(HPKE_SUITE, secret, b"key", context, 16)
-    base_nonce = hpke_labeled_expand(HPKE_SUITE, secret, b"base_nonce", context, 12)
-    return {
-        "enc": enc,
-        "shared_secret": shared_secret,
-        "key": key,
-        "base_nonce": base_nonce,
-        "ciphertext": aes128_gcm_encrypt(key, base_nonce, plaintext, aad),
-    }
-
-
-def reseat_seal_label(label: str, context_id: str, request_digest: bytes) -> bytes:
-    """`09-security-model.md` §9.18's HPKE rows for the re-seat seals:
-    label || BE32(len(context_id)) || context_id || request_digest."""
-    assert len(request_digest) == 32
-    return label.encode() + var_field(context_id) + request_digest
-
-
-def emit_key_positions_and_reseat() -> None:
-    section("§25.23 Vectors 80-82 key positions, re-seat request and answer, seals")
+def emit_key_positions() -> None:
+    section("§25.23 Vectors 80 and 82 key positions and the re-seat request")
     identifier = INCEPTION_IDENTIFIER
     identifier_text = scp_text_form(identifier)
     fork_point = INCEPTION_DIGEST
@@ -4069,147 +4007,6 @@ def emit_key_positions_and_reseat() -> None:
         "vector_80.key_positions_hash_resolved",
         key_positions_hash(3, [resolved, linear, unheld, displaced]),
     )
-
-    # --- Vector 82: the re-seat request, signed by Vector 41's #active key. ---
-    request_nonce = fixture_digest("re-seat request nonce")[:16]
-    anchor_digest = fixture_digest("re-seat anchor")
-    head_digest = fixture_digest("re-seat head")
-    key_package = fixture_bytes("re-seat key package", 96)
-    key_package_hash = sha256(key_package)
-    assert len(RESEAT_REQUEST_DOMAIN) == 22
-    request_preimage = canonical_preimage(
-        RESEAT_REQUEST_DOMAIN,
-        var_field(RESEAT_CONTEXT_ID),
-        var_field(identifier_text),
-        fixed_field(request_nonce),
-        u64(11),
-        fixed_field(anchor_digest),
-        u64(12),
-        fixed_field(head_digest),
-        fixed_field(key_package_hash),
-    )
-    request_digest = sha256(request_preimage)
-    request_signature = sign_group(REF_KEY_2, request_digest, "vector_82")
-    request_items = [
-        mp_str(RESEAT_CONTEXT_ID),
-        mp_str(identifier_text),
-        mp_bin(request_nonce),
-        mp_uint(11),
-        mp_bin(anchor_digest),
-        mp_uint(12),
-        mp_bin(head_digest),
-        mp_bin(key_package),
-        mp_bin(request_signature),
-    ]
-    request = mp_array(request_items)
-    assert request[0] == 0x99
-    emit("vector_82.context_id", RESEAT_CONTEXT_ID)
-    emit("vector_82.identifier", identifier_text)
-    emit_hex("vector_82.request_nonce", request_nonce)
-    emit_hex("vector_82.anchor_digest", anchor_digest)
-    emit_hex("vector_82.head_digest", head_digest)
-    emit_hex("vector_82.key_package", key_package)
-    emit_hex("vector_82.key_package_hash", key_package_hash)
-    emit("vector_82.preimage_len", len(request_preimage))
-    emit_hex("vector_82.preimage", request_preimage)
-    emit_hex("vector_82.request_digest", request_digest)
-    emit_hex("vector_82.signature", request_signature)
-    emit(
-        "vector_82.item_headers",
-        " ".join(hexs(mp_header(item)) for item in request_items),
-    )
-    emit("vector_82.request_len", len(request))
-    emit_hex("vector_82.request", request)
-    ten_items = b"\x9a" + request[1:] + mp_uint(41)
-    emit("vector_82.rejected_ten_items_len", len(ten_items))
-    emit_hex("vector_82.rejected_ten_items_tail", ten_items[-(2 + 64 + 1) :])
-    long_signature = mp_bin(request_signature + b"\x00")
-    emit_hex("vector_82.rejected_65_byte_signature_item", long_signature)
-    emit_hex("vector_82.info", b"scp-reseat-request-v1" + var_field(RESEAT_CONTEXT_ID))
-    emit_hex(
-        "vector_82.aad", b"scp-reseat-request-aad-v1" + var_field(RESEAT_CONTEXT_ID)
-    )
-
-    # --- Vector 81: the re-seat answer, published by carol for epoch 7. ---
-    group_info = fixture_bytes("re-seat group info", 300)
-    wrap_key = fixture_digest("re-seat wrap key")[:16]
-    key_material = jcs(
-        {
-            "context_metadata_key": fixture_digest("re-seat metadata key").hex(),
-            "sender_key_seed": None,
-        }
-    )
-    context_params = jcs(
-        {"governance": "SingleAdmin", "mode": "Encrypted", "ttl": None}
-    )
-    reordered_params = b'{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}'
-    assert json.loads(reordered_params) == json.loads(context_params)
-    assert reordered_params != context_params
-    publisher = ID_CAROL
-    assert len(RESEAT_GROUPINFO_DOMAIN) == 24
-    answer_preimage = canonical_preimage(
-        RESEAT_GROUPINFO_DOMAIN,
-        var_field(RESEAT_CONTEXT_ID),
-        u64(7),
-        fixed_field(request_digest),
-        var_field(identifier_text),
-        fixed_field(sha256(group_info)),
-        fixed_field(sha256(wrap_key)),
-        fixed_field(sha256(key_material)),
-        fixed_field(sha256(context_params)),
-        var_field(publisher),
-    )
-    answer_digest = sha256(answer_preimage)
-    answer_signature = sign_group(REF_KEY_1, answer_digest, "vector_81")
-    answer_items = [
-        mp_str(RESEAT_CONTEXT_ID),
-        mp_uint(7),
-        mp_bin(request_digest),
-        mp_bin(group_info),
-        mp_bin(wrap_key),
-        mp_bin(key_material),
-        mp_bin(context_params),
-        mp_str(publisher),
-        mp_bin(answer_signature),
-    ]
-    answer = mp_array(answer_items)
-    emit_hex("vector_81.group_info", group_info)
-    emit_hex("vector_81.wrap_key", wrap_key)
-    emit("vector_81.key_material", key_material.decode())
-    emit("vector_81.context_params", context_params.decode())
-    emit("vector_81.context_params_rejected", reordered_params.decode())
-    emit("vector_81.publisher_did", publisher)
-    emit("vector_81.preimage_len", len(answer_preimage))
-    emit_hex("vector_81.preimage", answer_preimage)
-    emit_hex("vector_81.canonical_hash", answer_digest)
-    emit_hex("vector_81.signature", answer_signature)
-    emit(
-        "vector_81.item_headers",
-        " ".join(hexs(mp_header(item)) for item in answer_items),
-    )
-    emit("vector_81.answer_len", len(answer))
-    emit_hex("vector_81.answer_sha256", sha256(answer))
-
-    # --- The answer's seal, binding request_digest in info and aad.
-    # The recipient key is Vector 37's wrapping key; the ephemeral key is
-    # §25.2's tertiary key.
-    recipient = keypair_from_seed(
-        WRAPPING_KEY_SEED, TEST_VECTOR_KEY_LABEL, "wrapping key"
-    )
-    info = reseat_seal_label(
-        "scp-reseat-groupinfo-v1", RESEAT_CONTEXT_ID, request_digest
-    )
-    aad = reseat_seal_label(
-        "scp-reseat-groupinfo-aad-v1", RESEAT_CONTEXT_ID, request_digest
-    )
-    sealed = hpke_seal_base(recipient, REF_KEY_3, info, aad, answer)
-    emit_hex("vector_81.seal_groupinfo.info", info)
-    emit_hex("vector_81.seal_groupinfo.aad", aad)
-    emit_hex("vector_81.seal_groupinfo.shared_secret", sealed["shared_secret"])
-    emit_hex("vector_81.seal_groupinfo.key", sealed["key"])
-    emit_hex("vector_81.seal_groupinfo.base_nonce", sealed["base_nonce"])
-    emit("vector_81.seal_groupinfo.ciphertext_len", len(sealed["ciphertext"]))
-    emit_hex("vector_81.seal_groupinfo.ciphertext_sha256", sha256(sealed["ciphertext"]))
 
 
 # --- §25.34 Vector 83: the custody-reachability probe ---
@@ -4442,6 +4239,7 @@ def emit_context_operator() -> None:
     preimage = canonical_preimage(CONTEXT_OPERATOR_SEPARATOR, fields)
     assert len(preimage) == 24 + 4 + 64 + 32 + 33 + 32, len(preimage)
     binding_hash = sha256(preimage)
+    _CONTEXT_BINDING_HASH.append(binding_hash)
     signature = sign_group(CONTEXT_OPERATOR_ACTIVE, binding_hash, "vector_92")
     wire = fields + signature
     assert len(wire) == 165 + len(CONTEXT_OPERATOR_CONTEXT_ID), len(wire)
@@ -4519,6 +4317,325 @@ def emit_context_operator() -> None:
     emit_hex("vector_95.signature", sign_group(CONTEXT_KEY, receipt_digest, "vector_95"))
 
 
+# ---------------------------------------------------------------------------
+# §25.37 Vectors 96-100: the request queue
+# (`05-contexts.md` §5.9.1.1; `09-security-model.md` §9.5.2 Request and
+# HeadRecord, §9.9.2; `07-trust-validation-and-capabilities.md` §7.3.1.1).
+#
+# An MLS epoch's exporter secret cannot be derived outside an MLS group, so
+# Vector 97 takes it as a fixture input and derives the request key by RFC
+# 9420 §8.5's MLS-Exporter with SHA-256, the KDF of the P-256 suite. The
+# KeyPackage the re-seat body carries is fixture bytes standing for one: the
+# vectors fix the item's encoding, signature and seal, and §9.7.1's
+# KeyPackage checks are out of their scope.
+# ---------------------------------------------------------------------------
+
+REQUEST_CONTEXT_ID = CONTEXT_OPERATOR_CONTEXT_ID
+REQUEST_GROUP_ID = sha256(b"scp-25-request-queue-group-id")
+REQUEST_SIGNER = REF_KEY_1
+REQUEST_KIND_RESEAT = 0x06
+REQUEST_CLASS_REJOIN = 1
+REQUEST_COUNTER = 3
+REQUEST_NOT_AFTER = 1_767_229_200
+REQUEST_RESEAT_IDENTIFIER = fixture_identifier("re-seated member")
+REQUEST_KEY_PACKAGE = sha256(b"scp-25-request-fixture-key-package-1") + sha256(
+    b"scp-25-request-fixture-key-package-2"
+)
+# The item is sealed at epoch 6, and the Commit that opens epoch 7 is the
+# Commit for epoch 6 (05 §5.9.1.1 "Commitment", N = 6): it lists epochs 5 and
+# 6, gives epoch 6 its own t_b as close time, and lists no entry for epoch 7,
+# whose key the joiner derives itself.
+REQUEST_EPOCH = 6
+REQUEST_PREVIOUS_EPOCH = 5
+REQUEST_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-6")
+REQUEST_PREVIOUS_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-5")
+REQUEST_ITEM_POSITION = 40
+REQUEST_COVER_TIME = 1_767_225_600
+REQUEST_PREVIOUS_CLOSE_TIME = 1_767_225_000
+HEAD_RECORD_POSITION = 44
+HEAD_RECORD_HEAD_HASH = sha256(b"scp-25-head-record-chain-entry-44")
+HEAD_RECORD_LAST_SENT_SEQ = 12
+HEAD_RECORD_TIME = 1_767_226_000
+HEAD_RECORD_SENDER = ID_SENDER
+HEAD_RECORD_SENDER_LEAF_INDEX = 0
+HEAD_RECORD_RECIPIENT_LEAF_INDEX = 1
+HEAD_RECORD_RECIPIENT = REF_KEY_3
+HEAD_RECORD_EPHEMERAL = REF_KEY_2
+HEAD_RECORD_KEY = sha256(b"scp-25-head-record-aes-key")[:16]
+_CONTEXT_BINDING_HASH: list[bytes] = []
+
+
+def mls_varint(length: int) -> bytes:
+    """RFC 9420 §2.1.2 variable-length integer prefix of a vector."""
+    if length < 1 << 6:
+        return bytes([length])
+    if length < 1 << 14:
+        return (0x4000 | length).to_bytes(2, "big")
+    assert length < 1 << 30
+    return (0x80000000 | length).to_bytes(4, "big")
+
+
+def mls_vector(raw: bytes) -> bytes:
+    return mls_varint(len(raw)) + raw
+
+
+def expand_with_label(secret: bytes, label: bytes, context: bytes, length: int) -> bytes:
+    """RFC 9420 §8: KDF.Expand(secret, KDFLabel, length) with SHA-256."""
+    kdf_label = u16(length) + mls_vector(b"MLS 1.0 " + label) + mls_vector(context)
+    return hkdf_expand(secret, kdf_label, length)
+
+
+def mls_exporter(exporter_secret: bytes, label: bytes, context: bytes, length: int) -> bytes:
+    """RFC 9420 §8.5: ExpandWithLabel(DeriveSecret(exporter_secret, label),
+    "exported", Hash(context), length), where DeriveSecret(s, l) is
+    ExpandWithLabel(s, l, "", Nh)."""
+    derived = expand_with_label(exporter_secret, label, b"", 32)
+    return expand_with_label(derived, b"exported", sha256(context), length)
+
+
+def request_key(exporter_secret: bytes) -> bytes:
+    return mls_exporter(exporter_secret, b"SCP request key", REQUEST_GROUP_ID, 32)
+
+
+def item_nonce(epoch_key: bytes, plaintext_hash: bytes) -> bytes:
+    return expand_with_label(epoch_key, b"SCP request nonce", plaintext_hash, 12)
+
+
+def item_key(epoch_key: bytes, nonce: bytes) -> bytes:
+    return expand_with_label(epoch_key, b"SCP request item", nonce, 16)
+
+
+def request_item_aad(epoch: int, item_class: int) -> bytes:
+    return (
+        b"SCP-REQUEST-ITEM-V1"
+        + var_field(REQUEST_GROUP_ID)
+        + u64(epoch)
+        + u8(item_class)
+    )
+
+
+def hpke_base_seal(
+    recipient: KeyPair, ephemeral: KeyPair, info: bytes, plaintext: bytes
+) -> tuple[bytes, bytes]:
+    """RFC 9180 §5.1.1 base mode, DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
+    AES-128-GCM, single shot at sequence 0, empty AAD; returns (enc, ct)."""
+    enc = ephemeral.uncompressed
+    dh = ecdh_p256(ephemeral.d, recipient.point)
+    assert dh == ecdh_p256(recipient.d, ephemeral.point)
+    eae_prk = hpke_labeled_extract(HPKE_SUITE_KEM, b"", b"eae_prk", dh)
+    shared_secret = hpke_labeled_expand(
+        HPKE_SUITE_KEM, eae_prk, b"shared_secret", enc + recipient.uncompressed, 32
+    )
+    psk_id_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"psk_id_hash", b"")
+    info_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"info_hash", info)
+    context = b"\x00" + psk_id_hash + info_hash
+    secret = hpke_labeled_extract(HPKE_SUITE, shared_secret, b"secret", b"")
+    key = hpke_labeled_expand(HPKE_SUITE, secret, b"key", context, 16)
+    base_nonce = hpke_labeled_expand(HPKE_SUITE, secret, b"base_nonce", context, 12)
+    return enc, aes128_gcm_encrypt(key, base_nonce, plaintext)
+
+
+def emit_request_queue() -> None:
+    section("§25.37 Vectors 96-100 request queue: request, keys, sealed item, joiner secrets, head record")
+    assert _CONTEXT_BINDING_HASH, "Vector 92 runs first"
+    binding_hash = _CONTEXT_BINDING_HASH[0]
+
+    # Vector 96: a re-seat request's body, preimage and signature.
+    body = mp_array([mp_str(REQUEST_RESEAT_IDENTIFIER), mp_bin(REQUEST_KEY_PACKAGE)])
+    assert len(REQUEST_RESEAT_IDENTIFIER) == 56
+    signer_key_hash = sha256(REQUEST_SIGNER.uncompressed)
+    body_hash = sha256(body)
+    preimage = canonical_preimage(
+        "SCP-REQUEST-V1:",
+        var_field(REQUEST_CONTEXT_ID),
+        fixed_field(signer_key_hash),
+        u64(REQUEST_COUNTER),
+        u64(REQUEST_NOT_AFTER),
+        u8(REQUEST_KIND_RESEAT),
+        fixed_field(body_hash),
+    )
+    assert len(preimage) == 15 + 4 + 64 + 32 + 8 + 8 + 1 + 32, len(preimage)
+    emit("vector_96.context_id", REQUEST_CONTEXT_ID)
+    emit("vector_96.reseat_identifier", REQUEST_RESEAT_IDENTIFIER)
+    emit_hex("vector_96.key_package_fixture", REQUEST_KEY_PACKAGE)
+    emit_hex("vector_96.body", body)
+    emit_hex("vector_96.body_hash", body_hash)
+    emit_hex("vector_96.signer_public_key_uncompressed", REQUEST_SIGNER.uncompressed)
+    emit_hex("vector_96.signer_key_hash", signer_key_hash)
+    emit("vector_96.counter", REQUEST_COUNTER)
+    emit("vector_96.not_after", REQUEST_NOT_AFTER)
+    digest = sha256(preimage)
+    signature = sign_group(REQUEST_SIGNER, digest, "vector_96")
+    emit("vector_96.preimage_len", len(preimage))
+    emit_hex("vector_96.preimage", preimage)
+    emit_hex("vector_96.canonical_hash", digest)
+    emit_hex("vector_96.signature", signature)
+    plaintext = mp_array(
+        [
+            mp_uint(REQUEST_KIND_RESEAT),
+            mp_bin(body),
+            mp_bin(signer_key_hash),
+            mp_uint(REQUEST_COUNTER),
+            mp_uint(REQUEST_NOT_AFTER),
+            mp_bin(signature),
+        ]
+    )
+    plaintext_hash = sha256(plaintext)
+    emit("vector_96.plaintext_len", len(plaintext))
+    emit_hex("vector_96.plaintext", plaintext)
+    emit_hex("vector_96.plaintext_hash", plaintext_hash)
+
+    # Vector 97: the epoch request key and the item key.
+    epoch_key = request_key(REQUEST_EXPORTER_SECRET)
+    assert len(epoch_key) == 32
+    derived = expand_with_label(REQUEST_EXPORTER_SECRET, b"SCP request key", b"", 32)
+    nonce = item_nonce(epoch_key, plaintext_hash)
+    key = item_key(epoch_key, nonce)
+    assert len(nonce) == 12 and len(key) == 16
+    # Another plaintext derives another nonce, so two devices that sign under
+    # one shared key with one counter never seal two plaintexts under one
+    # item key and nonce.
+    other_plaintext = plaintext[:-1] + bytes([plaintext[-1] ^ 1])
+    assert item_nonce(epoch_key, sha256(other_plaintext)) != nonce
+    emit_hex("vector_97.group_id", REQUEST_GROUP_ID)
+    emit("vector_97.epoch", REQUEST_EPOCH)
+    emit_hex("vector_97.exporter_secret", REQUEST_EXPORTER_SECRET)
+    emit_hex("vector_97.derived_secret", derived)
+    emit_hex("vector_97.request_key", epoch_key)
+    emit_hex("vector_97.plaintext_hash", plaintext_hash)
+    emit_hex("vector_97.nonce", nonce)
+    emit_hex("vector_97.item_key", key)
+
+    # Vector 98: the padded plaintext, the AAD and the sealed item.
+    padded = pad(plaintext)
+    assert len(padded) == 256, len(padded)
+    aad = request_item_aad(REQUEST_EPOCH, REQUEST_CLASS_REJOIN)
+    assert len(aad) == 19 + 4 + 32 + 8 + 1, len(aad)
+    ciphertext = aes128_gcm_encrypt(key, nonce, padded, aad)
+    sealed = mp_array(
+        [
+            mp_uint(REQUEST_EPOCH),
+            mp_uint(REQUEST_CLASS_REJOIN),
+            mp_bin(nonce),
+            mp_bin(ciphertext),
+        ]
+    )
+    emit_hex("vector_98.padded_plaintext", padded)
+    emit_hex("vector_98.aad", aad)
+    emit("vector_98.ciphertext_len", len(ciphertext))
+    emit_hex("vector_98.ciphertext", ciphertext)
+    emit("vector_98.sealed_item_len", len(sealed))
+    emit_hex("vector_98.sealed_item", sealed)
+    # The node changes the class: the open fails, because the AAD differs.
+    other_aad = request_item_aad(REQUEST_EPOCH, 0)
+    emit_hex("vector_98.class_0_aad", other_aad)
+    emit_hex(
+        "vector_98.class_0_ciphertext",
+        aes128_gcm_encrypt(key, nonce, padded, other_aad),
+    )
+
+    # Vector 99: the retained-key commitments and the 0xFF06 body.
+    previous_key = request_key(REQUEST_PREVIOUS_EXPORTER_SECRET)
+    retained = [
+        (REQUEST_PREVIOUS_EPOCH, REQUEST_PREVIOUS_CLOSE_TIME, previous_key),
+        (REQUEST_EPOCH, REQUEST_COVER_TIME, epoch_key),
+    ]
+    epoch_keys = b""
+    for epoch, close_time, epoch_secret in retained:
+        commitment = sha256(b"SCP-REQUEST-KEY-COMMIT" + u64(epoch) + epoch_secret)
+        emit_hex(f"vector_99.epoch_{epoch}.request_key", epoch_secret)
+        emit(f"vector_99.epoch_{epoch}.close_time", close_time)
+        emit_hex(f"vector_99.epoch_{epoch}.commitment", commitment)
+        epoch_keys += u64(epoch) + u64(close_time) + epoch_secret
+    emit_hex("vector_99.epoch_5.exporter_secret", REQUEST_PREVIOUS_EXPORTER_SECRET)
+    item_keys = u64(REQUEST_ITEM_POSITION) + key
+    secrets = mls_vector(epoch_keys) + mls_vector(item_keys)
+    assert len(secrets) == 2 + 2 * 48 + 1 + 24, len(secrets)
+    emit("vector_99.item_position", REQUEST_ITEM_POSITION)
+    emit("vector_99.scp_request_secrets_len", len(secrets))
+    emit_hex("vector_99.scp_request_secrets", secrets)
+
+    # Vector 100: a head record, its seal and one wrap.
+    leaf_key_hash = sha256(REQUEST_SIGNER.uncompressed)
+    record_preimage = canonical_preimage(
+        "SCP-HEAD-RECORD-V1:",
+        fixed_field(binding_hash),
+        u64(HEAD_RECORD_POSITION),
+        fixed_field(HEAD_RECORD_HEAD_HASH),
+        u64(HEAD_RECORD_LAST_SENT_SEQ),
+        u64(HEAD_RECORD_TIME),
+    )
+    assert len(record_preimage) == 19 + 32 + 8 + 32 + 8 + 8, len(record_preimage)
+    record_digest = sha256(record_preimage)
+    record_signature = sign_group(REQUEST_SIGNER, record_digest, "vector_100")
+    record = mp_array(
+        [
+            mp_bin(binding_hash),
+            mp_uint(HEAD_RECORD_POSITION),
+            mp_bin(HEAD_RECORD_HEAD_HASH),
+            mp_uint(HEAD_RECORD_LAST_SENT_SEQ),
+            mp_uint(HEAD_RECORD_TIME),
+            mp_bin(leaf_key_hash),
+            mp_bin(record_signature),
+        ]
+    )
+    info = (
+        b"scp-head-record-v1"
+        + var_field(REQUEST_CONTEXT_ID)
+        + var_field(HEAD_RECORD_SENDER)
+    )
+    record_aad = sha256(info)
+    record_ciphertext = aes128_gcm_encrypt(HEAD_RECORD_KEY, bytes(12), record, record_aad)
+    enc, wrapped = hpke_base_seal(
+        HEAD_RECORD_RECIPIENT, HEAD_RECORD_EPHEMERAL, info, HEAD_RECORD_KEY
+    )
+    assert len(enc) == 65 and len(wrapped) == 32
+    published = mp_array(
+        [
+            mp_uint(HEAD_RECORD_SENDER_LEAF_INDEX),
+            mp_array(
+                [
+                    mp_array(
+                        [
+                            mp_uint(HEAD_RECORD_RECIPIENT_LEAF_INDEX),
+                            mp_bin(enc),
+                            mp_bin(wrapped),
+                        ]
+                    )
+                ]
+            ),
+            mp_bin(record_ciphertext),
+        ]
+    )
+    resubmission_info = (
+        b"scp-resubmission-v1"
+        + var_field(REQUEST_CONTEXT_ID)
+        + var_field(HEAD_RECORD_SENDER)
+    )
+    emit_hex("vector_100.binding_hash", binding_hash)
+    emit("vector_100.position", HEAD_RECORD_POSITION)
+    emit_hex("vector_100.head_hash", HEAD_RECORD_HEAD_HASH)
+    emit("vector_100.last_sent_seq", HEAD_RECORD_LAST_SENT_SEQ)
+    emit("vector_100.time", HEAD_RECORD_TIME)
+    emit("vector_100.preimage_len", len(record_preimage))
+    emit_hex("vector_100.preimage", record_preimage)
+    emit_hex("vector_100.canonical_hash", record_digest)
+    emit_hex("vector_100.signature", record_signature)
+    emit_hex("vector_100.record", record)
+    emit("vector_100.sender", HEAD_RECORD_SENDER)
+    emit_hex("vector_100.info", info)
+    emit_hex("vector_100.aad", record_aad)
+    emit_hex("vector_100.record_key", HEAD_RECORD_KEY)
+    emit_hex("vector_100.record_ciphertext", record_ciphertext)
+    emit_hex("vector_100.recipient_public_key", HEAD_RECORD_RECIPIENT.uncompressed)
+    emit_hex("vector_100.ephemeral_scalar", HEAD_RECORD_EPHEMERAL.private_bytes)
+    emit_hex("vector_100.enc", enc)
+    emit_hex("vector_100.wrapped_key", wrapped)
+    emit("vector_100.published_len", len(published))
+    emit_hex("vector_100.published", published)
+    emit_hex("vector_100.resubmission_info", resubmission_info)
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -4553,10 +4670,11 @@ def main() -> int:
     emit_challenge_vectors()
     emit_participation_seed()
     emit_push_signing_bytes()
-    emit_key_positions_and_reseat()
+    emit_key_positions()
     emit_custody_probe()
     emit_device_attestation()
     emit_context_operator()
+    emit_request_queue()
     print("\n".join(_LINES))
     return 0
 
