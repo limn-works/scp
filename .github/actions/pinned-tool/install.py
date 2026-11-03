@@ -8,9 +8,24 @@ retried, and the step fails naming the tool and URL when every attempt mismatche
 only then unpacks it.
 
 WHY NOT THE UPSTREAM SETUP ACTIONS. oven-sh/setup-bun@v2 (src/action.ts:182-183),
-ilammy/setup-nasm@v1 (index.js:65-76), PyO3/maturin-action@v1 (src/index.ts:550-556)
-and actions/setup-python@v5 (src/install-python.ts:133-139) each unpack what
-`@actions/tool-cache`'s downloadTool returned, with no digest comparison.
+ilammy/setup-nasm@v1 (index.js:65-76), wasm-pack 0.14.0 (src/install/mod.rs:121-162
+fetches wasm-opt and, at a version PATH lacks, wasm-bindgen), PyO3/maturin-action@v1 (src/index.ts:550-556),
+actions/setup-python@v5 (src/install-python.ts:133-139) and github/codeql-action/init
+(src/tools-download.ts:117 at v4) each unpack what `@actions/tool-cache`'s downloadTool
+returned, with no digest comparison. `cargo install <crate>` checks the crate only
+against the checksum the crates.io index serves beside it, which pins nothing.
+
+THREE KINDS OF PIN.
+  PINS     an executable archive: the members are unpacked into a bin directory that
+           goes on PATH, or a python-versions package installs itself into the tool
+           cache.
+  BUNDLES  a file handed to the next step as published: the step output `path` names
+           the checked file. github/codeql-action/init takes the CodeQL bundle through
+           its `tools:` input this way, so it downloads nothing itself.
+  CRATES   a crate's source: the checked `.crate` is unpacked and `path` names its
+           directory, for `cargo install --locked --path`. The crate ships its
+           Cargo.lock, whose checksums cargo checks every dependency against, so the
+           pin covers the crate and everything it builds.
 
 WHERE EACH DIGEST COMES FROM.
   bun      SHASUMS256.txt in the oven-sh/bun release the version names, which agrees
@@ -18,8 +33,14 @@ WHERE EACH DIGEST COMES FROM.
   nasm     www.nasm.us publishes no checksum; the digest is the SHA-256 of the archive
            as fetched from www.nasm.us and from setup-nasm's GitHub mirror on
            2026-11-02, which agreed.
+  wasm-opt the `.sha256` file WebAssembly/binaryen publishes beside each release asset,
+           which the archive fetched on 2026-11-03 matched.
   maturin  the SHA-256 GitHub records for each PyO3/maturin release asset
            (`gh api repos/PyO3/maturin/releases/tags/<tag>`, field `digest`).
+  codeql   the same GitHub-recorded digest for each asset of the bundle release the
+           pinned init action links (codeql-bundle-v2.27.4 for init v4.39.2).
+  crates   the checksum crates.io records for the version, which the downloaded
+           `.crate` matched on 2026-11-03.
   python   the same GitHub-recorded digest for the actions/python-versions asset where
            GitHub records one (3.10.22 for Linux); the 3.10.11 macOS and Windows
            assets predate GitHub's digests, so theirs is the SHA-256 of the asset as
@@ -36,13 +57,8 @@ macOS one runs "Install Certificates.command", which installs certifi; both woul
 from PyPI unchecked, so the script runs with PIP_NO_INDEX=1 and PIP_FIND_LINKS naming a
 directory holding only the pinned, checked pip and certifi wheels.
 
-maturin goes where PyO3/maturin-action looks before it downloads: installMaturin
-(src/index.ts:568-576) calls `tc.find('maturin', <version>, 'x64')` and uses a hit, so
-the binary is unpacked to $RUNNER_TOOL_CACHE/maturin/<version>/x64 with the
-`x64.complete` marker tc.find requires (maturin-action passes `x64` on every CPU), and
-every maturin-action step passes the same version as `maturin-version`. Job
-python-wheels-linux in build-matrix.yml runs no maturin-action; it mounts the binary from
-that directory into its manylinux container.
+maturin goes into $RUNNER_TEMP/maturin. Job python-wheels-linux in build-matrix.yml
+mounts the binary from there into its manylinux container.
 """
 
 from __future__ import annotations
@@ -77,6 +93,9 @@ NASM_VERSION = "2.16.01"
 MATURIN_VERSION = "1.16.0"
 MATURIN_URL = f"https://github.com/PyO3/maturin/releases/download/v{MATURIN_VERSION}/"
 PYTHON_VERSIONS_URL = "https://github.com/actions/python-versions/releases/download/"
+# The binaryen release wasm-pack 0.14.0 downloads for wasm-opt (src/install/mod.rs:206).
+BINARYEN_VERSION = "version_117"
+CODEQL_URL = "https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.27.4/"
 
 # (tool, runner OS, CPU) -> archive.
 PINS: dict[tuple[str, str, str], Archive] = {
@@ -132,6 +151,15 @@ PINS: dict[tuple[str, str, str], Archive] = {
         "ca9fa03d2b37bbfc2851a62a787f1b6948b33ebd9cc6856376244a340377961b",
         ("maturin.exe",),
     ),
+    # wasm-pack runs the first wasm-opt on PATH (src/wasm_opt.rs at 0.14.0), so with this
+    # one there it downloads none. The Linux binary is static.
+    ("wasm-opt", "Linux", "X64"): Archive(
+        f"https://github.com/WebAssembly/binaryen/releases/download/{BINARYEN_VERSION}/"
+        f"binaryen-{BINARYEN_VERSION}-x86_64-linux.tar.gz",
+        91090107,
+        "3dc677006555b355ea2da5e82602065a161d5e83eaefd3f759afa00b96e83212",
+        (f"binaryen-{BINARYEN_VERSION}/bin/wasm-opt",),
+    ),
     ("python3.10", "Linux", "X64"): Archive(
         PYTHON_VERSIONS_URL
         + "3.10.22-36876129702/python-3.10.22-linux-24.04-x64.tar.gz",
@@ -168,6 +196,40 @@ WHEELS = (
     ),
 )
 
+# (tool, runner OS, CPU) -> a file the next step reads. Each CodeQL tool is the bundle
+# for one `languages:` value of .github/workflows/codeql.yml.
+BUNDLES: dict[tuple[str, str, str], Archive] = {
+    ("codeql-javascript-typescript", "Linux", "X64"): Archive(
+        CODEQL_URL + "codeql-bundle-javascript-linux64.tar.zst",
+        136296871,
+        "082e798c97831283a2a5f69e9198c51270e5767013d5333daeeab6520af9ce72",
+    ),
+    ("codeql-python", "Linux", "X64"): Archive(
+        CODEQL_URL + "codeql-bundle-python-linux64.tar.zst",
+        111263054,
+        "d862cb11aff035988f178703b69751be072f2aa7e76616f16bb725a207b50b7d",
+    ),
+    ("codeql-rust", "Linux", "X64"): Archive(
+        CODEQL_URL + "codeql-bundle-rust-linux64.tar.zst",
+        98269325,
+        "1c2f867094b80e43c9a0e511090e57e0ea3bf107600b4b3763c52b9020b4ec4b",
+    ),
+}
+
+# tool -> its crate's source, on every runner.
+CRATES: dict[str, Archive] = {
+    "cargo-fuzz": Archive(
+        "https://static.crates.io/crates/cargo-fuzz/cargo-fuzz-0.13.2.crate",
+        42552,
+        "5acfd01930e49823e58c30dd8012d3338a620377d7c7d4cc140ca4b2169400e2",
+    ),
+    "cargo-llvm-lines": Archive(
+        "https://static.crates.io/crates/cargo-llvm-lines/cargo-llvm-lines-0.4.48.crate",
+        17472,
+        "9e55b5486943f5842313e04e3a22ee51c301784dec1101087a88cc5c145930eb",
+    ),
+}
+
 
 def extract(archive: Path, members: tuple[str, ...], bin_dir: Path) -> None:
     """Copy each member out of archive into bin_dir, executable."""
@@ -192,9 +254,6 @@ def append(variable: str, line: str) -> None:
 
 
 def bin_dir_for(tool: str) -> Path:
-    if tool == "maturin":
-        # The directory tc.find('maturin', MATURIN_VERSION, 'x64') returns.
-        return Path(os.environ["RUNNER_TOOL_CACHE"], "maturin", MATURIN_VERSION, "x64")
     if tool == "bun":
         # Where oven-sh/setup-bun put it.
         return Path.home() / ".bun" / "bin"
@@ -237,8 +296,32 @@ def runner_platform(tool: str) -> tuple[str, str]:
     return system, cpu
 
 
+def hand_over(tool: str, archive: Archive, unpack: bool) -> int:
+    """Download a BUNDLES or CRATES pin and name it in the step output `path`."""
+    target = Path(os.environ["RUNNER_TEMP"], "pinned-tool", tool)
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    path = target / file_name(archive.url)
+    download_verified(tool, archive.url, archive.size, archive.sha256, path)
+    if unpack:
+        with tarfile.open(path) as t:
+            t.extractall(target, filter="data")
+        path.unlink()
+        path = target / file_name(archive.url).removesuffix(".crate")
+        if not (path / "Cargo.lock").is_file():
+            raise InstallError(f"{file_name(archive.url)} carries no Cargo.lock")
+    append("GITHUB_OUTPUT", f"path={path}")
+    print(f"{tool}: checked {file_name(archive.url)}, at {path}")
+    return 0
+
+
 def main(tool: str) -> int:
+    if tool in CRATES:
+        return hand_over(tool, CRATES[tool], unpack=True)
     runner = runner_platform(tool)
+    if (tool, *runner) in BUNDLES:
+        return hand_over(tool, BUNDLES[(tool, *runner)], unpack=False)
     archive = PINS.get((tool, *runner))
     if archive is None:
         raise InstallError(
@@ -259,8 +342,6 @@ def main(tool: str) -> int:
         extract(path, archive.members, bin_dir)
     if tool == "bun":
         (bin_dir / "bunx").symlink_to(bin_dir / "bun")
-    if tool == "maturin":
-        (bin_dir.parent / "x64.complete").write_text("")
     append("GITHUB_PATH", str(bin_dir))
     print(f"{tool}: installed {', '.join(archive.members)} to {bin_dir}")
     return 0

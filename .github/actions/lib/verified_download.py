@@ -9,6 +9,7 @@ archive that must be refused.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import time
 import urllib.request
 from pathlib import Path
@@ -56,7 +57,9 @@ def download_verified(
                 f"got {got_size} bytes with {algorithm} {got_digest}, "
                 f"want {size} bytes with {algorithm} {digest}"
             )
-        except OSError as error:
+        # http.client raises IncompleteRead when a chunked body ends early, and
+        # BadStatusLine on a garbled reply; neither subclasses OSError.
+        except (OSError, http.client.HTTPException) as error:
             problem = f"download failed: {error}"
         destination.unlink(missing_ok=True)
         print(f"::warning::{name}: attempt {attempt} of {attempts}: {url}: {problem}")

@@ -1,0 +1,8 @@
+# Compiled into sphinx.txt beside this file with every artifact's SHA-256, and CI installs
+# that file with `pip install --require-hashes`, so pip installs only the files hashed
+# there. Regenerate it after any edit here:
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#     .github/requirements/sphinx.in -o .github/requirements/sphinx.txt
+sphinx
+furo
+sphinx-autodoc-typehints

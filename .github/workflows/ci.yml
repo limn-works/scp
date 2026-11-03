@@ -266,8 +266,8 @@ env:
 # THE ORDER. After rust-cache, because rust-cache hashes every `CARGO*` variable its step
 # sees into its cache key, and a fetch before it would also download what the restore then
 # overwrites; after the toolchain step, because `RUSTUP_AUTO_INSTALL: "0"` leaves cargo no
-# compiler until that step installs one; after a `cargo install`, which downloads a tool
-# from crates.io. No step sets `CARGO_NET_OFFLINE` by hand. Check `offline-cargo` in
+# compiler until that step installs one; after a `cargo install`, which downloads the
+# crates the installed tool's own Cargo.lock names. No step sets `CARGO_NET_OFFLINE` by hand. Check `offline-cargo` in
 # `scripts/tests/ci-gate/ci_gate_selftest.py` holds every job in `.github/workflows/` to
 # this. cargo-deny fetches its advisory database from github.com outside cargo, so job
 # rust-deny downloads it in a step of its own and runs its check with `--offline`.
@@ -332,8 +332,8 @@ jobs:
       # instead, and the `fuzz` filter's `fuzz/**` entry already covers that file.
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         with:
           filters: |
@@ -677,7 +677,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-error-codes.sh
 
   # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
@@ -700,8 +700,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
@@ -770,7 +773,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
@@ -799,7 +802,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       # The wheel entry comes from scripts/check-shipped-feature-graph.sh
@@ -829,20 +832,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
       # The packages the gate's requirements file pins: mypy, and the packages
       # whose types mypy resolves for the sites and guide blocks.
-      - run: pip install -r scripts/examples-typecheck/requirements.txt
+      - run: pip install --require-hashes -r scripts/examples-typecheck/requirements.txt
       - uses: ./.github/actions/pinned-tool
         with:
           tool: bun
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --frozen-lockfile
       # The cases run first: each feeds the gate a guide that must pass or must
       # fail, among them a block that calls removed SDK API with no skip marker.
       - name: Self-test gate
@@ -867,7 +870,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       - name: Every shipped artifact links the wiping global allocator
@@ -881,7 +884,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       - name: Fetch base branch
@@ -916,7 +919,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -936,16 +939,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      # Pin pytest and tree-sitter-rust to compatible version ranges so a
-      # breaking upstream release cannot silently break CI (round-6 MINOR-3).
-      # Other tree-sitter grammars remain unpinned to match the convention
-      # used by the protocol-sync job below and minimize churn.
-      - run: pip install 'pytest>=8,<10' 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
+      # gates.in says why each package is pinned where it is.
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       - name: Gate self-tests (extractor null-safety)
         run: python3.12 -m pytest scripts/test_check_sdk_coverage.py -v
       - run: python3.12 scripts/check-sdk-coverage.py
@@ -963,12 +963,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      - run: pip install tree-sitter tree-sitter-rust
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       - run: python3.12 scripts/check-protocol-sync.py
 
   # ── Python stub parity ───────────────────────────────────────────────
@@ -979,16 +979,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      # ruff pinned for reproducible CI — an unpinned `pip install ruff`
-      # silently tracks upstream and a new release (e.g. 0.16.x restyling
-      # Markdown code blocks) can red the lint gate repo-wide with no local
-      # change. Bump deliberately in its own PR. Keep in sync with python-lint.
-      - run: pip install tree-sitter tree-sitter-rust ruff==0.15.4
+      # ruff.in says why ruff is pinned.
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       # Self-test MUST run first: it plants a deliberately-transposed stub
       # parameter and proves the gate REJECTS it, before we trust it on the
       # real tree.
@@ -1005,7 +1002,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1019,7 +1016,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       - run: bash scripts/check-protocol-deps.sh --self-test
@@ -1040,7 +1037,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1054,7 +1051,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-no-fallback-registry.sh
 
   handle-affinity:
@@ -1064,7 +1061,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-handle-affinity.sh
 
   # ── Toolchain wiring ───────────────────────────────────────────────
@@ -1089,7 +1086,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
       # library has held since 3.11, and it fails when no interpreter on PATH imports it.
       - uses: ./.github/actions/toolcache-setup
@@ -1126,7 +1123,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1164,7 +1161,7 @@ jobs:
       # is per repository; and it holds every uniffi-bindgen step to reading the library
       # out of the directory its own `cargo run` writes, which is the step shape that
       # compiled the crate graph twice in build-xcframework.sh and in build-matrix.yml.
-      - run: pip install 'pyyaml>=6,<7'
+      - run: pip install --require-hashes -r .github/requirements/pyyaml.txt
       - run: python3.12 scripts/check-workflow-compile-steps.py
       - name: Run workflow-compile-steps cases
         run: bash scripts/tests/workflow-compile-steps/run-tests.sh
@@ -1219,7 +1216,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       # check-cross-layer.sh diffs against origin/$GITHUB_BASE_REF, and against
@@ -1235,18 +1232,18 @@ jobs:
       # without a deliberate bump.
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
       # file and which the toolchain-wiring-cases job installs the same pin for.
-      - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       # check-examples-typecheck.sh runs mypy over the packages its requirements
       # file pins, which the examples-typecheck job installs too, and the
       # TypeScript compiler that `bun install` puts under
       # bindings/typescript/node_modules.
-      - run: pip install -r scripts/examples-typecheck/requirements.txt
+      - run: pip install --require-hashes -r scripts/examples-typecheck/requirements.txt
       - uses: ./.github/actions/pinned-tool
         with:
           tool: bun
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - uses: ./.github/actions/rust-toolchain
@@ -1269,7 +1266,7 @@ jobs:
       # this artifact.
       - name: Upload the runner output the cases read
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fix-round-check-evidence
           path: ${{runner.temp}}/fix-round-check-evidence
@@ -1289,7 +1286,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-no-mutable-globals.sh
 
   no-mutable-globals-python:
@@ -1299,7 +1296,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1313,7 +1310,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-no-ts-mutable-globals.sh
 
   no-mutable-globals-kotlin:
@@ -1323,7 +1320,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-no-kotlin-mutable-globals.sh
 
   # Swift `no_static_var` / `no_static_lazy_var` custom rules live inside
@@ -1343,12 +1340,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      - run: pip install tree-sitter tree-sitter-rust
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       # Self-test MUST run first: it proves the scanner catches every
       # known bypass pattern before we trust it on the real tree.
       - name: Self-test scanner
@@ -1372,7 +1369,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1399,7 +1396,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1407,7 +1404,7 @@ jobs:
       # The generator cross-checks every key and signature through `cryptography` when it
       # imports, so CI installs it to run the stronger check.
       - name: Install generator dependencies
-        run: python3.12 -m pip install 'cryptography>=44,<51'
+        run: python3.12 -m pip install --require-hashes -r .github/requirements/python-test.txt
       # Self-test MUST run first: it plants a changed digit in spec 25 and in a Rust
       # vector test and asserts the check names each one, so a green real scan means the
       # check compared the files rather than that it can no longer fail.
@@ -1428,7 +1425,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1453,7 +1450,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Real check
         run: bash scripts/check-agent-verdict-criterion.sh
       # The cases run after the real check and plant each way the section can break,
@@ -1468,7 +1465,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-deleted-primitives.sh
       - name: Run deleted-primitives fixture tests
         run: bash scripts/tests/deleted-primitives/run-tests.sh
@@ -1480,7 +1477,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: bash scripts/check-handler-no-panic.sh
 
   no-panic-abort:
@@ -1490,7 +1487,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Self-test MUST run first: it plants panic = "abort" in a scratch
       # manifest (must be DETECTED) and confirms benign lines
       # (panic = "unwind" / the clippy lint panic = "deny" / a comment) are
@@ -1507,7 +1504,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Self-test MUST run first: it proves the detector flags the planted
       # non-canonical spellings and passes the benign controls listed in the
       # script header, before the real check runs on the tree. This gate is naming hygiene so
@@ -1524,7 +1521,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Self-test MUST run first: it plants an instance-wide AtomicBool saga
       # guard + a fake FFI saga export (must FAIL), correct per-set gating
       # (must PASS), and a no-gating-at-all supervisor (must FAIL) — proving
@@ -1541,12 +1538,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      - run: pip install tree-sitter tree-sitter-rust
+      - run: pip install --require-hashes -r .github/requirements/gates.txt
       - run: python3.12 scripts/check-bridge-instance-lifecycle.py
 
   wasm-protocol:
@@ -1556,7 +1553,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -1583,7 +1580,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: node
@@ -1600,13 +1597,21 @@ jobs:
           shared-key: wasm32
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      # Pin wasm-pack to a specific version for reproducibility (via the same
-      # taiki-e/install-action the nextest job uses), instead of the unpinned
-      # `curl … | sh` installer that always pulls latest.
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+      # wasm-pack downloads wasm-bindgen from GitHub unchecked unless PATH holds the
+      # version Cargo.lock names, and wasm-opt unless PATH holds one
+      # (src/install/mod.rs:55-90 and src/wasm_opt.rs at 0.14.0). taiki-e checks both
+      # binaries against its manifest's SHA-256 and pinned-tool checks wasm-opt, so
+      # wasm-pack downloads nothing. Check `verified-download` of
+      # scripts/tests/ci-gate/ci_gate_selftest.py holds every wasm-pack install to this.
+      - name: Install wasm-pack and wasm-bindgen
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: wasm-pack@0.14.0
+          fallback: none
+          tool: wasm-pack@0.14.0,wasm-bindgen@0.2.114
+      - name: Install wasm-opt
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: wasm-opt
       # Runs the `#[wasm_bindgen_test]` cases under Node — the real wasm32
       # execution the `wasm-protocol` build gate only compiles. Covers the
       # cross-target determinism KAT wasm entries, the error-mapping `JsValue`
@@ -1621,7 +1626,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
         with:
           components: rustfmt
@@ -1687,7 +1692,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
@@ -1955,7 +1960,7 @@ jobs:
             sudo rm -rf /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -1966,13 +1971,16 @@ jobs:
           shared-key: workspace-debug
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # One leg runs the check: it reads ci.yml and the lockfile, which every leg
       # shares, so a second run would only repeat its five `cargo tree` calls.
       - name: Check the shards cover every member once under canonical features
         if: matrix.leg == 'testing'
         run: |
-          python3 -m pip install --quiet 'pyyaml>=6,<7'
+          python3 -m pip install --quiet --require-hashes -r .github/requirements/pyyaml.txt
           python3 scripts/check-test-shard-features.py --self-test
           python3 scripts/check-test-shard-features.py
       - name: Put libpython on the loader path
@@ -2027,7 +2035,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2038,7 +2046,10 @@ jobs:
           shared-key: workspace-debug
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - name: Put libpython on the loader path
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -2140,7 +2151,7 @@ jobs:
       matrix:
         group: ["transport-local", "transport-network", "transport-push", "transport-blob", "node-relay", "platform-testing", "sqlite-without-memory-management"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2159,7 +2170,10 @@ jobs:
           shared-key: optional-features
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - name: Run transport tests under combined and local-cache
         if: matrix.group == 'transport-local'
         run: |
@@ -2426,7 +2440,7 @@ jobs:
       matrix:
         leg: ["transport-local", "transport-network", "platform"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2437,7 +2451,10 @@ jobs:
           shared-key: apple-transport-platform
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # The comments on the scp-transport commands in job
       # rust-test-optional-features say what each one selects and why each
       # filter carries `--no-tests=fail`.
@@ -2501,8 +2518,11 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2605,7 +2625,7 @@ jobs:
             aarch64|arm64) NAPI_PKG="@limn-works/scp-ts-napi-linux-arm64-gnu" ;;
             *) echo "Unsupported arch: $ARCH"; exit 1 ;;
           esac
-          (cd bindings/typescript && bun install)
+          (cd bindings/typescript && bun install --frozen-lockfile)
           PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
           mkdir -p "$PKG_DIR"
           cp target/debug/libscp_ffi_napi.so "$PKG_DIR/index.node"
@@ -2664,8 +2684,11 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2805,8 +2828,11 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -2953,7 +2979,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -2993,7 +3019,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -3045,7 +3071,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # cargo-deny comes from its upstream release binary, which taiki-e/install-action
       # checks against the sha256 its manifest records, instead of from
       # `EmbarkStudios/cargo-deny-action`. That action is a Docker container action, so
@@ -3061,8 +3087,9 @@ jobs:
       # did. cargo-deny's `cargo metadata` runs on the pin the toolchain step below
       # installs, as every other Rust job does. To move the version, change it here;
       # install-action fails on a version its manifest does not list.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
+          fallback: none
           tool: cargo-deny@0.20.2
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
@@ -3123,11 +3150,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The comment on rust-deny's install step says why cargo-deny comes from this action
       # and why 0.20.2. Move both versions together.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
+          fallback: none
           tool: cargo-deny@0.20.2
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-toolchain
@@ -3154,7 +3182,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       - name: Seed the template's lockfile from the root lockfile
@@ -3236,7 +3264,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The `docker-container` driver starts buildkit from an image, which
       # setup-buildx-action pulls from Docker Hub as `moby/buildkit:buildx-stable-1`
       # unless told otherwise; on 2026-10-09 that pull timed out at auth.docker.io and
@@ -3245,18 +3273,20 @@ jobs:
       # written. The `docker` driver would pull no image, but it cannot export a cache to
       # a registry, which job `docker-image-cache` needs, and both jobs keep one driver
       # so the cache one writes is the cache the other reads. The `Dockerfile`'s `FROM`
-      # lines name the same mirror for the same reason.
-      - uses: docker/setup-buildx-action@v3
+      # lines name the same mirror for the same reason. The image is named by digest:
+      # in job `docker-image-cache` this container exports the cache with the GHCR
+      # token login-action stores, so whoever moved the tag would hold that token.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       # `continue-on-error` so a failed login cannot fail the build check.
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         continue-on-error: true
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: false
@@ -3288,17 +3318,17 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Job `docker-image`'s copy of this step says why buildkit comes from the mirror.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-      - uses: docker/login-action@v3
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_CACHE_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: false
@@ -3456,7 +3486,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -3467,7 +3497,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin
+          pip install --require-hashes -r .github/requirements/maturin.txt
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -3498,7 +3528,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the PyO3 module a run with the same inputs built
         id: artifact-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
@@ -3525,7 +3555,7 @@ jobs:
           # DHT nullifier behind `testing`; the functional test harness opts in).
           maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # `[tool.maturin]` in bindings/python/pyproject.toml sets
           # `python-source = "."` and `module-name = "scp_sdk._scp_core"`, so
@@ -3542,7 +3572,7 @@ jobs:
           if-no-files-found: error
       - name: Save the PyO3 module under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
@@ -3575,7 +3605,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -3603,7 +3633,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the NAPI addon a run with the same inputs built
         id: artifact-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
@@ -3630,7 +3660,7 @@ jobs:
           # `scp-core/testing`, so this one flag is the set both consumers spelled.
           cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing
       - name: Upload NAPI native addon
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: napi-addon-linux
           path: target/ci-bridge/libscp_ffi_napi.so
@@ -3638,7 +3668,7 @@ jobs:
           if-no-files-found: error
       - name: Save the NAPI addon under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
@@ -3669,7 +3699,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # `build-xcframework.sh` runs cargo, `xcodebuild -create-xcframework` and `lipo`,
       # and compiles no Swift. No macOS job installs a Swift toolchain: the two
       # consumers that run `swift build` use the one the runner image ships, and each
@@ -3700,7 +3730,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the XCFramework a run with the same inputs built
         id: artifact-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             bindings/swift/ScpFFI.xcframework
@@ -3758,7 +3788,7 @@ jobs:
             fi
           done
       - name: Upload XCFramework and generated bindings
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # Three outputs, all under bindings/swift, which upload-artifact takes as
           # the artifact root: the binary target Package.swift names by path, the C
@@ -3777,7 +3807,7 @@ jobs:
           if-no-files-found: error
       - name: Save the XCFramework under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             bindings/swift/ScpFFI.xcframework
@@ -3800,7 +3830,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -3811,7 +3841,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin
+          pip install --require-hashes -r .github/requirements/maturin.txt
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -3841,7 +3871,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the PyO3 module a run with the same inputs built
         id: artifact-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
@@ -3861,7 +3891,7 @@ jobs:
           cd bindings/python
           maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pyo3-module-macos
           path: bindings/python/scp_sdk/_scp_core*.so
@@ -3869,7 +3899,7 @@ jobs:
           if-no-files-found: error
       - name: Save the PyO3 module under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
@@ -3885,14 +3915,13 @@ jobs:
       run:
         working-directory: bindings/python
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      # ruff pinned for reproducible CI (see the pyi-generated job above for
-      # rationale). Bump deliberately in its own PR.
-      - run: pip install ruff==0.15.4
+      # ruff.in says why ruff is pinned.
+      - run: pip install --require-hashes -r .github/requirements/ruff.txt
       - run: ruff format --check .
       - run: ruff check .
       # H14 / M16: enforce `is not None` over falsy checks on Optional
@@ -3937,13 +3966,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
       - name: Download PyO3 native module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pyo3-module-linux
           path: bindings/python/scp_sdk
@@ -3951,7 +3980,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio mypy==1.20.2 'cryptography>=42'
+          pip install --require-hashes -r .github/requirements/python-test.txt
       # THE DEFECT THIS CLOSES: every real-FFI test module under bindings/python/tests
       # skips itself when the extension is absent, and so does the `scp` fixture in
       # bindings/python/tests/conftest.py, which skips a test only when `SCP(...)`
@@ -4052,7 +4081,7 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # No runner image caches CPython 3.10; pinned-tool installs the package
       # actions/setup-python would download, after checking its digest.
       - uses: ./.github/actions/pinned-tool
@@ -4071,7 +4100,7 @@ jobs:
           save-if: false
       - uses: ./.github/actions/cargo-fetch
       - name: Install maturin
-        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
+        run: python3.12 -m pip install --require-hashes -r .github/requirements/maturin.txt
       # No --features, no --manifest-path and no --release: maturin reads the
       # features and the manifest from the `[tool.maturin]` table of
       # bindings/python/pyproject.toml and builds the dev profile.
@@ -4144,12 +4173,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/pinned-tool
         with:
           tool: bun
       - name: Download NAPI native addon
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           # Into the directory the wiring step below reads, so that step keeps its
           # one source of truth for the cdylib's path.
@@ -4157,7 +4186,7 @@ jobs:
           path: target/ci-bridge
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Wire NAPI addon into node_modules
         run: |
           # Determine the platform-specific package name and library filename
@@ -4269,7 +4298,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/pinned-tool
         with:
           tool: bun
@@ -4281,16 +4310,24 @@ jobs:
           shared-key: wasm32
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
-      # the --release-only build guard depends on the shipped wasm being a
-      # release build (ADR-057 Prereq-4).
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+      # wasm-pack downloads wasm-bindgen from GitHub unchecked unless PATH holds the
+      # version Cargo.lock names, and wasm-opt unless PATH holds one
+      # (src/install/mod.rs:55-90 and src/wasm_opt.rs at 0.14.0). taiki-e checks both
+      # binaries against its manifest's SHA-256 and pinned-tool checks wasm-opt, so
+      # wasm-pack downloads nothing. Check `verified-download` of
+      # scripts/tests/ci-gate/ci_gate_selftest.py holds every wasm-pack install to this.
+      - name: Install wasm-pack and wasm-bindgen
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: wasm-pack@0.14.0
+          fallback: none
+          tool: wasm-pack@0.14.0,wasm-bindgen@0.2.114
+      - name: Install wasm-opt
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: wasm-opt
       - name: Install dependencies
         working-directory: bindings/typescript-wasm
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Build (wasm-pack release + tsup + wasm asset copy)
         working-directory: bindings/typescript-wasm
         run: bun run build
@@ -4345,7 +4382,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/pinned-tool
         with:
           tool: bun
@@ -4357,20 +4394,31 @@ jobs:
           shared-key: wasm32
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+      # wasm-pack downloads wasm-bindgen from GitHub unchecked unless PATH holds the
+      # version Cargo.lock names, and wasm-opt unless PATH holds one
+      # (src/install/mod.rs:55-90 and src/wasm_opt.rs at 0.14.0). taiki-e checks both
+      # binaries against its manifest's SHA-256 and pinned-tool checks wasm-opt, so
+      # wasm-pack downloads nothing. Check `verified-download` of
+      # scripts/tests/ci-gate/ci_gate_selftest.py holds every wasm-pack install to this.
+      - name: Install wasm-pack and wasm-bindgen
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: wasm-pack@0.14.0
+          fallback: none
+          tool: wasm-pack@0.14.0,wasm-bindgen@0.2.114
+      - name: Install wasm-opt
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: wasm-opt
       # Build the local wasm SDK package so the scaffold's file: dependency
       # resolves against real, built dist/ (types + ESM + the .wasm sibling).
       - name: Build @limn-works/scp-ts-wasm (dependency)
         working-directory: bindings/typescript-wasm
         run: |
-          bun install
+          bun install --frozen-lockfile
           bun run build
       - name: Install scaffold dependencies
         working-directory: scaffolds/typescript-web
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Check + lint + build
         working-directory: scaffolds/typescript-web
         run: |
@@ -4408,7 +4456,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: java
@@ -4418,7 +4466,7 @@ jobs:
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true
       # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
@@ -4631,7 +4679,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -4661,7 +4709,7 @@ jobs:
       # over the cdylib and so decides the bindings this cache holds.
       - name: Restore the UniFFI cdylib and Kotlin bindings a run with the same inputs built
         id: artifact-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             target/debug/libscp_ffi_uniffi.so
@@ -4719,7 +4767,7 @@ jobs:
             fi
           done
       - name: Upload UniFFI cdylib and Kotlin bindings
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # The paths share no directory below the workspace, so upload-artifact takes
           # the workspace as the artifact root and each consumer restores them by
@@ -4732,7 +4780,7 @@ jobs:
           if-no-files-found: error
       - name: Save the UniFFI cdylib and Kotlin bindings under their input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             target/debug/libscp_ffi_uniffi.so
@@ -4777,7 +4825,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: java
@@ -4791,7 +4839,7 @@ jobs:
       # restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to the
       # paths the producer wrote them at. A missing artifact fails this step.
       - name: Download UniFFI cdylib and Kotlin bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: uniffi-kotlin-linux
           path: .
@@ -4814,7 +4862,7 @@ jobs:
       # installed before it.
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true
       - name: Run tests
@@ -4837,6 +4885,18 @@ jobs:
           # would otherwise rebuild the crate, so these tests compile against the
           # bindings uniffi-cdylib-linux uploads and load the cdylib it uploads.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
+      # release.yml's publish-maven step builds these four jars, and the Android javadoc
+      # jar resolves Dokka 1.4.32 through AGP, which no other task here resolves. Gradle
+      # checks every dependency they resolve against gradle/verification-metadata.xml,
+      # so a missing checksum fails here on the pull request instead of at publish.
+      - name: Build the javadoc and sources jars the release publishes
+        working-directory: bindings/kotlin
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          ./gradlew :scp-kt:javadocJar :scp-kt:sourcesJar
+          :scp-kt-android:javaDocReleaseJar :scp-kt-android:releaseSourcesJar
+          -Pscp.uniffi.prebuiltBindings=true
       # Gradle prints no test totals, so a change that moved this suite between jobs or
       # artifacts and lost tests would pass unseen. This step sums the JUnit XML each
       # test task wrote and prints one line per task, which a reviewer compares between
@@ -4926,7 +4986,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: java
@@ -4966,7 +5026,7 @@ jobs:
       # The artifact root is the workspace (see the upload in uniffi-cdylib-linux). This
       # job reads only the generated `scp.kt`; it builds its own Android cdylib below.
       - name: Download the UniFFI Kotlin bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: uniffi-kotlin-linux
           path: .
@@ -5003,7 +5063,7 @@ jobs:
             echo "::error::src/main/jniLibs exists; the testing cdylib must reach no main source set"
             exit 1
           fi
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true
       # The emulator cold-boots: `-no-snapshot` neither loads nor saves a snapshot, and
@@ -5113,7 +5173,7 @@ jobs:
       run:
         working-directory: bindings/swift
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install SwiftLint and SwiftFormat
         # HOMEBREW_NO_AUTO_UPDATE prevents brew from auto-upgrading
         # formulae between CI runs, reducing version drift risk.
@@ -5143,14 +5203,14 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The Swift toolchain is the one the runner image ships, not a pinned download:
       # Swift 6.2, the minimum Package.swift declares, is not tested. This step records
       # which toolchain the build and tests below ran on.
       - name: Print Swift toolchain version
         run: swift --version
       - name: Download XCFramework and generated bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: swift-xcframework-dev
           path: bindings/swift
@@ -5173,7 +5233,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # rust-cache runs `rustc -vV` in the checkout root, where the stable pin governs,
       # so the first step installs that pin (minimal, no extras) for rust-cache alone.
       # The second installs the nightly `fuzz/rust-toolchain.toml` names and sets it as
@@ -5207,7 +5267,10 @@ jobs:
       # test by its exact path with `--no-tests=fail`, so renaming, deleting,
       # or cfg-gating it selects nothing and fails the step, whatever other
       # library tests the crate gains.
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       - name: Run fuzz crate library tests
         working-directory: fuzz
         run: cargo nextest run --no-tests=fail --lib -E 'test(=tests::arb_message_type_discriminants_match_production)'
@@ -5231,7 +5294,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
         # on ~10 minutes of toolchain setup and native builds below.
@@ -5266,12 +5329,12 @@ jobs:
         with:
           tool: bun
       - name: Download PyO3 native module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pyo3-module-linux
           path: bindings/python/scp_sdk
       - name: Download NAPI native addon
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: napi-addon-linux
           path: target/ci-bridge
@@ -5279,7 +5342,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio
+          pip install --require-hashes -r .github/requirements/python-test.txt
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
       - name: Assert the downloaded extension imports, constructs, and carries the gated methods
@@ -5302,7 +5365,7 @@ jobs:
           "
       - name: Install TypeScript workspace deps
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -5409,7 +5472,7 @@ jobs:
     env:
       GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -5418,11 +5481,11 @@ jobs:
         with:
           tool: java
           version: "17"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true
       - name: Download PyO3 native module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pyo3-module-linux
           path: bindings/python/scp_sdk
@@ -5430,7 +5493,7 @@ jobs:
       # `.` restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to
       # the paths the producer wrote them at. A missing artifact fails this step.
       - name: Download UniFFI cdylib and Kotlin bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: uniffi-kotlin-linux
           path: .
@@ -5438,7 +5501,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio
+          pip install --require-hashes -r .github/requirements/python-test.txt
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
       - name: Assert the downloaded extension imports, constructs, and carries the gated methods
@@ -5530,7 +5593,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
@@ -5539,12 +5602,12 @@ jobs:
       - name: Print Swift toolchain version
         run: swift --version
       - name: Download PyO3 native module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pyo3-module-macos
           path: bindings/python/scp_sdk
       - name: Download XCFramework and generated bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: swift-xcframework-dev
           path: bindings/swift
@@ -5552,7 +5615,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio
+          pip install --require-hashes -r .github/requirements/python-test.txt
       # See the step of this name in job python-test for the skip-on-absence defect it
       # closes.
       - name: Assert the downloaded extension imports, constructs, and carries the gated methods
@@ -5628,12 +5691,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
-      - run: pip install 'pyyaml>=6,<7'
+      - run: pip install --require-hashes -r .github/requirements/pyyaml.txt
       - run: bash scripts/tests/ci-gate/run-tests.sh --group docs
 
   ci-workflow-selftest:
@@ -5643,14 +5706,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
       # one required status check, matching a pytest pin in sdk-coverage.
-      - run: pip install 'pyyaml>=6,<7'
+      - run: pip install --require-hashes -r .github/requirements/pyyaml.txt
       - run: bash scripts/tests/ci-gate/run-tests.sh --group rest
       # A ci-gate assertion pins every release.yml job that uploads a
       # `-signed` artifact — sign-apple, sign-windows and sign-maven — to
@@ -5770,14 +5833,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
           version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
       # one required status check, matching a pytest pin in sdk-coverage.
-      - run: pip install 'pyyaml>=6,<7'
+      - run: pip install --require-hashes -r .github/requirements/pyyaml.txt
       - name: Check job results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}

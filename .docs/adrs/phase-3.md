@@ -59,7 +59,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 - **Module:** `crates/scp-ffi/src/`
 - **Build output:** Python extension module `_scp_core` (imported by the `scp_sdk` Python package)
 - **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. Bridge functions use `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the GIL.
-- **Platform wheels:** maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.
+- **Platform wheels:** maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions, which run maturin directly (no `maturin-action`, which downloads tools unchecked).
 
 ### Dependencies
 

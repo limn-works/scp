@@ -1,0 +1,9 @@
+# Compiled into ruff.txt beside this file with every artifact's SHA-256, and CI installs
+# that file with `pip install --require-hashes`, so pip installs only the files hashed
+# there. Regenerate it after any edit here:
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#     .github/requirements/ruff.in -o .github/requirements/ruff.txt
+# An unpinned ruff tracks upstream, and a release that restyles code (0.16 reformats
+# Markdown code blocks) fails the lint gate repository-wide with no local change. Bump it
+# in its own PR, together with the ruff line in gates.in.
+ruff==0.15.4

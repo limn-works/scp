@@ -35,8 +35,8 @@
 # compiler to resolve), after `Swatinem/rust-cache` (which restores `~/.cargo/registry`, so a
 # warm fetch downloads only what changed, and which hashes every `CARGO*` variable its step
 # sees into its cache key, so `CARGO_NET_OFFLINE` must not exist yet when it runs), and
-# before every other cargo command. A `cargo install` runs before it, because installing a
-# tool from crates.io needs the network. `scripts/tests/ci-gate/ci_gate_selftest.py` check
+# before every other cargo command. A `cargo install` runs before it, because building a
+# tool from its pinned source downloads the crates that source's Cargo.lock names. `scripts/tests/ci-gate/ci_gate_selftest.py` check
 # `offline-cargo` holds every workflow job to that order.
 #
 # FAILURE IS TYPED, NEVER DEGRADED. Each case below exits non-zero with a `::error::` line

@@ -9,13 +9,12 @@
 # build prove that, by comparing the compiler this image actually resolved against the
 # channel in the copied-in file and failing the build when they differ.
 #
-# WHY THIS TAG FLOATS WHILE `.mise.toml` PINS EVERY OTHER TOOL EXACTLY. The tag still
-# selects things: a Debian package baseline, a rustup version, an image digest that moves
-# under it. It no longer selects the compiler that compiles this workspace, which is the
-# only property a pinned tag bought and the only one that broke the merge queue. Pinning
+# WHY THE TAG NAMES NO RUST VERSION. The image selects a Debian package baseline and a
+# rustup version, not the compiler that compiles this workspace. Pinning
 # `rust:1.98.0-slim-bookworm` would put a Rust version back into this file and reopen the
-# two-declarations defect; pinning a digest would put a second thing to bump beside the
-# pin. Neither buys back a property the copied-in file does not already give.
+# two-declarations defect. The digest after the tag pins the image bytes (WHY BOTH BASE
+# IMAGES COME FROM mirror.gcr.io, below); moving it moves the Debian baseline and rustup,
+# never the compiler.
 #
 # Installing the pin's cross-compilation targets costs bandwidth this image never links
 # against, and it buys the property that the container and a developer's shell resolve one
@@ -53,9 +52,13 @@ FROM cargo-chef-${TARGETARCH} AS cargo-chef
 # and rate-limited per runner IP; on 2026-10-09 CI jobs failed on that limit (a
 # `429 Too Many Requests`, and a timeout at auth.docker.io) before building anything. A
 # local `docker build` reads the mirror the same way and needs no Docker Hub account.
+# Each is named by digest, so BuildKit checks what it pulls against the digest and a
+# moved tag cannot change the base; to move one, resolve the tag's new index digest.
+# Check `verified-download` in scripts/tests/ci-gate/ci_gate_selftest.py fails a `FROM`
+# without a digest.
 #
 # Stage 1: Chef — install the pinned toolchain and cargo-chef
-FROM mirror.gcr.io/library/rust:slim-bookworm AS chef
+FROM mirror.gcr.io/library/rust:slim-bookworm@sha256:24707e70a4f1e23d9a7b25202ec43126d28a52294b96aad5c670df1fd1f1d400 AS chef
 WORKDIR /app
 # Build-script dependencies of `scp-relay` and `scp-node` that the slim image omits:
 # `aws-lc-sys` runs cmake, `ring` runs perl, and `libsqlite3-sys` compiles SQLCipher,
@@ -113,7 +116,7 @@ RUN cargo build --release --offline -p scp-relay -p scp-node
 # Both binaries link `libcrypto.so.3` dynamically, because `libsqlite3-sys` builds
 # SQLCipher against OpenSSL. `libssl3` is named explicitly rather than left to arrive as
 # a dependency of `ca-certificates`, which is what supplied it before.
-FROM mirror.gcr.io/library/debian:bookworm-slim AS runtime
+FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*

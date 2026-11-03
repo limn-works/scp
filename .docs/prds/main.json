@@ -2546,7 +2546,7 @@
         "module": "scp-ffi/pyo3/",
         "build_output": "Python extension module `_scp_core`",
         "async_runtime": "A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by PyO3's native async machinery.",
-        "platform_wheels": "maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.",
+        "platform_wheels": "maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions, which run maturin directly (no `maturin-action`, which downloads tools unchecked).",
         "libraries": [
           "pyo3 (0.22+)",
           "maturin (build tool)"
@@ -7535,7 +7535,7 @@
       "actionItems": [
         "Create `.github/workflows/build-matrix.yml` with cross-platform build jobs for all 3 OS targets and architectures",
         "Create `.github/workflows/release.yml` with the 7-step release workflow: conformance gate, changelog check, version tag, build, sign, publish, GitHub Release",
-        "Configure maturin-action for Python wheel builds (manylinux_2_28, macOS universal2, Windows)",
+        "Configure maturin Python wheel builds, run directly rather than through maturin-action (manylinux_2_28, macOS universal2, Windows)",
         "Configure napi-rs build for npm native addon",
         "Configure XCFramework build for Swift Package Manager",
         "Configure Maven publishing for Kotlin and Java",

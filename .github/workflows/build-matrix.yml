@@ -54,10 +54,10 @@ jobs:
             runner: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Cache Cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -134,7 +134,7 @@ jobs:
           done
 
       - name: Upload Rust artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rust-${{ matrix.target }}
           path: |
@@ -196,7 +196,7 @@ jobs:
             runner: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Both legs build on the runner, so each interpreter `-i` names below must
       # exist there. No runner image
@@ -223,9 +223,6 @@ jobs:
         with:
           tool: nasm
 
-      # maturin-action uses a maturin already in the tool cache at `maturin-version`
-      # (src/index.ts:568-576) and downloads one unchecked otherwise; pinned-tool puts
-      # the checked binary there.
       - name: Install maturin
         uses: ./.github/actions/pinned-tool
         with:
@@ -238,25 +235,20 @@ jobs:
       # names, `macosx_11_0_universal2` in `.docs/standards/python.md`; 11.0 is the
       # first release that runs on arm64. rustc and the cc crate read it only when
       # they compile for an Apple target, so the Windows leg ignores it.
-      # `container: off` keeps maturin-action out of Docker (src/index.ts:1287-1295),
-      # where its script downloads maturin, rustup and uv unchecked
-      # (src/index.ts:711-725).
+      # rust-toolchain.toml lists both Apple targets universal2 joins, so the
+      # toolchain step already installed them.
       - name: Build wheel
-        uses: PyO3/maturin-action@v1
+        working-directory: bindings/python
+        shell: bash
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
-        with:
-          maturin-version: "1.16.0"
-          container: "off"
-          target: ${{ matrix.target }}
-          args: >-
-            --release
-            --out dist
-            -i python3.10 python3.11 python3.12 python3.13
-          working-directory: bindings/python
+          TARGET: ${{ matrix.target }}
+        run: >-
+          maturin build --release --out dist --target "$TARGET"
+          -i python3.10 python3.11 python3.12 python3.13
 
       - name: Upload Python wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-wheel-${{ matrix.target }}
           path: bindings/python/dist/*.whl
@@ -279,7 +271,9 @@ jobs:
   #     reports; CARGO_NET_OFFLINE keeps cargo from fetching any other.
   #   - The interpreters are the image's own /opt/python/cp3XX builds.
   # The aarch64 leg runs on an arm64 runner, so neither leg cross-compiles.
-  # Every mount but the workspace and the registry is read-only.
+  # Every mount but the workspace is read-only, the registry and the git checkouts
+  # included: the container's cargo writes its lock and cache bookkeeping under its
+  # own /root/.cargo, outside the mounts.
   # ---------------------------------------------------------------------------
   python-wheels-linux:
     name: Python wheel (${{ matrix.target }})
@@ -297,7 +291,7 @@ jobs:
             image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.31-1@sha256:724b504247662e1cf122590957c857211ec2d16b113ec134f92c570a2d01250f
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install maturin
         uses: ./.github/actions/pinned-tool
@@ -315,10 +309,10 @@ jobs:
         run: |
           for attempt in 1 2 3 4; do
             if docker pull "$IMAGE"; then exit 0; fi
-            echo "docker pull $IMAGE failed (attempt $attempt of 4)"
+            echo "pulling $IMAGE failed (attempt $attempt of 4)"
             [ "$attempt" = 4 ] || sleep $((attempt * 10))
           done
-          echo "::error::$IMAGE: docker pull failed on every attempt"
+          echo "::error::$IMAGE: every pull attempt failed"
           exit 1
 
       # IN_CONTAINER is the script the image runs; `docker run -e IN_CONTAINER` passes
@@ -349,15 +343,15 @@ jobs:
             -w /io/bindings/python \
             -v "$sysroot:/opt/rust:ro" \
             -v "$maturin:/usr/local/bin/maturin:ro" \
-            -v "$CARGO_HOME_ON_RUNNER/registry:/root/.cargo/registry" \
-            -v "$CARGO_HOME_ON_RUNNER/git:/root/.cargo/git" \
+            -v "$CARGO_HOME_ON_RUNNER/registry:/root/.cargo/registry:ro" \
+            -v "$CARGO_HOME_ON_RUNNER/git:/root/.cargo/git:ro" \
             --env-file "$RUNNER_TEMP/cargo.env" \
             -e IN_CONTAINER \
             "$IMAGE" \
             bash -euo pipefail -c "$IN_CONTAINER"
 
       - name: Upload Python wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-wheel-${{ matrix.target }}
           path: bindings/python/dist/*.whl
@@ -369,7 +363,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -383,16 +377,11 @@ jobs:
 
       # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: "1.16.0"
-          command: sdist
-          args: >-
-            --out dist
-          working-directory: bindings/python
+        working-directory: bindings/python
+        run: maturin sdist --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-sdist
           path: bindings/python/dist/*.tar.gz
@@ -428,10 +417,10 @@ jobs:
             npm-platform: win32-x64-msvc
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Cache Cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -474,7 +463,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/scp_ffi_napi.dll" napi-out/index.node
 
       - name: Upload NAPI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: napi-${{ matrix.target }}
           path: napi-out/index.node
@@ -490,7 +479,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -566,7 +555,7 @@ jobs:
             -output bindings/swift/ScpFFI.xcframework
 
       - name: Upload XCFramework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: swift-xcframework
           path: bindings/swift/ScpFFI.xcframework/
@@ -577,7 +566,7 @@ jobs:
         run: swift package generate-documentation --target SCP --output-path docs
 
       - name: Upload Swift docs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-swift
           path: bindings/swift/docs/
@@ -593,12 +582,12 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
       # this job has no setup-gradle, whose `validate-wrappers` does the same check.
       - name: Validate the Gradle wrapper jar
-        uses: gradle/actions/wrapper-validation@v4
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Setup Java
         uses: ./.github/actions/toolcache-setup
@@ -666,7 +655,7 @@ jobs:
         run: ./gradlew :scp-kt:jar
 
       - name: Upload Kotlin AAR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kotlin-aar
           path: |
@@ -702,7 +691,7 @@ jobs:
             lib-ext: dll
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -724,7 +713,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
 
       - name: Upload C ABI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cbindgen-${{ matrix.target }}
           path: |
@@ -750,7 +739,7 @@ jobs:
       - cbindgen
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-artifacts/
 
@@ -758,7 +747,7 @@ jobs:
         run: find release-artifacts/ -type f | sort
 
       - name: Upload combined release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: scp-release-bundle
           path: release-artifacts/

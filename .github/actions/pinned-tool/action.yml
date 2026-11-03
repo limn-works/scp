@@ -1,17 +1,25 @@
 name: Install a pinned tool from a checked archive
 description: >-
-  Downloads bun, NASM or maturin at the version install.py pins, refuses an archive whose
-  size or SHA-256 differs from the pin (retrying a bounded number of times), and adds the
-  tool to PATH. Check `verified-download` in scripts/tests/ci-gate/ci_gate_selftest.py
-  fails a workflow that installs these tools through an action that unpacks unchecked.
+  Downloads a tool, a bundle or a crate at the version install.py pins, refuses an archive
+  whose size or SHA-256 differs from the pin (retrying a bounded number of times), and
+  then adds the tool to PATH or names the checked file or crate source in output `path`.
+  Check `verified-download` in scripts/tests/ci-gate/ci_gate_selftest.py fails a workflow
+  that downloads through anything else.
 inputs:
   tool:
-    description: One of the tools install.py pins (bun, nasm, maturin).
+    description: >-
+      A key of install.py's PINS (bun, nasm, maturin, python3.10), BUNDLES (the CodeQL
+      bundles) or CRATES (cargo-fuzz, cargo-llvm-lines).
     required: true
+outputs:
+  path:
+    description: For a BUNDLES or CRATES tool, the checked file or the unpacked crate.
+    value: ${{ steps.install.outputs.path }}
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: install
+      shell: bash
       env:
         PINNED_TOOL: ${{ inputs.tool }}
       run: |

@@ -1,6 +1,5 @@
 node_modules/
 dist/
-bun.lock
 bun.lockb
 *.tsbuildinfo
 # wasm-pack output — generated into the source tree by `bun run build:wasm`
