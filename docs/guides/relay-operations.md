@@ -183,6 +183,24 @@ These only apply to `scp-node` (not `scp-relay`):
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
+| `SCP_NODE_BINDING` | (none) | The installed `NodeBinding`, as its RFC 8785 canonical JSON (spec 09 §9.6.3 step 4). Set together with `SCP_NODE_URL`, or leave both unset. Unset, the node keeps its node key and its QUERY responses carry no `node_proof`. At start the node refuses a binding whose `node_key` is not its own, whose `possession_sig` fails under its key, or whose `url_hash` is not the SHA-256 of `SCP_NODE_URL`, and exits 1. A value that is not UTF-8, or one variable set without the other, also exits 1. `--relay-only` and `--ephemeral` keep no node key and exit 1 when either variable is set. See "Binding a node" below. |
+| `SCP_NODE_URL` | (none) | The node's canonical URL, whose SHA-256 the binding's `url_hash` names. |
+
+### Binding a node
+
+A node signs a node proof on its QUERY responses only after its operator installs a `NodeBinding` for it (spec 09 §9.6.3 "How a node gets its key and its binding", §9.10.12). The four steps run locally, and none crosses the wire:
+
+1. **Key.** Start the node once from its storage directory. The first start draws the node key and stores it under `scp/node-key` in the node's encrypted storage (spec 17 §17.3); every later start reads the same key. The node never exports the private half.
+2. **Possession signature.** Stop the node and run, against the same storage directory:
+
+   ```bash
+   scp-node sign-binding --operator scp:<IDENTIFIER> --url <CANONICAL_URL> \
+       --key-state-head <HEX> --storage-path /var/lib/scp/node
+   ```
+
+   `--operator` is the operator's identifier in its canonical `scp:` text form, and `--key-state-head` is 64 hex characters. `--storage-path` defaults to `SCP_STORAGE_PATH`. The command prints `{"node_key":"…","possession_sig":"…","url_hash":"…"}` and exits 0. Storage that holds no node key exits 1, because only a node start draws one. No wire message makes the node sign.
+3. **Operator signature.** The operator signs `operator_sig` over the same preimage P under its `#active` key at `key_state_head`, and assembles the six-field `NodeBinding` (`operator`, `node_key`, `url_hash`, `key_state_head`, `possession_sig`, `operator_sig`) as RFC 8785 canonical JSON. The SCP SDKs do not yet export an operation that signs `operator_sig`, because their identities are not yet KERI identifiers with a key-event log.
+4. **Installation.** Start the node with `SCP_NODE_BINDING` set to the binding's canonical JSON and `SCP_NODE_URL` set to the URL from step 2. An SDK-started node takes the same two values in `NodeStartConfig.node_binding` as `{"kind": "installed", "binding_json": …, "url": …}`. The node checks `node_key`, `possession_sig` and `url_hash` and refuses to start when any check fails; it does not check `operator_sig`, which each party checks against the operator's key-event log.
 
 ### CLI flags
 
