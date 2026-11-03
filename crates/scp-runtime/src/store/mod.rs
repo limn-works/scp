@@ -23,6 +23,7 @@ pub mod context;
 pub mod economy;
 pub mod event_log;
 pub mod identity;
+pub mod node_key;
 pub mod nonce;
 pub mod outlets;
 pub mod push;
