@@ -8,6 +8,7 @@
 **Amended 2026-10-13 (challenger grading):** the Class S list gains two journal and governance entries, the challenger attempt ledger and the live capability requirement list, and the `IdentityActor` rejection names `ChallengerLedgerActor` as the second scoped per-identity actor.
 **Amended 2026-10-20 (participation signing key):** Decision 7a permits the actor to hold the participation signing key of `07-trust-validation-and-capabilities.md` §7.3.2.1 in `Zeroizing` memory within one actor turn, and Decision 4 names the `scp_wrapping_key` (`0xFF01`) MLS leaf key as the key the participation seed is re-wrapped to.
 **Amended 2026-11-02 (Decision 17, node-backed identity):** each local identity gets one `IdentityActor` beside its `KeyPackageStoreActor`, which serializes every act on that identity's key-event log; `SupervisorHandle::live()` refuses a dropped Supervisor and one whose shutdown has begun at the entry of every identity dispatch; and each bridge's `CoreFields` builds its Supervisor at construction, so the `OnceLock` Supervisor slot and `with_supervisor` are deleted. Decision 2's hierarchy line and the rejected alternative "Introduce an `IdentityActor` per local identity" each gain one sentence that points at Decision 17.
+**Amended 2026-11-03 (Decision 14, benchmark harness deleted):** the `perf_baseline` test is deleted. No CI job ran it, and without `SCP_PERF_GATE=1` it measured six operations, wrote a git-ignored JSON file and asserted nothing. Decision 14 now names no harness and no merge gate. Decision 13 and §Consequences no longer name the test.
 **Related:** ADR-034 (WASM Constraints), ADR-046 (Bridge Parity Harness), ADR-047 (Bridge Symmetry Enforcement), ADR-048 (SCP Multi-Instance), ADR-055 (WASM bridge removal). Plan: `~/.claude/plans/generic-moseying-lightning.md`.
 
 ## Context
@@ -365,11 +366,13 @@ Every commit that deletes or splits a serializing primitive needs a Shuttle/stre
 1. Correctness: no deadlock, no stuck mailboxes, sequential equivalence.
 2. No other lock now shows >2× the prior acquire count (no whack-a-mole contention shift — see Decision 12's OpenSSL evidence).
 
-Generalizes the OpenMLS shared-storage gate: any commit that deletes the 5 `std::sync::Mutex` fields off `NodeMlsFactory` or splits the `pending_joins` global slot into per-actor scratchpads triggers this gate. Coverage path: existing `shuttle_actor` test + persistence-ordering tests + new acquire-count threshold instrumentation. The instrumentation lands in commit 13 alongside the `perf_baseline` test.
+Generalizes the OpenMLS shared-storage gate: any commit that deletes the 5 `std::sync::Mutex` fields off `NodeMlsFactory` or splits the `pending_joins` global slot into per-actor scratchpads triggers this gate. Coverage path: existing `shuttle_actor` test + persistence-ordering tests + new acquire-count threshold instrumentation. The instrumentation landed in commit 13.
 
 ### 14. Performance regression as a rollback trigger
 
-Pre-merge baseline + post-merge measurement on six operations at N=1/4/16:
+Amended 2026-11-03. No test or CI job measures the dispatch path, and no merge waits on a measurement. The `perf_baseline` harness this decision named, which landed in commit 13 of the ADR-049 ladder, is deleted.
+
+A pull request that reports a measurement of the actor or Supervisor dispatch path measures these six operations at N=1, 4 and 16 concurrent contexts, before and after the change, on one machine:
 
 - `handshake` (welcome + keypackage + add_member)
 - `send_message`
@@ -378,9 +381,7 @@ Pre-merge baseline + post-merge measurement on six operations at N=1/4/16:
 - `broadcast_publish`
 - `broadcast_subscribe`
 
-A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline + post-merge measurement is implemented in `cargo test -p scp-testing --test perf_baseline`, landing in commit 13 of the ADR-049 ladder (Phase 4 of the post-review-round-1 plan).
-
-Mandatory coverage: BOTH workload classes (crypto-dominated AND protocol-overhead-dominated) AND BOTH read fast path AND write slow path. The handshake path is crypto-dominated; the broadcast publish/subscribe path is overhead-dominated; that pair stresses both classes.
+A regression above 15% on any (operation, N) pair blocks that pull request. The six operations cover both workload classes: cryptography dominates `handshake`, and protocol overhead dominates `broadcast_publish` and `broadcast_subscribe`. Together they cover the read fast path and the write slow path.
 
 ### 15. PR-7 crypto-state move is one atomic PR, not per-domain
 
@@ -519,7 +520,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
 
 **Dependencies.** Adds `shuttle` (model checker, dev-only) to the dev-dependencies. (An earlier draft also added `tree-sitter-rust` for the source-text scanner; that scanner was dropped — see "Why no scanner" in §5 — so no AST-check dependency is introduced.)
 
-**Performance.** Baseline measurement is mandatory per Decision 14 — pre-merge baseline + post-merge measurement on six operations (`handshake`, `send_message`, `deliver_incoming`, `governance_propose`, `broadcast_publish`, `broadcast_subscribe`) at N=1/4/16. A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline harness lands as `cargo test -p scp-testing --test perf_baseline` in commit 13.
+**Performance.** Decision 14, as amended 2026-11-03, names six operations at N=1/4/16 and a 15% bound for any pull request that reports a measurement of the dispatch path. No test or CI job measures them.
 
 Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. The lock-free read invariant (Decision 12) keeps the hot read paths off the `RwLock::read` cost cliff documented in OpenSSL #30659 (~67 cycles per uncontended acquire vs ~17 for `__atomic_load_n`).
 
