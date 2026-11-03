@@ -26,9 +26,9 @@
 //! was `Current` at `signing_key_state_head`. Both read the key from the
 //! governor's validated key-event log, never from a key the caller names.
 
-use scp_crypto::p256::{P256Error, SIGNATURE_LEN, verify_prehash_strict};
+use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{DidError, Identifier, NodeEntryUrlError, NodeId, NodeUrl};
-use scp_kel::{NodeKeyError, ResolvedState, node_list_routing_id};
+use scp_kel::{KeyStateSource, NodeKeyError, node_list_routing_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -105,8 +105,8 @@ impl VerifiedNodeListEntry {
     /// Checks that `binding.url_hash` is the SHA-256 of `url`, so a binding
     /// signed for one URL cannot be listed under another, then verifies the
     /// binding under the operator's `#active` at `binding.key_state_head` on
-    /// `operator`, the key state the verifier's resolution of `binding.operator`
-    /// accepted (see
+    /// `operator`, the key state of `binding.operator` a party's resolution
+    /// accepted or a validating store retains (see
     /// [`VerifiedNodeBinding::verify`]).
     ///
     /// # Errors
@@ -115,7 +115,7 @@ impl VerifiedNodeListEntry {
     /// [`NodeListEntryError::Binding`].
     pub fn verify(
         entry: NodeListEntry,
-        operator: &ResolvedState,
+        operator: &impl KeyStateSource,
     ) -> Result<Self, NodeListEntryError> {
         if node_url_hash(&entry.url) != entry.binding.url_hash {
             return Err(NodeListEntryError::UrlHashMismatch);
@@ -437,8 +437,8 @@ pub enum NodeListKeyClass {
     Attribution,
 }
 
-/// A [`NodeListRecord`] whose governor signature verified, with the class it
-/// verified under.
+/// A [`NodeListRecord`] whose governor signature verified, with the class and
+/// the governor key it verified under.
 ///
 /// [`Self::verify`] is the only constructor, and the type has no
 /// `Deserialize`. The entries are not verified here: each entry's operator
@@ -447,12 +447,16 @@ pub enum NodeListKeyClass {
 pub struct VerifiedNodeListRecord {
     record: NodeListRecord,
     class: NodeListKeyClass,
+    signing_key: P256PublicKey,
 }
 
 impl VerifiedNodeListRecord {
     /// Verifies `record`'s signature strictly under the governor key `class`
-    /// names, read from `governor`, the key state the verifier's resolution of
-    /// `record.governor` accepted: the `#active` at the chain's head for
+    /// names, read from `governor`, the key state of `record.governor`: the
+    /// [`ResolvedState`](scp_kel::ResolvedState) a party's resolution
+    /// accepted, or the [`RetainedChain`](scp_kel::RetainedChain) a validating
+    /// store holds (`03-identity.md` §3.10.10). The key is the `#active` at
+    /// the chain's head for
     /// [`NodeListKeyClass::Standing`], and the `#active` at
     /// `signing_key_state_head` for [`NodeListKeyClass::Attribution`].
     ///
@@ -465,7 +469,7 @@ impl VerifiedNodeListRecord {
     pub fn verify(
         record: NodeListRecord,
         class: NodeListKeyClass,
-        governor: &ResolvedState,
+        governor: &impl KeyStateSource,
     ) -> Result<Self, NodeListError> {
         let governor_active = match class {
             NodeListKeyClass::Standing => current_active(governor, &record.governor),
@@ -476,7 +480,11 @@ impl VerifiedNodeListRecord {
         .map_err(NodeListError::GovernorKey)?;
         verify_prehash_strict(&governor_active, &record.digest()?, &record.signature)
             .map_err(NodeListError::Signature)?;
-        Ok(Self { record, class })
+        Ok(Self {
+            record,
+            class,
+            signing_key: governor_active,
+        })
     }
 
     /// Borrows the record this value verified.
@@ -489,6 +497,13 @@ impl VerifiedNodeListRecord {
     #[must_use]
     pub const fn class(&self) -> NodeListKeyClass {
         self.class
+    }
+
+    /// The governor key the signature verified under: the `#active` that
+    /// [`Self::class`] names, read from the key state [`Self::verify`] took.
+    #[must_use]
+    pub const fn signing_key(&self) -> &P256PublicKey {
+        &self.signing_key
     }
 
     /// Returns the record this value verified, dropping the verified marker.
@@ -852,6 +867,18 @@ mod tests {
         assert_eq!(
             verdict(&by_new_key, NodeListKeyClass::Standing),
             Ok(NodeListKeyClass::Standing)
+        );
+        // Each verified value carries the key its class read.
+        let signer = |r: &NodeListRecord, class| {
+            VerifiedNodeListRecord::verify(r.clone(), class, &resolved).map(|v| *v.signing_key())
+        };
+        assert_eq!(
+            signer(&by_old_key, NodeListKeyClass::Attribution),
+            Ok(key(9).public_key())
+        );
+        assert_eq!(
+            signer(&by_new_key, NodeListKeyClass::Standing),
+            Ok(key(10).public_key())
         );
         assert_eq!(
             VerifiedNodeListRecord::verify(

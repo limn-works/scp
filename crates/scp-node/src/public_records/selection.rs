@@ -12,13 +12,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use scp_crypto::p256::P256PublicKey;
 use scp_did::{Identifier, KeyCondition, NodeId};
 use scp_kel::{
-    AcceptedChainHolder, EntryVerdict, EventKind, RoutingKind, ValidatedChain, key_state_at,
-    replay, routing_id, validate_entry,
+    AcceptedChainHolder, EntryVerdict, EventKind, RetainedChain, RoutingKind, ValidatedChain,
+    key_state_at, replay, routing_id, validate_entry,
 };
+use scp_protocol::crypto::anchored_key::AnchoredKeyError;
 use scp_protocol::node::{
-    ConflictStatement, NodeListRecord, ServiceRecordFrame, VerifiedNodeListEntry,
-    decode_conflict_frame, decode_key_event_frame, decode_node_list_frame,
-    decode_service_record_frame,
+    ConflictStatement, NodeListError, NodeListKeyClass, NodeListRecord, ServiceRecordFrame,
+    VerifiedNodeListEntry, VerifiedNodeListRecord, decode_conflict_frame, decode_key_event_frame,
+    decode_node_list_frame, decode_service_record_frame,
 };
 use scp_relay_client::code;
 use scp_transport::native::public_records::PublicRecordRefusal;
@@ -150,6 +151,13 @@ impl HeldLog {
     /// Every chain the holder holds, accepted and retained suffixes.
     pub(super) fn chains(&self) -> Vec<ValidatedChain> {
         self.holder.held().cloned().collect()
+    }
+
+    /// Every chain the holder retains under R9, as the store-held key state
+    /// admission and selection verify signatures under (`03-identity.md`
+    /// §3.10.10, §9.10.12).
+    pub(super) fn retained(&self) -> Vec<RetainedChain> {
+        self.holder.retained()
     }
 }
 
@@ -335,9 +343,10 @@ pub(super) fn decode_service_records(
 // scp:nls:
 // ---------------------------------------------------------------------------
 
-/// The governor's `#active` at `head` on a held chain carrying that event,
-/// and whether a held chain's current key state marks that key
-/// `Compromised` (§9.10.12, the `scp:nls:` row).
+/// The governor's `#active` a node-list record verified under, on a
+/// governor chain the node retains, and whether a held chain carrying the
+/// record's `signing_key_state_head` marks that key `Compromised` at its head
+/// (§9.10.12, the `scp:nls:` row).
 pub(super) struct SigningKey {
     /// The 33-byte key.
     pub(super) key: [u8; 33],
@@ -345,29 +354,74 @@ pub(super) struct SigningKey {
     pub(super) compromised: bool,
 }
 
-/// Resolves the key a node-list record's signature verifies under, from the
-/// governor chains the node holds; `None` where no held chain carries
-/// `signing_key_state_head`.
-pub(super) fn node_list_signing_key(
-    governor_chains: &[ValidatedChain],
-    signing_key_state_head: &[u8; 32],
-) -> Option<SigningKey> {
-    let key = governor_chains.iter().find_map(|chain| {
-        key_state_at(chain, signing_key_state_head)
-            .ok()
-            .map(|state| *state.active_key())
-    })?;
-    let compromised = governor_chains
-        .iter()
-        .filter(|chain| key_state_at(chain, signing_key_state_head).is_ok())
-        .any(|chain| {
-            replay(chain)
-                .key_state()
-                .keys
-                .iter()
-                .any(|entry| entry.key == key && entry.condition == KeyCondition::Compromised)
-        });
-    Some(SigningKey { key, compromised })
+/// Why no governor chain the node retains verifies a node-list record.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum NodeListUnverified {
+    /// The node holds no key-event log of the record's governor.
+    #[error("this node holds no key-event log of the governor")]
+    NoGovernorLog,
+    /// No retained governor chain verifies the record. The error is the
+    /// first refusal other than a head off the chain, or a head off the
+    /// chain where every chain refused that.
+    #[error("no governor chain this node holds verifies the record: {0}")]
+    Refused(NodeListError),
+}
+
+/// Verifies `record` under the log-anchored class on each governor chain the
+/// node retains under R9, accepted or suffix, and returns the key of the
+/// first chain that verifies it (§9.10.12: the node "holds every chain it
+/// retains under R9, accepted or suffix, and selects per chain"; the
+/// `scp:nls:` row). Every chain carrying the record's `signing_key_state_head`
+/// shares the events up to it, so each reads the same key there.
+///
+/// `governor` is the store-held key state of `03-identity.md` §3.10.10: store
+/// admission is availability only and grants no trust.
+///
+/// # Errors
+///
+/// [`NodeListUnverified`] where the node holds no governor log or no
+/// retained chain verifies the record.
+pub(super) fn verify_node_list(
+    governor: &[RetainedChain],
+    record: &NodeListRecord,
+) -> Result<SigningKey, NodeListUnverified> {
+    let head = &record.signing_key_state_head;
+    let mut refusal: Option<NodeListError> = None;
+    for chain in governor {
+        match VerifiedNodeListRecord::verify(record.clone(), NodeListKeyClass::Attribution, chain) {
+            Ok(verified) => {
+                let key = verified.signing_key().to_compressed();
+                let compromised = governor
+                    .iter()
+                    .filter(|held| held.key_state_at(head).is_ok())
+                    .any(|held| {
+                        held.key_state().keys.iter().any(|entry| {
+                            entry.key == key && entry.condition == KeyCondition::Compromised
+                        })
+                    });
+                return Ok(SigningKey { key, compromised });
+            }
+            Err(e) => {
+                let off_chain = matches!(
+                    e,
+                    NodeListError::GovernorKey(AnchoredKeyError::HeadNotOnChain)
+                );
+                match &refusal {
+                    None => refusal = Some(e),
+                    Some(NodeListError::GovernorKey(AnchoredKeyError::HeadNotOnChain))
+                        if !off_chain =>
+                    {
+                        refusal = Some(e);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    Err(refusal.map_or(
+        NodeListUnverified::NoGovernorLog,
+        NodeListUnverified::Refused,
+    ))
 }
 
 /// One stored node-list record and the key its signature verified under,
@@ -410,17 +464,17 @@ pub(super) async fn held_node_lists(
     routing_id: &[u8; 32],
 ) -> Result<Vec<HeldNodeList>, PublicRecordRefusal> {
     let stored = load_retained(storage, routing_id).await?;
-    let mut chains: HashMap<Identifier, Vec<ValidatedChain>> = HashMap::new();
+    let mut chains: HashMap<Identifier, Vec<RetainedChain>> = HashMap::new();
     let mut held = Vec::with_capacity(stored.len());
     for blob in stored {
         let record = decode_node_list_frame(&blob.blob).map_err(|e| corrupt("node-list", &e))?;
         if let std::collections::hash_map::Entry::Vacant(e) = chains.entry(record.governor) {
             let log = held_log(storage, &record.governor).await?;
-            e.insert(log.chains());
+            e.insert(log.retained());
         }
         let signing = chains
             .get(&record.governor)
-            .and_then(|chains| node_list_signing_key(chains, &record.signing_key_state_head));
+            .and_then(|chains| verify_node_list(chains, &record).ok());
         held.push(HeldNodeList {
             blob_id: blob.blob_id,
             record,
@@ -452,25 +506,20 @@ pub(super) async fn bound_witnesses(
     storage: &dyn BlobStorage,
     records: &[NodeListRecord],
 ) -> Result<HashMap<NodeId, BoundWitness>, PublicRecordRefusal> {
-    let mut chains: HashMap<Identifier, Vec<ValidatedChain>> = HashMap::new();
+    let mut chains: HashMap<Identifier, Vec<RetainedChain>> = HashMap::new();
     let mut bound = HashMap::new();
     for entry in records.iter().flat_map(|record| record.entries.iter()) {
         let operator = entry.binding.operator;
         if let std::collections::hash_map::Entry::Vacant(e) = chains.entry(operator) {
             let log = held_log(storage, &operator).await?;
-            e.insert(log.chains());
+            e.insert(log.retained());
         }
-        let active = chains.get(&operator).and_then(|chains| {
-            chains.iter().find_map(|chain| {
-                key_state_at(chain, &entry.binding.key_state_head)
-                    .ok()
-                    .map(|state| *state.active_key())
-            })
+        let verified = chains.get(&operator).and_then(|chains| {
+            chains
+                .iter()
+                .find_map(|chain| VerifiedNodeListEntry::verify(entry.clone(), chain).ok())
         });
-        let Some(active) = active.and_then(|key| P256PublicKey::from_sec1(&key).ok()) else {
-            continue;
-        };
-        if let Ok(verified) = VerifiedNodeListEntry::verify(entry.clone(), &active) {
+        if let Some(verified) = verified {
             bound.insert(
                 *verified.binding().node_id(),
                 BoundWitness {

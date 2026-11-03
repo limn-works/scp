@@ -35,7 +35,7 @@ use scp_crypto::p256::{
     COMPRESSED_POINT_LEN, P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict,
 };
 use scp_did::Identifier;
-use scp_kel::ResolvedState;
+use scp_kel::KeyStateSource;
 use sha2::{Digest, Sha256};
 
 use super::node_address::Reader;
@@ -283,8 +283,10 @@ impl VerifiedContextOperatorBinding {
     ///
     /// `held` is the `binding_hash` of the invitation a joiner holds, or of
     /// the `0xFF02` extension a member's group state holds. `operator` is the
-    /// key state the verifier's resolution of `binding.operator` accepted;
-    /// the signing key is the `#active` that was `Current` at
+    /// key state of `binding.operator`: the
+    /// [`ResolvedState`](scp_kel::ResolvedState) a party's resolution
+    /// accepted, or the [`RetainedChain`](scp_kel::RetainedChain) a
+    /// validating store holds (`03-identity.md` §3.10.10); the signing key is the `#active` that was `Current` at
     /// `binding.key_state_head` on its chain, the
     /// §9.7.1 log-anchored class. §9.7.1's first-seen rule for a later
     /// `Compromised` marking stays the caller's.
@@ -300,7 +302,7 @@ impl VerifiedContextOperatorBinding {
     pub fn verify(
         binding: ContextOperatorBinding,
         held: &HeldBindingHash,
-        operator: &ResolvedState,
+        operator: &impl KeyStateSource,
     ) -> Result<Self, ContextOperatorError> {
         let binding_hash = binding.binding_hash()?;
         if binding_hash != held.0 {

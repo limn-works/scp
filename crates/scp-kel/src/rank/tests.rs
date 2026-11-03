@@ -1043,3 +1043,51 @@ fn chains_of_two_identifiers_are_refused() -> TestResult {
 mod retention;
 
 mod verdict;
+
+/// `03-identity.md` §3.10.10 `RetainedChain`: the holder's retained set, in
+/// the order it first held each chain, each read at its head and at a past
+/// event the same way through the inherent methods and through
+/// `KeyStateSource`, and an event off the chain refused.
+#[test]
+fn retained_reads_every_held_chain_through_both_paths() -> TestResult {
+    use crate::{KeyStateSource, NotOnChain, RetainedChain, key_state_at, replay};
+
+    let v54 = chain_of(&v41_v54()?)?;
+    let v55 = chain_of(&v41_v55()?)?;
+    let v54_digest: [u8; 32] = fixtures::array(V54_DIGEST)?;
+    let v55_digest: [u8; 32] = fixtures::array(V55_DIGEST)?;
+
+    let mut holder = AcceptedChainHolder::new();
+    assert!(holder.retained().is_empty());
+    assert_eq!(holder.hold(v55.clone())?, first_held());
+    assert!(matches!(
+        holder.hold(v54.clone())?,
+        HoldOutcome::AcceptedReplaced { .. }
+    ));
+    let retained = holder.retained();
+    assert_eq!(
+        retained
+            .iter()
+            .map(RetainedChain::head_digest)
+            .collect::<Vec<_>>(),
+        vec![v55_digest, v54_digest]
+    );
+    for (held, chain) in retained.iter().zip([&v55, &v54]) {
+        assert_eq!(RetainedChain::identifier(held), &chain.identifier());
+        assert_eq!(KeyStateSource::identifier(held), &chain.identifier());
+        assert_eq!(RetainedChain::key_state(held), replay(chain).key_state());
+        assert_eq!(KeyStateSource::key_state(held), replay(chain).key_state());
+        let past = key_state_at(chain, &v41_digest())?.key_state().clone();
+        assert_eq!(RetainedChain::key_state_at(held, &v41_digest())?, past);
+        assert_eq!(KeyStateSource::key_state_at(held, &v41_digest())?, past);
+        assert_eq!(
+            RetainedChain::key_state_at(held, &[0x5A; 32]),
+            Err(NotOnChain { digest: [0x5A; 32] })
+        );
+        assert_eq!(
+            KeyStateSource::key_state_at(held, &[0x5A; 32]),
+            Err(NotOnChain { digest: [0x5A; 32] })
+        );
+    }
+    Ok(())
+}

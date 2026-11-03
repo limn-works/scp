@@ -15,7 +15,7 @@
 
 use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{Identifier, NodeId, NodeUrl};
-use scp_kel::{NodeKeyError, ResolvedState, derive_node_id, parse_node_key};
+use scp_kel::{KeyStateSource, NodeKeyError, derive_node_id, parse_node_key};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::anchored_key::{AnchoredKeyError, active_at};
@@ -131,8 +131,11 @@ impl VerifiedNodeBinding {
     /// `#active` at `key_state_head`, and `possession_sig` under `node_key`,
     /// both over `P` and both strict (low-`s`, no second hash).
     ///
-    /// `operator` is the key state the verifier's resolution of
-    /// `binding.operator` accepted. The operator's key is read from it at `binding.key_state_head`, the
+    /// `operator` is the key state of `binding.operator`: the
+    /// [`ResolvedState`](scp_kel::ResolvedState) a party's resolution
+    /// accepted, or the [`RetainedChain`](scp_kel::RetainedChain) a
+    /// validating store holds (`03-identity.md` §3.10.10). The operator's key
+    /// is read from it at `binding.key_state_head`, the
     /// log-anchored class of §9.7.1, so a key from another identity or
     /// another position never verifies the binding. §9.7.1's first-seen rule
     /// for a later `Compromised` marking stays the caller's.
@@ -143,7 +146,7 @@ impl VerifiedNodeBinding {
     /// node key, operator key, operator signature, possession signature.
     pub fn verify(
         binding: NodeBinding,
-        operator: &ResolvedState,
+        operator: &impl KeyStateSource,
     ) -> Result<Self, NodeBindingError> {
         let node_key = parse_node_key(&binding.node_key)?;
         let operator_active = active_at(operator, &binding.operator, &binding.key_state_head)
@@ -230,7 +233,10 @@ pub(crate) mod tests {
     }
 
     /// The verdict on a copy of `binding`, without the verified value.
-    fn check(binding: &NodeBinding, operator: &ResolvedState) -> Result<(), NodeBindingError> {
+    fn check(
+        binding: &NodeBinding,
+        operator: &scp_kel::ResolvedState,
+    ) -> Result<(), NodeBindingError> {
         VerifiedNodeBinding::verify(binding.clone(), operator).map(|_| ())
     }
 

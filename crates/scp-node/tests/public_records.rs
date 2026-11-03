@@ -178,6 +178,36 @@ impl Identity {
         }
     }
 
+    /// A `KeyState` at sequence 1, signed by the root, that installs
+    /// `successor` as `#active` and drops the inception's `#active` as
+    /// `dropped`: `Superseded` for a rotation, `Compromised` (from the
+    /// inception) for a compromise.
+    fn replace_active(&self, successor: &P256SecretKey, dropped: KeyCondition) -> Event {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.keys = vec![
+            entry(point(&self.root), KeyRole::RootMember),
+            entry(point(successor), KeyRole::Active),
+            KeyEntry {
+                condition: dropped,
+                ..entry(point(&self.active), KeyRole::Active)
+            },
+        ];
+        let preimage = EventPreimage::key_state(KeyStateFields {
+            identifier: self.id,
+            sequence: 1,
+            predecessor_digest: self.inception.digest,
+            root_group: root_group(),
+            key_state: snapshot,
+            seals: Vec::new(),
+        });
+        let (unit, digest, _) = signed_event(&preimage, &self.root);
+        Event {
+            unit,
+            digest,
+            sequence: 1,
+        }
+    }
+
     fn did_routing(&self) -> [u8; 32] {
         routing_id(RoutingKind::KeyEvents, &self.id)
     }
@@ -262,11 +292,17 @@ impl World {
     /// A node list at `sequence`, anchored at the governor's inception and
     /// signed by `signer`.
     fn node_list(&self, sequence: u64, signer: &P256SecretKey) -> Vec<u8> {
+        self.node_list_at(sequence, &self.governor.inception.digest, signer)
+    }
+
+    /// A node list at `sequence` naming the governor, anchored at `head` and
+    /// signed by `signer`.
+    fn node_list_at(&self, sequence: u64, head: &[u8; 32], signer: &P256SecretKey) -> Vec<u8> {
         let mut record = NodeListRecord {
             context_id: CONTEXT_ID.to_owned(),
             sequence,
             governor: self.governor.id,
-            signing_key_state_head: self.governor.inception.digest,
+            signing_key_state_head: *head,
             entries: vec![self.entry(&self.node_key)],
             signature: [0; 64],
         };
@@ -611,13 +647,6 @@ async fn nls_admits_the_governor_attribution_key_and_keeps_the_highest_sequence(
     let governor = &world.governor;
     let routing = node_list_routing_id(CONTEXT_ID);
 
-    // No governor log held yet.
-    assert_eq!(
-        client
-            .retain(routing, world.node_list(1, &governor.active))
-            .await,
-        Reply::Err(code::DID_RECORD_REJECTED)
-    );
     assert_eq!(
         client
             .retain(
@@ -654,6 +683,172 @@ async fn nls_admits_the_governor_attribution_key_and_keeps_the_highest_sequence(
     assert_eq!(
         client.query(routing).await,
         vec![world.node_list(2, &governor.active)]
+    );
+}
+
+/// `03-identity.md` §3.10.10 and the nls row: the key is the `#active` the
+/// held governor chain names at `signing_key_state_head`, not the head's.
+/// After a rotation, the inception's `#active` signing at the inception is
+/// admitted, the rotated key signing at the inception is refused with
+/// `4040`, and the rotated key signing at the rotation is admitted.
+#[tokio::test]
+async fn nls_admits_the_key_the_held_governor_chain_names_at_signing_key_state_head() {
+    let world = World::new();
+    let node = start_node(world.terms(QuotaLimits::UNBOUNDED)).await;
+    let mut client = Client::connect(&node).await;
+    let governor = &world.governor;
+    let routing = node_list_routing_id(CONTEXT_ID);
+    let successor = key(0x1A);
+    let rotation = governor.replace_active(&successor, KeyCondition::Superseded);
+
+    assert_eq!(
+        client
+            .retain(
+                governor.did_routing(),
+                governor.frame(&[&governor.inception, &rotation])
+            )
+            .await,
+        Reply::Ok
+    );
+    let inception = governor.inception.digest;
+    assert_eq!(
+        client
+            .retain(routing, world.node_list_at(1, &inception, &governor.active))
+            .await,
+        Reply::Ok
+    );
+    assert_eq!(
+        client
+            .retain(routing, world.node_list_at(2, &inception, &successor))
+            .await,
+        Reply::Err(code::DID_RECORD_REJECTED)
+    );
+    assert_eq!(
+        client
+            .retain(routing, world.node_list_at(2, &rotation.digest, &successor))
+            .await,
+        Reply::Ok
+    );
+    assert_eq!(
+        client.query(routing).await,
+        vec![
+            world.node_list_at(1, &inception, &governor.active),
+            world.node_list_at(2, &rotation.digest, &successor),
+        ]
+    );
+}
+
+/// The nls row reads "the governor key state the node holds": with no
+/// key-event log of the governor held, and another identity's log held, a
+/// record its governor's `#active` signs is refused with `4040`, the code
+/// the `scp:svc:` row uses where the node holds no log of the identity.
+#[tokio::test]
+async fn nls_refuses_a_record_with_4040_when_no_governor_log_is_held() {
+    let world = World::new();
+    let node = start_node(world.terms(QuotaLimits::UNBOUNDED)).await;
+    let mut client = Client::connect(&node).await;
+    let operator = &world.operator;
+    let routing = node_list_routing_id(CONTEXT_ID);
+
+    assert_eq!(
+        client
+            .retain(
+                operator.did_routing(),
+                operator.frame(&[&operator.inception])
+            )
+            .await,
+        Reply::Ok
+    );
+    assert_eq!(
+        client
+            .retain(routing, world.node_list(1, &world.governor.active))
+            .await,
+        Reply::Err(code::DID_RECORD_REJECTED)
+    );
+    assert!(client.query(routing).await.is_empty());
+}
+
+/// A record naming the governor but signed under another identity is
+/// refused with `4040`, both where it anchors at the other identity's own
+/// event (a head off every governor chain) and where it anchors at the
+/// governor's inception (a signature the governor's `#active` did not make),
+/// though the node holds both identities' logs.
+#[tokio::test]
+async fn nls_refuses_a_record_under_another_identity_with_4040() {
+    let world = World::new();
+    let node = start_node(world.terms(QuotaLimits::UNBOUNDED)).await;
+    let mut client = Client::connect(&node).await;
+    let (governor, operator) = (&world.governor, &world.operator);
+    let routing = node_list_routing_id(CONTEXT_ID);
+
+    for identity in [governor, operator] {
+        assert_eq!(
+            client
+                .retain(
+                    identity.did_routing(),
+                    identity.frame(&[&identity.inception])
+                )
+                .await,
+            Reply::Ok
+        );
+    }
+    assert_eq!(
+        client
+            .retain(
+                routing,
+                world.node_list_at(1, &operator.inception.digest, &operator.active)
+            )
+            .await,
+        Reply::Err(code::DID_RECORD_REJECTED)
+    );
+    assert_eq!(
+        client
+            .retain(
+                routing,
+                world.node_list_at(1, &governor.inception.digest, &operator.active)
+            )
+            .await,
+        Reply::Err(code::DID_RECORD_REJECTED)
+    );
+    assert!(client.query(routing).await.is_empty());
+}
+
+/// The nls row: "The node drops each record whose signing key a later
+/// governor event marks `Compromised`." A record admitted under the
+/// inception's `#active` is deleted once the governor's next event marks
+/// that key `Compromised`, and the same record is then refused with `4040`.
+#[tokio::test]
+async fn nls_drops_a_record_after_a_later_compromised_event() {
+    let world = World::new();
+    let node = start_node(world.terms(QuotaLimits::UNBOUNDED)).await;
+    let mut client = Client::connect(&node).await;
+    let governor = &world.governor;
+    let routing = node_list_routing_id(CONTEXT_ID);
+    let record = world.node_list(1, &governor.active);
+
+    assert_eq!(
+        client
+            .retain(
+                governor.did_routing(),
+                governor.frame(&[&governor.inception])
+            )
+            .await,
+        Reply::Ok
+    );
+    assert_eq!(client.retain(routing, record.clone()).await, Reply::Ok);
+    assert_eq!(client.query(routing).await, vec![record.clone()]);
+
+    let compromise = governor.replace_active(&key(0x1B), KeyCondition::Compromised);
+    assert_eq!(
+        client
+            .retain(governor.did_routing(), governor.frame(&[&compromise]))
+            .await,
+        Reply::Ok
+    );
+    assert!(client.query(routing).await.is_empty());
+    assert_eq!(
+        client.retain(routing, record).await,
+        Reply::Err(code::DID_RECORD_REJECTED)
     );
 }
 

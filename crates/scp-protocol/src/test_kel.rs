@@ -10,10 +10,11 @@ use scp_did::{
 use std::time::SystemTime;
 
 use scp_kel::{
-    Continuation, EncodedPreimage, EntryVerdict, EventPreimage, InceptionFields, KeyStateFields,
-    KeyStateSnapshot, OperatorProof, ReplayedState, ResolutionInput, ResolutionVerdict,
-    ResolvedState, SignatureForm, SignerGroup, SourceExhaustion, SourceRead, ValidatedChain,
-    classify, encode_preimage, prerotation_commitment, replay, validate_entry,
+    AcceptedChainHolder, Continuation, EncodedPreimage, EntryVerdict, EventPreimage,
+    InceptionFields, KeyStateFields, KeyStateSnapshot, OperatorProof, ReplayedState,
+    ResolutionInput, ResolutionVerdict, ResolvedState, RetainedChain, SignatureForm, SignerGroup,
+    SourceExhaustion, SourceRead, ValidatedChain, classify, encode_preimage,
+    prerotation_commitment, replay, validate_entry,
 };
 use sha2::{Digest, Sha256};
 
@@ -188,6 +189,17 @@ impl Identity {
         classification
             .key_state
             .ok_or_else(|| "an Adopted verdict carries a key state".into())
+    }
+
+    /// The log as a validating store holds it: [`Self::chain`] held by an
+    /// `AcceptedChainHolder`, the one constructor of a `RetainedChain`
+    /// (`03-identity.md` §3.10.10).
+    pub fn retained(&self) -> TestResult<RetainedChain> {
+        let mut holder = AcceptedChainHolder::new();
+        let _: scp_kel::HoldOutcome = holder.hold(self.chain()?)?;
+        let [retained] = <[RetainedChain; 1]>::try_from(holder.retained())
+            .map_err(|held| format!("expected one retained chain, got {}", held.len()))?;
+        Ok(retained)
     }
 
     /// The replay of [`Self::chain`] at its head.

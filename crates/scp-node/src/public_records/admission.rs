@@ -10,14 +10,13 @@
 
 use std::collections::BTreeSet;
 
-use scp_crypto::p256::P256PublicKey;
 use scp_did::Identifier;
 use scp_kel::{
     EntryVerdict, EventKind, RoutingKind, node_list_routing_id, routing_id, validate_entry,
 };
 use scp_protocol::node::{
-    NodeListKeyClass, VerifiedNodeListRecord, check_node_list_publish, decode_conflict_frame,
-    decode_key_event_frame, decode_node_list_frame, decode_service_record_frame,
+    check_node_list_publish, decode_conflict_frame, decode_key_event_frame, decode_node_list_frame,
+    decode_service_record_frame,
 };
 use scp_relay_client::code;
 use scp_transport::native::public_records::{PublicRecordRefusal, RetainedPublish};
@@ -27,8 +26,8 @@ use super::NodeListSource;
 use super::selection::{
     HeldNodeList, bound_witnesses, decode_conflicts, decode_service_records,
     designated_service_keys, held_log, held_node_lists, hold_units, load_retained,
-    node_list_signing_key, select_conflicts, select_key_events, select_node_lists,
-    select_service_records, statement_admissible,
+    select_conflicts, select_key_events, select_node_lists, select_service_records,
+    statement_admissible, verify_node_list,
 };
 
 /// What a kind's selection keeps at one routing id after a write.
@@ -182,38 +181,32 @@ pub(super) async fn reselect_service_records(
 
 /// `scp:nls:` admission: the routing id derives from the record's
 /// `context_id`, and the record verifies under the governor's `#active` at
-/// `signing_key_state_head` in the governor key state the node holds, a key
-/// no later governor event marks `Compromised` (§9.6.3, §9.10.12).
+/// `signing_key_state_head` on a governor chain the node retains under R9, a
+/// key no later governor event marks `Compromised` (§9.6.3, §9.10.12). The
+/// governor key state is the store-held `RetainedChain` of `03-identity.md`
+/// §3.10.10, never a resolution: admission is availability only.
 ///
 /// # Errors
 ///
-/// `4040` for a record the decoder refuses, a governor log the node does not
-/// hold at `signing_key_state_head`, a signature that fails, a compromised
-/// signing key, or a record the selection would not keep; `5000` on a
-/// storage failure.
+/// `4040` for a record the decoder refuses, a governor whose key-event log
+/// the node does not hold, a record no retained governor chain verifies (a
+/// head off every chain, another identity's key, a failed signature), a
+/// compromised signing key, or a record the selection would not keep;
+/// `5000` on a storage failure.
 pub(super) async fn admit_node_list(
     storage: &dyn BlobStorage,
     publish: &RetainedPublish,
 ) -> Result<Selection, PublicRecordRefusal> {
     let record = check_node_list_publish(&publish.routing_id, true, None, &publish.blob)
         .map_err(|e| rejected(format!("the node-list record is refused: {e}")))?;
-    let governor_chains = held_log(storage, &record.governor).await?.chains();
-    let Some(signing) = node_list_signing_key(&governor_chains, &record.signing_key_state_head)
-    else {
-        return Err(rejected(
-            "this node holds no governor chain carrying the record's signing_key_state_head",
-        ));
-    };
+    let governor = held_log(storage, &record.governor).await?.retained();
+    let signing = verify_node_list(&governor, &record)
+        .map_err(|e| rejected(format!("the node-list record is refused: {e}")))?;
     if signing.compromised {
         return Err(rejected(
             "a later governor event marks the signing key Compromised",
         ));
     }
-    let key = P256PublicKey::from_sec1(&signing.key)
-        .map_err(|e| rejected(format!("the governor's #active does not parse: {e}")))?;
-    let record = VerifiedNodeListRecord::verify(record, NodeListKeyClass::Attribution, &key)
-        .map_err(|e| rejected(format!("the node-list signature fails: {e}")))?
-        .into_record();
     let mut records = held_node_lists(storage, &publish.routing_id).await?;
     let held = load_retained(storage, &publish.routing_id).await?;
     records.push(HeldNodeList {
