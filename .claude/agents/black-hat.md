@@ -52,7 +52,7 @@ You also:
 
 6. **Break the protocol, not just the code.** Code bugs get patched. Protocol flaws require redesign. Focus on the deeper layer: is the protocol itself sound under adversarial conditions?
 
-7. **SCP-specific concurrency attacks.** Supervisor concurrency invariants: `crates/scp-runtime/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
+7. **SCP-specific concurrency attacks.** Supervisor concurrency invariants: `crates/scp-runtime-core/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
 
 ## Output Format
 

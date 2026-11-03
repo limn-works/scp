@@ -727,7 +727,7 @@ pub struct CommittedStreamingOutletInvocation {
     /// [`settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)).
     /// The on-actor `SettleOutletStream` handler READS this flag FIRST — a
     /// PRE-COMMIT `Deref` read at the top of
-    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream),
+    /// `scp_runtime_outlets::helpers::settle_outlet_stream`,
     /// actor-serialized so the read is authoritative — and skips the ENTIRE
     /// settlement (no persist, no capture) if it is already `true`; otherwise it
     /// moves the money AND flips this to `true` in the SAME Class-S persist (refund +
@@ -750,7 +750,7 @@ pub struct CommittedStreamingOutletInvocation {
     /// concurrent layer, the key is the delegated crash layer. The runtime-enforced
     /// root close is a capture-dedup ledger tracked as
     /// <https://github.com/limn-works/scp/issues/2156>; see the two-layer model on
-    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream).
+    /// `scp_runtime_outlets::helpers::settle_outlet_stream`.
     /// Crash recovery also reads it:
     /// witness present &
     /// `settled == false` ⇒ the money move never ran (crash / eviction in the
@@ -816,7 +816,7 @@ pub struct CommittedStreamingOutletInvocation {
 /// by construction and a saga is never double-reversed.
 ///
 /// **Reversal is unconditional on the crash path** — see
-/// [`reverse_caller_reservation_record`](crate::context::outlets_helpers::reverse_caller_reservation_record).
+/// `scp_runtime_outlets::helpers::reverse_caller_reservation_record`.
 /// The record and the deductions it reverses are rehydrated from ONE consistent
 /// snapshot into the SAME restored context, so there is no "replaced instance"
 /// to confuse: routing by `context_id` plus keying every reversal by

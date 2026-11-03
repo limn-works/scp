@@ -1034,7 +1034,7 @@ pub struct ClassSState {
     /// (`InboundPolicy::max_calls_per_minute`) caps that accept rate: worst-case
     /// `max_calls_per_minute × (SAGA_NONCE_DEDUP_TTL_SECS / 60)` distinct nonces
     /// over the window. The default (60/min ⇒ 600 over the 10-minute window)
-    /// holds with a ~16× margin; the [`crate::context::actor::handlers::saga`]
+    /// holds with a ~16× margin; the `scp_runtime_saga::handler`
     /// tests assert a ≥2× margin against the default and a documented
     /// configuration ceiling so a future high `max_calls_per_minute` cannot
     /// silently erode the eviction-based bound.
@@ -2664,7 +2664,7 @@ impl PerContextState {
     /// provider — nothing is emitted and the counter is left untouched at the
     /// boundary), delegates the crypto to the field-granular
     /// [`ContextCryptoState::seal`] core, then advances `send_tracker` on
-    /// success (the single canonical [`SequenceReservation`]). Production seals
+    /// success (the single canonical [`scp_runtime_types::context::actor::sequence::SequenceReservation`]). Production seals
     /// through the Class-C view in `build_encrypted_envelope`, never this
     /// wrapper (ADR-049 §15 option-b).
     ///

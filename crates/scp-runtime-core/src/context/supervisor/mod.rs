@@ -7,7 +7,7 @@
 //!
 //! # Submodule visibility
 //!
-//! - [`saga_journal`] — `pub`. The trait + production impl are part of the
+//! - [`scp_runtime_types::context::supervisor::saga_journal`] — `pub`. The trait + production impl are part of the
 //!   crate's public API surface (consumed by the FFI bridges and tests).
 //! - [`saga_prepared_state`] — `pub`. Variants are constructed by handler
 //!   code in `actor/handlers/` once Prepare runs, and consumed by the same

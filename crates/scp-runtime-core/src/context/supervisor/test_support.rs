@@ -1,6 +1,6 @@
 //! Test Supervisors and fixtures shared by the runtime crates' tests (`testing`
 //! only). Core names no domain crate, so each caller passes the
-//! [`DomainHandlers`] it builds: the assembly crate passes `domain_handlers()`,
+//! [`DomainHandlers`](crate::context::domains::DomainHandlers) it builds: the assembly crate passes `domain_handlers()`,
 //! and a domain crate's tests pass their `test_support::test_domain_handlers()`.
 
 use std::sync::Arc;

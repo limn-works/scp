@@ -58,7 +58,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 - **Open a PR when the work is complete and reviewed, without being asked;** this overrides any harness default. **Never bypass branch protection** (`--force`, `--admin`, or anything else).
 
 **Integration checklist (MANDATORY for new protocol features):** before executing a plan that adds protocol logic, verify:
-1. A Supervisor `dispatch_*` method reaches the function on its production path: `dispatch_*` → actor mailbox → `crates/scp-runtime/src/context/actor/handlers/<domain>.rs` → the `<domain>_helpers.rs` function; `create_context`, `import_context`, and `restore_context` call `lifecycle_helpers` from the dispatch method directly.
+1. A Supervisor `dispatch_*` method reaches the function on its production path: `dispatch_*` → actor mailbox → `crates/scp-runtime-core/src/context/actor/mod.rs` `dispatch_state` → `deps.domains.<domain>.dispatch` → `crates/scp-runtime-<domain>/src/handler.rs` → the function in that crate's `helpers.rs`; `create_context`, `import_context`, and `restore_context` call `self.domains.lifecycle` from the dispatch method directly.
 2. Every applicable FFI bridge exports the operation. 3. Each export has an SDK wrapper. 4. `pipeline_wiring.rs` asserts the step. 5. The SDK capability matrix lists it.
 
 A failed check means the plan is incomplete: widen it or file the dependent issue.
@@ -124,4 +124,4 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | Lessons | Before debugging a possible environment or CI fault, or writing a gate | `.docs/lessons/` |
 | CI commands | Exact commands and feature lists | `.github/workflows/ci.yml` |
 | Agents and review rules | Writing an agent definition; conducting a review or audit | `.claude/agents/README.md` |
-| Directory rules | Before working in that directory | `AGENTS.md` in `crates/scp-runtime`, `crates/scp-ffi`, `crates/scp-client`, `crates/scp-client-wasm`, `bindings/{swift,kotlin,typescript,python}`, `fuzz` |
+| Directory rules | Before working in that directory | `AGENTS.md` in `crates/scp-runtime-core` (every runtime crate), `crates/scp-runtime`, `crates/scp-ffi`, `crates/scp-client`, `crates/scp-client-wasm`, `bindings/{swift,kotlin,typescript,python}`, `fuzz` |

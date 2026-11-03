@@ -52,7 +52,7 @@ Errors should be helpful to users without exposing internals (stack traces, file
 Key security surfaces in SCP: relay transport, which the protocol treats as untrusted; MLS group membership and key distribution; UCAN capability chains; DID resolution; values crossing the FFI bridges from SDK callers; persisted key material; and development-only backends, which must never be reachable on a production path.
 
 ### SCP-specific checks
-- **Supervisor concurrency**: `crates/scp-runtime/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
+- **Supervisor concurrency**: `crates/scp-runtime-core/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
 - **Webhook SSRF**: DNS hostnames bypass IP blocklist (resolved by DNS pre-resolution). Verify all outbound HTTP uses HTTPS-only + no-redirect + DNS validation.
 - **Checkpoint signature verification**: Remote checkpoints must have Ed25519 signature + membership verified before comparing Merkle roots.
 

@@ -24,7 +24,7 @@ use std::sync::Arc;
 ///
 /// Shared by both seal seams — the deleted pre-PR-7 provider path and the
 /// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
-/// driven from the Class-C view in [`encrypt_and_send`], via
+/// driven from the Class-C view in `scp_runtime_messaging::helpers::encrypt_and_send`, via
 /// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
 /// inner-envelope construction and the sealed wire stays byte-identical across
 /// the flip (the 16 golden byte-identity tests continue to hold).
@@ -231,7 +231,7 @@ pub fn commit_send_nonce_token_on_abort<'d, 'c>(
     }
 }
 
-/// What [`decrypt_and_dispatch`] made of one inbound envelope.
+/// What `scp_runtime_messaging::helpers::decrypt_and_dispatch` made of one inbound envelope.
 #[derive(Debug)]
 pub enum Dispatched {
     /// An application envelope for the caller to verify and classify.

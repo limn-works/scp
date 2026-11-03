@@ -94,7 +94,7 @@ pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 /// Maximum number of pending commits allowed in the retry queue per context.
 ///
 /// Prevents unbounded memory growth during sustained transport outages.
-/// When this cap is reached, [`apply_broadcast_failure`](crate::context::governance_helpers::apply_broadcast_failure) sets the
+/// When this cap is reached, `scp_runtime_governance::helpers::apply_broadcast_failure` sets the
 /// `commit_fault` marker immediately rather than enqueuing, fail-closing
 /// the context for operator attention.
 pub const MAX_PENDING_COMMITS: usize = 50;
@@ -1424,7 +1424,7 @@ pub struct GovernanceState {
     /// Per-member participation record cache for proposer eligibility (#1530).
     ///
     /// Widened to `pub(crate)` in ADR-049 §15 so the hoisted
-    /// [`crate::context::messaging_helpers::finalize_send`] free function
+    /// `scp_runtime_messaging::helpers::finalize_send` free function
     /// can refresh the cache after a successful send (matches the legacy
     /// behavior — the legacy method body lived in `manager/messaging.rs`
     /// which has submodule-descendant visibility into this field; the
@@ -2199,7 +2199,7 @@ pub(crate) fn validate_genesis_outlets(
 /// the join path.
 ///
 /// The creator-side create path is
-/// [`crate::context::lifecycle_helpers::create_context`]; the join-side
+/// `scp_runtime_lifecycle::helpers::create_context`; the join-side
 /// spawn-from-Welcome path is
 /// [`crate::context::supervisor::Supervisor::build_welcome_joiner_state`].
 ///

@@ -13,7 +13,7 @@
 //!   &deps, cmd)` and routes to actor-shape helpers in
 //!   `crate::helpers` for per-context variants
 //!   (Join / Leave / Close / Export), and to actor-shape helpers in
-//!   `scp_runtime_queries::testing_access` for access-key variants
+//!   `scp_runtime_core::context::shared::queries` for access-key variants
 //!   (Generate / Revoke / Restore). Used from the actor's
 //!   `dispatch_state`
 //!   loop.
@@ -74,7 +74,7 @@ use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 ///
 /// Access-key commands (`GenerateContextAccessKey`,
 /// `RevokeContextAccessKey`, `RestoreContextAccessKey`) call the
-/// actor-shape helpers in [`scp_runtime_queries::testing_access`] (Phase
+/// actor-shape helpers in [`scp_runtime_core::context::shared::queries`] (Phase
 /// 2A.10) directly on `&mut state` — no supervisor shim involved.
 pub async fn dispatch(
     cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,

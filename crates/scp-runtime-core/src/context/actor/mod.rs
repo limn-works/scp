@@ -32,9 +32,11 @@
 //!   mailbox wrapper.
 //! - [`deps::ActorDeps`] — capability-reduced dependency bundle.
 //! - [`state::PerContextState`] — the owned state payload.
-//! - [`handlers`] — per-domain dispatch handlers. Each owns the real
-//!   actor-shape dispatch for its domain, operating on the actor's owned
-//!   state (`&mut ClassSCell`) and capability-reduced [`deps::ActorDeps`].
+//! - [`crate::context::domains::DomainHandlers`] — the per-domain dispatch
+//!   handlers, one `Arc<dyn ...>` per domain crate (ADR-070). Each domain
+//!   crate's `src/handler.rs` owns the real actor-shape dispatch for its
+//!   domain, operating on the actor's owned state (`&mut ClassSCell`) and
+//!   capability-reduced [`deps::ActorDeps`].
 
 pub mod class_s;
 pub mod commands;

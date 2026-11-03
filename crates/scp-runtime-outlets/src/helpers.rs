@@ -11,7 +11,7 @@
 //! 2. The economy-pipeline split for outlet invocation
 //!    ([`reserve_outlet_economy`], [`settle_outlet_economy_capture`],
 //!    [`rollback_outlet_economy`]) plus the supervisor-side orchestrator
-//!    [`invoke_outlet_with_economy`].
+//!    [`scp_runtime_core::context::shared::outlets::invoke_outlet_with_economy`].
 //!
 //! # The `invoke_outlet_with_economy` actor split (Phase 2A finalization)
 //!
@@ -34,8 +34,8 @@
 //!   [`OutletEconomyReservation`] (context handle + role-state snapshot +
 //!   the in-flight [`OutletEconomyTicket`]).
 //! - **Phase 2 (execute)** — the supervisor-side orchestrator
-//!   [`invoke_outlet_with_economy`] runs the non-`Send` executor through
-//!   [`invoke_outlet_execute_and_validate`] BETWEEN the two mailbox
+//!   [`scp_runtime_core::context::shared::outlets::invoke_outlet_with_economy`] runs the non-`Send` executor through
+//!   `scp_runtime_core::context::outlets::invoke::invoke_outlet_execute_and_validate` BETWEEN the two mailbox
 //!   round-trips. No lock is held; the actor is free to process other
 //!   commands.
 //! - **Phase 3 (settle)** — on executor success
@@ -135,7 +135,7 @@ fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amoun
 /// every terminal path"), used EXCLUSIVELY by the crash-recovery abort path
 /// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
 /// (The LIVE `Abort { Some }` and Commit-A paths reverse via the carrier
-/// through [`rollback_outlet_economy_generation_checked`], NOT this function — so
+/// through [`scp_runtime_core::context::shared::outlets::rollback_outlet_economy_generation_checked`], NOT this function — so
 /// this is the crash-recovery-only path and has exactly one production caller.)
 ///
 /// Reverses the local budget / velocity / hard-rate-limit AND voids the
@@ -158,7 +158,7 @@ fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amoun
 /// The confused-deputy concern the generation check addresses — a DIFFERENT
 /// instance replacing the state between reserve and settle — belongs to the
 /// LIVE reserve→settle race, which the carrier path
-/// ([`rollback_outlet_economy_generation_checked`]) handles. It does not apply
+/// ([`scp_runtime_core::context::shared::outlets::rollback_outlet_economy_generation_checked`]) handles. It does not apply
 /// here: there is no "replaced instance" on the crash path, only the same
 /// context's state restored from its own consistent snapshot. Routing by
 /// `context_id` and keying every reversal by `record.actor_did` is what
@@ -260,7 +260,7 @@ pub async fn reverse_caller_reservation_record(
 ///   **state-free** `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`.
 /// - **Streaming path** (`reserve_outlet_stream_economy` /
 ///   `reserve_stream_grant_escrow`): the `ContextError` is reverse-mapped by
-///   [`reserve_error_to_open_rejection`], which reads `current_state` **typed**
+///   [`scp_runtime_core::context::shared::outlets::reserve_error_to_open_rejection`], which reads `current_state` **typed**
 ///   into [`OpenStreamRejection::ContextNotActive`](scp_runtime_core::context::outlets::dispatch::OpenStreamRejection::ContextNotActive); the stream-open FFI seam
 ///   (`open_rejection_to_err`) then emits only `error_code()` + `slug()` — also
 ///   state-free.
