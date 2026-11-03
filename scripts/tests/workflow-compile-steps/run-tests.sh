@@ -104,6 +104,7 @@ FIXTURES=(
     "bad-push-runs-gradle-test"
     "bad-push-runs-unknown-action"
     "bad-push-runs-companion-if"
+    "bad-cache-writer-main-or-failure"
 )
 EXPECTED_EXITS=(
     "0"
@@ -133,6 +134,7 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "0"
+    "1"
     "1"
     "1"
     "1"
@@ -178,6 +180,7 @@ EXPECTED_SUBSTRINGS=(
     "runs Gradle task(s) :a:test that are not compile"
     "uses actions/download-artifact@v4 on a push"
     "job check-draft runs on a push as the companion of job changes"
+    "does not name refs/heads/main"
 )
 
 passed=0

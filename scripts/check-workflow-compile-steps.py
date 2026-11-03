@@ -10,7 +10,10 @@ CHECK 1 — every `./.github/actions/rust-cache` step names its group and says w
   The criterion: a step carries `with.shared-key` (a non-empty string), carries no
   `with.key`, and carries `with.save-if`; across every workflow file, each `shared-key`
   has exactly one step whose `save-if` is not the literal `false`, and that step's
-  `save-if` names `refs/heads/main`.
+  `save-if` passes gated_to_main: one `${{ }}` expression with no top-level `||`, one of
+  whose top-level `&&` terms is exactly `github.ref == 'refs/heads/main'`.
+  scripts/tests/ci-gate/ci_gate_selftest.py's main-only-writers check judges every other
+  Actions-cache writer by the same function.
 
   Why: `Swatinem/rust-cache` appends the job id to the key by default, so eighteen steps
   wrote eighteen copies of the same compiled dependencies against GitHub's 10 GB
@@ -180,6 +183,95 @@ def is_false(value: object) -> bool:
     )
 
 
+# The one form of a ref test that holds a cache save to `main`.
+MAIN_REF_TEST = re.compile(r"github\.ref\s*==\s*'refs/heads/main'", re.IGNORECASE)
+WRAPPED_EXPRESSION = re.compile(r"\$\{\{(.*)\}\}", re.DOTALL)
+
+
+def expression_body(value: object, bare: bool = False) -> str | None:
+    """The expression a workflow field holds, or None when it holds a literal.
+
+    A field holds an expression when one `${{ }}` spans its whole text. An `if:` field
+    (`bare`) also holds one when its text carries no `${{` at all, because GitHub reads
+    a bare `if:` as an expression.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    wrapped = WRAPPED_EXPRESSION.fullmatch(text)
+    if wrapped and "${{" not in wrapped.group(1):
+        return wrapped.group(1).strip()
+    if bare and "${{" not in text:
+        return text
+    return None
+
+
+def split_top(body: str, operator: str) -> list[str] | None:
+    """Split an expression at each `operator` outside parentheses and quoted strings.
+
+    None when the parentheses or quotes do not balance.
+    """
+    parts: list[str] = []
+    depth, start, index, quoted = 0, 0, 0, False
+    while index < len(body):
+        char = body[index]
+        if quoted:
+            if char == "'":
+                if body.startswith("''", index):
+                    index += 2
+                    continue
+                quoted = False
+        elif char == "'":
+            quoted = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and body.startswith(operator, index):
+            parts.append(body[start:index])
+            index += len(operator)
+            start = index
+            continue
+        index += 1
+    if quoted or depth:
+        return None
+    return parts + [body[start:]]
+
+
+def strip_parentheses(term: str) -> str:
+    """Remove each pair of parentheses that encloses the whole term."""
+    term = term.strip()
+    while term.startswith("(") and term.endswith(")") and split_top(term[1:-1], "\0"):
+        term = term[1:-1].strip()
+    return term
+
+
+def gated_to_main(value: object, bare: bool = False) -> bool:
+    """Whether a condition can hold only on a run of `refs/heads/main`.
+
+    The criterion: the field holds an expression (expression_body) with no top-level
+    `||`, and one of its top-level `&&` terms, with enclosing parentheses removed, is
+    exactly `github.ref == 'refs/heads/main'`. Such a term is a conjunct of the whole
+    condition, so the condition is false wherever it is false, whatever the other
+    terms read. Every other shape fails, including a correct condition written another
+    way: the rule reads a shape, so it never evaluates an expression.
+
+    Residual: GitHub compares strings without regard to case, so the term also holds
+    on a branch named `MAIN` or `Main`.
+    """
+    body = expression_body(value, bare)
+    if body is None:
+        return False
+    body = strip_parentheses(body)
+    alternatives = split_top(body, "||")
+    terms = split_top(body, "&&")
+    if alternatives is None or len(alternatives) != 1 or terms is None:
+        return False
+    return any(MAIN_REF_TEST.fullmatch(strip_parentheses(term)) for term in terms)
+
+
 def load_jobs(path: Path) -> dict:
     with path.open(encoding="utf-8") as handle:
         document = yaml.safe_load(handle)
@@ -325,11 +417,12 @@ def check_cache_step(
         return failures
     for key in keys:
         producers[key].append(where)
-    if not (isinstance(save_if, str) and DEFAULT_BRANCH_REF in save_if):
+    if not gated_to_main(save_if):
         failures.append(
             f"{where}: the writer of cache group {shared_key!r} has save-if {save_if!r}, "
-            f"which does not name {DEFAULT_BRANCH_REF}; an entry written on any other "
-            f"ref is readable by that ref alone"
+            f"which does not name {DEFAULT_BRANCH_REF} as a top-level `&&` term of one "
+            f"`${{{{ }}}}` expression with no top-level `||` (gated_to_main); an entry "
+            f"written on any other ref is readable by that ref alone"
         )
     return failures
 
