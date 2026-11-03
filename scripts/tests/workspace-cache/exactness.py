@@ -2,7 +2,7 @@
 """Prove end to end that a restored workspace-unit archive is reused only on equal content.
 
 Runs in CI job `workspace-cache-exactness` on a runner that restored the
-`workspace-debug` dependency cache. It builds two reader commands of job
+`workspace-debug` dependency cache. It builds a reader command of job
 rust-test-napi-production, packs their workspace units with
 scripts/ci-workspace-cache.py, gives every tracked file a fresh-checkout mtime, and
 then, for each plant below, deletes the units, restores the archive and rebuilds:
@@ -12,10 +12,9 @@ then, for each plant below, deletes the units, restores the archive and rebuilds
                  the file, every other unit of a package whose library changed, and
                  every unit of a workspace package depending on that library must
                  rebuild; every other unit must be reused.
-  include-byte   one byte of the JSON fixture scp-ffi-common's unit tests take through
-                 `include_str!`: the lib-test unit alone rebuilds, and the fixture test
-                 that compares the file to the struct fails, so the test observes the
-                 new content.
+  include-byte   one byte of the page the scp-node library embeds through
+                 `include_str!`: scp-node and every workspace package depending on it
+                 rebuild, and every other unit is reused.
   build-env      NAPI_TYPE_DEF_TMP_FOLDER, which scp-ffi-napi's build script declares
                  with `rerun-if-env-changed` and which napi-derive reads while it
                  expands scp-ffi-napi: every scp-ffi-napi unit rebuilds, and the folder
@@ -43,26 +42,16 @@ CACHE = [sys.executable, str(ROOT / "scripts/ci-workspace-cache.py")]
 TARGET = ROOT / "target"
 OLD_MTIME = 946_684_800
 
-# Two commands of job rust-test-napi-production, as job workspace-debug of
-# .github/workflows/cache-warm.yml compiles them, so the restored dependency cache
-# holds every dependency unit they need.
+# A command of job rust-test-napi-production, as job workspace-debug of
+# .github/workflows/cache-warm.yml compiles it, so the restored dependency cache holds
+# every dependency unit it needs. One command compiles each workspace package in one
+# feature set, so "every unit of a dependent package" names exactly the units cargo
+# links against the changed library (main() asserts this).
 COMMANDS = [
     ["cargo", "test", "--no-run", "-p", "scp-ffi-napi", "--features", "server"],
-    ["cargo", "test", "--no-run", "-p", "scp-ffi-common", "--features", "server"],
 ]
 SOURCE_FILE = "crates/scp-ffi/common/src/lib.rs"
-INCLUDE_FILE = "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
-FIXTURE_TEST = [
-    "cargo",
-    "test",
-    "-p",
-    "scp-ffi-common",
-    "--features",
-    "server",
-    "--lib",
-    "node_start_config",
-]
-
+INCLUDE_FILE = "crates/scp-node/assets/selfhost/index.html"
 failures: list[str] = []
 
 
@@ -251,6 +240,15 @@ def main() -> int:
     rdeps = reverse_deps()
     baseline = build()
     print(f"baseline: {len({unit_key(m) for m in baseline})} workspace units")
+    libs: dict[str, int] = {}
+    for m in {unit_key(m): m for m in baseline}.values():
+        if "lib" in m["target"]["kind"] and not m["profile"]["test"]:
+            libs[pkg_name(m)] = libs.get(pkg_name(m), 0) + 1
+    twice = sorted(name for name, n in libs.items() if n > 1)
+    if twice:
+        raise SystemExit(
+            f"{twice} compile in two feature sets; the expected sets would be inexact"
+        )
     tmp = Path(tempfile.mkdtemp())
     archive = tmp / "units.tar.zst"
     subprocess.run(
@@ -263,12 +261,11 @@ def main() -> int:
     for p in compare("none", build(), set()):
         fail(p)
 
-    # The source plant turns a space into a tab, which changes no behaviour, so only the
-    # rebuild assertion sees it. The fixture plant drops the closing brace, so every test
-    # reading the fixture fails if, and only if, the unit compiled the new bytes.
+    # Each plant turns the file's last space into a tab: one byte, and no behaviour a
+    # test could miss, so only the rebuild assertion can see it.
     plants = (
         ("source-byte", SOURCE_FILE, b" ", b"\t"),
-        ("include-byte", INCLUDE_FILE, b"}", b" "),
+        ("include-byte", INCLUDE_FILE, b" ", b"\t"),
     )
     for label, rel, old, new in plants:
         expected = expected_rebuilt(baseline, rel, rdeps)
@@ -283,18 +280,6 @@ def main() -> int:
             problems = compare(label, build(), expected)
             for p in problems:
                 fail(p)
-            if label == "include-byte":
-                proc = subprocess.run(
-                    FIXTURE_TEST, cwd=ROOT, capture_output=True, text=True, check=False
-                )
-                if proc.returncode == 0:
-                    fail(
-                        "include-byte: the fixture test passed against the changed fixture, so it did not read the new bytes"
-                    )
-                else:
-                    print(
-                        "include-byte: the fixture test fails against the changed fixture, as it must"
-                    )
             # Must-fail control: the mtime an mtime- or commit-time-based mechanism leaves.
             restore(archive)
             os.utime(ROOT / rel, (OLD_MTIME, OLD_MTIME))
