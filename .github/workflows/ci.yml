@@ -73,7 +73,7 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read.
-# Eighteen groups exist per generation: seventeen written by
+# Seventeen groups exist per generation: sixteen written by
 # `.github/workflows/cache-warm.yml`, one by `.github/workflows/fuzz.yml`.
 #
 # WHAT THE KEY HOLDS. Every step restores through `./.github/actions/rust-cache`, never
@@ -171,9 +171,6 @@ env:
 #   clippy-examples   `target/debug` under check mode, one package's dev-target feature
 #                     set at a time — rust-clippy's `examples` leg, which runs
 #                     scripts/check-examples-compile.sh.
-#   release-check     `target/release` under check mode and the feature resolution
-#                     `--features scp-core/testing,scp-runtime/saga-witness-test-mint`
-#                     — rust-clippy's `release-tests` leg.
 #   transport-optional-sqlite-without-memory-management
 #                     `target/debug` under rust-test-optional-features's
 #                     `sqlite-without-memory-management` leg, which builds libsqlite3-sys
@@ -1651,7 +1648,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: ["workspace", "examples", "packages-network", "packages-platform", "packages-blob", "packages-push", "packages-cloud", "packages-node-lib", "release-tests"]
+        leg: ["workspace", "examples", "packages-network", "packages-platform", "packages-blob", "packages-push", "packages-cloud", "packages-node-lib"]
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -1707,13 +1704,6 @@ jobs:
         if: matrix.leg == 'packages-network' || matrix.leg == 'packages-platform' || matrix.leg == 'packages-blob' || matrix.leg == 'packages-push' || matrix.leg == 'packages-cloud' || matrix.leg == 'packages-node-lib'
         with:
           shared-key: clippy-packages
-          save-if: false
-      # Writes the `release-check` group: the `release-tests` leg compiles under the
-      # release profile, into `target/release`, which no other group holds.
-      - uses: ./.github/actions/rust-cache
-        if: matrix.leg == 'release-tests'
-        with:
-          shared-key: release-check
           save-if: false
       - uses: ./.github/actions/cargo-fetch
       - name: Run clippy over the workspace
@@ -1843,26 +1833,6 @@ jobs:
           # leaves `node-bin` on, so only these two lint the library without it.
           cargo clippy -p scp-node --no-default-features --lib -- -D warnings
           cargo clippy -p scp-node --no-default-features --features testing --all-targets -- -D warnings
-      # Job `rust` of .github/workflows/build-matrix.yml runs
-      # `cargo test --workspace --release --features scp-core/testing,scp-runtime/saga-witness-test-mint`
-      # under `RUSTFLAGS: "-D warnings"`, and that workflow runs only on a tag push or a
-      # release. Every other command in this file compiles the tests under the dev
-      # profile, where `debug_assertions` holds, and under a feature list that enables
-      # each bridge's `testing`. So a test helper whose only callers sit behind
-      # `#[cfg(feature = "testing")]` or `#[cfg(debug_assertions)]` is dead in that
-      # release build, `dead_code` fails it, and no pull request saw it: scp-ffi's
-      # `test_cases_json` and `faulted_ucan_refusals` reached a release that way.
-      # This command lints every test target under the release profile and that
-      # feature list. Clippy runs rustc's own lints, `dead_code` among them, and
-      # `-- -D warnings` denies them in the workspace members only, as RUSTFLAGS does
-      # for the build-matrix command; check mode skips code generation and linking,
-      # which no lint reads.
-      - name: Run clippy over the release-profile test build
-        if: matrix.leg == 'release-tests'
-        run: |
-          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo clippy --workspace --tests --release --features scp-core/testing,scp-runtime/saga-witness-test-mint -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
       # workspaces, each carrying a defect the gate must reject or a layout it must accept.
       - name: Run examples-compile cases

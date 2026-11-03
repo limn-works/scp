@@ -2729,9 +2729,12 @@ mod tests {
     // builds) so the mispairing is caught rather than silently swapped. In a
     // release build the assert is compiled out and the slug is swapped for the
     // code's default (preserving the class/code/slug consistency invariant).
-    // Gated on `debug_assertions` because `#[should_panic]` requires the assert
-    // to actually be compiled in.
-    #[cfg(debug_assertions)]
+    // Ignored without `debug_assertions`, because `#[should_panic]` needs the
+    // assert compiled in; the body still compiles in a release test build.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the debug_assert! this test expects is compiled out without debug_assertions"
+    )]
     #[test]
     #[should_panic(expected = "likely a miswired (code, slug) pair")]
     fn from_code_debug_asserts_on_registered_wrong_class_slug() {

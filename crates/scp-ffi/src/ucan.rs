@@ -1630,127 +1630,135 @@ mod tests {
         });
     }
 
-    /// Calls every UCAN entry point against `ctx_id`, for
-    /// `every_ucan_entry_point_withholds_a_faulted_actor`.
+    /// `every_ucan_entry_point_withholds_a_faulted_actor` and its helper, under the
+    /// one `testing` gate both need.
     #[cfg(feature = "testing")]
-    fn faulted_ucan_refusals(
-        py: Python<'_>,
-        scp: &crate::scp::PyScp,
-        ctx_id: &str,
-        creator: &str,
-    ) -> [(&'static str, PyResult<()>); 5] {
-        [
-            (
-                "validate",
-                scp.ucan_validate(py, ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
-                    .map(drop),
-            ),
-            (
-                "evaluate",
-                scp.ucan_evaluate(
-                    py,
-                    ctx_id,
-                    "aaa.bbb.ccc",
-                    Some("messages:write"),
-                    creator,
-                    None,
-                )
-                .map(drop),
-            ),
-            (
-                "mint",
-                scp.ucan_mint(
-                    py,
-                    ctx_id,
-                    "did:dht:z6MkUcanGateFaultedAudience",
-                    vec!["messages:write".to_owned()],
-                    None,
-                )
-                .map(drop),
-            ),
-            (
-                "delegate",
-                scp.ucan_delegate(
-                    py,
-                    ctx_id,
-                    creator,
-                    "did:dht:z6MkUcanGateFaultedAudience",
-                    "aaa.bbb.ccc",
-                    vec!["messages:write".to_owned()],
-                )
-                .map(drop),
-            ),
-            (
-                "revoke",
-                scp.ucan_revoke(py, ctx_id, "aaa.bbb.ccc", creator),
-            ),
-        ]
-    }
+    mod faulted_actor {
+        use super::*;
 
-    /// Every UCAN entry point refuses a context whose actor crashed, was
-    /// poisoned, or does not answer with the withheld `SCP-CTX-2023` refusal,
-    /// and the refusal names neither the fault's own code nor the context.
-    ///
-    /// Each entry point reads the lifecycle state and the role state through
-    /// `active_ucan_role_state`, so a fault refuses the same way whichever of
-    /// the two reads it lands on; an entry point that read the role state
-    /// through `live_role_state` directly would pass `SCP-CTX-2130`,
-    /// `SCP-CTX-2134` or `SCP-CTX-2135` and the context id to an unauthorized
-    /// caller. The `e2e_bridge.rs` tests pin that the same entry points pass the
-    /// gate for an `Active` context.
-    #[test]
-    #[cfg(feature = "testing")]
-    fn every_ucan_entry_point_withholds_a_faulted_actor() {
-        let creator = "did:dht:z6MkUcanGateFaulted";
-        crate::init_runtime().ok();
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        crate::runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).expect("supervisor"));
-        let rt = crate::runtime().expect("tokio runtime");
-
-        for fault in ["mid_respawn", "poisoned", "unreachable"] {
-            let ctx_id = format!("ucan-gate-{fault}-{}", uuid::Uuid::new_v4());
-            crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
-            crate::runtime::create_supervisor_context_for_test(
-                bi,
-                &ctx_id,
-                creator,
-                &["messages:read".to_owned(), "messages:write".to_owned()],
-            );
-            match fault {
-                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
-                "poisoned" => rt.block_on(sup.test_poison_context(&ctx_id)),
-                _ => sup.test_make_actor_unreachable(&ctx_id),
-            }
-            assert!(
-                !matches!(
-                    Python::with_gil(|py| crate::runtime::read_live_context_state(py, bi, &ctx_id)),
-                    Ok(Some(scp_core::context::ContextState::Active))
+        /// Calls every UCAN entry point against `ctx_id`.
+        fn faulted_ucan_refusals(
+            py: Python<'_>,
+            scp: &crate::scp::PyScp,
+            ctx_id: &str,
+            creator: &str,
+        ) -> [(&'static str, PyResult<()>); 5] {
+            [
+                (
+                    "validate",
+                    scp.ucan_validate(py, ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
+                        .map(drop),
                 ),
-                "the fixture must leave the context unable to read Active ({fault})"
-            );
+                (
+                    "evaluate",
+                    scp.ucan_evaluate(
+                        py,
+                        ctx_id,
+                        "aaa.bbb.ccc",
+                        Some("messages:write"),
+                        creator,
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "mint",
+                    scp.ucan_mint(
+                        py,
+                        ctx_id,
+                        "did:dht:z6MkUcanGateFaultedAudience",
+                        vec!["messages:write".to_owned()],
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "delegate",
+                    scp.ucan_delegate(
+                        py,
+                        ctx_id,
+                        creator,
+                        "did:dht:z6MkUcanGateFaultedAudience",
+                        "aaa.bbb.ccc",
+                        vec!["messages:write".to_owned()],
+                    )
+                    .map(drop),
+                ),
+                (
+                    "revoke",
+                    scp.ucan_revoke(py, ctx_id, "aaa.bbb.ccc", creator),
+                ),
+            ]
+        }
 
-            let refusals = Python::with_gil(|py| faulted_ucan_refusals(py, &scp, &ctx_id, creator));
-            for (entry_point, result) in refusals {
-                let message = format!(
-                    "{}",
-                    result.expect_err("a faulted context must refuse every UCAN call")
+        /// Every UCAN entry point refuses a context whose actor crashed, was
+        /// poisoned, or does not answer with the withheld `SCP-CTX-2023` refusal,
+        /// and the refusal names neither the fault's own code nor the context.
+        ///
+        /// Each entry point reads the lifecycle state and the role state through
+        /// `active_ucan_role_state`, so a fault refuses the same way whichever of
+        /// the two reads it lands on; an entry point that read the role state
+        /// through `live_role_state` directly would pass `SCP-CTX-2130`,
+        /// `SCP-CTX-2134` or `SCP-CTX-2135` and the context id to an unauthorized
+        /// caller. The `e2e_bridge.rs` tests pin that the same entry points pass the
+        /// gate for an `Active` context.
+        #[test]
+        fn every_ucan_entry_point_withholds_a_faulted_actor() {
+            let creator = "did:dht:z6MkUcanGateFaulted";
+            crate::init_runtime().ok();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            crate::runtime::init_context_manager_for_test(bi)
+                .expect("the test supervisor initializes");
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).expect("supervisor"));
+            let rt = crate::runtime().expect("tokio runtime");
+
+            for fault in ["mid_respawn", "poisoned", "unreachable"] {
+                let ctx_id = format!("ucan-gate-{fault}-{}", uuid::Uuid::new_v4());
+                crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
+                crate::runtime::create_supervisor_context_for_test(
+                    bi,
+                    &ctx_id,
+                    creator,
+                    &["messages:read".to_owned(), "messages:write".to_owned()],
                 );
+                match fault {
+                    "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
+                    "poisoned" => rt.block_on(sup.test_poison_context(&ctx_id)),
+                    _ => sup.test_make_actor_unreachable(&ctx_id),
+                }
                 assert!(
-                    message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                        && message.contains("SCP-CTX-2023"),
-                    "{entry_point} ({fault}) must refuse with the withheld refusal: {message}"
+                    !matches!(
+                        Python::with_gil(|py| crate::runtime::read_live_context_state(
+                            py, bi, &ctx_id
+                        )),
+                        Ok(Some(scp_core::context::ContextState::Active))
+                    ),
+                    "the fixture must leave the context unable to read Active ({fault})"
                 );
-                assert!(
-                    !message.contains("SCP-CTX-2130")
-                        && !message.contains("SCP-CTX-2134")
-                        && !message.contains("SCP-CTX-2135")
-                        && !message.contains(&ctx_id),
-                    "{entry_point} ({fault}) must not disclose the fault or echo the id: {message}"
-                );
+
+                let refusals =
+                    Python::with_gil(|py| faulted_ucan_refusals(py, &scp, &ctx_id, creator));
+                for (entry_point, result) in refusals {
+                    let message = format!(
+                        "{}",
+                        result.expect_err("a faulted context must refuse every UCAN call")
+                    );
+                    assert!(
+                        message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                            && message.contains("SCP-CTX-2023"),
+                        "{entry_point} ({fault}) must refuse with the withheld refusal: {message}"
+                    );
+                    assert!(
+                        !message.contains("SCP-CTX-2130")
+                            && !message.contains("SCP-CTX-2134")
+                            && !message.contains("SCP-CTX-2135")
+                            && !message.contains(&ctx_id),
+                        "{entry_point} ({fault}) must not disclose the fault or echo the id: {message}"
+                    );
+                }
+                crate::runtime::remove_context(bi, &ctx_id);
             }
-            crate::runtime::remove_context(bi, &ctx_id);
         }
     }
 
