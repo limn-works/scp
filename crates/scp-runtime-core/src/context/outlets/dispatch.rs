@@ -3582,7 +3582,7 @@ async fn run_stream_pump_v2(
 /// is byte-identical to the escrow ledger's own `settle_at_close` split. Only
 /// the runtime-self-mismatch case changes: the receipt follows the signed
 /// manifest, not the ledger. Mirrors the money-conservation cap the sink-side
-/// [`crate::context::outlets_helpers::settle_outlet_stream`] already applies.
+/// `scp_runtime_outlets::helpers::settle_outlet_stream` already applies.
 #[must_use]
 pub fn anchor_settlement_receipt_to_manifest(
     manifest_reference: u32,

@@ -47,7 +47,7 @@ use std::sync::Arc;
 /// UCAN with no real signer was accepted.
 ///
 /// Public so the cross-context outlet-invocation saga handler
-/// ([`crate::context::actor::handlers::saga`]) reuses the SAME VM-aware DID→key
+/// (`scp_runtime_saga::handler`) reuses the SAME VM-aware DID→key
 /// adapter for its §7 UCAN re-validation (spec §6.2.4), rather than
 /// reimplementing the `#active`/`#agent` resolution and so producing a divergent
 /// answer than the rest of the runtime.
@@ -131,7 +131,7 @@ impl<S: std::hash::BuildHasher> RevocationChecker for ContextRevocationChecker<'
 ///
 /// Field visibility widened to `pub(crate)` in ADR-049 §15
 /// so the hoisted free functions in
-/// [`crate::context::economy_helpers`] can construct / destructure the
+/// `scp_runtime_economy::helpers` can construct / destructure the
 /// token without going through this module.
 pub struct PaidActionAuthorization {
     /// The prepared action containing the authorization envelope.
@@ -144,7 +144,7 @@ pub struct PaidActionAuthorization {
     pub metrics: ObservableMetrics,
 }
 
-/// Input parameters for [`enforce_economy`].
+/// Input parameters for `scp_runtime_economy::logic::enforce_economy`.
 ///
 /// F9: grouped into a struct to stop the parameter list from drifting
 /// back above the `clippy::too_many_arguments` threshold as new layers
@@ -219,7 +219,7 @@ pub struct EnforceEconomyRequest<'a> {
 pub struct EconomyTicket {
     /// The DID being charged — needed for every rollback operation.
     pub actor_did: DID,
-    /// The budget amount deducted by [`enforce_economy`] (if any).
+    /// The budget amount deducted by `scp_runtime_economy::logic::enforce_economy` (if any).
     pub deducted_cost: Option<scp_protocol::economy::types::Amount>,
     /// Identifier of the velocity entry appended in Phase 1; used to
     /// roll back the specific entry and not race concurrent senders.
@@ -305,7 +305,7 @@ pub fn rollback_economy_ticket_inline_view(
 
 /// Owned inputs that cross the sync→async boundary of the authorize split.
 ///
-/// All fields are owned / `Send`, so the async [`authorize_paid_action_hold`]
+/// All fields are owned / `Send`, so the async `scp_runtime_economy::helpers::authorize_paid_action_hold`
 /// future holds NO `&PerContextState` borrow (which would not be `Send`).
 #[allow(dead_code)]
 pub struct OwnedAuthInputs {
@@ -319,9 +319,11 @@ pub struct OwnedAuthInputs {
     pub metrics: ObservableMetrics,
 }
 
-/// Record a verified receipt in the bounded `payment_receipts` ring (the
-/// buffer half of [`surface_paid_action_receipt`]). Takes only the
-/// `&mut VecDeque<PaymentReceipt>` field.
+/// Record a verified receipt in the bounded `payment_receipts` ring.
+///
+/// This is the buffer half of
+/// `scp_runtime_economy::helpers::surface_paid_action_receipt`, and it takes
+/// only the `&mut VecDeque<PaymentReceipt>` field.
 ///
 /// Spec §19.11: backs the `payment_history` query — NOT the durable Merkle log.
 /// Bounded oldest-evicted ring at the same capacity as the sibling
@@ -365,7 +367,7 @@ pub async fn void_paid_action(_deps: &ActorDeps, auth: PaidActionAuthorization, 
 /// spending UCAN, then maps any failure into a `ContextError` with the
 /// appropriate SCP-ECON error code.
 ///
-/// Splitting this out of [`enforce_economy`] keeps the latter focused on
+/// Splitting this out of `scp_runtime_economy::logic::enforce_economy` keeps the latter focused on
 /// cost evaluation and budget arithmetic. The validator owns:
 ///
 /// - Ed25519 signature verification (kid-aware via the manager's

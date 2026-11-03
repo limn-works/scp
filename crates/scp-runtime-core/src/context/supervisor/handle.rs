@@ -754,7 +754,7 @@ impl SupervisorHandle {
     /// Capability-reduced wrapper around
     /// [`Supervisor::spawn_actor_with_state`](crate::context::supervisor::Supervisor::spawn_actor_with_state).
     /// Phase 2A finalization keystone: lifecycle bootstrap entry points
-    /// in [`crate::context::lifecycle_helpers`] (`create_context`,
+    /// in `scp_runtime_lifecycle::helpers` (`create_context`,
     /// `restore_context`, `import_context`) call this after building the
     /// actor-shape state so production paths populate
     /// `Supervisor::actors`, the sole context registry; there is no
@@ -804,7 +804,7 @@ impl SupervisorHandle {
     /// actor currently registered for `context_id`, awaiting its verdict.
     ///
     /// This is the actor-native replacement gate for
-    /// [`crate::context::lifecycle_helpers::import_context`]: the existing
+    /// `scp_runtime_lifecycle::helpers::import_context`: the existing
     /// actor, running on its own owned state, checks replaceability and
     /// performs the crypto teardown + epoch-floor validate/merge, then
     /// claims itself terminal and exits. Capability-reduced wrapper —
@@ -1263,10 +1263,10 @@ const fn _assert_send_sync() {
 /// its field is PRIVATE and it has a CLOSED constructor set, so a value can only
 /// come from a sanctioned derivation:
 ///
-/// 1. [`convergent_ttl_deadline`] — the prune-immune snapshot create base raised
+/// 1. [`crate::context::shared::ttl_close::convergent_ttl_deadline`] — the prune-immune snapshot create base raised
 ///    to the highest fail-safe `TtlExtended` leaf in the (Merkle-validated) log
 ///    (the partitioned single-source derivation).
-/// 2. [`convergent_ttl_deadline_secs`] — the prune-immune create base
+/// 2. [`crate::context::shared::ttl_close::convergent_ttl_deadline_secs`] — the prune-immune create base
 ///    (`creation_timestamp_secs + params.ttl`) from the persisted snapshot, used
 ///    both at create-arm time and as the base inside `convergent_ttl_deadline`.
 /// 3. [`ConvergentDeadline::extend`] — raises an already-convergent deadline by
@@ -1275,7 +1275,7 @@ const fn _assert_send_sync() {
 /// There is deliberately **no** `from_raw` / `Deserialize` (B1/B2): admitting a
 /// `ConvergentDeadline` from arbitrary bytes would reconstruct a "trusted"
 /// deadline from an untrusted scalar and re-open the M3 hole. The arming seam
-/// [`start_ttl_timer`] / [`dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer) accept ONLY this type, so
+/// `scp_runtime_ttl_close::helpers::start_ttl_timer` / [`dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer) accept ONLY this type, so
 /// every armed deadline is convergent by construction. The type is TRANSIENT —
 /// it lives only on the arming path and is never persisted; the durable
 /// [`TtlTimer::deadline_unix_secs`](crate::context::ttl::TtlTimer) cache stays a
@@ -1286,7 +1286,7 @@ pub struct ConvergentDeadline(pub u64);
 
 impl ConvergentDeadline {
     /// The absolute deadline as Unix seconds. Unwrapped ONLY at the persistence
-    /// cache write ([`start_ttl_timer`]) and when recording a leaf's
+    /// cache write (`scp_runtime_ttl_close::helpers::start_ttl_timer`) and when recording a leaf's
     /// `old`/`new` deadline fields — never to reconstruct a new
     /// `ConvergentDeadline` from the result.
     #[must_use]

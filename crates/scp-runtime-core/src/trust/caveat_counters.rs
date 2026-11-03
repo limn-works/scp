@@ -29,7 +29,7 @@
 //! the spend/rate window the counter exists to close). The methods here are
 //! pure `&mut self` transformations with no I/O — the fail-closed persist and
 //! the KEEP-on-failure discipline live in the combinator at the call site
-//! ([`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)).
+//! (`scp_runtime_outlets::helpers::reserve_outlet_economy`).
 //!
 //! See `.docs/specs/07-trust-validation-and-capabilities.md` §7.3.8 and
 //! `.docs/adrs/ADR-049-outlet-redesign.md` §9.

@@ -457,7 +457,7 @@ impl ContextActorHandle {
     /// Called by the `BridgeInstanceCore::suspend` default body in
     /// `scp_ffi_common::bridge_instance::BridgeInstanceCore`. The handler
     /// that processes the `Pause` variant is implemented in
-    /// [`crate::context::actor::handlers::lifecycle_control`].
+    /// `scp_runtime_lifecycle_control::handler`.
     ///
     /// # Errors
     ///

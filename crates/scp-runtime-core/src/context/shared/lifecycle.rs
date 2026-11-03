@@ -76,7 +76,7 @@ pub fn add_member_and_queue_distribution(
 }
 
 /// Which queued sender-key distributions one pass of
-/// [`drain_and_deliver_sender_keys`] publishes (spec 09 §9.16.9 step 2).
+/// `scp_runtime_lifecycle::helpers::drain_and_deliver_sender_keys` publishes (spec 09 §9.16.9 step 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributionScope {
     /// Only distributions never attempted: the publish right after a

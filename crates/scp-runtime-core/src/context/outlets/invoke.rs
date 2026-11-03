@@ -6005,7 +6005,7 @@ where
 /// §7.3.8 fail-closed coupling of the validated-narrowed effective invocation
 /// caveats to the revocation CID of the delegation that carried them.
 ///
-/// The counter-bearing consume ([`consume_caveat_counters`]) needs BOTH the
+/// The counter-bearing consume (`scp_runtime_outlets::helpers::consume_caveat_counters`) needs BOTH the
 /// caveat set (to know which caps to enforce) AND the `ucan_cid` (the
 /// per-delegation counter key). Bundling them into one value makes "caveats
 /// present ⟹ cid present" a COMPILE-TIME invariant rather than a three-bridge

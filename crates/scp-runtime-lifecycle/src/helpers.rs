@@ -68,7 +68,7 @@
 //!
 //! - [`restore_all_contexts`] (iterates persistence snapshots — no
 //!   actors exist before restore)
-//! - [`flush_all_contexts`]
+//! - [`scp_runtime_core::context::shared::lifecycle::flush_all_contexts`]
 //! - [`shutdown_all_contexts`]
 
 #![allow(clippy::significant_drop_tightening)]
@@ -2029,7 +2029,7 @@ async fn hydrate_imported_event_log(
 ///
 /// Validates the export, performs the C3 per-instance wipe policy,
 /// restores crypto state with the epoch-floor regression guard
-/// ([`restore_crypto_state_with_floor_guard`]), builds a fresh
+/// ([`scp_runtime_core::context::restored_crypto::restore_crypto_state_with_floor_guard`]), builds a fresh
 /// `PerContextState` from the snapshot, and spawns an owned-state actor.
 /// Returns a [`SpawnedContext`] that re-arms the TTL timer, when the context
 /// carries a finite `params.ttl`, at the absolute convergent deadline; the

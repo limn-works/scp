@@ -39,7 +39,7 @@ pub struct TtlExpiryOutcome {
 
 /// Distinguishes the two TTL-extension activation paths.
 ///
-/// Both share the [`extend_ttl_deadline_and_record`] leaf-atomic combinator
+/// Both share the `scp_runtime_ttl_close::helpers::extend_ttl_deadline_and_record` leaf-atomic combinator
 /// (B3), and each has its own convergent `proposal_id` + leaf-`timestamp`
 /// convention.
 pub enum ExtensionLeaf {
@@ -241,7 +241,8 @@ pub fn convergent_ttl_deadline(
 /// canonical build site since the dead orchestrators were deleted in #2199).
 /// Returns `Ok(None)` for Full scope (crypto retained), a Broadcast context (no
 /// crypto), or the destruction-required-but-crypto-absent anomaly. The
-/// attestation is returned to the LOCAL caller ([`handle_finalize_close`]) for
+/// attestation is returned to the LOCAL caller (`handle_finalize_close` in
+/// `scp_runtime_ttl_close::handler`) for
 /// logging; this is a pure in-process Rust value — it is NOT surfaced across the
 /// FFI reply (the oneshot stays `Result<(), ContextError>`), and recording it
 /// into the event log / `ContextClosed` leaf is a separate DOA wire-format
@@ -251,8 +252,6 @@ pub fn convergent_ttl_deadline(
 ///
 /// The error of the `Closing → Closed` transition and its terminal leaf;
 /// nothing is disposed then.
-///
-/// [`handle_finalize_close`]: crate::context::actor::handlers
 pub async fn finalize_close(
     // #2148 (ADR-049 birth-into-actor): the actor-owned crypto lives here — for
     // an Ephemeral/Summary explicit close it is disposed through the cell after

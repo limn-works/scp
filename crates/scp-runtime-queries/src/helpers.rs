@@ -47,9 +47,9 @@
 //! PerContextState, deps: &ActorDeps, ...)`):
 //!
 //! - [`drain_events`] — drains the receive buffer.
-//! - [`report_degraded_mode`] — emits a `DegradedMode` event.
-//! - [`generate_context_access_key`], [`revoke_context_access_key`],
-//!   [`restore_context_access_key`], [`set_access_key`],
+//! - [`scp_runtime_core::context::shared::queries::report_degraded_mode`] — emits a `DegradedMode` event.
+//! - [`scp_runtime_core::context::shared::queries::generate_context_access_key`], [`scp_runtime_core::context::shared::queries::revoke_context_access_key`],
+//!   [`scp_runtime_core::context::shared::queries::restore_context_access_key`], [`set_access_key`],
 //!   [`remove_access_key`] — access-key store mutations.
 //! - `inject_access_key`, `get_access_key`, `get_all_access_keys`,
 //!   `grant_budget_for_test`, `remaining_budget_for_test`,
@@ -65,8 +65,8 @@
 //!
 //! - [`event_log_entries`] — passthrough on `deps.event_log` (no per-
 //!   context state).
-//! - [`create_checkpoint_if_due_view`],
-//!   [`force_create_checkpoint_fields`] — field-disjoint signatures
+//! - [`scp_runtime_core::context::shared::queries::create_checkpoint_if_due_view`],
+//!   [`scp_runtime_core::context::shared::queries::force_create_checkpoint_fields`] — field-disjoint signatures
 //!   used by `messaging_helpers` / `lifecycle_helpers` actor paths to
 //!   drive §9.9.3 checkpointing.
 //!
@@ -80,7 +80,7 @@
 //! state, so they take `&Supervisor` rather than
 //! `&[mut] PerContextState`:
 //!
-//! - [`register_local_did`] / [`is_local_did`] — `local_dids` `ArcSwap` +
+//! - [`scp_runtime_core::context::shared::queries::register_local_did`] / [`scp_runtime_core::context::shared::queries::is_local_did`] — `local_dids` `ArcSwap` +
 //!   `write_lock` mutations.
 //!
 //! Relocated from `queries_helpers_legacy` during Phase 2A
@@ -198,7 +198,7 @@ pub fn member_count(state: &PerContextState) -> usize {
 /// `Some(epoch)` for an encrypted (MLS) context; `None` for a broadcast
 /// context, which uses the per-author AES-GCM layer and carries no MLS
 /// epoch. Mirrors the broadcast-vs-MLS discrimination used by
-/// [`build_checkpoint`] (`broadcast_context.is_none()` ⇒ MLS).
+/// [`scp_runtime_core::context::shared::queries::build_checkpoint`] (`broadcast_context.is_none()` ⇒ MLS).
 ///
 /// Consumed by the reconnection driver's Phase 2 (`local_epoch`).
 #[must_use]

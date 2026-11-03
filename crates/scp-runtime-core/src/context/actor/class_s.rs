@@ -189,7 +189,7 @@
 //! - **Behavioral (RED-CS3):** when consequence enforcement applies a downward-auth
 //!   mutation (a `suspended_capabilities` GROW or an `AssignRole`
 //!   `member_capabilities` demotion),
-//!   [`crate::context::governance_logic::enforce_triggered_consequences`] returns a
+//!   `scp_runtime_governance::logic::enforce_triggered_consequences` returns a
 //!   downward-auth flag and the cell-holding caller persists the already-applied
 //!   mutation **fail-closed** (keep-direction) before acking, in every production
 //!   consequence site (send / receive / outlet-settle / periodic sweep; governance
@@ -434,12 +434,12 @@ impl<'a> ClassSMut<'a> {
     }
 
     /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
-    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
+    /// apply (`scp_runtime_governance::helpers::apply_broadcast_failure`)
     /// mutates, bundled so a caller can pass all three at once. The MIRROR of
     /// [`ClassCMut::commit_broadcast_borrows`], but supplied from this
     /// Class-S-capable view so the apply rides the owning combinator's
     /// **fail-closed** persist: the safety-gated commit-broadcast sites
-    /// ([`crate::context::governance_helpers::keep_broadcast_failure`]) build the
+    /// (`scp_runtime_governance::helpers::keep_broadcast_failure`) build the
     /// borrows HERE — inside a `commit_class_s_keep` closure — rather than through
     /// the coalesced `ClassCMut` view, so the `commit_fault` safety gate and the
     /// `pending_commits` retry entry survive a crash before the ≤50 ms persist
@@ -557,7 +557,7 @@ impl<'a> SharedClassS<'a> {
 ///
 /// # Disjoint-borrow support (`ConsequenceStateSplit`)
 ///
-/// [`crate::context::governance_logic::ConsequenceStateSplit`] needs FIVE
+/// [`crate::context::actor::class_s::ConsequenceStateSplit`] needs FIVE
 /// simultaneous disjoint borrows of distinct [`PerContextState`] fields
 /// (`governance`, `&mut role_state`, `&membership`, `&mut receive_buffer`,
 /// `&mut checkpoint_events_since`). The view ALREADY holds these as disjoint
@@ -1978,7 +1978,7 @@ impl<'a> MembershipClassCMut<'a> {
 ///
 /// Each field is borrowed from a DISTINCT field of the underlying state, so the
 /// borrow checker accepts holding all of them at once — this is exactly the
-/// shape [`crate::context::governance_logic::ConsequenceStateSplit`] needs. The
+/// shape [`crate::context::actor::class_s::ConsequenceStateSplit`] needs. The
 /// migration of `ConsequenceStateSplit` onto this is a LATER PR; this struct
 /// only makes the view CAPABLE of producing the borrows.
 #[allow(
@@ -2004,7 +2004,7 @@ pub struct ClassCSplit<'a> {
     /// downward-auth GROW through THIS role view — the GROW method does not exist on
     /// `RoleStateClassCMut` (a COMPILE error). (The GROW direction itself is not
     /// gone: it lives on the consequence-only [`ConsequenceRoleStateMut`] carried by
-    /// [`crate::context::governance_logic::ConsequenceStateSplit`], and as the
+    /// [`crate::context::actor::class_s::ConsequenceStateSplit`], and as the
     /// inherent `pub` `ContextRoleState::suspend_*` behind a whole `&mut` — each
     /// persisted fail-closed by its combinator/caller; see the `RoleStateClassCMut`
     /// type doc SCOPE note.) The structural BLACK-CS-03 confinement of the
@@ -2027,7 +2027,7 @@ impl<'a> ClassCSplit<'a> {
     /// owning [`ClassSCell`] / [`ClassCMut`] in scope.
     ///
     /// This is the cell-free bridge that lets
-    /// [`crate::context::governance_logic::ConsequenceStateSplit`] reshape onto
+    /// [`crate::context::actor::class_s::ConsequenceStateSplit`] reshape onto
     /// the [`ClassCSplit`] field shape while keeping its
     /// `from_state(&mut PerContextState)` signature — every existing
     /// (non-cell) consequence construction site stays compiling unchanged. A
@@ -2104,7 +2104,7 @@ impl<'a> ClassCSplit<'a> {
 /// mutators (`suspend_capabilities` / `suspend_all`) and the demotion
 /// (`system_assign_role`). This is the ONLY split that can apply a downward-auth
 /// GROW — and its cell-holding caller persists that GROW FAIL-CLOSED before
-/// acking (RED-CS3: [`crate::context::governance_logic::enforce_triggered_consequences`]
+/// acking (RED-CS3: `scp_runtime_governance::logic::enforce_triggered_consequences`
 /// returns a downward-auth flag the caller acts on).
 ///
 /// Un-ALIASED from [`ClassCSplit`] (R1): a type alias would hand the GROW view to
@@ -2497,7 +2497,7 @@ impl<'a> ClassCMut<'a> {
     }
 
     /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
-    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
+    /// apply (`scp_runtime_governance::helpers::apply_broadcast_failure`)
     /// mutates, bundled so a cell holder can pass all three at once. Each is a
     /// distinct field of this view, so the simultaneous `&mut` is sound by
     /// construction. This view supplies them COALESCED (best-effort); the
@@ -2595,7 +2595,7 @@ impl<'a> ClassCMut<'a> {
 
     /// Reborrow the held disjoint Class-C structural fields into a
     /// [`ClassCSplit`], for the
-    /// [`crate::context::governance_logic::ConsequenceStateSplit`] pattern. The
+    /// [`crate::context::actor::class_s::ConsequenceStateSplit`] pattern. The
     /// view ALREADY holds five distinct field references (destructured apart in
     /// [`Self::new`]), so all five borrows are live simultaneously. None is
     /// Class-S: governance is the field-granular [`GovernanceClassCMut`] (which
@@ -3529,7 +3529,7 @@ impl ClassSCommitToken {
     ///
     /// The consequence-cascade sites thread a `&mut Option<ClassSCommitToken>`
     /// *sink* (owned at the cell boundary) rather than the bare `bool` they used
-    /// to: when [`enforce_triggered_consequences`](crate::context::governance_logic::enforce_triggered_consequences)
+    /// to: when `scp_runtime_governance::logic::enforce_triggered_consequences`
     /// applies a downward-auth GROW (a `suspended_capabilities` suspension or an
     /// `AssignRole` `member_capabilities` demotion), the site populates the sink
     /// with a token via this constructor (idempotently — multiple GROWs in one
@@ -3889,7 +3889,7 @@ impl ClassSDischargeGuard<'_> {
     }
 }
 
-/// The three disjoint Class-C `&mut` fields [`apply_broadcast_failure`] mutates,
+/// The three disjoint Class-C `&mut` fields `scp_runtime_governance::helpers::apply_broadcast_failure` mutates,
 /// threaded as ONE struct so the caller holds all three at once (they are
 /// distinct fields of [`PerContextState`], so the borrow checker accepts the
 /// simultaneous `&mut`).
@@ -3901,7 +3901,7 @@ impl ClassSDischargeGuard<'_> {
 /// sub-struct; the DURABILITY class is the caller's choice — the safety-gated
 /// sites supply these from a `commit_class_s_keep` `rest_mut()` view (fail-closed
 /// persist of `pending_commits`/`commit_fault`), the best-effort sites from a
-/// coalesced `ClassCMut` view (see [`apply_broadcast_failure`]).
+/// coalesced `ClassCMut` view (see `scp_runtime_governance::helpers::apply_broadcast_failure`).
 pub struct CommitBroadcastBorrows<'a> {
     /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
     pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,

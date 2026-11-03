@@ -2,7 +2,7 @@
 //! (`10-infrastructure-and-self-hosting.md` §10.7.1).
 //!
 //! A `PushRegistration` lists the routing IDs at which a blob for this device
-//! arrives on one relay. [`push_routes`] reads one context's share of that list
+//! arrives on one relay. [`scp_runtime_core::context::push_routes::push_routes`] reads one context's share of that list
 //! from the actor-owned state, and
 //! [`Supervisor::push_routing_ids`](scp_runtime_core::context::supervisor::Supervisor::push_routing_ids)
 //! fans the read across every known context and groups the answers by canonical

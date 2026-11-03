@@ -20,7 +20,7 @@
 //! # Top-level helpers
 //!
 //! Per-context (state-owning):
-//! [`create_governance_checkpoint`], [`add_checkpoint_cosignature`],
+//! [`scp_runtime_core::context::shared::trust_recovery::create_governance_checkpoint`], [`add_checkpoint_cosignature`],
 //! [`recovery_advance_epoch`], [`recovery_send_notification`].
 //!
 //! Cross-context (supervisor-shaped):
@@ -125,8 +125,8 @@ pub fn add_checkpoint_cosignature(
 /// # Fail-closed broadcast (spec §9.12 / ADR-049 §9)
 ///
 /// The epoch-advance Commit rides the SAME persistent retry queue as the other
-/// epoch-advancing commits: [`try_broadcast_commit`] +
-/// [`keep_broadcast_failure`]. On transport failure the `commit_fault`
+/// epoch-advancing commits: `scp_runtime_governance::helpers::try_broadcast_commit` +
+/// `scp_runtime_governance::helpers::keep_broadcast_failure`. On transport failure the `commit_fault`
 /// safety-gate marker and the `pending_commits` retry entry are persisted
 /// FAIL-CLOSED (a second `commit_class_s_keep`), and a second-persist failure
 /// aborts recovery with [`ContextError::PersistenceFailed`] — recovery is NOT

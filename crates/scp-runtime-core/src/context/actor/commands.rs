@@ -14,8 +14,8 @@
 //! # Shape
 //!
 //! The outer [`ContextCommand`] enum is a discriminated union over 12
-//! domain-grouped sub-enums, one per handler file in
-//! [`crate::context::actor::handlers`]. Each sub-enum carries the
+//! domain-grouped sub-enums, one per domain crate's `src/handler.rs`
+//! (`scp_runtime_<domain>::handler`, ADR-070). Each sub-enum carries the
 //! command-specific payload plus a `tokio::sync::oneshot::Sender` for the
 //! reply — the actor processes a command to completion and sends the
 //! typed result; the caller's oneshot receiver is the cancellation
@@ -93,8 +93,8 @@ pub type DrainEventsReply =
 /// Every command the `ContextActor` accepts. Routed by the actor's
 /// dispatch loop to the matching handler module.
 ///
-/// Variants correspond one-to-one with handler files under
-/// [`crate::context::actor::handlers`]. The dispatch loop in
+/// Variants correspond one-to-one with the domain crates' `src/handler.rs`
+/// files (`scp_runtime_<domain>::handler`). The dispatch loop in
 /// [`crate::context::actor::ContextActor::run`] matches on this enum.
 pub enum ContextCommand {
     /// Messaging — send, deliver, decrypt (spec §9.8).
@@ -527,7 +527,7 @@ pub enum MessagingCommand {
     ///
     /// EXPIRES with #2050. When production §9.17 distribution lands, DELETE this
     /// variant, its handler
-    /// [`handle_test_install_access_key`](crate::context::actor::handlers::messaging),
+    /// `handle_test_install_access_key` (`scp_runtime_messaging::handler`),
     /// the [`Supervisor::test_install_access_key`](crate::context::supervisor::Supervisor::test_install_access_key)
     /// mailbox entrypoint, and the harness
     /// `FullStackNode::pull_access_keys_from_creator` driver — then confirm the

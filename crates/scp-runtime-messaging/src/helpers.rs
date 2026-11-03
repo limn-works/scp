@@ -4,7 +4,7 @@
 //! # Purpose
 //!
 //! This module hosts messaging-domain helpers that operate on actor-owned
-//! [`PerContextState`] and
+//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`].
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
@@ -20,7 +20,7 @@
 //!
 //! # Helpers
 //!
-//! 1. [`build_inner_wire`] (pure: access-key wrap + inner-envelope
+//! 1. [`build_inner_wire`](scp_runtime_core::context::shared::messaging::build_inner_wire) (pure: access-key wrap + inner-envelope
 //!    sign+pad) feeding [`build_encrypted_envelope_actor`] — the
 //!    ADR-049 PR-7 actor seal (sender-key + MLS + outer-envelope)
 //!    against an actor-owned `ContextCryptoState`.
@@ -1876,7 +1876,7 @@ pub(crate) async fn send_heartbeat(
 ///
 /// The split exists so the cell borrow drops at the call boundary (the result is
 /// owned), leaving the cell free for the `send_message` body's subsequent
-/// `.await` of [`scp_runtime_economy::testing_access::authorize_paid_action_hold`] —
+/// `.await` of [`EconomyDomain::authorize_paid_action_hold`](scp_runtime_core::context::domains::EconomyDomain::authorize_paid_action_hold) —
 /// a `&ClassSCell` held ACROSS that await would make the actor future non-`Send`
 /// (`ClassSCell` is not `Sync`).
 pub fn authorize_send_payment_prepare(

@@ -173,7 +173,7 @@ pub fn restore_context_access_key(
 /// event/time thresholds have been reached.
 ///
 /// Takes per-field references so callers may pass disjoint sub-borrows of the
-/// unified [`PerContextState`] (ADR-049 §Decision 1).
+/// unified [`crate::context::actor::state::PerContextState`] (ADR-049 §Decision 1).
 ///
 /// The checkpoint is built and signed before this call because signing awaits
 /// custody (ADR-049 Decision 7a) and the close path records it inside a

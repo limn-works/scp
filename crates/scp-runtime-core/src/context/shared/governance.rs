@@ -95,7 +95,7 @@ pub fn migration_destination_id(context_id: &str, proposal_id: &ProposalId) -> S
 /// nothing behind and a retry of the same call can succeed. After that first
 /// record the call never returns `ActorBusy`: the migration holds the guard
 /// through its destination create and its rollback
-/// ([`execute_propose_context_migration`] takes this as a required argument).
+/// (`scp_runtime_governance::helpers::execute_propose_context_migration` takes this as a required argument).
 pub struct MigrationBootstrap {
     /// The held `bootstrap_spawn_lock`.
     pub guard: tokio::sync::OwnedMutexGuard<()>,
@@ -165,7 +165,7 @@ impl MigrationBootstrap {
     /// action is a migration, the proposal is `Approved` and not yet
     /// executed, no governance freeze stands, and no approved conflicting
     /// proposal makes it lose or freezes governance
-    /// ([`detect_and_handle_conflicts`]). Decided with reads only, before
+    /// (`scp_runtime_governance::helpers::detect_and_handle_conflicts`). Decided with reads only, before
     /// the call's first record. `freeze_expires` says the call clears the
     /// standing freeze as expired before it records the proposal.
     ///
@@ -207,8 +207,8 @@ impl MigrationBootstrap {
 
 /// The retry-queue bookkeeping a failed MLS-Commit broadcast requires.
 ///
-/// [`try_broadcast_commit`] returns it when the transport send FAILS, so the
-/// CALLER applies it (via [`apply_broadcast_failure`]) in the correct
+/// `scp_runtime_governance::helpers::try_broadcast_commit` returns it when the transport send FAILS, so the
+/// CALLER applies it (via `scp_runtime_governance::helpers::apply_broadcast_failure`) in the correct
 /// durability class.
 ///
 /// Splitting the failure bookkeeping OUT of the async transport send is what

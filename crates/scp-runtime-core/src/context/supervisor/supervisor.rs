@@ -4246,7 +4246,7 @@ impl Supervisor {
     /// `mls_storage` slot and the per-identity `KeyPackageStoreHandle` is
     /// get-or-spawned, both since the storage-foundation reshape) and
     /// delegate to the actor-shape helpers in
-    /// [`crate::context::lifecycle_helpers`]. Those helpers spawn the
+    /// `scp_runtime_lifecycle::helpers`. Those helpers spawn the
     /// per-context actor that OWNS the freshly built `PerContextState`
     /// and register its handle in the supervisor registry — there is no
     /// legacy `contexts` `DashMap` write. Building deps requires
@@ -5080,7 +5080,7 @@ impl Supervisor {
     /// to the per-actor path: a per-context fan-out would yield the same
     /// results because the payment-adapter lookup is supervisor-scoped,
     /// not actor-scoped. The actor-shape twin
-    /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
+    /// `scp_runtime_economy::helpers::verify_payment_receipts`
     /// runs the identical loop over `deps.payment_adapter`; the two paths
     /// are observably equivalent and differ only in the serialization
     /// point. Batches with no single owning actor have no per-context
@@ -5214,7 +5214,7 @@ impl Supervisor {
     /// +
     /// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification):
     /// the handle pair serves the actor-shape helper
-    /// [`crate::context::trust_recovery_helpers::recovery_notify_contact`]
+    /// `scp_runtime_trust_recovery::helpers::recovery_notify_contact`
     /// (called from a context actor's `run()` loop via the
     /// capability-reduced `deps.supervisor`), whereas this method serves
     /// `dispatch_trust_recovery_direct`'s `RecoveryNotifyContact` arm,
@@ -5434,7 +5434,7 @@ impl Supervisor {
     /// the notification to its mailbox (ADR-049 §9.12, PR-7 SCP-CRYPTOMOVE-001).
     ///
     /// This is the supervisor-direct fallback for the per-context actor's
-    /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)
+    /// `scp_runtime_trust_recovery::helpers::recovery_send_notification`
     /// handler, reached when the target context has no registered actor. Since
     /// PR-7 moved the MLS crypto state onto the per-context actor (one-way
     /// take), this path can no longer seal through the retired supervisor-scoped
@@ -5802,7 +5802,7 @@ impl Supervisor {
     ///
     /// This is the owned-state spawn path. The lifecycle bootstrap caller
     /// (create / restore / import in
-    /// [`crate::context::lifecycle_helpers`]) builds a fresh actor-shape
+    /// `scp_runtime_lifecycle::helpers`) builds a fresh actor-shape
     /// `PerContextState` and hands the state + deps bundle into this
     /// method. The spawned actor becomes the sole owner of that state.
     ///
@@ -6305,7 +6305,7 @@ impl Supervisor {
     ///    surface [`ContextError::ActorCrashed`] — there is nothing to
     ///    rehydrate.
     /// 3. **Rebuild deps + `ContextHandle`** and delegate to
-    ///    [`crate::context::lifecycle_helpers::restore_context`] — the
+    ///    `scp_runtime_lifecycle::helpers::restore_context` — the
     ///    single respawn primitive that reconstructs the FULL
     ///    `PerContextState` (governance, MLS crypto, §9.10.4 routing /
     ///    pseudonym registry, rate-limit) and spawns the new watched actor.
@@ -12772,7 +12772,7 @@ impl Supervisor {
     ///    did not answer), so it is returned and nothing is created over the
     ///    context (ADR-049 §10).
     /// 3. Create a fresh bilateral-persistent context through the
-    ///    actor-shape [`lifecycle_helpers::create_context`](crate::context::lifecycle_helpers::create_context)
+    ///    actor-shape `scp_runtime_lifecycle::helpers::create_context`
     ///    (membership, roles, governance, owned-state actor spawn), with
     ///    `local_did` as creator — mirroring the
     ///    [`LifecycleCommand::CreateContext`]
@@ -13290,7 +13290,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// Propagates the typed [`ContextError`] of
-    /// [`messaging_helpers::rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym);
+    /// `scp_runtime_messaging::helpers::rotate_pseudonym`;
     /// [`ContextError::TransportFailed`] if the reply channel is dropped.
     pub async fn rotate_pseudonym(
         &self,
@@ -15003,7 +15003,7 @@ impl Supervisor {
     /// actor and await the reconciled-record count.
     ///
     /// Called once per context from the restore path
-    /// ([`restore_context`](crate::context::lifecycle_helpers)) after
+    /// (`scp_runtime_lifecycle::helpers::restore_context`) after
     /// `spawn_actor_with_state`, mirroring the post-restore TTL re-arm. The
     /// handler refunds + releases the durable reserves of any stream whose
     /// off-mailbox pump survived the crash (its close-time settle lands on the
@@ -17142,7 +17142,7 @@ impl Supervisor {
 
     /// Build the Welcome-derived [`PerContextState`](crate::context::actor::state::PerContextState)
     /// for a joiner (ADR-049 Phase 2J). Mirrors the fresh-context field set that
-    /// [`crate::context::lifecycle_helpers::create_context`] builds, but with the
+    /// `scp_runtime_lifecycle::helpers::create_context` builds, but with the
     /// caller as a `"member"` and `creator_did` as the context creator/admin.
     ///
     /// The MLS crypto (group + sender key) is NOT stored here — it lives in the

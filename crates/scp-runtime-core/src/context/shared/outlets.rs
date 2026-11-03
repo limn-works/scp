@@ -42,8 +42,8 @@ pub struct ManagedOutletInvocationOutput {
 /// Phase-1 bookkeeping bundle for a outlet invocation in flight.
 ///
 /// Crosses the actor mailbox inside a [`OutletEconomyReservation`]: produced by
-/// [`reserve_outlet_economy`] (actor), carried through the executor
-/// (supervisor), then consumed by [`settle_outlet_economy_capture`] /
+/// `scp_runtime_outlets::helpers::reserve_outlet_economy` (actor), carried through the executor
+/// (supervisor), then consumed by `scp_runtime_outlets::helpers::settle_outlet_economy_capture` /
 /// [`rollback_outlet_economy`] (actor).
 ///
 /// The `#[must_use]` + `Drop` debug-assert invariant catches any future
@@ -123,7 +123,7 @@ impl OutletEconomyTicket {
 
     /// Test-only constructor for an escrow-BEARING ticket carrying a budget
     /// deduction and a captured policy, so the capture path
-    /// ([`settle_outlet_economy_capture`]) actually runs payment capture against a
+    /// (`scp_runtime_outlets::helpers::settle_outlet_economy_capture`) actually runs payment capture against a
     /// supplied adapter. Used by the RED-CS3 outlet-settle fail-closed test, which
     /// pairs this with a failing-capture adapter to exercise the
     /// payment-capture-failure early-return path.
@@ -264,7 +264,7 @@ impl OutletEconomyTicket {
 
 /// The `Send` output of the Phase-1 economy reserve.
 ///
-/// Produced by [`reserve_outlet_economy`] inside the actor, carried by the
+/// Produced by `scp_runtime_outlets::helpers::reserve_outlet_economy` inside the actor, carried by the
 /// supervisor orchestrator across the non-`Send` executor, and handed back into
 /// the actor for Phase 3 settle.
 ///
@@ -299,7 +299,7 @@ impl std::fmt::Debug for OutletEconomyReservation {
 }
 
 /// The `Send` output of the streaming open reserve
-/// ([`reserve_outlet_stream_economy`]).
+/// (`scp_runtime_outlets::helpers::reserve_outlet_stream_economy`).
 ///
 /// Mirrors [`OutletEconomyReservation`] for the streaming-native invocation
 /// path: produced inside the per-context actor on owned Class-S state, carried
@@ -356,7 +356,7 @@ impl std::fmt::Debug for StreamEconomyReservation {
 /// The `SCP-OUTLET-6089` "invoker is not a member" marker string.
 ///
 /// Stamped into the `PermissionDenied` message by the
-/// [`reserve_outlet_stream_economy`] membership gate and matched back out by
+/// `scp_runtime_outlets::helpers::reserve_outlet_stream_economy` membership gate and matched back out by
 /// [`reserve_error_to_open_rejection`]. Kept as one const so the producer and
 /// the reverse-map consumer move together — a permanent membership/authorization
 /// denial must map to a NON-retryable class, never the retryable transport
@@ -372,7 +372,7 @@ pub const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// AUTHORITATIVE figure — NOT a fresh policy evaluation — so it is authorized and
 /// captured verbatim; the receipt reflects exactly what the invoker consumed.
 /// Shared by the on-actor
-/// [`settle_outlet_stream`] and the supervisor-side no-actor fallback
+/// `scp_runtime_outlets::helpers::settle_outlet_stream` and the supervisor-side no-actor fallback
 /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor).
 ///
 /// # Idempotency (both legs)
@@ -393,7 +393,7 @@ pub const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// BOTH points. This is a REQUIRED ADAPTER CONTRACT — the runtime keeps no
 /// capture-dedup ledger of its own (root close tracked in
 /// <https://github.com/limn-works/scp/issues/2156>); see the exactly-once
-/// two-layer model on [`settle_outlet_stream`].
+/// two-layer model on `scp_runtime_outlets::helpers::settle_outlet_stream`.
 ///
 /// # Errors
 ///
@@ -429,7 +429,7 @@ pub async fn authorize_and_capture_stream_billed(
 /// the per-context actor on owned state.
 ///
 /// Voids any payment escrow hold, then reverses the velocity entry, budget
-/// deduction, and hard-rate-limit token consumed by [`reserve_outlet_economy`].
+/// deduction, and hard-rate-limit token consumed by `scp_runtime_outlets::helpers::reserve_outlet_economy`.
 /// Generation-checked Phase-3 rollback. Reverses the reservation against THIS
 /// actor's owned state ONLY if the reservation's `generation` still matches the
 /// live actor's `state.generation`; on a MISMATCH the actor was despawned and a
@@ -439,7 +439,7 @@ pub async fn authorize_and_capture_stream_billed(
 /// confused-deputy write to the WRONG context instance. On mismatch it voids
 /// only the EXTERNAL escrow (the real payment hold the prior instance
 /// authorized at reserve) and consumes the ticket — exactly mirroring
-/// [`settle_outlet_economy`]'s generation guard, but for the failure/abort
+/// `scp_runtime_outlets::helpers::settle_outlet_economy`'s generation guard, but for the failure/abort
 /// path.
 ///
 /// This is the rollback-path counterpart the saga abort handler and the
@@ -738,7 +738,7 @@ pub fn invocation_error_to_context(
 ///
 /// # Mapping direction (documented per the chunk-3 plan §3a note)
 ///
-/// The streaming reserve ([`reserve_outlet_stream_economy`]) runs INSIDE the
+/// The streaming reserve (`scp_runtime_outlets::helpers::reserve_outlet_stream_economy`) runs INSIDE the
 /// per-context actor and can only reply with a `Send` [`ContextError`] across
 /// the mailbox, so it encodes its two economic open-time rejections through the
 /// LOSSLESS forward direction —

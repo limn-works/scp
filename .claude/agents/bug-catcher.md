@@ -48,7 +48,7 @@ For each piece of code you review:
 - Check for main-thread-only operations being called from background contexts
 
 #### SCP-specific concurrency checklist
-Supervisor concurrency invariants: `crates/scp-runtime/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
+Supervisor concurrency invariants: `crates/scp-runtime-core/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
 
 ### 3. Memory and Lifecycle Analysis
 - Identify retain cycles / reference cycles, especially in closures and callbacks

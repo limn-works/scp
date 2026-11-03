@@ -103,7 +103,7 @@ use scp_runtime_types::context::supervisor::saga_journal::SagaId;
 /// configured ceiling").
 ///
 /// Derived from the dedup cache capacity, the saga dedup TTL window
-/// ([`SAGA_NONCE_DEDUP_TTL_SECS`] = 600s = 10 min), and the required ≥2× safety
+/// ([`scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS`] = 600s = 10 min), and the required ≥2× safety
 /// margin: at this per-minute rate the worst-case distinct-nonce volume over
 /// the TTL window stays at or below half the
 /// [`NONCE_DEDUP_CAPACITY`](scp_protocol::crypto::sender_keys::NONCE_DEDUP_CAPACITY)
@@ -551,7 +551,7 @@ fn misrouted<T>(
 /// `OutboundPolicy.allowed_callers`, then stages (does NOT apply) the outbound
 /// rate-limit decrement + escrow reservation via the existing reserve
 /// mechanism. The escrow amount is the outlet's REGISTERED per-invocation cost —
-/// [`reserve_outlet_economy`] derives it from the caller context's economy policy
+/// `scp_runtime_outlets::helpers::reserve_outlet_economy` derives it from the caller context's economy policy
 /// / outlet registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
 /// The resulting `Send` [`OutletEconomyReservation`](scp_runtime_core::context::shared::outlets::OutletEconomyReservation) is a `#[must_use]` RAII
@@ -1533,7 +1533,7 @@ fn validate_input_specificity(
 /// happens in [`prepare_b`] after every check passes.
 ///
 /// **Window relationship (BLACK-XCTX-01).** The nonce-dedup TTL
-/// ([`SAGA_NONCE_DEDUP_TTL_SECS`]) STRICTLY exceeds this freshness check's
+/// ([`scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS`]) STRICTLY exceeds this freshness check's
 /// skew tolerance (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`), so a `nonce` recorded
 /// at the trailing edge of its freshness window is still remembered by the
 /// dedup cache through the rest of that window — a replay carrying a *refreshed*
