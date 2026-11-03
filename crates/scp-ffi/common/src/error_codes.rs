@@ -2016,11 +2016,14 @@ pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
     use scp_node::NodeError as N;
     match e {
         E::InvalidConfig(_)
-        | E::Node(N::MissingField(_) | N::InvalidConfig(_) | N::WebPushWithoutWellKnown) => {
-            STORAGE_8007
-        }
+        | E::Node(
+            N::MissingField(_)
+            | N::InvalidConfig(_)
+            | N::WebPushWithoutWellKnown
+            | N::NodeBinding(_),
+        ) => STORAGE_8007,
         E::Storage(_) | E::Io(_) => STORAGE_8008,
-        E::Node(N::Storage(_)) => STORAGE_8009,
+        E::Node(N::Storage(_) | N::NodeKey(_)) => STORAGE_8009,
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) => IDENT_1063,
         E::Node(N::IdentityCreation(e)) => e.code(),
         E::Node(N::Relay(_) | N::OwnAddresses(_)) => TRANS_5051,
@@ -2065,7 +2068,12 @@ pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorCl
     match e {
         E::InvalidConfig(_)
         | E::Node(
-            N::MissingField(_) | N::InvalidConfig(_) | N::WebPushWithoutWellKnown | N::Storage(_),
+            N::MissingField(_)
+            | N::InvalidConfig(_)
+            | N::WebPushWithoutWellKnown
+            | N::Storage(_)
+            | N::NodeKey(_)
+            | N::NodeBinding(_),
         )
         | E::Storage(_)
         | E::Io(_)
@@ -2191,6 +2199,18 @@ mod server_error_tests {
             (
                 E::Node(N::WebPushWithoutWellKnown),
                 STORAGE_8007,
+                Validation,
+            ),
+            (
+                E::Node(N::NodeBinding(
+                    scp_protocol::node::NodeBindingInstallError::ForeignNodeKey,
+                )),
+                STORAGE_8007,
+                Validation,
+            ),
+            (
+                E::Node(N::NodeKey(scp_node::node_key::NodeKeyStoreError::NoKey)),
+                STORAGE_8009,
                 Validation,
             ),
             (

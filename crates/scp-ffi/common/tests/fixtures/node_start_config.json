@@ -26,6 +26,10 @@
     ],
     "nat": [
       {"kind": "auto"}
+    ],
+    "node_binding": [
+      {"kind": "unbound"},
+      {"kind": "installed", "binding_json": "{\"node_key\":\"02\"}", "url": "https://node.example.org"}
     ]
   },
   "optional_arm_fields": {
@@ -33,7 +37,7 @@
   },
   "fields": [
     "reach", "identity", "blob_storage", "tls", "dht", "cors_origins",
-    "bind_addr", "http_bind_addr", "nat", "projection_rate_limit"
+    "node_binding", "bind_addr", "http_bind_addr", "nat", "projection_rate_limit"
   ],
   "config": {
     "reach": {"kind": "domain", "domain": "node.example.org"},
@@ -42,6 +46,7 @@
     "tls": {"kind": "acme", "email": "ops@example.org"},
     "dht": {"kind": "disabled"},
     "cors_origins": {"kind": "allowlist", "origins": ["https://app.example.org"]},
+    "node_binding": {"kind": "installed", "binding_json": "{\"node_key\":\"02\"}", "url": "https://node.example.org"},
     "bind_addr": "127.0.0.1:0",
     "http_bind_addr": "0.0.0.0:8443",
     "nat": {"kind": "auto"},

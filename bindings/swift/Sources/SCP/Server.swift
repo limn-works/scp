@@ -350,10 +350,10 @@ public struct Node: Sendable {
 
 #if os(macOS)
     // `NodeStartConfig` and its enums (`FfiReach`, `FfiBlobBackend`,
-    // `FfiTlsMode`, `FfiDhtMode`, `FfiCorsOrigins`, `FfiNat`) are the UniFFI
-    // record and enums in ScpBindings.swift, as `StorageConfig` is for
-    // `SCP.init(storage:)`. They carry the field names, arms and required and
-    // optional split of the bridge's `NodeStartConfig` (construction.md
+    // `FfiTlsMode`, `FfiDhtMode`, `FfiCorsOrigins`, `FfiNodeBinding`,
+    // `FfiNat`) are the UniFFI record and enums in ScpBindings.swift, as
+    // `StorageConfig` is for `SCP.init(storage:)`. They carry the field
+    // names, arms and required and optional split of the bridge's `NodeStartConfig` (construction.md
     // §"Node start — `NodeStartConfig`", ADR-052): a flat config with no
     // builder, required fields with no default, and optional fields that
     // default to `nil`. The UniFFI layer is platform-agnostic; the node start
@@ -394,7 +394,8 @@ public struct Node: Sendable {
         ///     blobStorage: .sqlite(path: "/var/lib/scp/blobs.sqlite"),
         ///     tls: .plaintext,
         ///     dht: .disabled,
-        ///     corsOrigins: .allowlist(origins: ["https://app.example.org"])
+        ///     corsOrigins: .allowlist(origins: ["https://app.example.org"]),
+        ///     nodeBinding: .unbound
         /// ))
         /// ```
         ///

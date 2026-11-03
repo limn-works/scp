@@ -144,7 +144,8 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
     /// delivery and unified rate limiting (ADR-037 AC3). Set
     /// `config.session_config.public_records` to the relay's value, so a
     /// retained record reaches the shared store only through one admission
-    /// (§9.10.12).
+    /// (§9.10.12), and `config.session_config.node_proofs` to the relay's
+    /// value, so every transport proves under one binding (§9.7.4.2).
     /// Set `config.session_config.relay_url` to a clone of the relay's handle
     /// and `config.session_config.push` to the relay's value too, so push
     /// messages are intercepted and follow a URL change (§10.7.1).
@@ -392,6 +393,7 @@ mod tests {
             session.mark_active();
             let queried = match session
                 .dispatch_message_multi(&ClientMessage::Query {
+                    proof_nonce: None,
                     ref_id: Some("q".to_owned()),
                     routing_id: rid,
                     since: None,

@@ -108,6 +108,28 @@ pub enum FfiNat {
     Auto {},
 }
 
+/// The node binding the node starts with (`09-security-model.md` §9.6.3
+/// step 4). Required, so a caller names `Unbound` instead of leaving a
+/// binding out by omission.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FfiNodeBinding {
+    /// No binding: the node still draws and keeps its node key, and answers
+    /// every QUERY without a `node_proof` (§9.10.12).
+    Unbound {},
+    /// The finished binding and the canonical URL the node serves under. At
+    /// start the node refuses a binding whose `node_key` is not its own,
+    /// whose `possession_sig` fails, or whose `url_hash` is not the SHA-256
+    /// of `url`.
+    Installed {
+        /// The binding's RFC 8785 canonical JSON, as the operator's SDK
+        /// returns it.
+        binding_json: String,
+        /// The node's canonical URL (§9.18.2 "Canonical node URL").
+        url: String,
+    },
+}
+
 /// The flat config `server::node_start` converts into the core `NodeConfig`.
 ///
 /// It has no storage field: `node_start` takes the `SCP` instance's own storage
@@ -129,6 +151,8 @@ pub struct NodeStartConfig {
     pub dht: FfiDhtMode,
     /// CORS origins for the public endpoints.
     pub cors_origins: FfiCorsOrigins,
+    /// The node binding the node starts with.
+    pub node_binding: FfiNodeBinding,
     /// Relay bind address; absent binds `127.0.0.1:0`.
     #[serde(default)]
     pub bind_addr: Option<SocketAddr>,
@@ -168,6 +192,7 @@ mod tests {
         "tls": {"kind": "acme", "email": "ops@example.org"},
         "dht": {"kind": "disabled"},
         "cors_origins": {"kind": "allowlist", "origins": ["https://app.example.org"]},
+        "node_binding": {"kind": "installed", "binding_json": "{}", "url": "https://node.example.org"},
         "bind_addr": "127.0.0.1:0",
         "nat": {"kind": "auto"},
         "projection_rate_limit": 30
@@ -200,6 +225,10 @@ mod tests {
                 cors_origins: FfiCorsOrigins::Allowlist {
                     origins: vec!["https://app.example.org".to_owned()]
                 },
+                node_binding: FfiNodeBinding::Installed {
+                    binding_json: "{}".to_owned(),
+                    url: "https://node.example.org".to_owned()
+                },
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
                 http_bind_addr: None,
                 nat: Some(FfiNat::Auto {}),
@@ -213,13 +242,15 @@ mod tests {
         let cfg = NodeStartConfig::from_json(
             r#"{"reach":{"kind":"local"},"identity":"did:dht:abc",
                 "blob_storage":{"kind":"in_memory"},"tls":{"kind":"acme"},
-                "dht":{"kind":"disabled"},"cors_origins":{"kind":"any_origin"}}"#,
+                "dht":{"kind":"disabled"},"cors_origins":{"kind":"any_origin"},
+                "node_binding":{"kind":"unbound"}}"#,
         )
         .expect("minimal config parses");
         assert_eq!(cfg.reach, FfiReach::Local {});
         assert_eq!(cfg.blob_storage, FfiBlobBackend::InMemory {});
         assert_eq!(cfg.tls, FfiTlsMode::Acme { email: None });
         assert_eq!(cfg.cors_origins, FfiCorsOrigins::AnyOrigin {});
+        assert_eq!(cfg.node_binding, FfiNodeBinding::Unbound {});
         assert_eq!(cfg.bind_addr, None);
         assert_eq!(cfg.http_bind_addr, None);
         assert_eq!(cfg.nat, None);
@@ -275,6 +306,11 @@ mod tests {
                 r#"{"kind": "acme", "email": "ops@example.org"}"#,
                 r#"{"kind": "acme", "emial": "ops@example.org"}"#,
             ),
+            (
+                r#"{"kind": "installed", "binding_json": "{}", "url": "https://node.example.org"}"#,
+                r#"{"kind": "unbound"}"#,
+                r#"{"kind": "unbound", "url": "https://node.example.org"}"#,
+            ),
         ] {
             let with_known = VALID.replacen(from, known, 1);
             let with_unknown = VALID.replacen(from, unknown, 1);
@@ -317,6 +353,13 @@ mod tests {
         );
         assert_ne!(without_cors, VALID);
         assert!(invalid(&without_cors), "missing cors_origins accepted");
+        let without_binding = VALID.replacen(
+            r#""node_binding": {"kind": "installed", "binding_json": "{}", "url": "https://node.example.org"},"#,
+            "",
+            1,
+        );
+        assert_ne!(without_binding, VALID);
+        assert!(invalid(&without_binding), "missing node_binding accepted");
     }
 
     // -----------------------------------------------------------------------
@@ -491,6 +534,7 @@ mod tests {
                 "dht" => assert_sum_type::<FfiDhtMode>(field, &fx),
                 "cors_origins" => assert_sum_type::<FfiCorsOrigins>(field, &fx),
                 "nat" => assert_sum_type::<FfiNat>(field, &fx),
+                "node_binding" => assert_sum_type::<FfiNodeBinding>(field, &fx),
                 other => panic!("no Rust type checks the fixture's `{other}` arms"),
             }
         }

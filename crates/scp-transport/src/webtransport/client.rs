@@ -1303,6 +1303,7 @@ impl TransportAdapter for WebTransportAdapter {
                         since,
                         after_blob: None,
                         limit: None,
+                        proof_nonce: None,
                     };
 
                     self.ws_send_fire_and_forget(&msg)?;

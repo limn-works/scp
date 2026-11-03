@@ -1113,6 +1113,7 @@ mod tests {
             "tls": {"kind": "plaintext"},
             "dht": {"kind": "disabled"},
             "cors_origins": {"kind": "any_origin"},
+            "node_binding": {"kind": "unbound"},
             "bind_addr": "127.0.0.1:0",
         });
         edit(&mut cfg);
@@ -1387,6 +1388,52 @@ mod tests {
             );
             node.shutdown();
             assert!(node.is_shutdown());
+        });
+    }
+
+    /// A `node_binding` of `installed` for this instance's node key starts
+    /// the node bound (`09-security-model.md` §9.6.3 step 4), and the same
+    /// binding on another instance, whose node key differs, is refused with
+    /// `SCP-STORAGE-8007`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_installs_a_binding_for_the_instance_node_key_only() {
+        use scp_ffi_common::test_helpers::{FIXTURE_NODE_URL, node_binding_json_for};
+
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let binding_json = rt()
+                .block_on(node_binding_json_for(
+                    &instance_storage(&scp.inner).unwrap(),
+                ))
+                .unwrap();
+            let installed = |c: &mut serde_json::Value| {
+                c["node_binding"] = serde_json::json!({
+                    "kind": "installed",
+                    "binding_json": binding_json,
+                    "url": FIXTURE_NODE_URL,
+                });
+            };
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = identity.did().to_owned();
+            let node = scp
+                .node_start(py, &start_json(&did, installed), &identity)
+                .expect("a binding of the instance's own node key installs");
+            node.shutdown();
+
+            let other = crate::scp::PyScp::new_in_memory_for_test();
+            let identity = other.identity_create(py, "in_memory", None).unwrap();
+            let did = identity.did().to_owned();
+            let raised = match other.node_start(py, &start_json(&did, installed), &identity) {
+                Ok(node) => {
+                    node.shutdown();
+                    panic!("a foreign binding must be refused");
+                }
+                Err(e) => e.to_string(),
+            };
+            assert!(raised.contains(codes::STORAGE_8007), "{raised}");
         });
     }
 

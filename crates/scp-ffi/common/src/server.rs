@@ -40,7 +40,8 @@ use scp_platform::sqlite::SqliteStorage;
 use crate::bridge_instance::{CoreFields, InstanceBorrower, NodeBinding};
 use crate::dht::{DhtInitError, FfiDhtClient};
 use crate::node_start_config::{
-    FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiReach, FfiTlsMode, NodeStartConfig,
+    FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiNodeBinding, FfiReach, FfiTlsMode,
+    NodeStartConfig,
 };
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
@@ -726,13 +727,15 @@ where
     // absent: Argon2id over "" seals the key file under a key anyone who reads
     // the salt can derive (spec §17.8). Checked before the data directory or
     // the blob database is created, so a refused call leaves nothing on disk.
-    let passphrase = match identity {
-        Some(_) => None,
-        None => Some(
-            passphrase
-                .filter(|passphrase| !passphrase.is_empty())
-                .ok_or(ServerError::MissingPassphrase)?,
-        ),
+    //
+    // The refusal returns a fresh error, not `?` over a `Result` that holds
+    // the passphrase: the early return then carries no secret into the
+    // node's start result (the same rule as the node key in
+    // `scp_node::config`).
+    let passphrase = match (identity.is_some(), passphrase) {
+        (true, _) => None,
+        (false, Some(passphrase)) if !passphrase.is_empty() => Some(passphrase),
+        (false, _) => return Err(ServerError::MissingPassphrase),
     };
 
     validate_data_dir(data_dir)?;
@@ -790,7 +793,9 @@ where
     } else {
         // Persistent key custody — keys survive process restarts. The
         // passphrase was validated at entry, before any file was created.
-        let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
+        let Some(passphrase) = passphrase else {
+            return Err(ServerError::MissingPassphrase);
+        };
         let key_path = data_dir.join("identity.key");
         // The open runs an Argon2id derivation (64 MiB, three passes) and can
         // wait up to 10 s on a file another process is creating (spec §17.8);
@@ -975,9 +980,24 @@ struct ValidatedNodeStart {
     tls: TlsMode,
     cors_origins: Option<Vec<String>>,
     blob_storage: FfiBlobBackend,
+    node_binding: scp_node::NodeBindingSlot,
     bind_addr: Option<SocketAddr>,
     http_bind_addr: Option<SocketAddr>,
     projection_rate_limit: Option<u32>,
+}
+
+/// Lowers a [`FfiNodeBinding`] to the core slot, parsing the binding's
+/// canonical JSON and the canonical URL. A binding that does not parse is
+/// refused, never read as no binding (`09-security-model.md` §9.6.3 step
+/// 4); the checks against the node's own key run at start.
+fn lower_node_binding(binding: FfiNodeBinding) -> Result<scp_node::NodeBindingSlot, ServerError> {
+    match binding {
+        FfiNodeBinding::Unbound {} => Ok(scp_node::NodeBindingSlot::Unbound),
+        FfiNodeBinding::Installed { binding_json, url } => {
+            scp_node::node_key::binding_slot_from(Some(&binding_json), Some(&url))
+                .map_err(|e| invalid(format!("node_binding: {e}")))
+        }
+    }
 }
 
 /// Runs every check `node_start` makes before it touches the filesystem:
@@ -994,6 +1014,7 @@ fn validate_node_start(
         tls,
         dht,
         cors_origins,
+        node_binding,
         bind_addr,
         http_bind_addr,
         nat,
@@ -1011,6 +1032,7 @@ fn validate_node_start(
     let tls = lower_tls(tls)?;
     scp_node::validate_reach_and_tls(&reach, &tls)?;
     let cors_origins = lower_cors(cors_origins)?;
+    let node_binding = lower_node_binding(node_binding)?;
     match &blob_storage {
         FfiBlobBackend::InMemory {} => {}
         FfiBlobBackend::Redb { path } | FfiBlobBackend::Sqlite { path } => {
@@ -1036,6 +1058,7 @@ fn validate_node_start(
         tls,
         cors_origins,
         blob_storage,
+        node_binding,
         bind_addr,
         http_bind_addr,
         projection_rate_limit,
@@ -1086,6 +1109,7 @@ fn node_config<S: EncryptedStorage>(
         cors_origins: v.cors_origins,
         projection_rate_limit: v.projection_rate_limit,
         nat: NatSlot::Auto,
+        node_binding: v.node_binding,
         ..NodeConfig::defaults(
             v.reach,
             // `Explicit` carries no custody, so `K` is annotated to the
@@ -2786,6 +2810,7 @@ mod tests {
             cors_origins: FfiCorsOrigins::Allowlist {
                 origins: vec!["https://app.example.org".to_owned()],
             },
+            node_binding: FfiNodeBinding::Unbound {},
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             nat: Some(FfiNat::Auto {}),
@@ -2793,14 +2818,69 @@ mod tests {
         }
     }
 
-    /// Every config that fails validation returns its sdk-common code and
-    /// leaves no directory or file at its blob path's parent.
-    #[tokio::test]
-    async fn node_start_rejects_an_invalid_config_before_creating_any_file() {
-        use crate::error_codes::{IDENT_1063, STORAGE_8007, server_error_code};
+    /// Sends a QUERY carrying a `proof_nonce` to `node`'s relay and returns
+    /// the `node_proof` of the `query_complete` that ends the response.
+    async fn node_proof_of(
+        node: &RunningNode,
+        sent: &scp_protocol::node::SentQuery,
+    ) -> Option<Box<scp_protocol::node::NodeProof>> {
+        use futures::{SinkExt as _, StreamExt as _};
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
-        type Mutate = fn(&mut NodeStartConfig);
-        let cases: [(&str, Mutate, &str); 9] = [
+        let mut request = node
+            .internal_relay_url()
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.bridge_token_hex().as_str())
+                .parse()
+                .expect("header"),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("connect");
+        let (mut sink, mut stream) = ws.split();
+        let query = ClientMessage::Query {
+            ref_id: Some("proof".to_owned()),
+            routing_id: sent.routing_id,
+            since: sent.since,
+            after_blob: sent.after_blob,
+            limit: sent.limit,
+            proof_nonce: Some(sent.nonce),
+        };
+        sink.send(Message::Binary(query.to_bytes().expect("encode")))
+            .await
+            .expect("send");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("a response within 5 s")
+            .expect("a frame")
+            .expect("a readable frame");
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary frame, got {frame:?}");
+        };
+        let RelayMessage::Event {
+            event_type,
+            node_proof,
+            ..
+        } = RelayMessage::from_bytes(&bytes).expect("decode")
+        else {
+            panic!("expected the query_complete event");
+        };
+        assert_eq!(event_type, "query_complete");
+        node_proof
+    }
+
+    type Mutate = fn(&mut NodeStartConfig);
+
+    /// Each invalid config: its label, the edit that makes the fixture
+    /// invalid, and the sdk-common code the start returns.
+    fn invalid_config_cases() -> [(&'static str, Mutate, &'static str); 11] {
+        use crate::error_codes::{IDENT_1063, STORAGE_8007};
+
+        [
             (
                 "acme on local reach",
                 |c| c.tls = FfiTlsMode::Acme { email: None },
@@ -2867,13 +2947,40 @@ mod tests {
                 STORAGE_8007,
             ),
             (
+                "node binding that is not a binding's canonical JSON",
+                |c| {
+                    c.node_binding = FfiNodeBinding::Installed {
+                        binding_json: "{}".to_owned(),
+                        url: crate::test_helpers::FIXTURE_NODE_URL.to_owned(),
+                    };
+                },
+                STORAGE_8007,
+            ),
+            (
+                "node binding with a URL that is not canonical",
+                |c| {
+                    c.node_binding = FfiNodeBinding::Installed {
+                        binding_json: "{}".to_owned(),
+                        url: "not a url".to_owned(),
+                    };
+                },
+                STORAGE_8007,
+            ),
+            (
                 "another operator's DID",
                 |c| c.identity = "did:dht:someone-else".to_owned(),
                 IDENT_1063,
             ),
-        ];
+        ]
+    }
 
-        for (label, mutate, code) in cases {
+    /// Every config that fails validation returns its sdk-common code and
+    /// leaves no directory or file at its blob path's parent.
+    #[tokio::test]
+    async fn node_start_rejects_an_invalid_config_before_creating_any_file() {
+        use crate::error_codes::server_error_code;
+
+        for (label, mutate, code) in invalid_config_cases() {
             let identity = create_test_identity().await;
             let tmp = temp_dir_for("node-start-invalid");
             let mut cfg = local_start_config(&identity.identity.did, &tmp.join("blobs.redb"));
@@ -2941,6 +3048,110 @@ mod tests {
             drop(node);
             let _ = std::fs::remove_dir_all(&tmp);
         }
+    }
+
+    /// A `node_binding` of `Installed` starts the node bound
+    /// (`09-security-model.md` §9.6.3 step 4): its QUERY responses carry a
+    /// node proof under the binding's node key over the query sent, while
+    /// the same instance started `Unbound` sends none.
+    #[tokio::test]
+    async fn node_start_installs_the_node_binding() {
+        use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
+
+        let identity = create_test_identity().await;
+        let did = identity.identity.did.clone();
+        let tmp = temp_dir_for("node-start-bound");
+        let storage = instance_in_memory_storage();
+        let binding_json = crate::test_helpers::node_binding_json_for(
+            &InstanceStorage::InMemoryEncrypted(Arc::clone(&storage)),
+        )
+        .await
+        .expect("the operator assembles a binding");
+        let node_key =
+            scp_protocol::node::NodeBinding::from_canonical_json(binding_json.as_bytes())
+                .expect("binding JSON")
+                .node_key;
+        let sent = scp_protocol::node::SentQuery {
+            nonce: [0x5e; 32],
+            routing_id: [0x3c; 32],
+            since: Some(7),
+            after_blob: None,
+            limit: Some(5),
+        };
+
+        let unbound_operator = create_test_identity().await;
+        let unbound = node_start(
+            local_start_config(&unbound_operator.identity.did, &tmp.join("unbound.redb")),
+            unbound_operator,
+            InstanceStorage::InMemoryEncrypted(Arc::clone(&storage)),
+        )
+        .await
+        .expect("an unbound config starts");
+        assert!(
+            node_proof_of(&unbound, &sent).await.is_none(),
+            "an unbound node proves nothing"
+        );
+        unbound.shutdown();
+        drop(unbound);
+
+        let mut cfg = local_start_config(&did, &tmp.join("bound.redb"));
+        cfg.node_binding = FfiNodeBinding::Installed {
+            binding_json,
+            url: crate::test_helpers::FIXTURE_NODE_URL.to_owned(),
+        };
+        let node = node_start(cfg, identity, InstanceStorage::InMemoryEncrypted(storage))
+            .await
+            .expect("a binding for the instance's node key installs");
+        let proof = node_proof_of(&node, &sent)
+            .await
+            .expect("a bound node's query_complete carries a node proof");
+        let key = P256PublicKey::from_sec1(&node_key).expect("node key");
+        verify_prehash_strict(&key, &proof.digest(), &proof.signature)
+            .expect("the proof verifies under the binding's node key");
+        assert_eq!(proof.nonce, sent.nonce);
+        assert_eq!(proof.query_digest, sent.digest());
+        node.shutdown();
+        drop(node);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A binding signed for another instance's node key is refused at start
+    /// with the node-binding error, and the node does not start.
+    #[tokio::test]
+    async fn node_start_refuses_a_binding_for_another_node_key() {
+        use crate::error_codes::{STORAGE_8007, server_error_code};
+
+        let identity = create_test_identity().await;
+        let did = identity.identity.did.clone();
+        let tmp = temp_dir_for("node-start-foreign");
+        let binding_json = crate::test_helpers::node_binding_json_for(
+            &InstanceStorage::InMemoryEncrypted(instance_in_memory_storage()),
+        )
+        .await
+        .expect("the operator assembles a binding");
+        let mut cfg = local_start_config(&did, &tmp.join("blobs.redb"));
+        cfg.node_binding = FfiNodeBinding::Installed {
+            binding_json,
+            url: crate::test_helpers::FIXTURE_NODE_URL.to_owned(),
+        };
+        let result = node_start(
+            cfg,
+            identity,
+            InstanceStorage::InMemoryEncrypted(instance_in_memory_storage()),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let err = result.err().expect("a foreign binding is refused");
+        assert!(
+            matches!(
+                err,
+                ServerError::Node(scp_node::NodeError::NodeBinding(
+                    scp_protocol::node::NodeBindingInstallError::ForeignNodeKey
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(server_error_code(&err), STORAGE_8007);
     }
 
     /// The internal relay URL carries the bound host, brackets IPv6, and maps

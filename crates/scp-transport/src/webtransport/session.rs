@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::native::node_proof::{self, NodeProofs};
 use crate::native::public_records::{self, PublicRecords};
 use crate::native::storage::BlobStorage;
 use crate::native::storage::QueryCursor;
@@ -117,6 +118,11 @@ pub struct WebTransportSessionConfig {
     /// [`RelayConfig::public_records`](crate::native::server::RelayConfig::public_records).
     /// Defaults to [`PublicRecords::Refused`].
     pub public_records: PublicRecords,
+    /// Whether this session signs node proofs on `query_complete`. It MUST
+    /// equal the node's
+    /// [`RelayConfig::node_proofs`](crate::native::server::RelayConfig::node_proofs).
+    /// Defaults to [`NodeProofs::Unbound`].
+    pub node_proofs: NodeProofs,
     /// The relay's live reserved entries, from which each reserved push
     /// routing ID derives (§10.7.1 step 2, "Tier 3 relays"). When this
     /// listener shares a relay's blob store, it MUST be a clone of that
@@ -144,6 +150,7 @@ impl WebTransportSessionConfig {
             delivery_jitter_ms: 50,
             subscribe_rate_limit: 20,
             public_records: PublicRecords::Refused,
+            node_proofs: NodeProofs::Unbound,
             relay_url,
             push: PushRole::Disabled,
         }
@@ -359,9 +366,17 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                 since,
                 after_blob,
                 limit,
+                proof_nonce,
             } => {
                 let messages = self
-                    .handle_query_inner(ref_id.clone(), *routing_id, *since, *after_blob, *limit)
+                    .handle_query_inner(
+                        ref_id.clone(),
+                        *routing_id,
+                        *since,
+                        *after_blob,
+                        *limit,
+                        *proof_nonce,
+                    )
                     .await?;
                 Ok(DispatchResult::Multi(messages))
             }
@@ -593,6 +608,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             }
 
             messages.push(RelayMessage::Event {
+                node_proof: None,
                 ref_id,
                 event_type: "backfill_complete".to_string(),
             });
@@ -650,6 +666,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         since: Option<u64>,
         after_blob: Option<[u8; 32]>,
         limit: Option<u32>,
+        proof_nonce: Option<[u8; 32]>,
     ) -> Result<Vec<RelayMessage>, WebTransportSessionError> {
         let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
@@ -697,14 +714,18 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             }
         };
 
+        // The proof covers the blobs in the order they are returned below.
+        let proof_query =
+            node_proof::proof_query(proof_nonce, routing_id, since, after_blob, limit);
+        let complete = node_proof::query_complete(
+            &self.config.node_proofs,
+            ref_id,
+            proof_query.as_ref(),
+            &blobs,
+        );
         let mut messages = Vec::with_capacity(blobs.len() + 1);
         messages.extend(blobs.into_iter().map(public_records::blob_message));
-
-        // Emit query_complete event.
-        messages.push(RelayMessage::Event {
-            ref_id,
-            event_type: "query_complete".to_string(),
-        });
+        messages.push(complete);
 
         Ok(messages)
     }
@@ -1263,6 +1284,7 @@ mod tests {
         // limit = 0 should fail.
         let result = handler
             .dispatch_message_multi(&ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: [0x44; 32],
                 since: None,
@@ -1285,6 +1307,7 @@ mod tests {
         // limit > max should fail.
         let result = handler
             .dispatch_message_multi(&ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: [0x44; 32],
                 since: None,
@@ -1325,7 +1348,7 @@ mod tests {
             .await;
 
         let result = handler
-            .handle_query_inner(Some("q-1".to_owned()), routing_id, None, None, None)
+            .handle_query_inner(Some("q-1".to_owned()), routing_id, None, None, None, None)
             .await;
         assert!(result.is_ok());
         let messages = result.unwrap();
@@ -1341,6 +1364,78 @@ mod tests {
             }
             other => panic!("expected Event(query_complete), got {:?}", other),
         }
+    }
+
+    /// A session whose config carries the node's bound key ends a QUERY
+    /// carrying `proof_nonce` with a proof over the blob it returned, and an
+    /// unbound session returns none.
+    #[tokio::test]
+    async fn a_bound_session_signs_the_query_complete() {
+        let key = crate::native::node_proof::tests::bound_key(7).unwrap();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let routing_id = [0x55; 32];
+        storage
+            .store(
+                routing_id,
+                [0xAA; 32],
+                None,
+                crate::native::storage::StoredLifetime::Ttl(60),
+                b"blob-data".to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut handler = WebTransportSessionHandler::new(
+            SessionId(1),
+            WebTransportSessionConfig {
+                node_proofs: NodeProofs::Sign(Arc::clone(&key)),
+                ..WebTransportSessionConfig::defaults(push_gate::test_relay_url())
+            },
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            CancellationToken::new(),
+            PublishRateLimiter::new(100),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        handler.mark_active();
+        let before = crate::native::node_proof::tests::now_secs();
+        let messages = handler
+            .handle_query_inner(None, routing_id, None, None, None, Some([0x5a; 32]))
+            .await
+            .unwrap();
+        let after = crate::native::node_proof::tests::now_secs();
+        let proof =
+            crate::native::node_proof::tests::proof_of(&key, messages.last().unwrap()).unwrap();
+        assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(
+            proof.query_digest,
+            scp_protocol::node::SentQuery {
+                nonce: [0x5a; 32],
+                routing_id,
+                since: None,
+                after_blob: None,
+                limit: None,
+            }
+            .digest()
+        );
+        assert!((before..=after).contains(&proof.observed_at));
+        assert_eq!(
+            proof.value_digest,
+            scp_protocol::node::response_value_digest(&[b"blob-data".as_slice()]).unwrap()
+        );
+
+        let mut unbound = make_handler_with_storage(storage);
+        unbound.mark_active();
+        let messages = unbound
+            .handle_query_inner(None, routing_id, None, None, None, Some([0x5a; 32]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            messages.last(),
+            Some(RelayMessage::Event {
+                node_proof: None,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

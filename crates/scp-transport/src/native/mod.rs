@@ -38,6 +38,7 @@ pub(crate) mod client;
 pub mod combined;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
+pub mod node_proof;
 #[cfg(feature = "postgres-blob")]
 pub mod postgres_blob;
 pub mod public_records;

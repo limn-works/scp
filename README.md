@@ -222,6 +222,8 @@ binary exit 1; the default applies only when the variable is unset.
 | `SCP_NODE_DOMAIN` | *(required)* | Domain for DID document and relay URL |
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP listen address |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit (req/s) for broadcast projection endpoints |
+| `SCP_NODE_BINDING` | (none) | The installed `NodeBinding`, as its RFC 8785 canonical JSON (spec 09 §9.6.3 step 4). Set together with `SCP_NODE_URL`, or leave both unset. Unset, the node keeps its node key and its QUERY responses carry no `node_proof`. At start the node refuses a binding whose `node_key` is not its own, whose `possession_sig` fails under its key, or whose `url_hash` is not the SHA-256 of `SCP_NODE_URL`, and exits 1. A value that is not UTF-8, or one variable set without the other, also exits 1. `--relay-only` and `--ephemeral` keep no node key and exit 1 when either variable is set. [Binding a node](docs/guides/relay-operations.md#binding-a-node) walks the four steps with `scp-node sign-binding`. |
+| `SCP_NODE_URL` | (none) | The node's canonical URL, whose SHA-256 the binding's `url_hash` names. |
 
 ## Fuzzing
 

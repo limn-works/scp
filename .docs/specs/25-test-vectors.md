@@ -1472,9 +1472,9 @@ Key-event frame of the recovery, 756 bytes (3 × 64-byte signatures):
 - `list_record` is a node-list record (§9.6.3) at `sequence` 3, with Vector 49's `context_id` and entries, this vector's identity as `governor`, and Vector 41's preimage digest as `signing_key_state_head`. Its canonical hash is `5a4e9c64f3c5e5a38e035e1e694dedac63fe51aaa3eb5ac13e61cdef42b46dcb`, and its signature under the §25.2 secondary key is `5de7f4875963b4829604e49c68af4e57d9ef8f6ab961fb52da12c44f24e7550e76f0e7494ae66440e61a86122eab0f1c0b66f5f21c1beae4c08740999765e3b8`. Its bytes are the record's RFC 8785 form, 1782 bytes, with SHA-256 `e8bfe67b0fe13614345c34460da175817d534c120de83247c947309276ac16fa`.
 - The serving node is Vector 49's entry 0, whose node key is the §25.2 reference key, so the confirmation's second field is that key's `NodeId` (Vector 90), `e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610`, and `service_record` is empty.
 - `response` holds one blob, the recovery frame above. Under §9.5.1's repeated-field rule its `value_digest` is `9762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a`.
-- `node_proof` names the serving node's `NodeId`, has the proof `nonce` `5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b`, the routing ID SHA-256("scp:did:" || identifier), and `observed_at` from Vector 44, and is signed under the reference key: `e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c3239762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a000000006553f10019ccb6fb372c14165c1774324b3c9e96a0fff3ee18a60047b980404deaa949cf7f8615dfa625481895765838b261f38d8c39b8c7bc80f37fed3931a6ff2f80f8` (200 bytes).
+- `node_proof` names the serving node's `NodeId`, has the proof `nonce` `5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b`, the routing ID SHA-256("scp:did:" || identifier), the query digest of a QUERY that carries none of `since`, `after_blob` and `limit`, `e0cd6df2d8118500379c3a2b33005ce4ab3f8d8c8c05e349dc50390542065e7b` (over the 53-byte preimage `"SCP-NODE-QUERY-V1:"` || routing ID || `000000`, `5343502d4e4f44452d51554552592d56313a4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323000000`), and `observed_at` from Vector 44, and is signed under the reference key: `e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323e0cd6df2d8118500379c3a2b33005ce4ab3f8d8c8c05e349dc50390542065e7b9762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a000000006553f10007a3604999ced42420321549a264d43eaaf47f9cf0c2c90d07b60cb26e518b7e39f8d272e25a177c5d607ebc788d0cebb39b1101d04b169014152e63c718515b` (232 bytes).
 
-The confirmation is 2786 bytes, with SHA-256 `9019e84d1db0c49bfebd81c97cbe9bbdb0dc80f5971d9839dc16e8ec29c24994`. The body is BE32(0) || BE32(2786) || the confirmation, 2794 bytes, with SHA-256 `23fcb000df708bb1da13eaee8223455613e28ba204a610e0f8543f5fffe472c4`.
+The confirmation is 2818 bytes, with SHA-256 `5bda16cff60f18c6ac6fbd418e1e7e2a9e042f37725e51aec7fb7b2f58fb8ba5`. The body is BE32(0) || BE32(2818) || the confirmation, 2826 bytes, with SHA-256 `5b60f0030c40bf90469f9cb19cda4829e7cbf4c2fed098c1f3aac4680740fcd8`.
 
 **`key_positions_hash` over four positions at `node_list_sequence` 3.** The fixture positions:
 - The Contested position of this vector's identity, with heads d1 and d2 in ascending digest order and `contested_since` 12. It recorded the recovery at epoch 5, while it was Linear, and the contest recorded at epoch 12 left `recovered_at` unchanged at [5, 1, d2].
@@ -2016,6 +2016,17 @@ The serving node is named by its `NodeId` (Vector 90), the `NodeId` of §25.2's 
 node_id:       e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610   (Vector 90)
 nonce:         8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
 routing_id:    4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323   (Vector 41's routing id)
+The QUERY answered, every optional field present:
+  since:      1699913600
+  after_blob: f941933b4c834f373b919fde2782f89a76ccf057ebee4a3753af6805346443a6   (SHA-256("scp-25-query-after-blob"))
+  limit:      100
+Query preimage (97 bytes = 18-byte separator + routing_id + 0x01 || BE64(since) + 0x01 || after_blob + 0x01 || BE32(limit)):
+  5343502d4e4f44452d51554552592d56313a4102ed70d1c4b106466149a7d129
+  630c11a20554683ae012fdffa56341d1c323010000000065529f8001f941933b
+  4c834f373b919fde2782f89a76ccf057ebee4a3753af6805346443a601000000
+  64
+query_digest:
+  e610a17abc246d3198523e3d2609e8844fcfdfe16647acc6e997ca1f835ca2a0
 Served blobs, concatenated for display ("scp-25-served-blob-a", "scp-25-served-blob-bb"):
   7363702d32352d7365727665642d626c6f622d617363702d32352d7365727665
   642d626c6f622d6262
@@ -2023,20 +2034,21 @@ value_digest = SHA-256(BE32(2) || BE32(len(A)) || A || BE32(len(B)) || B):
   ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115
 observed_at:   1700000000
 
-Preimage (154 bytes = 18-byte separator + 136 field bytes):
+Preimage (186 bytes = 18-byte separator + 168 field bytes):
   5343502d4e4f44452d50524f4f462d56313ae77d53354271e4c1c3c319cf7b5c
   fcc23be431c2ec795d5b6ecf549355f156108c10b9bc0b5acdcfb85432747587
   fbbd8894bbad69f35de6dff46093513daac84102ed70d1c4b106466149a7d129
-  630c11a20554683ae012fdffa56341d1c323ebbf1905dedb60f162f2cc5190ae
+  630c11a20554683ae012fdffa56341d1c323e610a17abc246d3198523e3d2609
+  e8844fcfdfe16647acc6e997ca1f835ca2a0ebbf1905dedb60f162f2cc5190ae
   0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100
 Canonical hash:
-  576f5707e3f53d47e9dbf92e376cf28032dfba602087803c93451326318d0952
-Signature, reference key (200 bytes on the wire):
-  e3181283bee0dfc05c16d114441e110743ebe830078d42380c68e520e8655855
-  7e2ddfbebb87ab89de8c16432122da3f5e8e230eecb8424359d35c816a8c03ab
+  a10cc4bf06da5d6b956f1ed8bb9cd28e2c4b6e123b4a794d2d17f94286c4be3d
+Signature, reference key (232 bytes on the wire):
+  4e6eec70c9f3f1b3cfe91ac2bbabc75961576f32850dfec1640c288a8ab0bf4c
+  3c875f1acc0b79281019926854d3196f3b8d586f12ce9ee2406778a570bc4508
 ```
 
-A conforming implementation verifies this proof against the reference key's 33-byte form and refuses it against the secondary key, whose `NodeId` differs from `node_id`. It refuses the proof after any one byte of the 200 changes.
+A conforming implementation verifies this proof against the reference key's 33-byte form and refuses it against the secondary key, whose `NodeId` differs from `node_id`. It refuses the proof after any one byte of the 232 changes, and refuses it against a QUERY that differs from the one above in any of `since`, `after_blob` or `limit`, because each changes the query digest.
 
 ### Vector 45: the conflict statement a witness emits when its one check fails
 

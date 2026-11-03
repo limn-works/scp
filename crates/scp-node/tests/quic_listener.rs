@@ -102,6 +102,7 @@ async fn quic_publish_then_query_roundtrips() {
 
     // QUERY the same routing id over QUIC — must see the published blob.
     let query = ClientMessage::Query {
+        proof_nonce: None,
         ref_id: Some("q-1".to_owned()),
         routing_id,
         since: None,
@@ -114,6 +115,88 @@ async fn quic_publish_then_query_roundtrips() {
             .iter()
             .any(|m| matches!(m, RelayMessage::Blob { blob: b, .. } if b == &blob)),
         "query must return the blob published over QUIC, got {query_responses:?}"
+    );
+
+    conn.close(0u32.into(), b"done");
+    serving.stop().await;
+}
+
+/// A bound node answers a QUERY over QUIC carrying `proof_nonce` with a
+/// `query_complete` whose node proof the binding's key signed over the query
+/// sent (§9.10.12): the QUIC listener holds the node's proofs, not an
+/// unbound default.
+#[tokio::test]
+async fn a_bound_node_proves_a_quic_query() {
+    use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
+    use scp_did::{Identifier, NodeUrl};
+    use scp_protocol::node::{NodeBinding, SentQuery};
+
+    install_crypto_provider();
+    let storage = std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+    let repository =
+        scp_core::store::ProtocolRepository::new_for_testing(std::sync::Arc::clone(&storage));
+    scp_node::node_key::load_or_generate(&repository)
+        .await
+        .unwrap();
+    let url = NodeUrl::new("wss://localhost/scp/v1").unwrap();
+    let grant = scp_node::node_key::sign_possession(
+        &repository,
+        &Identifier::from_bytes([0x0a; 32]),
+        &url,
+        &[0x0b; 32],
+    )
+    .await
+    .unwrap();
+    let binding = NodeBinding {
+        operator: Identifier::from_bytes([0x0a; 32]),
+        node_key: grant.node_key,
+        url_hash: grant.url_hash,
+        key_state_head: [0x0b; 32],
+        operator_sig: [0x0c; 64],
+        possession_sig: grant.possession_sig,
+    };
+    let node = quic_support::build_tls_node_with(
+        scp_node::PushSlot::Disabled,
+        storage,
+        scp_node::NodeBindingSlot::Installed {
+            binding: Box::new(binding.clone()),
+            url,
+        },
+    )
+    .await;
+    let mut serving = serve_in_background(node).await;
+    let conn = connect_quic(&mut serving).await;
+
+    let sent = SentQuery {
+        nonce: [0x5e; 32],
+        routing_id: [0x3c; 32],
+        since: Some(9),
+        after_blob: None,
+        limit: Some(4),
+    };
+    let query = ClientMessage::Query {
+        proof_nonce: Some(sent.nonce),
+        ref_id: Some("q-proof".to_owned()),
+        routing_id: sent.routing_id,
+        since: sent.since,
+        after_blob: sent.after_blob,
+        limit: sent.limit,
+    };
+    let responses = send_and_recv(&conn, &query).await;
+    let Some(RelayMessage::Event {
+        node_proof: Some(proof),
+        ..
+    }) = responses.last()
+    else {
+        panic!("a bound node's QUIC query_complete carries a node proof: {responses:?}");
+    };
+    let node_key = P256PublicKey::from_sec1(&binding.node_key).unwrap();
+    verify_prehash_strict(&node_key, &proof.digest(), &proof.signature).unwrap();
+    assert_eq!(proof.nonce, sent.nonce);
+    assert_eq!(proof.query_digest, sent.digest());
+    assert_eq!(
+        proof.node_id,
+        scp_kel::derive_node_id(&binding.node_key).unwrap()
     );
 
     conn.close(0u32.into(), b"done");

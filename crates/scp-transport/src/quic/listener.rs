@@ -47,6 +47,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::native::node_proof::{self, NodeProofs};
 use crate::native::public_records::{self, PublicRecords};
 use crate::native::storage::BlobStorage;
 use crate::native::storage::QueryCursor;
@@ -126,6 +127,12 @@ pub struct QuicListenerConfig {
     /// admission whichever transport carries it. Defaults to
     /// [`PublicRecords::Refused`].
     pub public_records: PublicRecords,
+    /// Whether this listener signs node proofs on `query_complete`. It MUST
+    /// equal the node's
+    /// [`RelayConfig::node_proofs`](crate::native::server::RelayConfig::node_proofs),
+    /// so every transport proves under the one installed binding. Defaults
+    /// to [`NodeProofs::Unbound`].
+    pub node_proofs: NodeProofs,
     /// The relay's live reserved entries, from which each reserved push
     /// routing ID derives (§10.7.1 step 2, "Tier 3 relays"). When this
     /// listener shares a relay's blob store, it MUST be a clone of that
@@ -156,6 +163,7 @@ impl QuicListenerConfig {
             rate_limit_subscribes_per_minute: DEFAULT_RATE_LIMIT_SUBSCRIBES_PER_MINUTE,
             delivery_jitter_ms: DEFAULT_DELIVERY_JITTER_MS,
             public_records: PublicRecords::Refused,
+            node_proofs: NodeProofs::Unbound,
             relay_url,
             push: PushRole::Disabled,
         }
@@ -668,9 +676,18 @@ async fn handle_stream<S: BlobStorage + 'static>(
             since,
             after_blob,
             limit,
+            proof_nonce,
         } => {
             handle_query(
-                send, ref_id, routing_id, since, after_blob, limit, &storage, &config,
+                send,
+                ref_id,
+                routing_id,
+                since,
+                after_blob,
+                limit,
+                proof_nonce,
+                &storage,
+                &config,
             )
             .await
         }
@@ -1000,6 +1017,7 @@ async fn handle_subscribe<S: BlobStorage>(
 
         // Emit backfill_complete event.
         let event = RelayMessage::Event {
+            node_proof: None,
             ref_id,
             event_type: "backfill_complete".to_string(),
         };
@@ -1059,6 +1077,7 @@ async fn handle_query<S: BlobStorage>(
     since: Option<u64>,
     after_blob: Option<[u8; 32]>,
     limit: Option<u32>,
+    proof_nonce: Option<[u8; 32]>,
     storage: &Arc<S>,
     config: &QuicListenerConfig,
 ) -> Result<(), StreamError> {
@@ -1107,16 +1126,14 @@ async fn handle_query<S: BlobStorage>(
         }
     };
 
+    // The proof covers the blobs in the order they are written below.
+    let proof_query = node_proof::proof_query(proof_nonce, routing_id, since, after_blob, limit);
+    let complete =
+        node_proof::query_complete(&config.node_proofs, ref_id, proof_query.as_ref(), &blobs);
     for stored in blobs {
         write_relay_message(&mut send, &public_records::blob_message(stored)).await?;
     }
-
-    // Emit query_complete event.
-    let event = RelayMessage::Event {
-        ref_id,
-        event_type: "query_complete".to_string(),
-    };
-    write_and_finish(send, &event).await
+    write_and_finish(send, &complete).await
 }
 
 /// Handles a DELETE operation on a QUIC stream: `4041` for a retained
@@ -1411,6 +1428,59 @@ mod tests {
         handle.shutdown();
     }
 
+    /// A listener holding the node's bound key ends a QUERY carrying
+    /// `proof_nonce` with a proof over the blob it returned.
+    #[tokio::test]
+    async fn a_bound_quic_listener_signs_the_query_complete() {
+        let key = crate::native::node_proof::tests::bound_key(7).unwrap();
+        let (handle, addr, certs, _storage, _subs) =
+            crate::quic::test_support::start_test_listener_with_proofs(NodeProofs::Sign(
+                Arc::clone(&key),
+            ));
+        let connection = connect_client(addr, &certs).await;
+        let routing_id = [2u8; 32];
+        let publish = ClientMessage::Publish {
+            ref_id: None,
+            routing_id,
+            recipient_hint: None,
+            lifetime: BlobLifetime::Ttl(scp_relay_client::PublishTtl::of::<3600>()),
+            blob: vec![99u8; 50],
+        };
+        let _ = send_and_recv(&connection, &publish).await;
+        let query = ClientMessage::Query {
+            proof_nonce: Some([0x5a; 32]),
+            ref_id: Some("q-1".to_string()),
+            routing_id,
+            since: None,
+            after_blob: None,
+            limit: Some(5),
+        };
+        let before = crate::native::node_proof::tests::now_secs();
+        let responses = send_and_recv(&connection, &query).await;
+        let after = crate::native::node_proof::tests::now_secs();
+        let proof =
+            crate::native::node_proof::tests::proof_of(&key, responses.last().unwrap()).unwrap();
+        assert_eq!(proof.nonce, [0x5a; 32]);
+        assert_eq!(
+            proof.query_digest,
+            scp_protocol::node::SentQuery {
+                nonce: [0x5a; 32],
+                routing_id,
+                since: None,
+                after_blob: None,
+                limit: Some(5),
+            }
+            .digest()
+        );
+        assert!((before..=after).contains(&proof.observed_at));
+        assert_eq!(
+            proof.value_digest,
+            scp_protocol::node::response_value_digest(&[vec![99u8; 50]]).unwrap()
+        );
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn quic_query_returns_published_blobs() {
         let (handle, addr, certs, _storage, _subs) = start_test_listener();
@@ -1430,6 +1500,7 @@ mod tests {
 
         // Query for it.
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("q-1".to_string()),
             routing_id,
             since: None,
@@ -1626,6 +1697,7 @@ mod tests {
         let connection = connect_client(addr, &certs).await;
 
         let query = ClientMessage::Query {
+            proof_nonce: None,
             ref_id: Some("lim-1".to_string()),
             routing_id: [6u8; 32],
             since: None,
@@ -2099,6 +2171,7 @@ mod tests {
         let queried = send_and_recv(
             &connection,
             &ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: Some("q".into()),
                 routing_id,
                 since: None,

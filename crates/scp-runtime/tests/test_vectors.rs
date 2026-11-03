@@ -65,7 +65,7 @@ use scp_protocol::identity::attestation::IdentityLinkAttestation;
 use scp_protocol::node::{
     NODE_BINDING_SEPARATOR, NODE_LIST_SEPARATOR, NODE_PROOF_SEPARATOR, NodeBinding,
     NodeBindingError, NodeListEntry, NodeListEntryError, NodeListError, NodeListFrameError,
-    NodeListKeyClass, NodeListRecord, NodeProof, NodeProofError, VerifiedNodeBinding,
+    NodeListKeyClass, NodeListRecord, NodeProof, NodeProofError, SentQuery, VerifiedNodeBinding,
     VerifiedNodeListEntry, VerifiedNodeListRecord, check_node_list_publish, decode_node_list_frame,
     encode_node_list_frame, entries_canonical_json, node_url_hash, response_value_digest,
 };
@@ -1745,27 +1745,55 @@ fn vector_91_node_binding() {
     );
 }
 
-fn vector_44_proof() -> NodeProof {
-    NodeProof {
-        node_id: vector_49_entry(0).binding.node_id().unwrap(),
+/// The two blobs Vector 44's proof covers.
+const VECTOR_44_BLOBS: [&[u8]; 2] = [b"scp-25-served-blob-a", b"scp-25-served-blob-bb"];
+
+/// The QUERY Vector 44 answers, every optional field present.
+fn vector_44_query() -> SentQuery {
+    SentQuery {
         nonce: unhex32("8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8"),
         routing_id: unhex32("4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323"),
-        value_digest: response_value_digest(&[
-            b"scp-25-served-blob-a".as_slice(),
-            b"scp-25-served-blob-bb".as_slice(),
-        ])
-        .unwrap(),
+        since: Some(1_699_913_600),
+        after_blob: Some(sha256(b"scp-25-query-after-blob")),
+        limit: Some(100),
+    }
+}
+
+fn vector_44_proof() -> NodeProof {
+    let query = vector_44_query();
+    NodeProof {
+        node_id: vector_49_entry(0).binding.node_id().unwrap(),
+        nonce: query.nonce,
+        routing_id: query.routing_id,
+        query_digest: query.digest(),
+        value_digest: response_value_digest(&VECTOR_44_BLOBS).unwrap(),
         observed_at: 1_700_000_000,
-        signature: unhex("e3181283bee0dfc05c16d114441e110743ebe830078d42380c68e520e86558557e2ddfbebb87ab89de8c16432122da3f5e8e230eecb8424359d35c816a8c03ab").try_into().unwrap(),
+        signature: unhex("4e6eec70c9f3f1b3cfe91ac2bbabc75961576f32850dfec1640c288a8ab0bf4c3c875f1acc0b79281019926854d3196f3b8d586f12ce9ee2406778a570bc4508").try_into().unwrap(),
     }
 }
 
 #[test]
 fn vector_44_node_proof() {
+    let query = vector_44_query();
     let proof = vector_44_proof();
     assert_eq!(
         hex::encode(proof.node_id.as_bytes()),
         "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610"
+    );
+    assert_eq!(
+        hex::encode(query.after_blob.unwrap()),
+        "f941933b4c834f373b919fde2782f89a76ccf057ebee4a3753af6805346443a6"
+    );
+    let query_digest = query.digest();
+    assert_spec_preimage(
+        "vector 44 query",
+        "5343502d4e4f44452d51554552592d56313a4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323010000000065529f8001f941933b4c834f373b919fde2782f89a76ccf057ebee4a3753af6805346443a60100000064",
+        97,
+        &query_digest,
+    );
+    assert_eq!(
+        hex::encode(query_digest),
+        "e610a17abc246d3198523e3d2609e8844fcfdfe16647acc6e997ca1f835ca2a0"
     );
     assert_eq!(
         hex::encode(proof.value_digest),
@@ -1774,43 +1802,78 @@ fn vector_44_node_proof() {
     let digest = proof.digest();
     assert_eq!(
         hex::encode(digest),
-        "576f5707e3f53d47e9dbf92e376cf28032dfba602087803c93451326318d0952"
+        "a10cc4bf06da5d6b956f1ed8bb9cd28e2c4b6e123b4a794d2d17f94286c4be3d"
     );
     assert_spec_preimage(
         "vector 44",
-        "5343502d4e4f44452d50524f4f462d56313ae77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156108c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac84102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100",
-        154,
+        "5343502d4e4f44452d50524f4f462d56313ae77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156108c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac84102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323e610a17abc246d3198523e3d2609e8844fcfdfe16647acc6e997ca1f835ca2a0ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100",
+        186,
         &digest,
     );
     assert_reference_signature(
         "vector 44",
         &digest,
-        "e3181283bee0dfc05c16d114441e110743ebe830078d42380c68e520e86558557e2ddfbebb87ab89de8c16432122da3f5e8e230eecb8424359d35c816a8c03ab",
+        "4e6eec70c9f3f1b3cfe91ac2bbabc75961576f32850dfec1640c288a8ab0bf4c3c875f1acc0b79281019926854d3196f3b8d586f12ce9ee2406778a570bc4508",
     );
     let bytes = proof.to_bytes();
-    assert_eq!(bytes.len(), 200);
-    assert_eq!(NodeProof::from_bytes(&bytes).unwrap(), proof);
+    assert_eq!(bytes.len(), 232);
+    assert_eq!(NodeProof::from_bytes(&bytes), proof);
     let node = vector_49_bound(0);
-    proof.verify_signature(&node).unwrap();
+    let verify = |p: &NodeProof, binding: &VerifiedNodeBinding, sent: &SentQuery| {
+        p.verify(binding, sent, &VECTOR_44_BLOBS, 1_700_000_000, 60)
+    };
+    verify(&proof, &node, &query).unwrap();
 
     // Negative: the secondary key's binding names another node, the high-`s`
-    // form of the signature is refused, and any changed byte fails.
+    // form of the signature is refused, a QUERY that differs in any optional
+    // field is another query, and any changed byte fails.
     assert_eq!(
-        proof.verify_signature(&vector_49_bound(1)),
+        verify(&proof, &vector_49_bound(1), &query),
         Err(NodeProofError::NodeIdMismatch)
     );
     let mut high = proof.clone();
     high.signature = high_s_form(&proof.signature);
     assert_eq!(
-        high.verify_signature(&node),
+        verify(&high, &node, &query),
         Err(NodeProofError::Signature(P256Error::HighS))
     );
+    for other in [
+        SentQuery {
+            since: Some(u64::MAX),
+            ..query
+        },
+        SentQuery {
+            since: None,
+            ..query
+        },
+        SentQuery {
+            after_blob: Some([0; 32]),
+            ..query
+        },
+        SentQuery {
+            after_blob: None,
+            ..query
+        },
+        SentQuery {
+            limit: Some(99),
+            ..query
+        },
+        SentQuery {
+            limit: None,
+            ..query
+        },
+    ] {
+        assert_eq!(
+            verify(&proof, &node, &other),
+            Err(NodeProofError::QueryDigestMismatch),
+            "{other:?}"
+        );
+    }
     for i in 0..bytes.len() {
         let mut changed = bytes;
         changed[i] ^= 1;
-        let decoded = NodeProof::from_bytes(&changed).unwrap();
         assert!(
-            decoded.verify_signature(&node).is_err(),
+            verify(&NodeProof::from_bytes(&changed), &node, &query).is_err(),
             "byte {i} changed and the proof still verified"
         );
     }
@@ -1959,22 +2022,53 @@ fn vector_80_list_record_and_node_proof() {
         "e8bfe67b0fe13614345c34460da175817d534c120de83247c947309276ac16fa"
     );
 
-    let proof_bytes = unhex(
-        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c3239762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a000000006553f10019ccb6fb372c14165c1774324b3c9e96a0fff3ee18a60047b980404deaa949cf7f8615dfa625481895765838b261f38d8c39b8c7bc80f37fed3931a6ff2f80f8",
-    );
-    let proof = NodeProof::from_bytes(&proof_bytes).unwrap();
+    let proof_bytes: [u8; 232] = unhex(
+        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323e0cd6df2d8118500379c3a2b33005ce4ab3f8d8c8c05e349dc50390542065e7b9762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a000000006553f10007a3604999ced42420321549a264d43eaaf47f9cf0c2c90d07b60cb26e518b7e39f8d272e25a177c5d607ebc788d0cebb39b1101d04b169014152e63c718515b",
+    )
+    .try_into()
+    .unwrap();
+    let proof = NodeProof::from_bytes(&proof_bytes);
     assert_eq!(proof.node_id, vector_49_entry(0).binding.node_id().unwrap());
     assert_eq!(
         hex::encode(proof.nonce),
         "5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b"
     );
+    // The QUERY carried none of `since`, `after_blob` and `limit`.
+    let sent = SentQuery {
+        nonce: proof.nonce,
+        routing_id: proof.routing_id,
+        since: None,
+        after_blob: None,
+        limit: None,
+    };
+    let mut query_preimage = b"SCP-NODE-QUERY-V1:".to_vec();
+    query_preimage.extend_from_slice(&proof.routing_id);
+    query_preimage.extend_from_slice(&[0, 0, 0]);
+    assert_eq!(query_preimage.len(), 53);
+    assert_eq!(sha256(&query_preimage), sent.digest());
+    assert_eq!(
+        hex::encode(proof.query_digest),
+        "e0cd6df2d8118500379c3a2b33005ce4ab3f8d8c8c05e349dc50390542065e7b"
+    );
+    assert_eq!(proof.query_digest, sent.digest());
     assert_eq!(
         hex::encode(proof.value_digest),
         "9762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a"
     );
-    proof.verify_signature(&vector_49_bound(0)).unwrap();
+    assert_eq!(proof.observed_at, vector_44_proof().observed_at);
+    assert_reference_signature(
+        "vector 80 node proof",
+        &proof.digest(),
+        &hex::encode(proof.signature),
+    );
     assert_eq!(
-        proof.verify_signature(&vector_49_bound(1)),
+        proof.verify(
+            &vector_49_bound(1),
+            &sent,
+            &[[0u8; 0]; 0],
+            1_700_000_000,
+            60
+        ),
         Err(NodeProofError::NodeIdMismatch)
     );
 }

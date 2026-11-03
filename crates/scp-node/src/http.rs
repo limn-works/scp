@@ -2338,6 +2338,9 @@ fn spawn_quic_listener(
         // moves both transports' reserved push routing ID at once (§10.7.1).
         relay_url: rc.relay_url.clone(),
         push: rc.push.clone(),
+        // The same node key and binding the WebSocket relay signs with, so a
+        // QUERY over QUIC carries the node's proof of control too (§9.10.12).
+        node_proofs: rc.node_proofs.clone(),
     };
 
     let listener = QuicListener::new(

@@ -321,6 +321,7 @@ impl TransportAdapter for UdpDtlsAdapter {
 
         Box::pin(async move {
             let msg = ClientMessage::Query {
+                proof_nonce: None,
                 ref_id: None,
                 routing_id: routing_id_bytes,
                 since,

@@ -37,7 +37,9 @@ use zeroize::Zeroizing;
 
 use scp_identity::DidCache;
 use scp_identity::dht::SequenceStore;
-use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, PushSlot, Reach, TlsMode};
+use scp_node::{
+    DhtMode, IdentitySource, Node, NodeBindingSlot, NodeConfig, PushSlot, Reach, TlsMode,
+};
 use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
@@ -195,6 +197,32 @@ fn print_help() -> ! {
     std::process::exit(0);
 }
 
+/// The `SIGN-BINDING` section of [`help_text`].
+const SIGN_BINDING_HELP: &str = "\
+SIGN-BINDING:
+    Signs the node's possession_sig for a NodeBinding against the node's own storage
+    (spec 09 section 9.6.3, step 2) and prints {node_key, possession_sig, url_hash}
+    as hex JSON. Stop the node first: the command opens the storage the node holds.
+    Start the node once first: storage that holds no node key exits 1, since only
+    a start draws the key. No network message runs the command.
+    --operator <ID>         The operator identifier, in its scp: text form
+    --url <URL>             The node's canonical URL (ws or wss, path ending /scp/v1)
+    --key-state-head <HEX>  The operator's key-state head, 64 hex characters
+    --storage-path <PATH>   The node's storage directory (also SCP_STORAGE_PATH)
+";
+
+/// The node-binding variables of [`help_text`]'s `ENVIRONMENT VARIABLES`.
+const NODE_BINDING_ENV_HELP: &str = "\
+    SCP_NODE_BINDING            The installed NodeBinding, as its canonical JSON (spec 09
+                                section 9.6.3, step 4). Set with SCP_NODE_URL or not at
+                                all. At start the node refuses a binding of another key,
+                                a possession_sig that fails under its key, or a url_hash
+                                that is not SCP_NODE_URL's, and exits 1. Unset, the node
+                                returns no node_proof. --relay-only and --ephemeral,
+                                which keep no node key, exit 1 on it, as does a value
+                                that is not UTF-8
+    SCP_NODE_URL                The node's canonical URL the binding's url_hash names";
+
 /// The usage text [`print_help`] prints.
 fn help_text() -> String {
     format!(
@@ -203,6 +231,7 @@ scp-node — SCP application node
 
 USAGE:
     scp-node [OPTIONS]
+    scp-node sign-binding --operator <ID> --url <URL> --key-state-head <HEX> [--storage-path <PATH>]
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
@@ -226,6 +255,7 @@ OPTIONS:
     --health                TCP health probe (exit 0 on success, 1 on failure)
     --help, -h              Show this help message
 
+{sign_binding}
 ENVIRONMENT VARIABLES:
     SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
                                or --self-host). Full node mode is the default; a
@@ -253,6 +283,7 @@ ENVIRONMENT VARIABLES:
                                 NAT probing.
     SCP_NODE_DHT_GATEWAYS       Comma-separated DHT HTTP gateway URLs
     SCP_STORAGE_PATH            SQLite database directory (same as --storage-path)
+{node_binding}
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
@@ -289,6 +320,8 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
     RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
         webpush = startup::NODE_WEBPUSH_HELP,
+        sign_binding = SIGN_BINDING_HELP,
+        node_binding = NODE_BINDING_ENV_HELP,
     )
 }
 
@@ -297,6 +330,173 @@ ENVIRONMENT VARIABLES:
 // ---------------------------------------------------------------------------
 
 // `env_or` is provided by `scp_transport::startup::env_or`.
+
+/// The two binding variables as the environment holds them (§9.6.3 step
+/// 4): each is `None` when unset, and a value that is not UTF-8 is an error,
+/// never read as unset. Every run mode reads the variables through this one
+/// function, so no mode drops a binding the operator set.
+#[derive(Debug, PartialEq, Eq)]
+struct NodeBindingEnv {
+    binding: Option<String>,
+    url: Option<String>,
+}
+
+impl NodeBindingEnv {
+    /// Reads `SCP_NODE_BINDING` and `SCP_NODE_URL` through `var`.
+    fn read(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Self, String> {
+        let text = |name: &str| {
+            var(name)
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| format!("{name} is set but is not UTF-8"))
+                })
+                .transpose()
+        };
+        Ok(Self {
+            binding: text("SCP_NODE_BINDING")?,
+            url: text("SCP_NODE_URL")?,
+        })
+    }
+
+    /// Reads the process environment, exiting 1 when a variable is set but
+    /// cannot be read.
+    fn from_env_or_exit() -> Self {
+        Self::read(|name| env::var_os(name)).unwrap_or_else(|e| {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        })
+    }
+
+    /// The refusal a run mode that holds no persistent node key prints when
+    /// either variable is set: `mode` keeps no instance storage a binding's
+    /// key could live in, so starting without the binding would silently
+    /// drop the proofs the operator asked for.
+    fn refusal_without_a_node_key(&self, mode: &str) -> Option<String> {
+        (self.binding.is_some() || self.url.is_some()).then(|| {
+            format!(
+                "ERROR: SCP_NODE_BINDING and SCP_NODE_URL install a node binding, which \
+                 needs the node key a full node keeps in its instance storage. {mode} keeps \
+                 no node key across starts; unset both, or run a persistent full node."
+            )
+        })
+    }
+}
+
+/// The binding the operator installed through `SCP_NODE_BINDING` and
+/// `SCP_NODE_URL` (§9.6.3 step 4), exiting 1 when a variable is set but
+/// unreadable, when only one is set, or when either does not parse.
+fn node_binding_or_exit() -> NodeBindingSlot {
+    let env = NodeBindingEnv::from_env_or_exit();
+    match scp_node::node_key::binding_slot_from(env.binding.as_deref(), env.url.as_deref()) {
+        Ok(slot) => slot,
+        Err(e) => {
+            eprintln!("ERROR: SCP_NODE_BINDING / SCP_NODE_URL: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Exits 1 when the operator configured a node binding for `mode`, which
+/// holds no persistent node key ([`NodeBindingEnv::refusal_without_a_node_key`]).
+fn refuse_node_binding_or_exit(mode: &str) {
+    if let Some(error) = NodeBindingEnv::from_env_or_exit().refusal_without_a_node_key(mode) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+/// The arguments of `scp-node sign-binding` (§9.6.3 step 2).
+#[derive(Debug, PartialEq, Eq)]
+struct SignBindingArgs {
+    operator: scp_did::Identifier,
+    url: scp_did::NodeUrl,
+    key_state_head: [u8; 32],
+    storage_path: Option<PathBuf>,
+}
+
+/// Parses the arguments after `sign-binding`. `storage_env` is the resolved
+/// `SCP_STORAGE_PATH`, which `--storage-path` overrides.
+fn parse_sign_binding(
+    args: &[String],
+    storage_env: Option<PathBuf>,
+) -> Result<SignBindingArgs, String> {
+    let mut operator = None;
+    let mut url = None;
+    let mut key_state_head = None;
+    let mut storage_path = None;
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let value = rest.next().ok_or_else(|| format!("{flag} takes a value"))?;
+        let slot = match flag.as_str() {
+            "--operator" => &mut operator,
+            "--url" => &mut url,
+            "--key-state-head" => &mut key_state_head,
+            "--storage-path" => &mut storage_path,
+            other => return Err(format!("unknown sign-binding argument {other}")),
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return Err(format!("{flag} is given twice"));
+        }
+    }
+    let operator = operator
+        .ok_or("--operator is required")?
+        .parse::<scp_did::Identifier>()
+        .map_err(|e| format!("--operator: {e}"))?;
+    let url = scp_did::NodeUrl::new(url.ok_or("--url is required")?)
+        .map_err(|e| format!("--url: {e}"))?;
+    let mut head = [0u8; 32];
+    hex::decode_to_slice(
+        key_state_head.ok_or("--key-state-head is required")?,
+        &mut head,
+    )
+    .map_err(|_| "--key-state-head is not 64 hex characters".to_owned())?;
+    Ok(SignBindingArgs {
+        operator,
+        url,
+        key_state_head: head,
+        storage_path: storage_path.map(PathBuf::from).or(storage_env),
+    })
+}
+
+/// Runs `scp-node sign-binding`: opens the node's own storage, signs
+/// `possession_sig` with the node key it holds, prints the result as JSON on
+/// stdout, and exits; storage that holds no key exits 1, because only a
+/// node's start draws one (§17.3 "Node key"). A local command
+/// over the storage directory is the only way the node signs a binding
+/// (§9.6.3 step 2).
+async fn run_sign_binding(args: &[String]) -> ! {
+    let parsed =
+        match parse_sign_binding(args, env::var("SCP_STORAGE_PATH").ok().map(PathBuf::from)) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("ERROR: sign-binding: {e}");
+                std::process::exit(2);
+            }
+        };
+    let storage_dir = resolve_storage_path_or_exit(parsed.storage_path.as_ref());
+    validate_storage_path_or_exit(&storage_dir).await;
+    let storage_key = resolve_storage_key_or_exit(&storage_dir).await;
+    let storage = open_sqlite_or_exit(&storage_dir, &storage_key).await;
+    drop(storage_key);
+    match scp_node::node_key::sign_possession(
+        &scp_core::store::ProtocolRepository::new(storage),
+        &parsed.operator,
+        &parsed.url,
+        &parsed.key_state_head,
+    )
+    .await
+    {
+        Ok(signature) => {
+            println!("{}", signature.to_json());
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("ERROR: sign-binding: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 
 /// Returns the value inside `result`, or prints its [`startup::StartupError`]
 /// to stderr and exits 1.
@@ -382,6 +582,7 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
+    refuse_node_binding_or_exit("--relay-only");
     let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
     let mut config = or_exit(startup::relay_config_from_env());
     tracing::info!(
@@ -467,6 +668,9 @@ async fn run_full_node_ephemeral() {
     use scp_platform::testing::InMemoryKeyCustody;
 
     exit_on_ignored_cloud_backend("--ephemeral", EPHEMERAL_STORE);
+    // An ephemeral node draws a fresh node key in memory on every start, so
+    // no binding the operator signed can name it.
+    refuse_node_binding_or_exit("--ephemeral");
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -515,14 +719,17 @@ async fn run_full_node_ephemeral() {
     run_node_with(
         domain,
         http_addr,
-        custody,
-        did_method,
+        IdentitySource::Generate {
+            custody,
+            did_method,
+        },
         encrypted_storage,
         // Ephemeral contract: in-memory blob, no persistence, env ignored.
         ephemeral_blob_backend(),
         // Ephemeral mode offers no push: an enabled relay needs a durable
         // registration store.
         PushSlot::Disabled,
+        NodeBindingSlot::Unbound,
     )
     .await;
 }
@@ -609,6 +816,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // §17.17.1 SCP-CAPSEL-8000). The store is the node's own, so a set store
     // variable exits here too (SCP-CAPSEL-8001).
     let push_senders = or_exit(startup::push_senders_from_env().await);
+    // The installed binding parses before the storage directory exists, so a
+    // malformed one exits with nothing created.
+    let node_binding = node_binding_or_exit();
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -682,11 +892,14 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             run_node_with(
                 domain,
                 http_addr,
-                custody,
-                did_method,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
                 Arc::clone(&node_storage_arc),
                 blob_storage,
                 push,
+                node_binding,
             )
             .await;
         }
@@ -711,11 +924,14 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             run_node_with(
                 domain,
                 http_addr,
-                custody,
-                did_method,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
                 Arc::clone(&node_storage_arc),
                 blob_storage,
                 push,
+                node_binding,
             )
             .await;
         }
@@ -976,6 +1192,7 @@ const EPHEMERAL_STORE: &str = "in memory";
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
+    let node_binding = node_binding_or_exit();
     let port: u16 = or_exit(startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16));
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
@@ -1047,6 +1264,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         on_ready: Some(Box::new(|ready: scp_node::HostSiteReady| {
             print_self_host_live_url(&ready);
         })),
+        node_binding,
     };
 
     let shutdown = or_exit(shutdown::shutdown_signal().map_err(startup::StartupError::from));
@@ -1158,8 +1376,9 @@ async fn run_node_with<
 >(
     domain: String,
     http_addr: SocketAddr,
-    custody: Arc<K>,
-    did_method: Arc<D>,
+    // The generated identity, from the custody and DID method the caller's
+    // DHT mode chose.
+    identity: IdentitySource<K, D>,
     storage: S,
     // The relay's blob backend, selected by each caller at ITS OWN boundary
     // (SCP-CAPINJECT-010 / spec §17.17.1). Threaded as a required parameter —
@@ -1174,6 +1393,9 @@ async fn run_node_with<
     // Whether the relay offers push, selected by the caller like
     // `blob_storage` (PUSH-012).
     push: PushSlot,
+    // The operator's installed binding, read by the caller before it opens
+    // any storage (§9.6.3 step 4).
+    node_binding: NodeBindingSlot,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
@@ -1236,8 +1458,8 @@ async fn run_node_with<
     };
 
     // `Domain` is a publishing reach: `DhtMode::Production` makes `Node::start`
-    // publish through `did_method` and fail the start if that publish fails.
-    // The caller's DHT mode already chose `did_method` (the Pkarr client, or
+    // publish through the identity's DID method and fail the start if that
+    // publish fails. The caller's DHT mode already chose it (the Pkarr client, or
     // the in-memory client in a `testing` build). `run_node_with` is generic
     // over `S: EncryptedStorage`, so the production `Node::start` (not
     // `start_for_testing`) is the correct entry.
@@ -1249,14 +1471,12 @@ async fn run_node_with<
         http_bind_addr: Some(http_addr),
         projection_rate_limit: Some(projection_rate),
         push,
+        node_binding,
         ..NodeConfig::defaults(
             Reach::Domain {
                 domain: domain.clone(),
             },
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            },
+            identity,
             storage,
             blob_storage,
         )
@@ -1335,6 +1555,14 @@ fn install_metrics_recorder() -> axum::Router {
 
 #[tokio::main]
 async fn main() {
+    // `sign-binding` is a local command over the node's storage, never a run
+    // mode, so it dispatches before any run-mode flag is read.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("sign-binding") {
+        or_exit(startup::init_tracing());
+        run_sign_binding(args.get(2..).unwrap_or_default()).await;
+    }
+
     let config = parse_args();
 
     if config.show_help {
@@ -1949,5 +2177,157 @@ mod tests {
                 && no_publish.contains("NOT DHT-discoverable"),
             "no-publish banner must state the address is not published and not DHT-discoverable"
         );
+    }
+
+    fn sign_args(pairs: &[(&str, &str)]) -> Vec<String> {
+        pairs
+            .iter()
+            .flat_map(|(k, v)| [(*k).to_owned(), (*v).to_owned()])
+            .collect()
+    }
+
+    fn operator_text() -> String {
+        scp_did::Identifier::from_bytes([0x0a; 32]).to_string()
+    }
+
+    /// `sign-binding` reads its three required arguments, and
+    /// `--storage-path` overrides `SCP_STORAGE_PATH`.
+    #[test]
+    fn sign_binding_reads_its_arguments() -> Result<(), String> {
+        let operator = operator_text();
+        let head = "0b".repeat(32);
+        let args = sign_args(&[
+            ("--operator", &operator),
+            ("--url", "wss://node.example.com/scp/v1"),
+            ("--key-state-head", &head),
+        ]);
+        let parsed = super::parse_sign_binding(&args, Some("/env".into()))?;
+        assert_eq!(parsed.operator, scp_did::Identifier::from_bytes([0x0a; 32]));
+        assert_eq!(parsed.url.as_str(), "wss://node.example.com/scp/v1");
+        assert_eq!(parsed.key_state_head, [0x0b; 32]);
+        assert_eq!(parsed.storage_path, Some("/env".into()));
+
+        let mut with_path = args;
+        with_path.extend(sign_args(&[("--storage-path", "/cli")]));
+        let parsed = super::parse_sign_binding(&with_path, Some("/env".into()))?;
+        assert_eq!(parsed.storage_path, Some("/cli".into()));
+        Ok(())
+    }
+
+    /// Every malformed `sign-binding` invocation is refused with the
+    /// argument it names.
+    #[test]
+    fn sign_binding_refuses_malformed_arguments() -> Result<(), String> {
+        let operator = operator_text();
+        let head = "0b".repeat(32);
+        let url = "wss://node.example.com/scp/v1";
+        let cases: [(Vec<String>, &str); 7] = [
+            (
+                sign_args(&[("--url", url), ("--key-state-head", &head)]),
+                "--operator is required",
+            ),
+            (
+                sign_args(&[("--operator", &operator), ("--key-state-head", &head)]),
+                "--url is required",
+            ),
+            (
+                sign_args(&[("--operator", &operator), ("--url", url)]),
+                "--key-state-head is required",
+            ),
+            (
+                sign_args(&[
+                    ("--operator", "0a"),
+                    ("--url", url),
+                    ("--key-state-head", &head),
+                ]),
+                "--operator:",
+            ),
+            (
+                sign_args(&[
+                    ("--operator", &operator),
+                    ("--url", "https://x.example/"),
+                    ("--key-state-head", &head),
+                ]),
+                "--url:",
+            ),
+            (
+                sign_args(&[
+                    ("--operator", &operator),
+                    ("--url", url),
+                    ("--key-state-head", &head),
+                    ("--url", url),
+                ]),
+                "--url is given twice",
+            ),
+            (vec!["--operator".to_owned()], "--operator takes a value"),
+        ];
+        for (args, expected) in cases {
+            match super::parse_sign_binding(&args, None) {
+                Err(e) => assert!(e.contains(expected), "{args:?}: {e}"),
+                Ok(parsed) => return Err(format!("{args:?} parsed as {parsed:?}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// A mode without a persistent node key refuses either binding variable
+    /// and passes when neither is set.
+    #[test]
+    fn a_mode_without_a_node_key_refuses_either_binding_variable() {
+        let env = |binding: bool, url: bool| super::NodeBindingEnv {
+            binding: binding.then(|| "{}".to_owned()),
+            url: url.then(|| "wss://n.example/scp/v1".to_owned()),
+        };
+        assert!(
+            env(false, false)
+                .refusal_without_a_node_key("--ephemeral")
+                .is_none()
+        );
+        for (binding, url) in [(true, false), (false, true), (true, true)] {
+            let refusal = env(binding, url).refusal_without_a_node_key("--ephemeral");
+            assert!(
+                refusal.is_some_and(|r| r.contains("--ephemeral keeps no node key")),
+                "{binding} {url}"
+            );
+        }
+    }
+
+    /// A binding variable that is set but not UTF-8 is an error, never read
+    /// as unset, so no mode starts unbound on a value the operator set.
+    #[test]
+    fn an_unreadable_binding_variable_is_an_error_not_absence() {
+        use std::os::unix::ffi::OsStringExt as _;
+        for name in ["SCP_NODE_BINDING", "SCP_NODE_URL"] {
+            let read = super::NodeBindingEnv::read(|var| {
+                (var == name).then(|| std::ffi::OsString::from_vec(vec![0xff, 0xfe]))
+            });
+            assert!(
+                read.as_ref()
+                    .is_err_and(|e| e.contains(name) && e.contains("not UTF-8")),
+                "{name}: {read:?}"
+            );
+        }
+        assert_eq!(
+            super::NodeBindingEnv::read(|var| (var == "SCP_NODE_URL")
+                .then(|| std::ffi::OsString::from("wss://n.example/scp/v1"))),
+            Ok(super::NodeBindingEnv {
+                binding: None,
+                url: Some("wss://n.example/scp/v1".to_owned()),
+            })
+        );
+    }
+
+    /// The help text documents the local command and both binding variables.
+    #[test]
+    fn help_documents_the_node_binding() {
+        let help = super::help_text();
+        for needed in [
+            "scp-node sign-binding",
+            "--key-state-head",
+            "SCP_NODE_BINDING",
+            "SCP_NODE_URL",
+        ] {
+            assert!(help.contains(needed), "help text lacks {needed}");
+        }
     }
 }
