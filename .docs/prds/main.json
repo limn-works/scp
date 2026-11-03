@@ -325,7 +325,8 @@
         "SCP-377",
         "SCP-378",
         "SCP-379",
-        "SCP-380"
+        "SCP-380",
+        "SCP-381"
       ]
     },
     {
@@ -13972,7 +13973,7 @@
         "Add one test per policy."
       ],
       "blockedBy": [
-        "SCP-366"
+        "SCP-381"
       ],
       "sources": [
         {
@@ -14014,7 +14015,7 @@
         "One test per acceptance step of `09-security-model.md` §9.6.3, each against `AdversarialNode`: a record whose `context_id` or `governor` mismatches is refused; a record below the persisted sequence floor is refused; a record below the pointer's `min_list_sequence` is refused; each entry's operator is resolved under R2 and R3 alone with no floor, and an entry whose binding fails verification is void while the rest of the list is adopted; adoption persists the record and each operator's head as floors, and a restart reads them back",
         "Attribution evidence is stored as the triple (binding, list record, entry index), and standing holds only while a non-void entry carries the binding: a test removes the entry in a later list and sees standing end while the triple stays (`09-security-model.md` §9.6.3)",
         "Two entries carrying one node key void both, and the first binding stays that key's attribution: a test (`09-security-model.md` §9.6.3)",
-        "`NodeClient` sends PUBLISH (`retain`, `delete_token_hash`, `write_key`), QUERY (`since`, `after_blob`, `limit`, `proof_nonce`), SUBSCRIBE, UNSUBSCRIBE, DELETE (`delete_token` or `write_key`), ACK, PING and the bridge frames, and reads OK, ERR (with `last_cosigned_head`), BLOB, the `query_complete` EVENT (`count`, `node_proof`), the `backfill_complete` EVENT and PONG; `crates/scp-relay-client/src/protocol.rs` gains every field it lacks, and one round-trip test per message checks its fields against `10-infrastructure-and-self-hosting.md` §10.4.1",
+        "`NodeClient` sends PUBLISH (`retain`, `delete_token_hash`, `write_key`), QUERY (`since`, `after_blob`, `limit`), SUBSCRIBE, UNSUBSCRIBE, DELETE (`delete_token` or `write_key`), ACK, PING and the bridge frames, and reads OK, ERR (with `last_cosigned_head`), BLOB, the `query_complete` EVENT (`count`), the `backfill_complete` EVENT and PONG; `crates/scp-relay-client/src/protocol.rs` gains every field it lacks, and one round-trip test per message checks its fields against `10-infrastructure-and-self-hosting.md` §10.4.1",
         "`node_list()`, the pure `fallback_set(&AcceptedNodeList, Option<&ServiceRecord>)` and `read_policy(&NodeUrl)` exist on the trait, each with a test (`03-identity.md` §3.10.10)",
         "`git grep -e TransportRelayQuerier -e RealMultiRelayQuerier -e TransportRelayPublisher -e DefaultRelayResolver -e FALLBACK_RELAYS -e SCP-RELAYRES -- crates bindings` prints nothing, and the tests of those types are deleted with them",
         "No `unwrap()` or `expect()` in library code",
@@ -14544,6 +14545,74 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.10.12 Node Record Frames"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-381",
+      "title": "Node proof of control: the `proof_nonce` and `node_proof` wire fields and the node's signed answer",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "in-progress",
+      "files": [
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "A resolver proves that a listed node served its QUERY response by sending a fresh 32-byte `proof_nonce` on the QUERY; a node that holds the node key its `NodeBinding` binds answers with a 200-byte `node_proof` on the `query_complete` EVENT, signed under `SCP-NODE-PROOF-V1:` over its `NodeId`, the nonce, the routing id, the digest of the bytes served and `observed_at` (`09-security-model.md` §9.7.4.2 definitions, §9.10.12; ADR-004 operation 4 and the EVENT row). R11's first-contact floor counts only proven sources, so SCP-367's adversarial fixture and SCP-368's node client need both fields. The `NodeProof` type, its preimage and its verification are SCP-364's; this story adds the wire fields and the signing node. A node with no bound node key answers without `node_proof`, never with a placeholder key. How a node comes to hold its node key and its `NodeBinding` (generated or imported, binding supplied how) is not yet stated by any spec section, so the criteria for holding the key and signing wait on that spec text. Node backend execution plan code PR C4b.",
+      "acceptanceCriteria": [
+        "`ClientMessage::Query` carries `proof_nonce: Option<[u8; 32]>`, encoded as a 32-byte MessagePack `bin` under the key `proof_nonce` and omitted when absent; a `bin` of another width is refused: a round-trip test against ADR-004's QUERY row",
+        "`RelayMessage::Event` carries `node_proof: Option<[u8; NODE_PROOF_LEN]>` (200 bytes), encoded as a `bin` under the key `node_proof` and omitted when absent; a `bin` of another width is refused: a round-trip test against ADR-004's EVENT row",
+        "Every transport that answers QUERY and holds no bound node key (native WebSocket server, QUIC listener, UDP listener, WebTransport session) answers a QUERY carrying `proof_nonce` with a `query_complete` EVENT that has no `node_proof`: a test at the native server (`09-security-model.md` §9.10.12)",
+        "`scp-node` holds its node key and its `NodeBinding` in the storage handle it inherits from its SCP instance, and signs nothing when either is absent (`09-security-model.md` §9.6.3, §9.7.1; `10-infrastructure-and-self-hosting.md` §10.4)",
+        "A node holding its node key and binding answers a QUERY carrying `proof_nonce` with a `NodeProof` whose `node_id` is the binding's `NodeId`, whose `value_digest` covers the blobs in the order sent, including a page of zero blobs, and that verifies under the binding's `node_key`: a test over the wire (`09-security-model.md` §9.7.4.2 definitions)",
+        "A proof checked against a nonce other than the one the QUERY sent fails verification: a test",
+        "A node with no binding answers a QUERY carrying `proof_nonce` without `node_proof`: a test over the wire",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `proof_nonce` to QUERY and `node_proof` to the EVENT, with a round-trip test each.",
+        "Answer without `node_proof` on every keyless transport.",
+        "Hold the node key and binding in the node's inherited storage, once a spec section states how a node obtains them.",
+        "Sign a `NodeProof` on `query_complete` when the QUERY carries a nonce."
+      ],
+      "blockedBy": [
+        "SCP-366"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.3 Node List Authentication"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.1 MLS-to-SCP Concept Mapping"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 The Node List and the Bootstrap Pointer"
         }
       ],
       "details": {}
