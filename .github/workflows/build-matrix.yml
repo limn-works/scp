@@ -237,14 +237,17 @@ jobs:
       # they compile for an Apple target, so the Windows leg ignores it.
       # rust-toolchain.toml lists both Apple targets universal2 joins, so the
       # toolchain step already installed them.
+      # pwsh, not bash: Git Bash puts its MSYS perl first on PATH, and openssl-src's
+      # Configure exits 2 under that perl. Under pwsh, `perl` is the runner image's
+      # Strawberry Perl, a native Windows build, as it was under maturin-action.
       - name: Build wheel
         working-directory: bindings/python
-        shell: bash
+        shell: pwsh
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
           TARGET: ${{ matrix.target }}
         run: >-
-          maturin build --release --out dist --target "$TARGET"
+          maturin build --release --out dist --target $env:TARGET
           -i python3.10 python3.11 python3.12 python3.13
 
       - name: Upload Python wheel
@@ -603,13 +606,30 @@ jobs:
         with:
           packages: ndk;27.2.12479018 platforms;android-35
 
+      # cc-rs, which ring's build script and the vendored OpenSSL compile C through,
+      # otherwise looks for unversioned `aarch64-linux-android-clang` and
+      # `aarch64-linux-android-ranlib` tools that NDK 27 does not ship, so each triple's
+      # C compiler, archiver and ranlib are named beside its linker. The Android job in
+      # ci.yml names the same four tools for x86_64.
       - name: Set NDK environment
         run: |
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang" >> $GITHUB_ENV
+          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018"
+            for pair in aarch64-linux-android:aarch64-linux-android21 \
+                armv7-linux-androideabi:armv7a-linux-androideabi21 \
+                x86_64-linux-android:x86_64-linux-android21 \
+                i686-linux-android:i686-linux-android21; do
+              triple="${pair%%:*}"
+              clang="$ndk_bin/${pair#*:}-clang"
+              upper="$(echo "$triple" | tr 'a-z-' 'A-Z_')"
+              lower="${triple//-/_}"
+              echo "CARGO_TARGET_${upper}_LINKER=$clang"
+              echo "CC_${lower}=$clang"
+              echo "AR_${lower}=$ndk_bin/llvm-ar"
+              echo "RANLIB_${lower}=$ndk_bin/llvm-ranlib"
+            done
+          } >> "$GITHUB_ENV"
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.

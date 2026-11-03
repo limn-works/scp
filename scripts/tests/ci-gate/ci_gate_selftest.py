@@ -5653,9 +5653,23 @@ def command_words(line: str) -> list[tuple[str, list[str]]] | None:
     )
     lexer.whitespace_split = True
     try:
-        tokens = list(lexer)
+        lexed = list(lexer)
     except ValueError:
         return None
+    # shlex joins adjacent punctuation, so `$(seq 60); do docker …` yields `);`, which
+    # is no separator, and the docker after `do` went unread. Split each such run of
+    # separator characters into separators, longest first.
+    tokens = []
+    for token in lexed:
+        if token in SHELL_SEPARATORS or not re.fullmatch(r"[();&|]+", token):
+            tokens.append(token)
+            continue
+        while token:
+            piece = next(
+                (s for s in ("&&", "||", ";;") if token.startswith(s)), token[0]
+            )
+            tokens.append(piece)
+            token = token[len(piece) :]
     found = []
     at_start, index = True, 0
     while index < len(tokens):
@@ -11660,6 +11674,9 @@ FETCH_WORDS = re.compile(
     r")(?![\w-])",
     re.IGNORECASE,
 )
+# A curl or wget whose every URL is a literal loopback address reaches only a server the
+# job itself started, so it downloads nothing from outside the runner.
+LOOPBACK_URL = re.compile(r"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?:[:/]\S*)?$")
 PIP_INSTALL = re.compile(r"(?<![\w.-])pip(?:3(?:\.\d+)?)?\s+(install|download|wheel)\b", re.I)
 PIP_REQUIREMENT = re.compile(r"(?<!\S)(?:-r|--requirement)(?:\s+|=)(\S+)")
 CARGO_INSTALL = re.compile(r"(?<![\w./-])cargo\s+(?:\+\S+\s+)?install\b")
@@ -11678,6 +11695,7 @@ DOCKER_SUBCOMMANDS = {
     "rm": "removes a container",
     "rmi": "removes a local image",
     "logs": "reads a container's log",
+    "exec": "runs a command in a running container, pulling nothing",
     "info": "reads the daemon's state",
     "version": "reads the client and daemon versions",
 }
@@ -11854,11 +11872,24 @@ def scanned_text(step: dict) -> str:
     return "\n".join(texts)
 
 
+def loopback_fetch(text: str, match: re.Match) -> bool:
+    """Whether a curl or wget command fetches only literal loopback URLs."""
+    if match.group(1).lower() not in ("curl", "wget"):
+        return False
+    command = re.split(r"&&|\|\||[;|\n]", text[match.end() :], maxsplit=1)[0]
+    if "$" in command or "`" in command:
+        return False
+    urls = [t for t in command.split() if "://" in t]
+    return bool(urls) and all(LOOPBACK_URL.match(u.strip("\"'")) for u in urls)
+
+
 def run_gaps(label: str, step: dict, job: dict | None) -> list[str]:
     """Each fetch in a step's run text that bypasses the pinned paths."""
     gaps = []
     text = scanned_text(step)
-    words = sorted({m.group(1).lower() for m in FETCH_WORDS.finditer(text)})
+    words = sorted({
+        m.group(1).lower() for m in FETCH_WORDS.finditer(text) if not loopback_fetch(text, m)
+    })
     if words:
         gaps.append(
             f"{label} runs {', '.join(words)}, which fetches outside the pinned paths; "
@@ -12659,6 +12690,20 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         "hashed pip of a file that does not exist": [
             {"run": "pip install --require-hashes --requirement=.github/requirements/absent.txt"}
         ],
+        "unpinned docker run after `$(…); do`": [
+            {"run": "for _ in $(seq 3); do docker run alpine:latest true && break; done"}
+        ],
+        "curl of a loopback and an outside URL": [
+            {"run": "curl -sf http://127.0.0.1:9090/a https://example.invalid/b"}
+        ],
+        "curl of a loopback-looking host": [
+            {"run": "curl -sf http://127.0.0.1.example.invalid/a"}
+        ],
+        "curl of a computed URL": [{"run": 'curl -sf "http://127.0.0.1:$PORT/a"'}],
+        "curl with a URL-less config": [{"run": "curl -K /tmp/urls"}],
+        "loopback curl chained to an outside curl": [
+            {"run": "curl -sf http://127.0.0.1:9090/a && curl -sf https://example.invalid/b"}
+        ],
         "hashed pip of a computed path": [
             {"run": 'pip install --require-hashes -r "$REQS"'}
         ],
@@ -12745,6 +12790,13 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             {"run": "python3 -m pip install --require-hashes -r .github/requirements/ruff.txt"}
         ],
         "bun install --frozen-lockfile": [{"run": "bun install --frozen-lockfile"}],
+        "a loopback health probe": [
+            {"run": "for _ in $(seq 60); do curl -sf -o /dev/null "
+                    "http://127.0.0.1:9090/scp-test && break; sleep 1; done"}
+        ],
+        "docker exec into a running container": [
+            {"run": "docker exec scp-ci-postgres pg_isready -U postgres"}
+        ],
         "cargo install of a checked source": [
             {"run": 'cargo +nightly install --locked --path "$CRATE"'}
         ],
