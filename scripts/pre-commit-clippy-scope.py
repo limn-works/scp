@@ -28,19 +28,24 @@ and `deny.toml` is read by cargo-deny, not by clippy.
 Otherwise the script selects each workspace member that holds a changed path, of any file
 type, because a crate can read a non-Rust file in its directory with `include_str!`. A
 commit that deletes or moves a file does not select a member that reads that file with
-`include_str!` or `include_bytes!` unless that member holds the file or the walk below
-reaches it from the member that holds the file; a file in no member's directory selects
-no member. The script then adds every
-workspace member that depends on a selected member, directly or transitively, as
-`Graph.affected` defines the walk, and prints `-p <name>` for each. It keeps only the
-`--features` entries whose package is selected.
+`include_str!` or `include_bytes!` unless that member holds the file; a file in no
+member's directory selects no member. The script prints `-p <name>` for each selected
+member and keeps only the `--features` entries whose package is selected.
+
+The script does not add the members that depend on a selected member. Cargo has no early
+cutoff, so after any edit every dependent is recompiled and re-linted in full, one after
+another along the dependency chain. That chain made the hook take 199-307 s after an
+scp-runtime edit and 205 s after an scp-protocol edit, against a 66 s edit-to-lib-test
+rebuild. CI's `rust-clippy` job lints the whole workspace on every pull request, so an
+edit that breaks a dependent's build or lints still fails before merge. Measurements:
+`~/.claude/plans/local-speed-2026-11.md`.
 
 `fuzz/` is a standalone workspace whose crates `fuzz/rust-toolchain.toml` builds on a
 nightly compiler, so the hook does not lint it; the script names each such `.rs` path on
 stderr.
 
-The script reads the member graph from `cargo metadata --format-version 1 --no-deps`, or
-from the file `--metadata` names. It exits nonzero when cargo metadata fails, so the hook
+The script reads the member directories from `cargo metadata --format-version 1 --no-deps`,
+or from the file `--metadata` names. It exits nonzero when cargo metadata fails, so the hook
 fails instead of linting nothing.
 """
 
@@ -96,61 +101,19 @@ def load_metadata(path: str | None) -> dict:
         raise ScopeError(f"cargo metadata printed no JSON: {err}") from err
 
 
-class Graph:
-    """Workspace members, keyed by directory, with their reverse dependency edges."""
-
-    def __init__(self, metadata: dict) -> None:
-        root = PurePosixPath(metadata["workspace_root"])
-        member_ids = set(metadata["workspace_members"])
-        members = [p for p in metadata["packages"] if p["id"] in member_ids]
-        if len(members) != len(member_ids):
-            raise ScopeError(
-                "cargo metadata lists a workspace member it gives no package for"
-            )
-        abs_dir_to_name = {
-            str(PurePosixPath(p["manifest_path"]).parent): p["name"] for p in members
-        }
-        # {member directory relative to the workspace root: package name}
-        self.dirs = {
-            str(PurePosixPath(d).relative_to(root)): n
-            for d, n in abs_dir_to_name.items()
-        }
-        # lib_dependents[x]: members whose library or build script compiles against x's library.
-        # dev_dependents[x]: members whose test, bench, or example targets compile against it.
-        self.lib_dependents: dict[str, set[str]] = {p["name"]: set() for p in members}
-        self.dev_dependents: dict[str, set[str]] = {p["name"]: set() for p in members}
-        for package in members:
-            for dep in package["dependencies"]:
-                dep_name = abs_dir_to_name.get(dep.get("path") or "")
-                if dep_name is None or dep_name == package["name"]:
-                    continue
-                edges = (
-                    self.dev_dependents
-                    if dep.get("kind") == "dev"
-                    else self.lib_dependents
-                )
-                edges[dep_name].add(package["name"])
-
-    def affected(self, changed: set[str]) -> set[str]:
-        """Return the changed members plus every member that depends on one of them.
-
-        A member whose library depends on a changed member's library compiles different code,
-        and so does every member that depends on that member's library, so the walk follows
-        normal and build edges until the set stops growing. A dev-dependency edge reaches
-        only the dependent's test, bench, and example targets, which no other member compiles
-        against, so the walk adds each dev-dependent of the library set and stops there.
-        """
-        libs = set(changed)
-        pending = list(changed)
-        while pending:
-            for dependent in self.lib_dependents[pending.pop()]:
-                if dependent not in libs:
-                    libs.add(dependent)
-                    pending.append(dependent)
-        affected = set(libs)
-        for lib in libs:
-            affected |= self.dev_dependents[lib]
-        return affected
+def member_dirs(metadata: dict) -> dict[str, str]:
+    """Return {member directory relative to the workspace root: package name}."""
+    root = PurePosixPath(metadata["workspace_root"])
+    member_ids = set(metadata["workspace_members"])
+    members = [p for p in metadata["packages"] if p["id"] in member_ids]
+    if len(members) != len(member_ids):
+        raise ScopeError(
+            "cargo metadata lists a workspace member it gives no package for"
+        )
+    return {
+        str(PurePosixPath(p["manifest_path"]).parent.relative_to(root)): p["name"]
+        for p in members
+    }
 
 
 def owning_member(path: str, dirs: dict[str, str]) -> tuple[str, str] | None:
@@ -167,10 +130,10 @@ def select(paths: list[str], metadata: dict, features: list[str]) -> list[str]:
     """Return the cargo arguments for the changed paths; an empty list means no lint."""
     if any(lints_everything(p) for p in paths):
         return workspace_args(features)
-    graph = Graph(metadata)
-    changed: set[str] = set()
+    dirs = member_dirs(metadata)
+    selected: set[str] = set()
     for path in paths:
-        owner = owning_member(path, graph.dirs)
+        owner = owning_member(path, dirs)
         if owner is None:
             if path.endswith(".rs"):
                 print(
@@ -186,8 +149,7 @@ def select(paths: list[str], metadata: dict, features: list[str]) -> list[str]:
         )
         if str(relative) in MEMBER_WIDE:
             return workspace_args(features)
-        changed.add(name)
-    selected = graph.affected(changed)
+        selected.add(name)
     if not selected:
         return []
     args: list[str] = []

@@ -97,9 +97,31 @@ fi
 
 # ── Auto-format (best-effort — failures don't block other languages) ──
 
+# Rust formats only the workspace members that hold a path this commit stages or a tracked
+# `.rs` file the working tree modified, because `git add -u` below stages each such file.
+# The member list comes from the clippy scope script, run without features, which prints
+# `--workspace` for a root-wide path; `cargo fmt` spells that `--all`. `cargo fmt --all`
+# took 3.2 s on every Rust commit, formatting one crate takes 0.7-1.0 s, and CI's fmt check
+# still reads every member. When the script cannot read the member graph, the hook formats
+# every member, and the clippy step below fails the commit on the same error.
 if $HAS_RUST; then
   echo "▸ Rust: auto-format"
-  cargo fmt --all 2>/dev/null || true
+  FMT_ARGS=()
+  if FMT_SCOPE=$( { changed_paths; git diff -z --name-only -- '*.rs'; } \
+      | python3.12 scripts/pre-commit-clippy-scope.py 2>/dev/null); then
+    while IFS= read -r arg; do
+      case "$arg" in
+        "") ;;
+        --workspace) FMT_ARGS+=(--all) ;;
+        *) FMT_ARGS+=("$arg") ;;
+      esac
+    done <<< "$FMT_SCOPE"
+  else
+    FMT_ARGS=(--all)
+  fi
+  if [ "${#FMT_ARGS[@]}" -gt 0 ]; then
+    cargo fmt "${FMT_ARGS[@]}" 2>/dev/null || true
+  fi
   git add -u -- '*.rs' 2>/dev/null || true
 fi
 
@@ -127,10 +149,11 @@ fi
 # ── Which workspace members clippy lints ──
 #
 # `scripts/pre-commit-clippy-scope.py` reads the changed paths and prints the clippy package
-# arguments: each workspace member holding a changed path plus every member that depends on
-# one of them, or `--workspace` when a changed path is one of the files the script's module
-# docstring lists, such as `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`. The script
-# keeps only the `CLIPPY_FEATURES` entries whose package it selects.
+# arguments: each workspace member holding a changed path, or `--workspace` when a changed
+# path is one of the files the script's module docstring lists, such as `Cargo.toml`,
+# `Cargo.lock`, or `rust-toolchain.toml`. The members that depend on a changed member are
+# left to CI's workspace clippy; the docstring gives the measured reason. The script keeps
+# only the `CLIPPY_FEATURES` entries whose package it selects.
 #
 # The hook runs the script on every commit, not only on a commit that changes a `.rs` file,
 # because a commit that changes only `Cargo.lock`, `rust-toolchain.toml`, or a non-Rust file
@@ -149,14 +172,28 @@ CLIPPY_FEATURES=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-
   done <<< "$SCOPE"
   if [ "${#CLIPPY_ARGS[@]}" -eq 0 ] && ! $HAS_RUST; then exit 0; fi
   echo "▸ Rust: clippy + protocol enforcement"
+  # The two protocol checks read no build output, so they run beside clippy rather than
+  # after it; together they took 2.8 s in series.
+  python3.12 scripts/check-protocol-sync.py > "$TMPDIR/protocol-sync.log" 2>&1 &
+  SYNC_PID=$!
+  bash scripts/check-protocol-deps.sh > "$TMPDIR/protocol-deps.log" 2>&1 &
+  DEPS_PID=$!
+  RUST_FAILED=false
   if [ "${#CLIPPY_ARGS[@]}" -eq 0 ]; then
     echo "  clippy skipped: no changed path is in a workspace member"
   else
     cargo clippy "${CLIPPY_ARGS[@]}" --all-targets -- -D warnings 2>&1 \
-      || { echo "  ✗ clippy failed"; exit 1; }
+      || { echo "  ✗ clippy failed"; RUST_FAILED=true; }
   fi
-  python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
-  bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
+  SYNC_OK=true
+  wait "$SYNC_PID" || SYNC_OK=false
+  cat "$TMPDIR/protocol-sync.log"
+  $SYNC_OK || { echo "  ✗ async code in scp-protocol"; RUST_FAILED=true; }
+  DEPS_OK=true
+  wait "$DEPS_PID" || DEPS_OK=false
+  cat "$TMPDIR/protocol-deps.log"
+  $DEPS_OK || { echo "  ✗ banned deps in scp-protocol"; RUST_FAILED=true; }
+  if $RUST_FAILED; then exit 1; fi
 ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &
 
 if $HAS_PYTHON; then
