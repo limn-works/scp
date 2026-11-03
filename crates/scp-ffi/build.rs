@@ -7,10 +7,17 @@
 /// `cargo:rustc-link-search=native=...` so the test binaries can find
 /// `libpython3.XX.dylib` automatically.
 fn main() {
+    // The script reads only itself and, on macOS, the `python3.12` that `PATH`
+    // finds. Without a rerun-if line cargo would rerun it, and rebuild this
+    // crate and every dependent, whenever any file of the package gets a newer
+    // mtime, which a CI restore of compiled workspace units always causes.
+    println!("cargo:rerun-if-changed=build.rs");
+
     // Only needed on macOS — Linux uses rpath or ld.so.conf.
     if std::env::consts::OS != "macos" {
         return;
     }
+    println!("cargo:rerun-if-env-changed=PATH");
 
     // Find the python3.12 interpreter (mise puts it on PATH).
     let output = std::process::Command::new("python3.12")

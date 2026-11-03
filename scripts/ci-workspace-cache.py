@@ -258,6 +258,34 @@ def package_roots(workspace: Path) -> dict[str, Path]:
     return {p["name"]: Path(p["manifest_path"]).parent for p in meta["packages"]}
 
 
+def package_mtime_build_runs(prof: Path, names: set[str]) -> list[str]:
+    """Workspace build-script runs that cargo fingerprints by the package's newest file mtime.
+
+    A build script that prints no `rerun-if-changed` or `rerun-if-env-changed` gets that
+    fallback: cargo stores "<newest mtime> (<file>)" over every file of the package. The
+    restore rewrites every tracked file's mtime, so the stored value never matches and
+    every reader reruns the script and rebuilds the package and its dependents. That
+    rebuild is safe but repeats on every reader, so the pack refuses it, and the build
+    script declares the inputs it reads.
+    """
+    problems: list[str] = []
+    fp = prof / ".fingerprint"
+    if not fp.is_dir():
+        return problems
+    for unit in fp.iterdir():
+        if not is_workspace_entry(unit.name, names):
+            continue
+        for f in unit.glob("run-build-script-*.json"):
+            local = json.loads(f.read_text()).get("local", [])
+            if any("Precalculated" in entry for entry in local):
+                problems.append(
+                    f"{f}: the build script of {unit.name} prints no rerun-if-changed or "
+                    "rerun-if-env-changed, so cargo keys its run on the package's newest "
+                    "file mtime; declare the inputs it reads"
+                )
+    return problems
+
+
 def check_inputs(
     workspace: Path, target: Path, names: set[str], blobs: dict[str, str]
 ) -> list[str]:
@@ -274,6 +302,7 @@ def check_inputs(
     problems: list[str] = []
     checked = 0
     for prof in profile_dirs(target):
+        problems.extend(package_mtime_build_runs(prof, names))
         sources: list[tuple[Path, list[str]]] = []
         deps = prof / "deps"
         if deps.is_dir():
