@@ -47,13 +47,19 @@ pub fn system_clock() -> ClockFn {
 /// A blob under the shared TTL expires `ttl` seconds after it is stored. A
 /// record of the five retained kinds (`scp:did:`, `scp:svc:`, `scp:wit:`,
 /// `scp:wcf:`, `scp:nls:`) carries no TTL: TTL purge never removes it, and
-/// only the node's public-record selection drops it.
+/// only the node's public-record selection drops it. It carries the node's
+/// admission counter instead, which every backend persists with it
+/// (§9.10.12 "Held earliest is admission order").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoredLifetime {
     /// Expires this many seconds after `stored_at`.
     Ttl(u32),
     /// Kept with no TTL (a `retain` PUBLISH).
-    Retained,
+    Retained {
+        /// The order the node admitted the record in at its routing id: one
+        /// above every counter the node held there when it stored it.
+        admission: u64,
+    },
 }
 
 impl StoredLifetime {
@@ -62,8 +68,23 @@ impl StoredLifetime {
     pub const fn ttl(self) -> Option<u32> {
         match self {
             Self::Ttl(ttl) => Some(ttl),
-            Self::Retained => None,
+            Self::Retained { .. } => None,
         }
+    }
+
+    /// The admission counter of a retained record; `None` on a TTL blob.
+    #[must_use]
+    pub const fn admission(self) -> Option<u64> {
+        match self {
+            Self::Ttl(_) => None,
+            Self::Retained { admission } => Some(admission),
+        }
+    }
+
+    /// Whether the blob is a retained record.
+    #[must_use]
+    pub const fn is_retained(self) -> bool {
+        matches!(self, Self::Retained { .. })
     }
 
     /// The unix second the blob expires at; `None` on a retained record.
@@ -71,17 +92,29 @@ impl StoredLifetime {
     pub const fn expires_at(self, stored_at: u64) -> Option<u64> {
         match self {
             Self::Ttl(ttl) => Some(stored_at.saturating_add(ttl as u64)),
-            Self::Retained => None,
+            Self::Retained { .. } => None,
         }
     }
 
-    /// The lifetime a stored `blob_ttl` column reads back as: a value is a
-    /// TTL and its absence a retained record.
-    #[must_use]
-    pub const fn from_ttl(ttl: Option<u32>) -> Self {
-        match ttl {
-            Some(ttl) => Self::Ttl(ttl),
-            None => Self::Retained,
+    /// The lifetime a stored row's `blob_ttl` and `admission` columns read
+    /// back as: a TTL alone is a TTL blob and a counter alone a retained
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] for a row carrying both or neither, which
+    /// no store writes; a damaged row never reads as a record TTL purge
+    /// must keep.
+    pub fn from_columns(ttl: Option<u32>, admission: Option<u64>) -> Result<Self, StorageError> {
+        match (ttl, admission) {
+            (Some(ttl), None) => Ok(Self::Ttl(ttl)),
+            (None, Some(admission)) => Ok(Self::Retained { admission }),
+            (Some(_), Some(_)) => Err(StorageError::Internal(
+                "a stored blob carries both a TTL and an admission counter".to_owned(),
+            )),
+            (None, None) => Err(StorageError::Internal(
+                "a stored blob carries neither a TTL nor an admission counter".to_owned(),
+            )),
         }
     }
 
@@ -93,6 +126,58 @@ impl StoredLifetime {
             None => false,
         }
     }
+}
+
+/// Which lifetimes a query returns.
+///
+/// Every backend applies it inside the query, before its limit, and reads no body of a blob it drops (spec
+/// §17.7 "Retained records and the lifetime filter"), so TTL-bearing blobs a
+/// publisher floods at a routing id cost a retained-only read nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifetimeFilter {
+    /// Every live blob: what a QUERY and a SUBSCRIBE backfill read.
+    Any,
+    /// Retained records only: what the node's selection reads.
+    Retained,
+    /// TTL-bearing blobs only: what the TTL quota counts.
+    Ttl,
+}
+
+impl LifetimeFilter {
+    /// Whether a blob of `lifetime` passes the filter.
+    #[must_use]
+    pub const fn admits(self, lifetime: StoredLifetime) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Retained => lifetime.is_retained(),
+            Self::Ttl => !lifetime.is_retained(),
+        }
+    }
+
+    /// The filter as the SQL backends bind it: `0` any, `1` retained, `2`
+    /// TTL.
+    #[must_use]
+    pub const fn sql_code(self) -> i32 {
+        match self {
+            Self::Any => 0,
+            Self::Retained => 1,
+            Self::Ttl => 2,
+        }
+    }
+}
+
+/// The SQL predicate over a bound filter code (see
+/// [`LifetimeFilter::sql_code`]) at placeholder `param`: a retained row is
+/// the one with no `blob_ttl`.
+#[cfg(any(
+    feature = "sqlite-blob",
+    feature = "combined",
+    feature = "postgres-blob"
+))]
+pub(crate) fn lifetime_predicate(param: &str) -> String {
+    format!(
+        "({param} = 0 OR ({param} = 1 AND blob_ttl IS NULL) OR ({param} = 2 AND blob_ttl IS NOT NULL))"
+    )
 }
 
 /// Which blobs of a routing id a query returns, before its limit (ADR-004
@@ -271,15 +356,18 @@ pub trait BlobStorage: Send + Sync {
     /// Returns `None` if the blob does not exist or has expired.
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError>;
 
-    /// Queries the live blobs of a `routing_id` that sort after `cursor`,
-    /// at most `limit` of them.
+    /// Queries the live blobs of a `routing_id` whose lifetime `filter`
+    /// admits and that sort after `cursor`, at most `limit` of them.
     ///
     /// Results are in ascending (`stored_at`, `blob_id`) order, so a page
-    /// walk resumes from the last pair it read (ADR-004 operation 4).
+    /// walk resumes from the last pair it read (ADR-004 operation 4). The
+    /// filter applies before the limit, and a backend reads no body of a blob
+    /// the filter drops.
     async fn query(
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError>;
 
@@ -504,6 +592,7 @@ impl BlobStorage for InMemoryBlobStorage {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let blobs = self.blobs.read().await;
@@ -514,22 +603,23 @@ impl BlobStorage for InMemoryBlobStorage {
             return Ok(Vec::new());
         };
 
-        let mut results: Vec<StoredBlob> = blob_ids
+        // Filter, order and limit over references, then copy only the bodies
+        // the limit keeps.
+        let mut kept: Vec<&StoredBlob> = blob_ids
             .iter()
             .filter_map(|id| {
                 let entry = blobs.get(id)?;
-                (!entry.expired(now)
+                (entry.stored_blob.routing_id == *routing_id
+                    && !entry.expired(now)
+                    && filter.admits(entry.stored_blob.lifetime)
                     && cursor.admits(entry.stored_blob.stored_at, &entry.stored_blob.blob_id))
-                .then(|| entry.stored_blob.clone())
+                .then_some(&entry.stored_blob)
             })
             .collect();
+        kept.sort_by_key(|blob| (blob.stored_at, blob.blob_id));
+        kept.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
 
-        sort_query_order(&mut results);
-
-        // Apply limit.
-        results.truncate(limit as usize);
-
-        Ok(results)
+        Ok(kept.into_iter().cloned().collect())
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -831,9 +921,10 @@ impl BlobStorage for BlobStorageBackend {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        dispatch!(self, query(routing_id, cursor, limit))
+        dispatch!(self, query(routing_id, cursor, filter, limit))
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -982,7 +1073,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -1009,7 +1105,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -1036,7 +1137,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         // All should be sorted by stored_at ascending.
@@ -1065,7 +1171,12 @@ mod tests {
             .unwrap();
 
         let results = storage
-            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id_b,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1185,7 +1296,12 @@ mod tests {
 
         // After deletion, query should return empty.
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());

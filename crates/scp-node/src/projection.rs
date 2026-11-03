@@ -1621,7 +1621,16 @@ pub async fn feed_handler(
 
     // Query blobs.
     let cursor = since_ts.map_or(QueryCursor::All, QueryCursor::Since);
-    let blobs = match state.blob_storage.query(&routing_id, cursor, limit).await {
+    let blobs = match state
+        .blob_storage
+        .query(
+            &routing_id,
+            cursor,
+            scp_transport::native::storage::LifetimeFilter::Any,
+            limit,
+        )
+        .await
+    {
         Ok(blobs) => blobs,
         Err(e) => {
             tracing::error!(

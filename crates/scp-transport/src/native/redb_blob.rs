@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::storage::{
-    BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, StoredLifetime, sort_query_order,
+    BlobStorage, ClockFn, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
     system_clock,
 };
 
@@ -35,34 +35,55 @@ const ROUTING_TABLE: MultimapTableDefinition<&[u8; 32], &[u8; 32]> =
 ///
 /// Stored as `MessagePack` in the blobs table. Fields mirror [`StoredBlob`]
 /// plus `expires_at` for TTL enforcement. A retained record has no
-/// `blob_ttl` and no `expires_at`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedBlob {
+/// `blob_ttl` and no `expires_at`, and carries its `admission` counter; a TTL
+/// blob carries no counter. The body is borrowed from the table's value, so
+/// reading a blob's metadata copies no body.
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedBlob<'a> {
     routing_id: [u8; 32],
     blob_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
     blob_ttl: Option<u32>,
+    admission: Option<u64>,
     stored_at: u64,
     expires_at: Option<u64>,
-    #[serde(with = "serde_bytes")]
-    blob: Vec<u8>,
+    #[serde(borrow)]
+    blob: &'a serde_bytes::Bytes,
 }
 
-impl SerializedBlob {
-    /// Converts to a [`StoredBlob`].
+/// Decodes a blobs-table value.
+fn decode(value: &[u8]) -> Result<SerializedBlob<'_>, StorageError> {
+    rmp_serde::from_slice(value).map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))
+}
+
+impl SerializedBlob<'_> {
+    /// The stored lifetime its `blob_ttl` and `admission` read back as.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] for an entry carrying both or neither.
+    fn lifetime(&self) -> Result<StoredLifetime, StorageError> {
+        StoredLifetime::from_columns(self.blob_ttl, self.admission)
+    }
+
+    /// Converts to a [`StoredBlob`], copying the body.
     ///
     /// `recipient_hint` is `Option<[u8; 32]>` in both types, so no manual
     /// conversion is needed — serde validates the length at deserialization
     /// time.
-    fn to_stored_blob(&self) -> StoredBlob {
-        StoredBlob {
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] for an entry whose lifetime does not read.
+    fn to_stored_blob(&self) -> Result<StoredBlob, StorageError> {
+        Ok(StoredBlob {
             routing_id: self.routing_id,
             blob_id: self.blob_id,
             recipient_hint: self.recipient_hint,
-            lifetime: StoredLifetime::from_ttl(self.blob_ttl),
+            lifetime: self.lifetime()?,
             stored_at: self.stored_at,
-            blob: self.blob.clone(),
-        }
+            blob: self.blob.to_vec(),
+        })
     }
 
     /// Whether the blob has expired at `now`; a retained blob never does.
@@ -182,9 +203,10 @@ impl BlobStorage for RedbBlobStore {
             blob_id,
             recipient_hint,
             blob_ttl: lifetime.ttl(),
+            admission: lifetime.admission(),
             stored_at,
             expires_at: lifetime.expires_at(stored_at),
-            blob: blob.clone(),
+            blob: serde_bytes::Bytes::new(&blob),
         };
 
         let serialized = rmp_serde::to_vec(&entry)
@@ -198,6 +220,13 @@ impl BlobStorage for RedbBlobStore {
             let mut blobs_table = write_txn
                 .open_table(BLOBS_TABLE)
                 .map_err(|e| StorageError::Internal(format!("redb open blobs: {e}")))?;
+            // An overwrite at another routing id leaves no index entry of the
+            // blob it replaces (spec §17.7).
+            let replaced = blobs_table
+                .get(&blob_id)
+                .map_err(|e| StorageError::Internal(format!("redb get: {e}")))?
+                .map(|value| decode(value.value()).map(|entry| entry.routing_id))
+                .transpose()?;
             blobs_table
                 .insert(&blob_id, serialized.as_slice())
                 .map_err(|e| StorageError::Internal(format!("redb insert blob: {e}")))?;
@@ -205,6 +234,11 @@ impl BlobStorage for RedbBlobStore {
             let mut routing_table = write_txn
                 .open_multimap_table(ROUTING_TABLE)
                 .map_err(|e| StorageError::Internal(format!("redb open routing: {e}")))?;
+            if let Some(previous) = replaced.filter(|previous| *previous != routing_id) {
+                routing_table
+                    .remove(&previous, &blob_id)
+                    .map_err(|e| StorageError::Internal(format!("redb remove routing: {e}")))?;
+            }
             routing_table
                 .insert(&routing_id, &blob_id)
                 .map_err(|e| StorageError::Internal(format!("redb insert routing: {e}")))?;
@@ -240,20 +274,20 @@ impl BlobStorage for RedbBlobStore {
             return Ok(None);
         };
 
-        let entry: SerializedBlob = rmp_serde::from_slice(value.value())
-            .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
+        let entry = decode(value.value())?;
 
         if entry.expired(now) {
             return Ok(None);
         }
 
-        Ok(Some(entry.to_stored_blob()))
+        entry.to_stored_blob().map(Some)
     }
 
     async fn query(
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
@@ -274,6 +308,8 @@ impl BlobStorage for RedbBlobStore {
             .get(routing_id)
             .map_err(|e| StorageError::Internal(format!("redb routing get: {e}")))?;
 
+        // Pass one reads metadata only: the (`stored_at`, `blob_id`) of every
+        // live entry at the routing id the filter and cursor admit.
         let mut candidates = Vec::new();
         for result in blob_ids_iter {
             let bid_guard =
@@ -284,23 +320,34 @@ impl BlobStorage for RedbBlobStore {
                 .get(&bid)
                 .map_err(|e| StorageError::Internal(format!("redb get blob: {e}")))?
             {
-                let entry: SerializedBlob = rmp_serde::from_slice(value.value())
-                    .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
-
-                if entry.expired(now) || !cursor.admits(entry.stored_at, &entry.blob_id) {
+                let entry = decode(value.value())?;
+                if entry.routing_id != *routing_id
+                    || entry.expired(now)
+                    || !filter.admits(entry.lifetime()?)
+                    || !cursor.admits(entry.stored_at, &entry.blob_id)
+                {
                     continue;
                 }
-
-                candidates.push(entry.to_stored_blob());
+                candidates.push((entry.stored_at, entry.blob_id));
             }
         }
+        candidates.sort_unstable();
+        candidates.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
 
-        sort_query_order(&mut candidates);
-
-        // Apply limit.
-        candidates.truncate(limit as usize);
-
-        Ok(candidates)
+        // Pass two copies the bodies the limit keeps.
+        let mut results = Vec::with_capacity(candidates.len());
+        for (_, bid) in candidates {
+            let value = blobs_table
+                .get(&bid)
+                .map_err(|e| StorageError::Internal(format!("redb get blob: {e}")))?
+                .ok_or_else(|| {
+                    StorageError::Internal(
+                        "redb blob vanished inside a read transaction".to_owned(),
+                    )
+                })?;
+            results.push(decode(value.value())?.to_stored_blob()?);
+        }
+        Ok(results)
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -322,9 +369,7 @@ impl BlobStorage for RedbBlobStore {
                 return Ok(false);
             };
 
-            let entry: SerializedBlob = rmp_serde::from_slice(value.value())
-                .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
-            entry.routing_id
+            decode(value.value())?.routing_id
         };
 
         // Delete from both tables in a single write transaction.
@@ -374,8 +419,7 @@ impl BlobStorage for RedbBlobStore {
             for result in iter {
                 let (key, value) =
                     result.map_err(|e| StorageError::Internal(format!("redb iter entry: {e}")))?;
-                let entry: SerializedBlob = rmp_serde::from_slice(value.value())
-                    .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
+                let entry = decode(value.value())?;
 
                 if entry.expired(now) {
                     expired_entries.push((*key.value(), entry.routing_id));

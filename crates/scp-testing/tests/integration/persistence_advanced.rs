@@ -25,7 +25,7 @@ use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_transport::native::storage::{
-    BlobStorage, InMemoryBlobStorage, QueryCursor, StoredLifetime,
+    BlobStorage, InMemoryBlobStorage, LifetimeFilter, QueryCursor, StoredLifetime,
 };
 
 /// The TTL the relay-side test blobs are stored under.
@@ -234,7 +234,7 @@ async fn relay_blobs_queryable_without_resubscribe() {
     // Query blobs by routing_id (simulating post-restart blob delivery
     // without re-subscribing -- the blob data is already in storage).
     let blobs = blob_storage
-        .query(&routing_id, QueryCursor::All, 100)
+        .query(&routing_id, QueryCursor::All, LifetimeFilter::Any, 100)
         .await
         .unwrap();
     assert_eq!(blobs.len(), 2, "both blobs should be queryable");
@@ -350,7 +350,7 @@ async fn combined_node_client_and_relay_data_coexist() {
 
     // --- Verify relay data ---
     let blobs = relay_storage
-        .query(&routing_id, QueryCursor::All, 100)
+        .query(&routing_id, QueryCursor::All, LifetimeFilter::Any, 100)
         .await
         .unwrap();
     assert_eq!(blobs.len(), 2);
@@ -457,14 +457,14 @@ async fn combined_node_multiple_contexts_independent() {
 
     // Blob routing isolation.
     let blobs_a = relay_storage
-        .query(&routing_a, QueryCursor::All, 100)
+        .query(&routing_a, QueryCursor::All, LifetimeFilter::Any, 100)
         .await
         .unwrap();
     assert_eq!(blobs_a.len(), 1);
     assert_eq!(blobs_a[0].blob, data_a);
 
     let blobs_b = relay_storage
-        .query(&routing_b, QueryCursor::All, 100)
+        .query(&routing_b, QueryCursor::All, LifetimeFilter::Any, 100)
         .await
         .unwrap();
     assert_eq!(blobs_b.len(), 1);

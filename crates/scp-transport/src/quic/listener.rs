@@ -675,7 +675,7 @@ async fn handle_stream<S: BlobStorage + 'static>(
             .await
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(send, ref_id, blob_id, ip, &storage, &rate_limiter).await
+            handle_delete(send, ref_id, blob_id, ip, &storage, &config, &rate_limiter).await
         }
         ClientMessage::Ping { ts } => handle_ping(send, ts).await,
         ClientMessage::Unsubscribe { ref_id, routing_id } => {
@@ -1127,19 +1127,27 @@ async fn handle_delete<S: BlobStorage>(
     blob_id: [u8; 32],
     ip: IpAddr,
     storage: &Arc<S>,
+    config: &QuicListenerConfig,
     rate_limiter: &PublishRateLimiter,
 ) -> Result<(), StreamError> {
-    let reply =
-        match public_records::delete_blob(storage.as_ref(), &blob_id, rate_limiter, ip).await {
-            Ok(()) => RelayMessage::Ok {
-                ref_id,
-                blob_id: None,
-            },
-            Err(refusal) => {
-                let (code, msg) = refusal.into_parts();
-                RelayMessage::Err { ref_id, code, msg }
-            }
-        };
+    let reply = match public_records::delete_blob(
+        &config.public_records,
+        storage.as_ref(),
+        &blob_id,
+        rate_limiter,
+        ip,
+    )
+    .await
+    {
+        Ok(()) => RelayMessage::Ok {
+            ref_id,
+            blob_id: None,
+        },
+        Err(refusal) => {
+            let (code, msg) = refusal.into_parts();
+            RelayMessage::Err { ref_id, code, msg }
+        }
+    };
     write_and_finish(send, &reply).await
 }
 
@@ -1984,7 +1992,12 @@ mod tests {
 
         // Verify the blob is in the shared storage.
         let blobs = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(blobs.len(), 1);
@@ -2043,7 +2056,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -2239,7 +2257,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -2261,6 +2284,7 @@ mod tests {
                 .query(
                     &fixture.bridge_own_id,
                     crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
                     100
                 )
                 .await
@@ -2321,7 +2345,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()

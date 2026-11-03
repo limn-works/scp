@@ -17,7 +17,9 @@ use scp_platform::{PlatformError, Storage};
 use zeroize::Zeroize;
 
 use super::sql_blob;
-use super::storage::{BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime};
+use super::storage::{
+    BlobStorage, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+};
 
 // ---------------------------------------------------------------------------
 // Clock function for testability
@@ -421,10 +423,11 @@ impl BlobStorage for CombinedNodeStorage {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        sql_blob::query(&*self.lock_conn()?, routing_id, cursor, limit, now)
+        sql_blob::query(&*self.lock_conn()?, routing_id, cursor, filter, limit, now)
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -774,7 +777,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -804,7 +812,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -834,7 +847,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         for window in results.windows(2) {
@@ -864,7 +882,12 @@ mod tests {
         .unwrap();
 
         let results = storage
-            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id_b,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());

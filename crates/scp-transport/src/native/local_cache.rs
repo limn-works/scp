@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::storage::{BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime};
+use super::storage::{
+    BlobStorage, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+};
 
 /// Clock function type for timestamp injection (testing).
 ///
@@ -212,9 +214,10 @@ impl<S: BlobStorage> BlobStorage for LocalBlobCache<S> {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        self.inner.query(routing_id, cursor, limit).await
+        self.inner.query(routing_id, cursor, filter, limit).await
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -370,7 +373,12 @@ mod tests {
         }
 
         let results = cache
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -398,7 +406,12 @@ mod tests {
         }
 
         let results = cache
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -426,7 +439,12 @@ mod tests {
         }
 
         let results = cache
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         for window in results.windows(2) {
@@ -455,7 +473,12 @@ mod tests {
             .unwrap();
 
         let results = cache
-            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id_b,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -509,7 +532,12 @@ mod tests {
         cache.delete(&blob_id).await.unwrap();
 
         let results = cache
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());

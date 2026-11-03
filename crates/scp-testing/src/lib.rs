@@ -29,7 +29,7 @@
 //!
 //! - [`storage_conformance!`] — 13 tests for [`Storage`](scp_platform::Storage)
 //!   (ADR-006, spec section 16.12.2).
-//! - [`blob_store_conformance!`] — 11 tests for
+//! - [`blob_store_conformance!`] — the §17.11 suite for
 //!   [`BlobStorage`](scp_transport::native::storage::BlobStorage)
 //!   (spec sections 17.11, 17.13).
 //! - [`payment_adapter_conformance!`] — 8 tests for `PaymentAdapter`

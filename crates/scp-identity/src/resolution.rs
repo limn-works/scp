@@ -383,8 +383,7 @@ mod tests {
         );
     }
 
-    /// Distinct keys bind to distinct routing IDs (no cross-identity collision
-    /// at the slot-exclusivity layer).
+    /// Distinct keys bind to distinct routing IDs.
     #[test]
     fn distinct_keys_bind_to_distinct_routing_ids() {
         assert_ne!(

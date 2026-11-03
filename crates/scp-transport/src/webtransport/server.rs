@@ -342,7 +342,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -488,7 +493,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -513,6 +523,7 @@ mod tests {
                 .query(
                     &fixture.bridge_own_id,
                     crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
                     100
                 )
                 .await
@@ -572,7 +583,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()

@@ -1486,6 +1486,7 @@ impl<S: Storage> ApplicationNode<S> {
             .query(
                 &routing_id,
                 scp_transport::native::storage::QueryCursor::All,
+                scp_transport::native::storage::LifetimeFilter::Any,
                 MAX_BLOB_QUERY,
             )
             .await

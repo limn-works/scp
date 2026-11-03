@@ -17,7 +17,8 @@ use tokio::sync::Mutex;
 
 use super::sql_blob;
 use super::storage::{
-    BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, StoredLifetime, system_clock,
+    BlobStorage, ClockFn, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+    system_clock,
 };
 
 /// `SQLite`-backed blob storage for relay-side encrypted message blobs.
@@ -35,6 +36,7 @@ use super::storage::{
 ///     routing_id BLOB NOT NULL,
 ///     recipient_hint BLOB,
 ///     blob_ttl INTEGER,          -- NULL: a retained record
+///     admission INTEGER,         -- a retained record's admission counter; NULL on a TTL blob
 ///     stored_at INTEGER NOT NULL,
 ///     expires_at INTEGER,        -- NULL: never expires
 ///     blob BLOB NOT NULL
@@ -180,10 +182,18 @@ impl BlobStorage for SqliteBlobStore {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        sql_blob::query(&*self.conn.lock().await, routing_id, cursor, limit, now)
+        sql_blob::query(
+            &*self.conn.lock().await,
+            routing_id,
+            cursor,
+            filter,
+            limit,
+            now,
+        )
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {

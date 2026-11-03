@@ -1522,6 +1522,7 @@ async fn assert_relay_view_is_ciphertext(built: &BuiltNode, routing_id: &[u8; 32
         .query(
             routing_id,
             scp_transport::native::storage::QueryCursor::All,
+            scp_transport::native::storage::LifetimeFilter::Any,
             1024,
         )
         .await

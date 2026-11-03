@@ -32,7 +32,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::storage::{
-    BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, StoredLifetime, system_clock,
+    BlobStorage, ClockFn, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+    lifetime_predicate, system_clock,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS blobs (
     routing_id BYTEA NOT NULL,
     recipient_hint BYTEA,
     blob_ttl INTEGER,
+    admission BIGINT,
     stored_at BIGINT NOT NULL,
     expires_at BIGINT,
     blob BYTEA NOT NULL
@@ -151,14 +153,20 @@ impl BlobStorage for PostgresBlobStore {
         let stored_at = self.now();
 
         let hint_slice: Option<&[u8]> = recipient_hint.as_ref().map(AsRef::as_ref);
+        let admission = lifetime
+            .admission()
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|e| StorageError::Internal(format!("admission counter out of range: {e}")))?;
 
         sqlx::query(
-            "INSERT INTO blobs (blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+            "INSERT INTO blobs (blob_id, routing_id, recipient_hint, blob_ttl, admission, stored_at, expires_at, blob) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (blob_id) DO UPDATE SET \
                routing_id = EXCLUDED.routing_id, \
                recipient_hint = EXCLUDED.recipient_hint, \
                blob_ttl = EXCLUDED.blob_ttl, \
+               admission = EXCLUDED.admission, \
                stored_at = EXCLUDED.stored_at, \
                expires_at = EXCLUDED.expires_at, \
                blob = EXCLUDED.blob",
@@ -167,6 +175,7 @@ impl BlobStorage for PostgresBlobStore {
         .bind(routing_id.as_slice())
         .bind(hint_slice)
         .bind(lifetime.ttl().map(u32_to_i32))
+        .bind(admission)
         .bind(u64_to_i64(stored_at))
         .bind(lifetime.expires_at(stored_at).map(u64_to_i64))
         .bind(&blob)
@@ -188,7 +197,7 @@ impl BlobStorage for PostgresBlobStore {
         let now = self.now();
 
         let row = sqlx::query(
-            "SELECT routing_id, recipient_hint, blob_ttl, stored_at, blob \
+            "SELECT routing_id, recipient_hint, blob_ttl, admission, stored_at, blob \
              FROM blobs WHERE blob_id = $1 AND (expires_at IS NULL OR expires_at > $2)",
         )
         .bind(blob_id.as_slice())
@@ -202,7 +211,7 @@ impl BlobStorage for PostgresBlobStore {
             Some(row) => {
                 let routing_id = bytes_to_array32(row.get::<Vec<u8>, _>("routing_id"))?;
                 let recipient_hint = optional_bytes_to_array32(row.get("recipient_hint"))?;
-                let lifetime = read_lifetime(&row);
+                let lifetime = read_lifetime(&row)?;
                 let stored_at = i64_to_u64(row.get::<i64, _>("stored_at"));
                 let blob: Vec<u8> = row.get("blob");
 
@@ -222,26 +231,31 @@ impl BlobStorage for PostgresBlobStore {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = self.now();
 
         // $3 is the `stored_at` floor and $4 the cursor's `blob_id`, or NULL
         // for a cursor without one; a row at the floor passes only above it.
-        let rows = sqlx::query(
-            "SELECT blob_id, recipient_hint, blob_ttl, stored_at, blob \
+        // $6 is the lifetime filter's code.
+        let rows = sqlx::query(&format!(
+            "SELECT blob_id, recipient_hint, blob_ttl, admission, stored_at, blob \
              FROM blobs \
              WHERE routing_id = $1 AND (expires_at IS NULL OR expires_at > $2) \
+               AND {} \
                AND stored_at >= $3 \
                AND ($4::BYTEA IS NULL OR stored_at > $3 OR blob_id > $4) \
              ORDER BY stored_at ASC, blob_id ASC \
              LIMIT $5",
-        )
+            lifetime_predicate("$6")
+        ))
         .bind(routing_id.as_slice())
         .bind(u64_to_i64(now))
         .bind(u64_to_i64(cursor.floor()))
         .bind(cursor.after_blob().map(|id| id.to_vec()))
         .bind(i64::from(limit))
+        .bind(filter.sql_code())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("postgres query: {e}")))?;
@@ -250,7 +264,7 @@ impl BlobStorage for PostgresBlobStore {
         for row in rows {
             let blob_id = bytes_to_array32(row.get::<Vec<u8>, _>("blob_id"))?;
             let recipient_hint = optional_bytes_to_array32(row.get("recipient_hint"))?;
-            let lifetime = read_lifetime(&row);
+            let lifetime = read_lifetime(&row)?;
             let stored_at = i64_to_u64(row.get::<i64, _>("stored_at"));
             let blob: Vec<u8> = row.get("blob");
 
@@ -348,9 +362,23 @@ const fn i32_to_u32(v: i32) -> u32 {
 }
 
 /// Converts a `Vec<u8>` from a `BYTEA` column to a `[u8; 32]`.
-/// Reads the `blob_ttl` column: a value is a TTL, NULL a retained record.
-fn read_lifetime(row: &sqlx::postgres::PgRow) -> StoredLifetime {
-    StoredLifetime::from_ttl(row.get::<Option<i32>, _>("blob_ttl").map(i32_to_u32))
+/// Reads the `blob_ttl` and `admission` columns: a TTL alone is a TTL blob
+/// and a counter alone a retained record.
+///
+/// # Errors
+///
+/// [`StorageError::Internal`] for a negative counter or a row carrying both
+/// columns or neither.
+fn read_lifetime(row: &sqlx::postgres::PgRow) -> Result<StoredLifetime, StorageError> {
+    let admission = row
+        .get::<Option<i64>, _>("admission")
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|e| StorageError::Internal(format!("admission counter out of range: {e}")))?;
+    StoredLifetime::from_columns(
+        row.get::<Option<i32>, _>("blob_ttl").map(i32_to_u32),
+        admission,
+    )
 }
 
 fn bytes_to_array32(bytes: Vec<u8>) -> Result<[u8; 32], StorageError> {
@@ -526,7 +554,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -553,7 +586,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -583,7 +621,12 @@ mod tests {
         }
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -612,7 +655,12 @@ mod tests {
             .unwrap();
 
         let results = storage
-            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id_b,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -657,7 +705,7 @@ mod tests {
                 routing_id,
                 retained_id,
                 None,
-                crate::native::storage::StoredLifetime::Retained,
+                crate::native::storage::StoredLifetime::Retained { admission: 0 },
                 retained.clone(),
             )
             .await
@@ -688,7 +736,7 @@ mod tests {
         assert_eq!(held.blob, retained);
         assert_eq!(
             held.lifetime,
-            crate::native::storage::StoredLifetime::Retained
+            crate::native::storage::StoredLifetime::Retained { admission: 0 }
         );
         assert!(storage.get(&ttl_id).await.unwrap().is_none());
     }
@@ -769,7 +817,12 @@ mod tests {
         storage.delete(&blob_id).await.unwrap();
 
         let results = storage
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -804,6 +857,7 @@ mod tests {
             .query(
                 &routing_id,
                 crate::native::storage::QueryCursor::Since(1_000_050),
+                crate::native::storage::LifetimeFilter::Any,
                 100,
             )
             .await

@@ -758,12 +758,6 @@ pub enum NodeListFrameError {
     /// The frame's `governor` differs from the record's.
     #[error("node-list frame governor differs from the record's governor")]
     GovernorMismatch,
-    /// A PUBLISH at `scp:nls:` without `retain`.
-    #[error("node-list PUBLISH does not set retain")]
-    RetainMissing,
-    /// A PUBLISH carrying both `retain` and `blob_ttl`.
-    #[error("node-list PUBLISH carries both retain and blob_ttl")]
-    RetainWithTtl,
     /// The PUBLISH routing id is not `SHA-256("scp:nls:" ‖ context_id)` over
     /// the record's `context_id`.
     #[error("node-list PUBLISH routing id does not derive from the record's context_id")]
@@ -815,30 +809,23 @@ pub fn decode_node_list_frame(bytes: &[u8]) -> Result<NodeListRecord, NodeListFr
 
 /// The structural admission of a PUBLISH at a `scp:nls:` routing id (§9.10.12).
 ///
-/// It checks that `retain` is set, `blob_ttl` is absent, the blob decodes as a
-/// node-list frame, and `routing_id` derives from the record's `context_id`.
+/// It checks that the blob decodes as a node-list frame and that `routing_id`
+/// derives from the record's `context_id`. The PUBLISH's lifetime is no input:
+/// `scp_relay_client::BlobLifetime` refuses both keys, neither key and
+/// `retain: false` on decode, and only a `Retained` PUBLISH reaches a store.
 ///
-/// The node's remaining admission step, the governor signature under the
-/// `#active` at `signing_key_state_head` in the governor key state the node
-/// holds, reads key state this function does not hold; the caller runs
-/// [`VerifiedNodeListRecord::verify`] under [`NodeListKeyClass::Attribution`]
-/// on the returned record.
+/// The node's remaining admission steps read key state and configuration this
+/// function does not hold: the caller checks the record's (`context_id`,
+/// `governor`) pair against its node-list pointers and runs
+/// [`AdmittedNodeListRecord::admit`] on a governor chain it retains.
 ///
 /// # Errors
 ///
 /// [`NodeListFrameError`] names the first rule the PUBLISH breaks.
 pub fn check_node_list_publish(
     routing_id: &[u8; 32],
-    retain: bool,
-    blob_ttl: Option<u32>,
     blob: &[u8],
 ) -> Result<NodeListRecord, NodeListFrameError> {
-    if !retain {
-        return Err(NodeListFrameError::RetainMissing);
-    }
-    if blob_ttl.is_some() {
-        return Err(NodeListFrameError::RetainWithTtl);
-    }
     let record = decode_node_list_frame(blob)?;
     if node_list_routing_id(&record.context_id) != *routing_id {
         return Err(NodeListFrameError::RoutingIdMismatch);
@@ -1318,38 +1305,37 @@ mod tests {
     }
 
     #[test]
-    fn publish_rule_retain_is_required() -> TestResult {
+    fn publish_rule_routing_id_derives_from_the_context_id() -> TestResult {
         let (record, bytes) = frame()?;
-        let routing = node_list_routing_id(&record.context_id);
         assert_eq!(
-            check_node_list_publish(&routing, false, None, &bytes),
-            Err(NodeListFrameError::RetainMissing)
-        );
-        assert_eq!(
-            check_node_list_publish(&routing, true, None, &bytes)?,
+            check_node_list_publish(&node_list_routing_id(&record.context_id), &bytes)?,
             record
         );
-        Ok(())
-    }
-
-    #[test]
-    fn publish_rule_retain_with_blob_ttl_is_refused() -> TestResult {
-        let (record, bytes) = frame()?;
-        let routing = node_list_routing_id(&record.context_id);
         assert_eq!(
-            check_node_list_publish(&routing, true, Some(60), &bytes),
-            Err(NodeListFrameError::RetainWithTtl)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn publish_rule_routing_id_derives_from_the_context_id() -> TestResult {
-        let (_, bytes) = frame()?;
-        assert_eq!(
-            check_node_list_publish(&node_list_routing_id("other"), true, None, &bytes),
+            check_node_list_publish(&node_list_routing_id("other"), &bytes),
             Err(NodeListFrameError::RoutingIdMismatch)
         );
+        Ok(())
+    }
+
+    /// The classifier's nls row: a node-list frame is of its kind only at
+    /// the routing id its own `context_id` derives, and of no kind at another
+    /// context's id or at an identifier-derived id of its governor.
+    #[test]
+    fn a_node_list_frame_classifies_only_at_its_context_routing_id() -> TestResult {
+        use super::super::kind::{NodeRecordKind, classify_node_record};
+        let (record, bytes) = frame()?;
+        assert_eq!(
+            classify_node_record(&node_list_routing_id(&record.context_id), &bytes),
+            Some(NodeRecordKind::NodeList)
+        );
+        for elsewhere in [
+            node_list_routing_id("other"),
+            scp_kel::routing_id(scp_kel::RoutingKind::KeyEvents, &record.governor),
+            scp_kel::routing_id(scp_kel::RoutingKind::ServiceRecord, &record.governor),
+        ] {
+            assert_eq!(classify_node_record(&elsewhere, &bytes), None);
+        }
         Ok(())
     }
 

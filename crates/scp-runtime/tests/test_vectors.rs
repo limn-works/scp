@@ -1883,7 +1883,7 @@ fn vector_49_node_list_record() {
         "456401835740d44056b9c511eb37dc9d4792601134b0876f9ad4dd8e4a9460e3"
     );
     assert_eq!(
-        check_node_list_publish(&routing_id, true, None, &frame).unwrap(),
+        check_node_list_publish(&routing_id, &frame).unwrap(),
         record
     );
 
@@ -1935,11 +1935,7 @@ fn vector_49_node_list_record() {
     bad.extend_from_slice(&json);
     assert!(decode_node_list_frame(&bad).is_err());
     assert_eq!(
-        check_node_list_publish(&routing_id, false, None, &frame),
-        Err(NodeListFrameError::RetainMissing)
-    );
-    assert_eq!(
-        check_node_list_publish(&unhex32(NODE_LIST_GOVERNOR), true, None, &frame),
+        check_node_list_publish(&unhex32(NODE_LIST_GOVERNOR), &frame),
         Err(NodeListFrameError::RoutingIdMismatch)
     );
 }

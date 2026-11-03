@@ -8,12 +8,17 @@
 //!
 //! ```text
 //! {prefix}/blobs/{blob_id_hex}                            — blob content + metadata headers
-//! {prefix}/routing/{routing_id_hex}/{blob_id_hex}         — empty routing index objects
+//! {prefix}/routing/{routing_id_hex}/r/{blob_id_hex}       — routing index of a retained record
+//! {prefix}/routing/{routing_id_hex}/t/{blob_id_hex}       — routing index of a TTL blob
 //! {prefix}/expiry/{expires_at:020}/{blob_id_hex}          — empty expiry index objects
 //! ```
 //!
 //! Metadata is stored as S3 object metadata (user-defined `x-amz-meta-*`
-//! headers). Numeric values are serialized as decimal strings.
+//! headers). Numeric values are serialized as decimal strings. A routing
+//! object is empty and carries `stored_at`, plus `admission` (retained) or
+//! `expires_at` (TTL), so a query filters, orders and limits from routing
+//! metadata and reads the body only of a blob it returns (spec §17.7
+//! "Retained records and the lifetime filter").
 //!
 //! # Request signing and TLS
 //!
@@ -67,17 +72,75 @@ use aws_smithy_http_client::tls;
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 
 use super::storage::{
-    BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob,
-    StoredLifetime, sort_query_order, system_clock,
+    BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, LifetimeFilter, QueryCursor, StorageError,
+    StoredBlob, StoredLifetime, system_clock,
 };
 
 /// The metadata value that marks a retained record, under [`RETAIN_KEY`].
 const RETAIN_VALUE: &str = "true";
 /// The metadata key a retained record carries in place of `blob_ttl`.
 const RETAIN_KEY: &str = "retain";
+/// The metadata key a retained record's admission counter rides under.
+const ADMISSION_KEY: &str = "admission";
+
+/// The routing-index class segment of a lifetime: `r` retained, `t` TTL.
+const fn class_segment(lifetime: StoredLifetime) -> &'static str {
+    if lifetime.is_retained() { "r" } else { "t" }
+}
+
+/// The routing-index class segments a filter lists.
+const fn filter_segments(filter: LifetimeFilter) -> &'static [&'static str] {
+    match filter {
+        LifetimeFilter::Any => &["r", "t"],
+        LifetimeFilter::Retained => &["r"],
+        LifetimeFilter::Ttl => &["t"],
+    }
+}
+
+/// The largest part a streaming store buffers before it uploads it, above
+/// S3's 5 MiB floor for every part but the last.
+const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// The most parts one multipart upload carries (S3's bound).
+const MAX_PARTS: i32 = 10_000;
+
+/// Appends the body's chunks to `part` until it holds [`PART_SIZE`] bytes
+/// or the body ends; `true` when the body ended.
+async fn fill_part(body: &mut BlobBodyStream, part: &mut Vec<u8>) -> Result<bool, StorageError> {
+    use futures::StreamExt;
+
+    while part.len() < PART_SIZE {
+        match body.next().await {
+            Some(chunk) => part.extend_from_slice(&chunk?),
+            None => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// A blob object's user metadata: its routing ID, `blob_id`, `stored_at`,
+/// lifetime and recipient hint.
+fn object_metadata(
+    routing_id: [u8; 32],
+    blob_id: [u8; 32],
+    recipient_hint: Option<[u8; 32]>,
+    lifetime: StoredLifetime,
+    stored_at: u64,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+    metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
+    metadata.insert("stored_at".to_owned(), stored_at.to_string());
+    insert_lifetime_metadata(&mut metadata, lifetime, stored_at);
+    if let Some(hint) = &recipient_hint {
+        metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
+    }
+    metadata
+}
 
 /// Writes a blob's lifetime into its object metadata: `blob_ttl` and
-/// `expires_at` for a TTL blob, `retain` for a retained record.
+/// `expires_at` for a TTL blob, `retain` and `admission` for a retained
+/// record.
 fn insert_lifetime_metadata(
     metadata: &mut HashMap<String, String>,
     lifetime: StoredLifetime,
@@ -91,23 +154,33 @@ fn insert_lifetime_metadata(
                 stored_at.saturating_add(u64::from(ttl)).to_string(),
             );
         }
-        StoredLifetime::Retained => {
+        StoredLifetime::Retained { admission } => {
             metadata.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
+            metadata.insert(ADMISSION_KEY.to_owned(), admission.to_string());
         }
     }
 }
 
 /// Reads a blob's lifetime back from its object metadata.
 ///
-/// An object must carry exactly one of `blob_ttl` and `retain=true`; an
-/// object with neither, both, or another `retain` value is refused, so a
-/// damaged object never reads as a record TTL purge must keep.
+/// An object must carry exactly one of `blob_ttl` and `retain=true`, and an
+/// `admission` counter exactly when it carries `retain=true`; any other
+/// object is refused, so a damaged object never reads as a record TTL purge
+/// must keep.
 fn lifetime_from_metadata(
     metadata: &HashMap<String, String>,
 ) -> Result<StoredLifetime, StorageError> {
+    let admission = metadata.get(ADMISSION_KEY);
     match (metadata.get("blob_ttl"), metadata.get(RETAIN_KEY)) {
+        (Some(_), None) if admission.is_some() => Err(StorageError::Internal(
+            "metadata carries blob_ttl and an admission counter".to_owned(),
+        )),
         (Some(ttl), None) => Ok(StoredLifetime::Ttl(S3BlobStore::parse_u32(ttl)?)),
-        (None, Some(retain)) if retain == RETAIN_VALUE => Ok(StoredLifetime::Retained),
+        (None, Some(retain)) if retain == RETAIN_VALUE => Ok(StoredLifetime::Retained {
+            admission: S3BlobStore::parse_u64(admission.ok_or_else(|| {
+                StorageError::Internal("a retained object carries no admission counter".to_owned())
+            })?)?,
+        }),
         (None, Some(_)) => Err(StorageError::Internal(
             "invalid retain value in metadata".to_owned(),
         )),
@@ -307,12 +380,27 @@ impl S3BlobStore {
         format!("{}/blobs/{}", self.prefix, hex::encode(blob_id))
     }
 
-    /// Returns the S3 key for a blob's routing index entry.
-    fn routing_key(&self, routing_id: &[u8; 32], blob_id: &[u8; 32]) -> String {
+    /// Returns the S3 key prefix of a routing id's index entries of one
+    /// class segment (`r` or `t`).
+    fn routing_class_prefix(&self, routing_id: &[u8; 32], segment: &str) -> String {
         format!(
-            "{}/routing/{}/{}",
+            "{}/routing/{}/{segment}/",
             self.prefix,
-            hex::encode(routing_id),
+            hex::encode(routing_id)
+        )
+    }
+
+    /// Returns the S3 key for a blob's routing index entry, under its
+    /// lifetime's class.
+    fn routing_key(
+        &self,
+        routing_id: &[u8; 32],
+        lifetime: StoredLifetime,
+        blob_id: &[u8; 32],
+    ) -> String {
+        format!(
+            "{}{}",
+            self.routing_class_prefix(routing_id, class_segment(lifetime)),
             hex::encode(blob_id)
         )
     }
@@ -453,6 +541,258 @@ impl S3BlobStore {
             }
         }
     }
+
+    /// Fetches the metadata of an index object by key; `None` when it does
+    /// not exist.
+    async fn head_index(&self, key: &str) -> Result<Option<HashMap<String, String>>, StorageError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => Ok(Some(output.metadata().cloned().unwrap_or_default())),
+            Err(e) => {
+                let service_err = e.into_service_error();
+                if service_err.is_not_found() {
+                    Ok(None)
+                } else {
+                    Err(StorageError::Internal(format!(
+                        "S3 head failed for {key}: {service_err}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Puts an empty index object at `key` carrying `metadata`.
+    async fn put_index(
+        &self,
+        key: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<(), StorageError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(Vec::<u8>::new()))
+            .set_metadata(Some(metadata))
+            .send()
+            .await
+            .map_err(|e| StorageError::Internal(format!("S3 put index failed for {key}: {e}")))?;
+        Ok(())
+    }
+
+    /// The routing and expiry index keys of a blob stored with `meta`.
+    fn index_keys(&self, meta: &BlobMetadata) -> (String, Option<String>) {
+        (
+            self.routing_key(&meta.routing_id, meta.lifetime, &meta.blob_id),
+            meta.lifetime
+                .expires_at(meta.stored_at)
+                .map(|expires_at| self.expiry_key(expires_at, &meta.blob_id)),
+        )
+    }
+
+    /// Reads the metadata of the blob `blob_id` holds before an overwrite,
+    /// so the overwrite can delete its index objects.
+    /// Uploads `first` and the rest of `body` as one multipart upload under
+    /// `key`, returning the byte count; on any failure the upload is aborted,
+    /// so the object under `key` is unchanged.
+    async fn put_multipart(
+        &self,
+        key: &str,
+        metadata: HashMap<String, String>,
+        first: Vec<u8>,
+        body: &mut BlobBodyStream,
+    ) -> Result<u64, StorageError> {
+        let created = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .set_metadata(Some(metadata))
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!("S3 multipart create failed for {key}: {e}"))
+            })?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "S3 multipart create for {key} returned no upload id"
+                ))
+            })?
+            .to_owned();
+        let uploaded = self.upload_parts(key, &upload_id, first, body).await;
+        if uploaded.is_err()
+            && let Err(abort) = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+        {
+            tracing::warn!(key, upload_id, %abort, "S3 multipart abort failed");
+        }
+        uploaded
+    }
+
+    /// Uploads `part` and every later part of `body` under `upload_id`, then
+    /// completes the upload.
+    async fn upload_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        mut part: Vec<u8>,
+        body: &mut BlobBodyStream,
+    ) -> Result<u64, StorageError> {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let mut completed = Vec::new();
+        let mut total = 0_u64;
+        let mut number = 0_i32;
+        loop {
+            let ended = fill_part(body, &mut part).await?;
+            if !part.is_empty() {
+                number += 1;
+                if number > MAX_PARTS {
+                    return Err(StorageError::Internal(format!(
+                        "S3 multipart upload for {key} passes {MAX_PARTS} parts"
+                    )));
+                }
+                total = total.saturating_add(part.len() as u64);
+                let uploaded = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(number)
+                    .body(ByteStream::from(std::mem::take(&mut part)))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        StorageError::Internal(format!(
+                            "S3 part {number} upload failed for {key}: {e}"
+                        ))
+                    })?;
+                completed.push(
+                    CompletedPart::builder()
+                        .set_e_tag(uploaded.e_tag().map(str::to_owned))
+                        .part_number(number)
+                        .build(),
+                );
+            }
+            if ended {
+                break;
+            }
+        }
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!("S3 multipart complete failed for {key}: {e}"))
+            })?;
+        Ok(total)
+    }
+
+    async fn replaced(&self, blob_id: &[u8; 32]) -> Result<Option<BlobMetadata>, StorageError> {
+        self.head_blob(blob_id)
+            .await?
+            .map(|metadata| Self::metadata_from_response(&metadata, None))
+            .transpose()
+    }
+
+    /// Puts the routing index entry of the blob `meta` describes and, for a
+    /// TTL blob, its expiry index entry; then deletes every index object of
+    /// the blob it `replaced` that the new blob does not reuse (spec §17.7:
+    /// an overwrite leaves no index entry of the blob it replaces).
+    async fn write_indexes(
+        &self,
+        meta: &BlobMetadata,
+        replaced: Option<BlobMetadata>,
+    ) -> Result<(), StorageError> {
+        let (routing_key, expiry_key) = self.index_keys(meta);
+        let mut routing_metadata = HashMap::new();
+        routing_metadata.insert("stored_at".to_owned(), meta.stored_at.to_string());
+        match meta.lifetime {
+            StoredLifetime::Retained { admission } => {
+                routing_metadata.insert(ADMISSION_KEY.to_owned(), admission.to_string());
+            }
+            StoredLifetime::Ttl(_) => {
+                if let Some(expires_at) = meta.lifetime.expires_at(meta.stored_at) {
+                    routing_metadata.insert("expires_at".to_owned(), expires_at.to_string());
+                }
+            }
+        }
+        self.put_index(&routing_key, routing_metadata).await?;
+        if let Some(expiry_key) = &expiry_key {
+            self.put_index(expiry_key, HashMap::new()).await?;
+        }
+        if let Some(previous) = replaced {
+            let (old_routing, old_expiry) = self.index_keys(&previous);
+            if old_routing != routing_key {
+                self.delete_object(&old_routing).await?;
+            }
+            if let Some(old_expiry) = old_expiry.filter(|old| Some(old) != expiry_key.as_ref()) {
+                self.delete_object(&old_expiry).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists every key under `prefix`, following continuation tokens.
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let mut keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|e| {
+                StorageError::Internal(format!("S3 list failed for prefix {prefix}: {e}"))
+            })?;
+            keys.extend(
+                output
+                    .contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(str::to_owned)),
+            );
+            if output.is_truncated() == Some(true) {
+                continuation_token = output.next_continuation_token().map(String::from);
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The `blob_id` an index key under `prefix` names.
+    fn blob_id_under(prefix: &str, key: &str) -> Result<[u8; 32], StorageError> {
+        let hex_id = key.strip_prefix(prefix).ok_or_else(|| {
+            StorageError::Internal(format!("index key {key} is not under {prefix}"))
+        })?;
+        Self::parse_hex_32(hex_id)
+    }
 }
 
 #[async_trait::async_trait]
@@ -466,16 +806,9 @@ impl BlobStorage for S3BlobStore {
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = self.now();
+        let metadata = object_metadata(routing_id, blob_id, recipient_hint, lifetime, stored_at);
 
-        // Build metadata map for S3 object user metadata.
-        let mut metadata = HashMap::new();
-        metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-        metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
-        metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        insert_lifetime_metadata(&mut metadata, lifetime, stored_at);
-        if let Some(hint) = &recipient_hint {
-            metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
-        }
+        let replaced = self.replaced(&blob_id).await?;
 
         // 1. Put primary blob object with content and metadata.
         let blob_key = self.blob_key(&blob_id);
@@ -484,50 +817,23 @@ impl BlobStorage for S3BlobStore {
             .bucket(&self.bucket)
             .key(&blob_key)
             .body(ByteStream::from(blob.clone()))
-            .set_metadata(Some(metadata.clone()))
+            .set_metadata(Some(metadata))
             .send()
             .await
             .map_err(|e| {
                 StorageError::Internal(format!("S3 put blob failed for {blob_key}: {e}"))
             })?;
 
-        // 2. Put routing index entry (empty body, metadata with stored_at).
-        let routing_key = self.routing_key(&routing_id, &blob_id);
-        let mut routing_metadata = HashMap::new();
-        routing_metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&routing_key)
-            .body(ByteStream::from(Vec::<u8>::new()))
-            .set_metadata(Some(routing_metadata))
-            .send()
-            .await
-            .map_err(|e| {
-                StorageError::Internal(format!(
-                    "S3 put routing index failed for {routing_key}: {e}"
-                ))
-            })?;
-
-        // 3. Put expiry index entry for a TTL blob (empty body, metadata with routing_id).
-        if let Some(expires_at) = lifetime.expires_at(stored_at) {
-            let expiry_key = self.expiry_key(expires_at, &blob_id);
-            let mut expiry_metadata = HashMap::new();
-            expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&expiry_key)
-                .body(ByteStream::from(Vec::<u8>::new()))
-                .set_metadata(Some(expiry_metadata))
-                .send()
-                .await
-                .map_err(|e| {
-                    StorageError::Internal(format!(
-                        "S3 put expiry index failed for {expiry_key}: {e}"
-                    ))
-                })?;
-        }
+        // 2. Put the index entries and delete the replaced blob's.
+        let meta = BlobMetadata {
+            routing_id,
+            blob_id,
+            recipient_hint,
+            lifetime,
+            stored_at,
+            content_length: None,
+        };
+        self.write_indexes(&meta, replaced).await?;
 
         Ok(StoredBlob {
             routing_id,
@@ -589,108 +895,55 @@ impl BlobStorage for S3BlobStore {
         &self,
         routing_id: &[u8; 32],
         cursor: QueryCursor,
+        filter: LifetimeFilter,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        let prefix = format!("{}/routing/{}/", self.prefix, hex::encode(routing_id));
+        let now = self.now();
 
-        // List all routing index entries for this routing_id.
-        let mut blob_id_hexes = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
-
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let output = request.send().await.map_err(|e| {
-                StorageError::Internal(format!("S3 list failed for prefix {prefix}: {e}"))
-            })?;
-
-            for object in output.contents() {
-                if let Some(key) = object.key() {
-                    // Extract the blob_id hex from the key suffix.
-                    if let Some(blob_id_hex) = key.strip_prefix(&prefix).filter(|s| !s.is_empty()) {
-                        blob_id_hexes.push(blob_id_hex.to_owned());
-                    }
+        // Pass one reads routing metadata only: list the class prefixes the
+        // filter names and keep every live entry the cursor admits.
+        let mut candidates: Vec<(u64, [u8; 32])> = Vec::new();
+        for segment in filter_segments(filter) {
+            let prefix = self.routing_class_prefix(routing_id, segment);
+            for key in self.list_keys(&prefix).await? {
+                let blob_id = Self::blob_id_under(&prefix, &key)?;
+                // An entry deleted between the list and the head is skipped.
+                let Some(metadata) = self.head_index(&key).await? else {
+                    continue;
+                };
+                let stored_at = Self::parse_u64(Self::require_metadata(&metadata, "stored_at")?)?;
+                let expired = metadata
+                    .get("expires_at")
+                    .map(|v| Self::parse_u64(v))
+                    .transpose()?
+                    .is_some_and(|expires_at| expires_at <= now);
+                if !expired && cursor.admits(stored_at, &blob_id) {
+                    candidates.push((stored_at, blob_id));
                 }
             }
+        }
+        candidates.sort_unstable();
 
-            if output.is_truncated() == Some(true) {
-                continuation_token = output.next_continuation_token().map(String::from);
-            } else {
+        // Pass two reads bodies in query order until the limit fills. A blob
+        // whose own metadata no longer matches the entry (an overwrite that
+        // stopped before deleting its old index entries) is skipped, so a
+        // stale entry costs one read and never a wrong answer.
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut results = Vec::with_capacity(candidates.len().min(limit));
+        for (stored_at, blob_id) in candidates {
+            if results.len() >= limit {
                 break;
             }
-        }
-
-        // Fetch each blob and filter/sort.
-        let now = self.now();
-        let mut results = Vec::new();
-
-        for blob_id_hex in &blob_id_hexes {
-            let blob_id_bytes = hex::decode(blob_id_hex).map_err(|e| {
-                StorageError::Internal(format!("invalid blob_id hex in routing index: {e}"))
-            })?;
-            let blob_id: [u8; 32] = blob_id_bytes.try_into().map_err(|_| {
-                StorageError::Internal("blob_id in routing index is not 32 bytes".to_owned())
-            })?;
-
-            // Fetch the full blob.
-            let key = self.blob_key(&blob_id);
-            let output = match self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await
-            {
-                Ok(output) => output,
-                Err(e) => {
-                    let service_err = e.into_service_error();
-                    // Blob may have been deleted between list and get — skip.
-                    if service_err.is_no_such_key() {
-                        continue;
-                    }
-                    return Err(StorageError::Internal(format!(
-                        "S3 get failed for {key}: {service_err}"
-                    )));
-                }
-            };
-
-            let metadata = output.metadata().cloned().unwrap_or_default();
-
-            let body = output
-                .body
-                .collect()
-                .await
-                .map_err(|e| StorageError::Internal(format!("S3 body read failed for {key}: {e}")))?
-                .into_bytes()
-                .to_vec();
-
-            let stored_blob = Self::stored_blob_from_response(&metadata, body)?;
-
-            if stored_blob.lifetime.expired(stored_blob.stored_at, now)
-                || !cursor.admits(stored_blob.stored_at, &stored_blob.blob_id)
-            {
+            let Some(stored) = self.get(&blob_id).await? else {
                 continue;
+            };
+            if stored.routing_id == *routing_id
+                && stored.stored_at == stored_at
+                && filter.admits(stored.lifetime)
+            {
+                results.push(stored);
             }
-
-            results.push(stored_blob);
         }
-
-        sort_query_order(&mut results);
-
-        // Apply limit.
-        // u32 fits in usize on all supported platforms (32-bit+).
-        #[allow(clippy::cast_possible_truncation)]
-        results.truncate(limit as usize);
-
         Ok(results)
     }
 
@@ -708,7 +961,7 @@ impl BlobStorage for S3BlobStore {
         // Delete the blob, its routing index entry, and a TTL blob's expiry
         // index entry (a retained blob has none).
         let blob_key = self.blob_key(blob_id);
-        let routing_key = self.routing_key(&routing_id, blob_id);
+        let routing_key = self.routing_key(&routing_id, lifetime, blob_id);
 
         self.delete_object(&blob_key).await?;
         self.delete_object(&routing_key).await?;
@@ -724,111 +977,39 @@ impl BlobStorage for S3BlobStore {
         let now = self.now();
         let prefix = expiry_list_prefix(&self.prefix);
 
-        // List all expiry index entries.
-        let mut expired_entries: Vec<(u64, [u8; 32], [u8; 32])> = Vec::new();
-        let mut continuation_token: Option<String> = None;
-        let mut reached_non_expired = false;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
-
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let output = request.send().await.map_err(|e| {
-                StorageError::Internal(format!("S3 list failed for prefix {prefix}: {e}"))
+        // Expiry keys sort by their zero-padded `expires_at`, so the walk
+        // stops at the first one not yet due.
+        let mut purged = 0usize;
+        for key in self.list_keys(&prefix).await? {
+            let suffix = key.strip_prefix(&prefix).ok_or_else(|| {
+                StorageError::Internal(format!("expiry key {key} is not under {prefix}"))
             })?;
-
-            for object in output.contents() {
-                let Some(key) = object.key() else {
-                    continue;
-                };
-                // Key format: {prefix}/expiry/{expires_at:020}/{blob_id_hex}
-                // Strip the prefix to get "{expires_at:020}/{blob_id_hex}"
-                let Some(suffix) = key.strip_prefix(&prefix) else {
-                    continue;
-                };
-                let parts: Vec<&str> = suffix.splitn(2, '/').collect();
-                if parts.len() != 2 {
-                    continue;
-                }
-                let Ok(expires_at) = parts[0].parse::<u64>() else {
-                    continue;
-                };
-
-                // If not yet expired, we can stop — keys are sorted
-                // lexicographically and the zero-padded timestamp
-                // ensures chronological order.
-                if expires_at > now {
-                    reached_non_expired = true;
-                    break;
-                }
-
-                let Ok(blob_id_bytes) = hex::decode(parts[1]) else {
-                    continue;
-                };
-                let Ok(blob_id) = <[u8; 32]>::try_from(blob_id_bytes) else {
-                    continue;
-                };
-
-                // Fetch routing_id from the expiry entry's metadata.
-                let routing_id = match self
-                    .client
-                    .head_object()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .send()
-                    .await
-                {
-                    Ok(head) => {
-                        let meta = head.metadata().cloned().unwrap_or_default();
-                        match meta.get("routing_id") {
-                            Some(v) => match Self::parse_hex_32(v) {
-                                Ok(rid) => rid,
-                                Err(_) => continue,
-                            },
-                            None => continue,
-                        }
-                    }
-                    Err(_) => continue,
-                };
-
-                expired_entries.push((expires_at, blob_id, routing_id));
-            }
-
-            // If we hit a non-expired key, no need to fetch more pages.
-            if reached_non_expired {
+            let (expires_at, blob_hex) = suffix
+                .split_once('/')
+                .ok_or_else(|| StorageError::Internal(format!("expiry key {key} names no blob")))?;
+            let expires_at = Self::parse_u64(expires_at)?;
+            if expires_at > now {
                 break;
             }
+            let blob_id = Self::parse_hex_32(blob_hex)?;
 
-            if output.is_truncated() == Some(true) {
-                continuation_token = output.next_continuation_token().map(String::from);
-            } else {
-                break;
+            // The entry is stale unless the blob it names still expires at
+            // this second: a deleted blob, a retained overwrite, or a TTL
+            // overwrite with another expiry. A stale entry is deleted and the
+            // blob is left alone.
+            let current = self.replaced(&blob_id).await?;
+            let due = current
+                .as_ref()
+                .filter(|meta| meta.lifetime.expires_at(meta.stored_at) == Some(expires_at));
+            if let Some(meta) = due {
+                self.delete_object(&self.blob_key(&blob_id)).await?;
+                self.delete_object(&self.routing_key(&meta.routing_id, meta.lifetime, &blob_id))
+                    .await?;
+                purged = purged.saturating_add(1);
             }
+            self.delete_object(&key).await?;
         }
-
-        let count = expired_entries.len();
-
-        // Delete each expired blob + its indices.
-        for (expires_at, blob_id, routing_id) in &expired_entries {
-            let blob_key = self.blob_key(blob_id);
-            let routing_key = self.routing_key(routing_id, blob_id);
-            let expiry_key = self.expiry_key(*expires_at, blob_id);
-
-            // Best-effort deletion — individual failures are logged but
-            // don't abort the purge.
-            let _ = self.delete_object(&blob_key).await;
-            let _ = self.delete_object(&routing_key).await;
-            let _ = self.delete_object(&expiry_key).await;
-        }
-
-        Ok(count)
+        Ok(purged)
     }
 
     async fn count(&self) -> Result<usize, StorageError> {
@@ -864,6 +1045,11 @@ impl BlobStorage for S3BlobStore {
         Ok(total)
     }
 
+    /// Streams the body to S3 holding at most one part in memory: a body
+    /// that ends within `PART_SIZE` is one `PutObject` of its exact
+    /// length, a longer one a multipart upload. `content_length` is advisory
+    /// and sizes only the first buffer; the stored length is the count of
+    /// bytes the body yielded.
     async fn store_streaming(
         &self,
         routing_id: [u8; 32],
@@ -871,123 +1057,43 @@ impl BlobStorage for S3BlobStore {
         recipient_hint: Option<[u8; 32]>,
         lifetime: StoredLifetime,
         content_length: Option<u64>,
-        body: BlobBodyStream,
+        mut body: BlobBodyStream,
     ) -> Result<BlobMetadata, StorageError> {
-        use bytes::Bytes;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-
-        // Adapt BlobBodyStream → http_body::Body → ByteStream for S3 PutObject.
-        // This streams directly to S3 without collecting the full blob in memory.
-        //
-        // Mutex satisfies the `Sync` bound required by `from_body_1_x` without
-        // unsafe code. The stream is only polled sequentially by the HTTP client,
-        // so the Mutex never actually contends.
-        struct StreamBody(std::sync::Mutex<BlobBodyStream>);
-
-        impl http_body::Body for StreamBody {
-            type Data = Bytes;
-            type Error = Box<dyn std::error::Error + Send + Sync>;
-
-            fn poll_frame(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
-                let mut guard = match self.0.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match guard.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(bytes))) => {
-                        Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
-                    }
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e) as _))),
-                    Poll::Ready(None) => Poll::Ready(None),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-        }
-
         let stored_at = self.now();
-
-        // Build metadata map for S3 object user metadata.
-        let mut metadata = HashMap::new();
-        metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-        metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
-        metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        insert_lifetime_metadata(&mut metadata, lifetime, stored_at);
-        if let Some(hint) = &recipient_hint {
-            metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
-        }
-
-        let adapter = StreamBody(std::sync::Mutex::new(body));
-        let mut put_builder = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.blob_key(&blob_id))
-            .set_metadata(Some(metadata.clone()));
-
-        // Set content length if provided — S3 can use it for validation.
-        if let Some(len) = content_length {
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                put_builder = put_builder.content_length(len as i64);
-            }
-        }
-
-        put_builder
-            .body(ByteStream::from_body_1_x(adapter))
-            .send()
-            .await
-            .map_err(|e| StorageError::Internal(format!("S3 streaming put failed: {e}")))?;
-
-        // Put routing index entry (empty body, metadata with stored_at).
-        let routing_key = self.routing_key(&routing_id, &blob_id);
-        let mut routing_metadata = HashMap::new();
-        routing_metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&routing_key)
-            .body(ByteStream::from(Vec::<u8>::new()))
-            .set_metadata(Some(routing_metadata))
-            .send()
-            .await
-            .map_err(|e| {
-                StorageError::Internal(format!(
-                    "S3 put routing index failed for {routing_key}: {e}"
-                ))
-            })?;
-
-        // Put expiry index entry for a TTL blob (empty body, metadata with routing_id).
-        if let Some(expires_at) = lifetime.expires_at(stored_at) {
-            let expiry_key = self.expiry_key(expires_at, &blob_id);
-            let mut expiry_metadata = HashMap::new();
-            expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+        let metadata = object_metadata(routing_id, blob_id, recipient_hint, lifetime, stored_at);
+        let replaced = self.replaced(&blob_id).await?;
+        let key = self.blob_key(&blob_id);
+        let first_capacity = content_length
+            .and_then(|len| usize::try_from(len).ok())
+            .map_or(0, |len| len.min(PART_SIZE));
+        let mut first = Vec::with_capacity(first_capacity);
+        let total = if fill_part(&mut body, &mut first).await? {
+            let total = first.len() as u64;
             self.client
                 .put_object()
                 .bucket(&self.bucket)
-                .key(&expiry_key)
-                .body(ByteStream::from(Vec::<u8>::new()))
-                .set_metadata(Some(expiry_metadata))
+                .key(&key)
+                .body(ByteStream::from(first))
+                .set_metadata(Some(metadata))
                 .send()
                 .await
                 .map_err(|e| {
-                    StorageError::Internal(format!(
-                        "S3 put expiry index failed for {expiry_key}: {e}"
-                    ))
+                    StorageError::Internal(format!("S3 streaming put failed for {key}: {e}"))
                 })?;
-        }
-
-        Ok(BlobMetadata {
+            total
+        } else {
+            self.put_multipart(&key, metadata, first, &mut body).await?
+        };
+        let meta = BlobMetadata {
             routing_id,
             blob_id,
             recipient_hint,
             lifetime,
             stored_at,
-            content_length,
-        })
+            content_length: Some(total),
+        };
+        self.write_indexes(&meta, replaced).await?;
+        Ok(meta)
     }
 
     async fn get_streaming(
@@ -1085,9 +1191,10 @@ mod tests {
     }
 
     #[test]
-    fn retained_lifetime_writes_retain_and_no_expiry() {
-        let metadata = lifetime_round_trip(StoredLifetime::Retained);
+    fn retained_lifetime_writes_retain_admission_and_no_expiry() {
+        let metadata = lifetime_round_trip(StoredLifetime::Retained { admission: 42 });
         assert_eq!(metadata.get(RETAIN_KEY).map(String::as_str), Some("true"));
+        assert_eq!(metadata.get(ADMISSION_KEY).map(String::as_str), Some("42"));
         assert!(!metadata.contains_key("blob_ttl"));
         assert!(!metadata.contains_key("expires_at"));
     }
@@ -1101,6 +1208,19 @@ mod tests {
         metadata.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
         metadata.insert("blob_ttl".to_owned(), "60".to_owned());
         assert!(lifetime_from_metadata(&metadata).is_err());
+    }
+
+    /// A retained object without its admission counter, and a TTL object
+    /// carrying one, are refused: neither reads as a lifetime.
+    #[test]
+    fn lifetime_metadata_refuses_a_misplaced_admission_counter() {
+        let mut retained = HashMap::new();
+        retained.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
+        assert!(lifetime_from_metadata(&retained).is_err());
+        let mut ttl = HashMap::new();
+        ttl.insert("blob_ttl".to_owned(), "60".to_owned());
+        ttl.insert(ADMISSION_KEY.to_owned(), "1".to_owned());
+        assert!(lifetime_from_metadata(&ttl).is_err());
     }
 
     /// Returns the test endpoint URL from env, defaulting to localhost `MinIO`.
@@ -1188,7 +1308,7 @@ mod tests {
                 routing_id,
                 retained_id,
                 None,
-                crate::native::storage::StoredLifetime::Retained,
+                crate::native::storage::StoredLifetime::Retained { admission: 0 },
                 retained.clone(),
             )
             .await
@@ -1219,7 +1339,7 @@ mod tests {
         assert_eq!(held.blob, retained);
         assert_eq!(
             held.lifetime,
-            crate::native::storage::StoredLifetime::Retained
+            crate::native::storage::StoredLifetime::Retained { admission: 0 }
         );
         assert!(storage.get(&ttl_id).await.unwrap().is_none());
     }
@@ -1294,7 +1414,12 @@ mod tests {
         }
 
         let results = store
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -1323,7 +1448,12 @@ mod tests {
         }
 
         let results = store
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -1352,7 +1482,12 @@ mod tests {
         }
 
         let results = store
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         for window in results.windows(2) {
@@ -1381,7 +1516,12 @@ mod tests {
             .unwrap();
 
         let results = store
-            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id_b,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1469,6 +1609,111 @@ mod tests {
         assert!(result.is_some());
     }
 
+    /// Every index key under `prefix`.
+    async fn keys_under(store: &S3BlobStore, prefix: &str) -> Vec<String> {
+        store.list_keys(prefix).await.unwrap()
+    }
+
+    /// §17.7: a TTL blob overwritten at another routing id as a retained
+    /// record leaves neither its routing object nor its expiry object, and
+    /// a TTL overwrite under another TTL leaves only the new expiry object.
+    #[tokio::test]
+    async fn overwrite_deletes_the_replaced_blobs_index_objects() {
+        let (clock, time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let (first, second) = ([0xA1; 32], [0xA2; 32]);
+        let data = vec![0xA1; 4];
+        let blob_id = make_blob_id(&data);
+        let expiry = expiry_list_prefix(&store.prefix);
+
+        store
+            .store(first, blob_id, None, StoredLifetime::Ttl(10), data.clone())
+            .await
+            .unwrap();
+        time.store(1_000_005, Ordering::SeqCst);
+        store
+            .store(first, blob_id, None, StoredLifetime::Ttl(60), data.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            keys_under(&store, &expiry).await,
+            vec![store.expiry_key(1_000_065, &blob_id)],
+            "the TTL overwrite leaves only its own expiry object",
+        );
+
+        store
+            .store(
+                second,
+                blob_id,
+                None,
+                StoredLifetime::Retained { admission: 0 },
+                data,
+            )
+            .await
+            .unwrap();
+        assert!(
+            keys_under(&store, &store.routing_class_prefix(&first, "t"))
+                .await
+                .is_empty()
+        );
+        assert!(keys_under(&store, &expiry).await.is_empty());
+        assert_eq!(
+            keys_under(&store, &store.routing_class_prefix(&second, "r")).await,
+            vec![store.routing_key(&second, StoredLifetime::Retained { admission: 0 }, &blob_id)],
+        );
+    }
+
+    /// Purge re-reads the blob an expiry object names: a stale expiry object
+    /// of a blob since overwritten as a retained record, or re-stored under a
+    /// later expiry, deletes only itself.
+    #[tokio::test]
+    async fn purge_skips_a_retained_or_unexpired_blob_behind_a_stale_expiry_object() {
+        let (clock, time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let routing_id = [0xA3; 32];
+        let retained = vec![0xA3; 4];
+        let retained_id = make_blob_id(&retained);
+        let restored = vec![0xA4; 4];
+        let restored_id = make_blob_id(&restored);
+        store
+            .store(
+                routing_id,
+                retained_id,
+                None,
+                StoredLifetime::Retained { admission: 0 },
+                retained,
+            )
+            .await
+            .unwrap();
+        store
+            .store(
+                routing_id,
+                restored_id,
+                None,
+                StoredLifetime::Ttl(3600),
+                restored,
+            )
+            .await
+            .unwrap();
+        // Index objects an older write would have left behind.
+        for blob_id in [&retained_id, &restored_id] {
+            store
+                .put_index(&store.expiry_key(1_000_010, blob_id), HashMap::new())
+                .await
+                .unwrap();
+        }
+
+        time.store(1_000_100, Ordering::SeqCst);
+        assert_eq!(store.purge_expired().await.unwrap(), 0);
+        assert!(store.get(&retained_id).await.unwrap().is_some());
+        assert!(store.get(&restored_id).await.unwrap().is_some());
+        assert_eq!(
+            keys_under(&store, &expiry_list_prefix(&store.prefix)).await,
+            vec![store.expiry_key(1_003_600, &restored_id)],
+            "purge deletes the stale objects and keeps the live one",
+        );
+    }
+
     #[tokio::test]
     async fn delete_cleans_up_routing_index() {
         let (clock, _time) = test_clock(1_000_000);
@@ -1492,7 +1737,12 @@ mod tests {
 
         // After deletion, query should return empty.
         let results = store
-            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::All,
+                crate::native::storage::LifetimeFilter::Any,
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1526,6 +1776,7 @@ mod tests {
             .query(
                 &routing_id,
                 crate::native::storage::QueryCursor::Since(1_000_000),
+                crate::native::storage::LifetimeFilter::Any,
                 100,
             )
             .await
@@ -1692,6 +1943,109 @@ mod tests {
         // Get should return None for expired blobs.
         let result = store.get(&blob_id).await.unwrap();
         assert!(result.is_none());
+    }
+
+    /// `data` as a body of 1 MiB chunks, failing after `fail_after` chunks
+    /// when that is set.
+    fn chunked(data: &[u8], fail_after: Option<usize>) -> BlobBodyStream {
+        let mut chunks: Vec<Result<bytes::Bytes, StorageError>> = data
+            .chunks(1024 * 1024)
+            .map(|chunk| Ok(bytes::Bytes::copy_from_slice(chunk)))
+            .collect();
+        if let Some(at) = fail_after {
+            chunks.truncate(at);
+            chunks.push(Err(StorageError::Internal("the body broke".to_owned())));
+        }
+        Box::pin(futures::stream::iter(chunks))
+    }
+
+    /// A body longer than one part goes up as a multipart upload whatever
+    /// length the advisory hint names, and the stored length is the count of
+    /// bytes the body yielded.
+    #[tokio::test]
+    async fn streaming_store_past_one_part_uploads_every_byte_under_a_wrong_hint() {
+        let (clock, _time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let data: Vec<u8> = (0..251u8).cycle().take(PART_SIZE * 2 + 3).collect();
+        let blob_id = make_blob_id(&data);
+
+        let meta = store
+            .store_streaming(
+                [0xD1; 32],
+                blob_id,
+                None,
+                StoredLifetime::Ttl(3600),
+                Some(5),
+                chunked(&data, None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta.content_length, Some(data.len() as u64));
+        let stored = store.get(&blob_id).await.unwrap().unwrap();
+        assert_eq!(stored.blob.len(), data.len());
+        assert!(
+            stored.blob == data,
+            "the multipart object holds the body's bytes in order"
+        );
+        assert_eq!(stored.lifetime, StoredLifetime::Ttl(3600));
+        let listed = store
+            .query(&[0xD1; 32], QueryCursor::All, LifetimeFilter::Any, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    /// A body that fails after its first part aborts the upload: the store
+    /// returns the body's error and holds no object, no index and no open
+    /// multipart upload for it.
+    #[tokio::test]
+    async fn streaming_store_failing_after_one_part_leaves_no_object() {
+        let (clock, _time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let data: Vec<u8> = (0..241u8).cycle().take(PART_SIZE * 2).collect();
+        let blob_id = make_blob_id(&data);
+        let first_part_chunks = PART_SIZE / (1024 * 1024) + 1;
+
+        let refused = store
+            .store_streaming(
+                [0xD2; 32],
+                blob_id,
+                None,
+                StoredLifetime::Ttl(3600),
+                None,
+                chunked(&data, Some(first_part_chunks)),
+            )
+            .await;
+
+        match refused {
+            Err(StorageError::Internal(detail)) => assert_eq!(detail, "the body broke"),
+            other => panic!("expected the body's error, got {other:?}"),
+        }
+        assert!(store.get(&blob_id).await.unwrap().is_none());
+        assert!(
+            store
+                .query(&[0xD2; 32], QueryCursor::All, LifetimeFilter::Any, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let key = store.blob_key(&blob_id);
+        let open = store
+            .client
+            .list_multipart_uploads()
+            .bucket(&store.bucket)
+            .prefix(&key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            open.uploads()
+                .iter()
+                .all(|upload| upload.key() != Some(key.as_str())),
+            "the failed upload is aborted, not left open: {:?}",
+            open.uploads()
+        );
     }
 }
 

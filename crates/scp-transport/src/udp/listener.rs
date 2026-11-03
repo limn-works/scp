@@ -825,6 +825,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
                 sessions,
                 &remote_addr,
                 storage,
+                relay_config,
                 rate_limiter,
             )
             .await;
@@ -1031,9 +1032,11 @@ async fn handle_udp_delete<S: BlobStorage>(
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
+    config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
 ) {
     let reply = match public_records::delete_blob(
+        &config.public_records,
         storage.as_ref(),
         &blob_id,
         rate_limiter,
@@ -1844,7 +1847,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -1959,7 +1967,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()
@@ -1981,6 +1994,7 @@ mod tests {
                 .query(
                     &fixture.bridge_own_id,
                     crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
                     100
                 )
                 .await
@@ -2032,7 +2046,12 @@ mod tests {
             );
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty()

@@ -21,5 +21,5 @@ fn make_redb_blob_store() -> (RedbBlobStore, Arc<AtomicU64>) {
     (store, clock)
 }
 
-// Run all 11 blob store conformance tests.
+// The blob store conformance suite (spec section 17.11).
 scp_testing::blob_store_conformance!(make_redb_blob_store());

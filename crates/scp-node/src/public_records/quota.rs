@@ -10,7 +10,6 @@
 
 use scp_relay_client::code;
 use scp_transport::native::public_records::PublicRecordRefusal;
-use scp_transport::native::storage::{StoredBlob, StoredLifetime};
 
 /// One of the four quota classes (§9.18.B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,20 +33,6 @@ impl QuotaClass {
         Self::IdentityPrivateState,
         Self::TtlBlobs,
     ];
-
-    /// The class a stored blob is charged to.
-    ///
-    /// A node stores `KeyPackage` sets and identity private state through no
-    /// path yet, so every stored blob is a retained record or a TTL blob.
-    // Stub — see SCP-374 (KeyPackage sets) and SCP-373 (identity private
-    // state): each charges its own class once it stores through this store.
-    #[must_use]
-    pub const fn of(stored: &StoredBlob) -> Self {
-        match stored.lifetime {
-            StoredLifetime::Retained => Self::RetainedPublicRecords,
-            StoredLifetime::Ttl(_) => Self::TtlBlobs,
-        }
-    }
 }
 
 /// The bound one class puts on the blobs one routing id holds.

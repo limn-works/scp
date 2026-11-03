@@ -9,7 +9,7 @@
 //!
 //! A verifier that takes a bare key trusts its caller to have read the key
 //! at the right position of the right identity's log. These functions read
-//! the key from a [`KeyStateSource`], a crate-private trait with two
+//! the key from a `KeyStateSource`, a crate-private trait with two
 //! implementors: a party's [`ResolvedState`], which only the verdict
 //! classifier constructs, and a validating store's [`RetainedChain`], which
 //! only a [`RetainedLog`](scp_kel::RetainedLog) constructs. The trait is

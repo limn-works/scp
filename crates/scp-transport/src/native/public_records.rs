@@ -29,7 +29,9 @@ use std::sync::Arc;
 use scp_protocol::node::{NodeRecordKind, classify_node_record};
 use scp_relay_client::{BlobLifetime, RelayMessage, RelayProtocolError, code};
 
-use super::storage::{BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime};
+use super::storage::{
+    BlobStorage, LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+};
 use crate::relay::push_gate::LiveRelayUrl;
 use crate::relay::rate_limit::PublishRateLimiter;
 
@@ -42,7 +44,10 @@ pub struct PublicRecordRefusal {
 }
 
 impl PublicRecordRefusal {
-    /// A refusal answered with `code`.
+    /// A refusal answered with `code`, for a refusal the request caused:
+    /// `msg` reaches the client. A node-side failure goes through
+    /// [`Self::internal`] or [`Self::storage`], which keep its detail off the
+    /// wire.
     #[must_use]
     pub fn new(code: u16, msg: impl Into<String>) -> Self {
         Self {
@@ -69,15 +74,33 @@ impl PublicRecordRefusal {
         (self.code, self.msg)
     }
 
+    /// The `5000` refusal for a node-side failure while doing `operation`.
+    ///
+    /// The `ERR` carries the code and `operation` only; `detail` (a backend
+    /// message, a decode error, a log refusal) is logged here and never
+    /// reaches the client, since it can name node internals.
+    #[must_use]
+    pub fn internal(operation: &str, detail: &dyn fmt::Display) -> Self {
+        Self::failed(code::INTERNAL_ERROR, operation, detail)
+    }
+
     /// The refusal for a failed storage `operation`: `5001` when the backend
-    /// is full, `5000` for every other failure.
+    /// is full, `5000` for every other failure. Like [`Self::internal`], the
+    /// `ERR` carries the code and `operation` only, and the backend's message
+    /// is logged.
     #[must_use]
     pub fn storage(operation: &str, err: &StorageError) -> Self {
         let code = match err {
             StorageError::StorageFull => code::STORAGE_FULL,
             StorageError::Internal(_) => code::INTERNAL_ERROR,
         };
-        Self::new(code, format!("{operation}: {err}"))
+        Self::failed(code, operation, err)
+    }
+
+    /// Logs `detail` and builds the refusal that carries `operation` alone.
+    fn failed(code: u16, operation: &str, detail: &dyn fmt::Display) -> Self {
+        tracing::warn!(code, operation, %detail, "public-record operation failed on the node");
+        Self::new(code, operation)
     }
 }
 
@@ -155,6 +178,21 @@ pub trait PublicRecordStore: Send + Sync {
         storage: &dyn BlobStorage,
         publish: TtlPublish,
     ) -> Result<StoredBlob, PublicRecordRefusal>;
+
+    /// Serves one DELETE of `blob_id` after its rate check: `4041` for a
+    /// retained record (§9.10.12), otherwise the delete. The store runs it
+    /// under the lock its admission takes for `blob_id`, so no admission
+    /// replaces a TTL copy with the retained record between the check and
+    /// the delete.
+    ///
+    /// # Errors
+    ///
+    /// `4041` for a retained record, or `5000` when storage fails.
+    async fn delete(
+        &self,
+        storage: &dyn BlobStorage,
+        blob_id: &[u8; 32],
+    ) -> Result<(), PublicRecordRefusal>;
 }
 
 /// Whether a server stores public records, and through which store.
@@ -321,7 +359,7 @@ pub async fn refuse_retained_copy<S: BlobStorage + ?Sized>(
         .get(blob_id)
         .await
         .map_err(|e| PublicRecordRefusal::storage("reading the blob", &e))?;
-    if held.is_some_and(|held| held.lifetime == StoredLifetime::Retained) {
+    if held.is_some_and(|held| held.lifetime.is_retained()) {
         return Err(PublicRecordRefusal::new(
             code::DID_RECORD_REJECTED,
             "the blob is a retained record",
@@ -361,17 +399,21 @@ pub async fn query_blobs<S: BlobStorage + ?Sized>(
     if reserved.reserves(&routing_id) {
         return Ok(Vec::new());
     }
-    storage.query(&routing_id, cursor, limit).await
+    storage
+        .query(&routing_id, cursor, LifetimeFilter::Any, limit)
+        .await
 }
 
-/// Serves one DELETE: the per-IP publish budget first, then `4041` for a
-/// retained record (§9.10.12), then the delete.
+/// Serves one DELETE: the per-IP publish budget first, then the node's
+/// [`PublicRecordStore::delete`], or [`delete_unretained`] on a server that
+/// stores no public record.
 ///
 /// # Errors
 ///
 /// `4020` over budget, `4041` for a retained record, or `5000` when storage
 /// fails, before or during the delete.
-pub async fn delete_blob<S: BlobStorage + ?Sized>(
+pub async fn delete_blob<S: BlobStorage>(
+    records: &PublicRecords,
     storage: &S,
     blob_id: &[u8; 32],
     rate_limiter: &PublishRateLimiter,
@@ -383,11 +425,28 @@ pub async fn delete_blob<S: BlobStorage + ?Sized>(
             "delete rate limit exceeded",
         ));
     }
+    match records {
+        PublicRecords::Store(store) => store.delete(storage, blob_id).await,
+        PublicRecords::Refused => delete_unretained(storage, blob_id).await,
+    }
+}
+
+/// Deletes `blob_id` unless it is a retained record, which it refuses with
+/// `4041` (§9.10.12). A [`PublicRecordStore`] calls it under the lock its
+/// admission takes for `blob_id`.
+///
+/// # Errors
+///
+/// `4041` for a retained record, or `5000` when storage fails.
+pub async fn delete_unretained<S: BlobStorage + ?Sized>(
+    storage: &S,
+    blob_id: &[u8; 32],
+) -> Result<(), PublicRecordRefusal> {
     let held = storage
         .get(blob_id)
         .await
         .map_err(|e| PublicRecordRefusal::storage("reading the blob", &e))?;
-    if held.is_some_and(|held| held.lifetime == StoredLifetime::Retained) {
+    if held.is_some_and(|held| held.lifetime.is_retained()) {
         return Err(PublicRecordRefusal::new(
             code::RETAINED_RECORD,
             "the blob is a retained record",
@@ -442,7 +501,12 @@ mod tests {
         assert_eq!(code_of(result), Some(code::DID_RECORD_REJECTED));
         assert!(
             storage
-                .query(&routing_id, QueryCursor::All, 10)
+                .query(
+                    &routing_id,
+                    QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
+                    10
+                )
                 .await?
                 .is_empty()
         );
@@ -497,7 +561,7 @@ mod tests {
                 routing_id,
                 blob_id,
                 None,
-                StoredLifetime::Retained,
+                StoredLifetime::Retained { admission: 0 },
                 blob.clone(),
             )
             .await?;
@@ -521,7 +585,7 @@ mod tests {
         .await;
         assert_eq!(code_of(result), Some(code::DID_RECORD_REJECTED));
         let held = storage.get(&blob_id).await?.ok_or("the record is gone")?;
-        assert_eq!(held.lifetime, StoredLifetime::Retained);
+        assert_eq!(held.lifetime, StoredLifetime::Retained { admission: 0 });
         assert_eq!(held.routing_id, routing_id);
         Ok(())
     }
@@ -558,6 +622,30 @@ mod tests {
         );
     }
 
+    /// A node-side failure's `ERR` names the operation and nothing of the
+    /// detail behind it.
+    #[test]
+    fn a_node_side_refusal_carries_the_operation_only() {
+        let detail = "postgres://node:secret@db/blobs refused the write";
+        for refusal in [
+            PublicRecordRefusal::storage(
+                "storing the blob",
+                &StorageError::Internal(detail.into()),
+            ),
+            PublicRecordRefusal::internal("storing the blob", &detail),
+        ] {
+            assert_eq!(
+                refusal.into_parts(),
+                (code::INTERNAL_ERROR, "storing the blob".to_owned())
+            );
+        }
+        assert_eq!(
+            PublicRecordRefusal::storage("storing the blob", &StorageError::StorageFull)
+                .into_parts(),
+            (code::STORAGE_FULL, "storing the blob".to_owned()),
+        );
+    }
+
     #[tokio::test]
     async fn delete_refuses_a_retained_record_with_4041_and_deletes_a_ttl_blob() -> TestResult {
         let storage = InMemoryBlobStorage::new();
@@ -568,7 +656,7 @@ mod tests {
                 [4; 32],
                 [5; 32],
                 None,
-                StoredLifetime::Retained,
+                StoredLifetime::Retained { admission: 0 },
                 b"r".to_vec(),
             )
             .await?;
@@ -583,14 +671,17 @@ mod tests {
             .await?;
 
         assert_eq!(
-            delete_blob(&storage, &[5; 32], &limiter, ip)
+            delete_blob(&PublicRecords::Refused, &storage, &[5; 32], &limiter, ip)
                 .await
                 .err()
                 .map(|r| r.code()),
             Some(code::RETAINED_RECORD)
         );
         assert!(storage.get(&[5; 32]).await?.is_some());
-        assert_eq!(delete_blob(&storage, &[6; 32], &limiter, ip).await, Ok(()));
+        assert_eq!(
+            delete_blob(&PublicRecords::Refused, &storage, &[6; 32], &limiter, ip).await,
+            Ok(())
+        );
         assert!(storage.get(&[6; 32]).await?.is_none());
         Ok(())
     }

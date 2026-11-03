@@ -4,13 +4,17 @@
 //! feature alone, so it links to neither type.
 //!
 //! A retained record (`09-security-model.md` §9.10.12) stores NULL in
-//! `blob_ttl` and `expires_at`: no live-row check expires it and TTL purge
-//! never deletes it. Queries return rows in ascending (`stored_at`,
-//! `blob_id`) order and resume after a [`QueryCursor`].
+//! `blob_ttl` and `expires_at` and its admission counter in `admission`: no
+//! live-row check expires it and TTL purge never deletes it. A TTL blob
+//! stores NULL in `admission`. Queries return rows in ascending
+//! (`stored_at`, `blob_id`) order, resume after a [`QueryCursor`], and apply
+//! a [`LifetimeFilter`] in the `WHERE` clause.
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::storage::{QueryCursor, StorageError, StoredBlob, StoredLifetime};
+use super::storage::{
+    LifetimeFilter, QueryCursor, StorageError, StoredBlob, StoredLifetime, lifetime_predicate,
+};
 
 /// Creates the `blobs` table and its indexes.
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS blobs (
@@ -18,6 +22,7 @@ pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS blobs (
         routing_id BLOB NOT NULL,
         recipient_hint BLOB,
         blob_ttl INTEGER,
+        admission INTEGER,
         stored_at INTEGER NOT NULL,
         expires_at INTEGER,
         blob BLOB NOT NULL
@@ -27,7 +32,7 @@ pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS blobs (
     CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);";
 
 /// The columns [`read_row`] reads, in order.
-const COLUMNS: &str = "routing_id, blob_id, recipient_hint, blob_ttl, stored_at, blob";
+const COLUMNS: &str = "routing_id, blob_id, recipient_hint, blob_ttl, admission, stored_at, blob";
 
 /// The live-row predicate over `?2 = now`: a retained row never expires.
 const LIVE: &str = "(expires_at IS NULL OR expires_at > ?2)";
@@ -44,7 +49,8 @@ fn column32(row: &rusqlite::Row<'_>, index: usize, name: &str) -> rusqlite::Resu
     })
 }
 
-/// Reads a row of [`COLUMNS`].
+/// Reads a row of [`COLUMNS`]. A row carrying both a TTL and an admission
+/// counter, or neither, fails as a conversion error.
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlob> {
     let recipient_hint = match row.get::<_, Option<Vec<u8>>>(2)? {
         Some(_) => Some(column32(row, 2, "recipient_hint")?),
@@ -54,9 +60,11 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlob> {
         routing_id: column32(row, 0, "routing_id")?,
         blob_id: column32(row, 1, "blob_id")?,
         recipient_hint,
-        lifetime: StoredLifetime::from_ttl(row.get(3)?),
-        stored_at: row.get(4)?,
-        blob: row.get(5)?,
+        lifetime: StoredLifetime::from_columns(row.get(3)?, row.get(4)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Integer, e.into())
+        })?,
+        stored_at: row.get(5)?,
+        blob: row.get(6)?,
     })
 }
 
@@ -64,13 +72,14 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlob> {
 pub(super) fn store(conn: &Connection, stored: StoredBlob) -> Result<StoredBlob, StorageError> {
     conn.execute(
         "INSERT OR REPLACE INTO blobs
-            (blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (blob_id, routing_id, recipient_hint, blob_ttl, admission, stored_at, expires_at, blob)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             stored.blob_id.as_slice(),
             stored.routing_id.as_slice(),
             stored.recipient_hint.map(|h| h.to_vec()),
             stored.lifetime.ttl(),
+            stored.lifetime.admission(),
             stored.stored_at,
             stored.lifetime.expires_at(stored.stored_at),
             stored.blob,
@@ -95,20 +104,24 @@ pub(super) fn get(
     .map_err(|e| internal("get", &e))
 }
 
-/// Reads the live blobs of a routing id after `cursor`, in query order.
+/// Reads the live blobs of a routing id that `filter` admits after
+/// `cursor`, in query order.
 pub(super) fn query(
     conn: &Connection,
     routing_id: &[u8; 32],
     cursor: QueryCursor,
+    filter: LifetimeFilter,
     limit: u32,
     now: u64,
 ) -> Result<Vec<StoredBlob>, StorageError> {
     // ?3 is the `stored_at` floor and ?4 the cursor's `blob_id`, or NULL for a
-    // cursor without one; a row at the floor passes only above ?4.
+    // cursor without one; a row at the floor passes only above ?4. ?6 is the
+    // lifetime filter's code.
+    let lifetime = lifetime_predicate("?6");
     let mut stmt = conn
         .prepare_cached(&format!(
             "SELECT {COLUMNS} FROM blobs
-             WHERE routing_id = ?1 AND {LIVE} AND stored_at >= ?3
+             WHERE routing_id = ?1 AND {LIVE} AND {lifetime} AND stored_at >= ?3
                AND (?4 IS NULL OR stored_at > ?3 OR blob_id > ?4)
              ORDER BY stored_at ASC, blob_id ASC
              LIMIT ?5"
@@ -122,6 +135,7 @@ pub(super) fn query(
                 cursor.floor(),
                 cursor.after_blob().map(|id| id.to_vec()),
                 limit,
+                filter.sql_code(),
             ],
             read_row,
         )

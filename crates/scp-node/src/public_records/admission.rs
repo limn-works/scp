@@ -11,26 +11,27 @@
 use std::collections::BTreeSet;
 
 use scp_did::Identifier;
-use scp_kel::{HoldOutcome, RoutingKind, node_list_routing_id, routing_id};
+use scp_kel::{HoldOutcome, node_list_routing_id};
 use scp_protocol::node::{
-    check_node_list_publish, decode_conflict_frame, decode_key_event_frame, decode_node_list_frame,
-    decode_service_record_frame,
+    NodeListRecord, check_node_list_publish, decode_conflict_frame, decode_key_event_frame,
+    decode_node_list_frame, decode_service_record_frame,
 };
 use scp_relay_client::code;
 use scp_transport::native::public_records::{PublicRecordRefusal, RetainedPublish};
 use scp_transport::native::storage::{BlobStorage, StoredBlob};
 
-use super::NodeListSource;
+use super::NodeListPin;
 use super::selection::{
-    HeldNodeList, bound_witnesses, decode_conflicts, decode_service_records,
-    designated_service_keys, frame_refusal, held_log, held_node_lists, load_retained,
-    select_conflicts, select_key_events, select_node_lists, select_service_records,
-    statement_admissible, verify_node_list,
+    HeldLog, HeldNodeList, LogCache, bound_witnesses, corrupt, decode_conflicts,
+    decode_service_records, designated_service_keys, frame_refusal, held_log, held_log_from,
+    held_node_lists, load_retained, next_admission, select_conflicts, select_key_events,
+    select_node_lists, select_service_records, statement_admissible, verify_node_list,
 };
 
 /// What a kind's selection keeps at one routing id after a write.
 pub(super) struct Selection {
-    /// The retained records at the routing id before the write.
+    /// The retained records at the routing id before the write, in admission
+    /// order.
     pub(super) held: Vec<StoredBlob>,
     /// The `blob_id`s the selection keeps, the arriving record's included
     /// where the selection keeps it.
@@ -46,6 +47,11 @@ fn rejected(msg: impl Into<String>) -> PublicRecordRefusal {
 /// check order on every event of the frame against the chains the node
 /// holds (`4044`), then R9's accepted-chain rule and suffix retention.
 ///
+/// The frame is admitted onto the identity's held log once, incrementally:
+/// [`held_log_from`] replays only the stored frames its cache lacks. The
+/// returned [`HeldLog`] carries the arriving frame under the counter the
+/// caller's commit gives it.
+///
 /// # Errors
 ///
 /// `4040` for a frame the decoder or frame admission refuses or that the
@@ -53,34 +59,26 @@ fn rejected(msg: impl Into<String>) -> PublicRecordRefusal {
 /// storage failure.
 pub(super) async fn admit_key_events(
     storage: &dyn BlobStorage,
+    logs: &LogCache,
     publish: &RetainedPublish,
-) -> Result<(Identifier, Selection), PublicRecordRefusal> {
+) -> Result<(Identifier, HeldLog, Selection), PublicRecordRefusal> {
     let frame = decode_key_event_frame(&publish.blob)
         .map_err(|e| rejected(format!("the key-event frame does not decode: {e}")))?;
     let identifier = frame.identifier();
-    let mut held = held_log(storage, &identifier).await?;
-    let units: Vec<&[u8]> = frame
-        .events()
-        .iter()
-        .map(scp_protocol::node::FrameEvent::unit)
-        .collect();
-    let outcome = held.log.admit(&units).map_err(|e| frame_refusal(&e))?;
+    // `classify_node_record` confirmed `publish.routing_id` derives from the
+    // frame's identifier, so the held frames are the records stored there.
+    let stored = load_retained(storage, &publish.routing_id).await?;
+    let mut held = held_log_from(logs, &identifier, &stored)?;
+    let outcome = held
+        .admit_frame(next_admission(&stored)?, publish.blob_id, &frame)
+        .map_err(|e| frame_refusal(&e))?;
     if matches!(outcome, HoldOutcome::Refused { .. }) {
         return Err(rejected(
             "the retention bounds keep no chain the frame extends",
         ));
     }
-    held.frames.push((
-        publish.blob_id,
-        frame
-            .events()
-            .iter()
-            .map(scp_protocol::node::FrameEvent::digest)
-            .collect(),
-    ));
-    let kept = select_key_events(&held.retained(), &held.frames);
-    let stored = load_retained(storage, &publish.routing_id).await?;
-    Ok((identifier, Selection { held: stored, kept }))
+    let kept = select_key_events(&held.retained(), held.frames());
+    Ok((identifier, held, Selection { held: stored, kept }))
 }
 
 /// `scp:svc:` admission: the record verifies under the service key a chain
@@ -94,11 +92,14 @@ pub(super) async fn admit_key_events(
 /// selection would not keep; `5000` on a storage failure.
 pub(super) async fn admit_service_record(
     storage: &dyn BlobStorage,
+    logs: &LogCache,
     publish: &RetainedPublish,
 ) -> Result<Selection, PublicRecordRefusal> {
     let record = decode_service_record_frame(&publish.blob)
         .map_err(|e| rejected(format!("the service record does not decode: {e}")))?;
-    let chains = held_log(storage, &record.identifier()).await?.retained();
+    let chains = held_log(storage, logs, &record.identifier())
+        .await?
+        .retained();
     if chains.is_empty() {
         return Err(rejected("this node holds no key-event log of the identity"));
     }
@@ -115,28 +116,36 @@ pub(super) async fn admit_service_record(
     Ok(Selection { held, kept })
 }
 
-/// The selection at a service-record routing id over what it holds, after
-/// the identity's held chains changed.
+/// The selection at `identifier`'s service-record routing id `routing` over
+/// what it holds, after the identity's held chains changed.
 ///
 /// # Errors
 ///
 /// `5000` on a storage failure or a stored record that does not decode.
 pub(super) async fn reselect_service_records(
     storage: &dyn BlobStorage,
+    logs: &LogCache,
     identifier: &Identifier,
-) -> Result<([u8; 32], Selection), PublicRecordRefusal> {
-    let routing = routing_id(RoutingKind::ServiceRecord, identifier);
-    let chains = held_log(storage, identifier).await?.retained();
-    let held = load_retained(storage, &routing).await?;
+    routing: &[u8; 32],
+) -> Result<Selection, PublicRecordRefusal> {
+    let held = load_retained(storage, routing).await?;
+    if held.is_empty() {
+        return Ok(Selection {
+            held,
+            kept: BTreeSet::new(),
+        });
+    }
+    let chains = held_log(storage, logs, identifier).await?.retained();
     let kept = select_service_records(
         &decode_service_records(&held)?,
         &designated_service_keys(&chains),
     );
-    Ok((routing, Selection { held, kept }))
+    Ok(Selection { held, kept })
 }
 
-/// `scp:nls:` admission: the routing id derives from the record's
-/// `context_id`, and the record verifies under the governor's `#active` at
+/// `scp:nls:` admission: the record's (`context_id`, `governor`) pair is one
+/// a pin of `pins` names, the routing id derives from its `context_id`, and
+/// the record verifies under the governor's `#active` at
 /// `signing_key_state_head` on a governor chain the node retains under R9, a
 /// key no later governor event marks `Compromised` (§9.6.3, §9.10.12). The
 /// governor key state is the store-held `RetainedChain` of `03-identity.md`
@@ -144,18 +153,29 @@ pub(super) async fn reselect_service_records(
 ///
 /// # Errors
 ///
-/// `4040` for a record the decoder refuses, a governor whose key-event log
-/// the node does not hold, a record no retained governor chain verifies (a
-/// head off every chain, another identity's key, a failed signature), a
-/// compromised signing key, or a record the selection would not keep;
-/// `5000` on a storage failure.
+/// `4040` for a record the decoder refuses, a pair no pin names, a governor
+/// whose key-event log the node does not hold, a record no retained governor
+/// chain verifies (a head off every chain, another identity's key, a failed
+/// signature), a compromised signing key, or a record the selection would
+/// not keep; `5000` on a storage failure.
 pub(super) async fn admit_node_list(
     storage: &dyn BlobStorage,
+    logs: &LogCache,
+    pins: &BTreeSet<NodeListPin>,
     publish: &RetainedPublish,
 ) -> Result<Selection, PublicRecordRefusal> {
-    let record = check_node_list_publish(&publish.routing_id, true, None, &publish.blob)
+    let record = check_node_list_publish(&publish.routing_id, &publish.blob)
         .map_err(|e| rejected(format!("the node-list record is refused: {e}")))?;
-    let governor = held_log(storage, &record.governor).await?.retained();
+    if !pins
+        .iter()
+        .any(|pin| pin.context_id == record.context_id && pin.governor == record.governor)
+    {
+        return Err(rejected(
+            "no node-list pointer this node is configured with names the record's context and \
+             governor",
+        ));
+    }
+    let governor = held_log(storage, logs, &record.governor).await?.retained();
     let signing = verify_node_list(&governor, &record)
         .map_err(|e| rejected(format!("the node-list record is refused: {e}")))?;
     if signing.compromised {
@@ -163,8 +183,8 @@ pub(super) async fn admit_node_list(
             "a later governor event marks the signing key Compromised",
         ));
     }
-    let mut records = held_node_lists(storage, &publish.routing_id).await?;
     let held = load_retained(storage, &publish.routing_id).await?;
+    let mut records = held_node_lists(storage, logs, &held).await?;
     records.push(HeldNodeList {
         blob_id: publish.blob_id,
         record,
@@ -174,69 +194,47 @@ pub(super) async fn admit_node_list(
     Ok(Selection { held, kept })
 }
 
-/// The selection at the configured node-list routing id over what it holds,
-/// after the governor's held chains changed; `None` where the node holds no
-/// node-list context or `governor` is not its governor.
+/// The selection at the node-list routing id `routing` over what it holds,
+/// after a governor's held chains changed.
 ///
 /// # Errors
 ///
 /// `5000` on a storage failure or a stored record that does not decode.
 pub(super) async fn reselect_node_list(
     storage: &dyn BlobStorage,
-    source: &NodeListSource,
-    governor: &Identifier,
-) -> Result<Option<([u8; 32], Selection)>, PublicRecordRefusal> {
-    let NodeListSource::Context {
-        context_id,
-        governor: configured,
-    } = source
-    else {
-        return Ok(None);
-    };
-    if configured != governor {
-        return Ok(None);
-    }
-    let routing = node_list_routing_id(context_id);
-    let records = held_node_lists(storage, &routing).await?;
-    let held = load_retained(storage, &routing).await?;
-    let kept = select_node_lists(&records);
-    Ok(Some((routing, Selection { held, kept })))
+    logs: &LogCache,
+    routing: &[u8; 32],
+) -> Result<Selection, PublicRecordRefusal> {
+    let held = load_retained(storage, routing).await?;
+    let kept = select_node_lists(&held_node_lists(storage, logs, &held).await?);
+    Ok(Selection { held, kept })
 }
 
-/// The node-list records of the node's configured context and governor,
+/// The node-list records of every pinned (`context_id`, `governor`) pair,
 /// whose bindings decide which node keys may sign a conflict statement.
-async fn configured_node_lists(
+async fn pinned_node_lists(
     storage: &dyn BlobStorage,
-    source: &NodeListSource,
-) -> Result<Vec<scp_protocol::node::NodeListRecord>, PublicRecordRefusal> {
-    let NodeListSource::Context {
-        context_id,
-        governor,
-    } = source
-    else {
-        return Ok(Vec::new());
-    };
-    load_retained(storage, &node_list_routing_id(context_id))
-        .await?
-        .iter()
-        .map(|blob| {
-            decode_node_list_frame(&blob.blob)
-                .map_err(|e| super::selection::corrupt("node-list", &e))
-        })
-        .filter(|record| {
-            record
-                .as_ref()
-                .map_or(true, |record| record.governor == *governor)
-        })
-        .collect()
+    pins: &BTreeSet<NodeListPin>,
+) -> Result<Vec<NodeListRecord>, PublicRecordRefusal> {
+    let mut records = Vec::new();
+    for pin in pins {
+        for blob in load_retained(storage, &node_list_routing_id(&pin.context_id)).await? {
+            let record =
+                decode_node_list_frame(&blob.blob).map_err(|e| corrupt("node-list", &e))?;
+            if record.governor == pin.governor {
+                records.push(record);
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// `scp:wcf:` admission: every statement is signed by a bound node key that
 /// the subject's key state names on either conflicting chain, with both
 /// conflicting heads events of chains the node holds (§9.10.12).
 ///
-/// A node with no node-list context binds no node key, so it admits no
-/// conflict statement.
+/// A node with no node-list pin binds no node key, so it admits no conflict
+/// statement.
 ///
 /// # Errors
 ///
@@ -244,13 +242,14 @@ async fn configured_node_lists(
 /// or a frame the selection would not keep; `5000` on a storage failure.
 pub(super) async fn admit_conflicts(
     storage: &dyn BlobStorage,
-    source: &NodeListSource,
+    logs: &LogCache,
+    pins: &BTreeSet<NodeListPin>,
     publish: &RetainedPublish,
 ) -> Result<Selection, PublicRecordRefusal> {
     let (subject, statements) = decode_conflict_frame(&publish.blob)
         .map_err(|e| rejected(format!("the conflict frame does not decode: {e}")))?;
-    let bound = bound_witnesses(storage, &configured_node_lists(storage, source).await?).await?;
-    let chains = held_log(storage, &subject).await?.retained();
+    let bound = bound_witnesses(storage, logs, &pinned_node_lists(storage, pins).await?).await?;
+    let chains = held_log(storage, logs, &subject).await?.retained();
     if let Some(index) = statements
         .iter()
         .position(|statement| !statement_admissible(statement, &subject, &chains, &bound))
@@ -267,30 +266,28 @@ pub(super) async fn admit_conflicts(
     Ok(Selection { held, kept })
 }
 
-/// The selection at a conflict routing id over what it holds, after the
-/// subject's held chains changed.
+/// The selection at `subject`'s conflict routing id `routing` over what it
+/// holds, after the subject's held chains changed.
 ///
 /// # Errors
 ///
 /// `5000` on a storage failure or a stored frame that does not decode.
 pub(super) async fn reselect_conflicts(
     storage: &dyn BlobStorage,
-    source: &NodeListSource,
+    logs: &LogCache,
+    pins: &BTreeSet<NodeListPin>,
     subject: &Identifier,
-) -> Result<([u8; 32], Selection), PublicRecordRefusal> {
-    let routing = routing_id(RoutingKind::ConflictStatements, subject);
-    let held = load_retained(storage, &routing).await?;
+    routing: &[u8; 32],
+) -> Result<Selection, PublicRecordRefusal> {
+    let held = load_retained(storage, routing).await?;
     if held.is_empty() {
-        return Ok((
-            routing,
-            Selection {
-                held,
-                kept: BTreeSet::new(),
-            },
-        ));
+        return Ok(Selection {
+            held,
+            kept: BTreeSet::new(),
+        });
     }
-    let bound = bound_witnesses(storage, &configured_node_lists(storage, source).await?).await?;
-    let chains = held_log(storage, subject).await?.retained();
+    let bound = bound_witnesses(storage, logs, &pinned_node_lists(storage, pins).await?).await?;
+    let chains = held_log(storage, logs, subject).await?.retained();
     let kept = select_conflicts(&decode_conflicts(&held)?, subject, &chains, &bound);
-    Ok((routing, Selection { held, kept }))
+    Ok(Selection { held, kept })
 }

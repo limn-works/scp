@@ -1,27 +1,29 @@
 //! What a node keeps of each retained kind (`09-security-model.md` §9.10.12,
 //! "Selection: what the node keeps").
 //!
-//! Every selection is a function of the records stored at one routing id and
-//! the key-event chains the node holds, so a node recomputes it from storage
-//! on each write and keeps no index beside the blob store. Each `select_*`
+//! Every selection is a function of the records stored at one routing id, in
+//! admission order, and the key-event chains the node holds, so a node
+//! recomputes it from storage on each write and keeps no index beside the
+//! blob store. Each `select_*`
 //! function returns the `blob_id`s the selection keeps; the caller deletes
 //! every other retained record at that routing id.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::PoisonError;
 
 use scp_crypto::p256::P256PublicKey;
 use scp_did::{Identifier, KeyCondition, NodeId};
-use scp_kel::{EventKind, FrameRefusal, RetainedChain, RetainedLog, RoutingKind, routing_id};
+use scp_kel::{FrameRefusal, HoldOutcome, RetainedChain, RetainedLog, RoutingKind, routing_id};
 use scp_protocol::crypto::anchored_key::AnchoredKeyError;
 use scp_protocol::node::{
-    AdmittedNodeListEntry, AdmittedNodeListRecord, ConflictStatement, NodeListError,
-    NodeListRecord, ServiceRecordFrame, decode_conflict_frame, decode_key_event_frame,
-    decode_node_list_frame, decode_service_record_frame,
+    AdmittedNodeListEntry, AdmittedNodeListRecord, ConflictStatement, FrameEvent, KeyEventFrame,
+    NodeListError, NodeListRecord, ServiceRecordFrame, decode_conflict_frame,
+    decode_key_event_frame, decode_node_list_frame, decode_service_record_frame,
 };
 use scp_relay_client::code;
 use scp_transport::native::public_records::PublicRecordRefusal;
 use scp_transport::native::storage::{
-    BlobStorage, QueryCursor, StorageError, StoredBlob, StoredLifetime,
+    BlobStorage, LifetimeFilter, QueryCursor, StorageError, StoredBlob,
 };
 
 /// One stored conflict frame: its `blob_id` and the statements it carries.
@@ -40,19 +42,19 @@ pub(super) fn storage_refusal(operation: &str, err: &StorageError) -> PublicReco
 /// node stores only records it admitted, so this is a corrupt store, and the
 /// node refuses rather than serve or select around it.
 pub(super) fn corrupt(kind: &str, err: &impl std::fmt::Display) -> PublicRecordRefusal {
-    PublicRecordRefusal::new(
-        code::INTERNAL_ERROR,
-        format!("a stored {kind} record does not decode: {err}"),
-    )
+    tracing::warn!(kind, "a stored retained record does not decode");
+    PublicRecordRefusal::internal("decoding a stored record", err)
 }
 
-/// Every retained record at `routing_id`, in ascending (`stored_at`,
-/// `blob_id`) order: the order the node stored them in, which every
-/// selection's tie-break reads as "held earliest".
+/// Every retained record at `routing_id`, in admission order: the order the
+/// node admitted them in, which every selection's tie-break reads as "held
+/// earliest" (§9.10.12 "Held earliest is admission order"). The query reads
+/// retained records only, so no TTL-bearing blob at the routing id costs the
+/// load anything.
 ///
 /// # Errors
 ///
-/// `5000` on a storage failure.
+/// `5000` on a storage failure or a retained record without a counter.
 pub(super) async fn load_retained(
     storage: &dyn BlobStorage,
     routing_id: &[u8; 32],
@@ -61,7 +63,7 @@ pub(super) async fn load_retained(
     let mut cursor = QueryCursor::All;
     loop {
         let page = storage
-            .query(routing_id, cursor, LOAD_PAGE)
+            .query(routing_id, cursor, LifetimeFilter::Retained, LOAD_PAGE)
             .await
             .map_err(|e| storage_refusal("loading a routing id's records", &e))?;
         let Some(last) = page.last() else {
@@ -72,15 +74,53 @@ pub(super) async fn load_retained(
             blob_id: last.blob_id,
         };
         let full = page.len() >= usize::try_from(LOAD_PAGE).unwrap_or(usize::MAX);
-        held.extend(
-            page.into_iter()
-                .filter(|stored| stored.lifetime == StoredLifetime::Retained),
-        );
+        held.extend(page);
         if !full {
             break;
         }
     }
-    Ok(held)
+    let mut ordered = held
+        .into_iter()
+        .map(|stored| {
+            stored
+                .lifetime
+                .admission()
+                .map(|admission| (admission, stored))
+                .ok_or_else(|| {
+                    PublicRecordRefusal::internal(
+                        "loading retained records",
+                        &"a retained-only query returned a TTL-bearing blob",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered.sort_unstable_by(|(a, left), (b, right)| {
+        a.cmp(b).then_with(|| left.blob_id.cmp(&right.blob_id))
+    });
+    Ok(ordered.into_iter().map(|(_, stored)| stored).collect())
+}
+
+/// The admission counter of the next record stored at a routing id holding
+/// `held`: one above every counter `held` carries, or `0` (§9.10.12 "Held
+/// earliest is admission order").
+///
+/// # Errors
+///
+/// `5000` once the counter would pass `i64::MAX`, the bound every backend
+/// stores.
+pub(super) fn next_admission(held: &[StoredBlob]) -> Result<u64, PublicRecordRefusal> {
+    let next = held
+        .iter()
+        .filter_map(|stored| stored.lifetime.admission())
+        .max()
+        .map_or(Some(0), |highest| highest.checked_add(1))
+        .filter(|next| i64::try_from(*next).is_ok());
+    next.ok_or_else(|| {
+        PublicRecordRefusal::internal(
+            "assigning an admission counter",
+            &"the routing id's admission counter is exhausted",
+        )
+    })
 }
 
 /// How many TTL-bearing blobs `routing_id` holds, counted up to `stop_at`:
@@ -98,7 +138,7 @@ pub(super) async fn count_ttl(
     let mut cursor = QueryCursor::All;
     while counted < stop_at {
         let page = storage
-            .query(routing_id, cursor, LOAD_PAGE)
+            .query(routing_id, cursor, LifetimeFilter::Ttl, LOAD_PAGE)
             .await
             .map_err(|e| storage_refusal("counting a routing id's TTL blobs", &e))?;
         let Some(last) = page.last() else {
@@ -109,11 +149,7 @@ pub(super) async fn count_ttl(
             blob_id: last.blob_id,
         };
         let full = page.len() >= usize::try_from(LOAD_PAGE).unwrap_or(usize::MAX);
-        counted = counted.saturating_add(
-            page.iter()
-                .filter(|stored| matches!(stored.lifetime, StoredLifetime::Ttl(_)))
-                .count(),
-        );
+        counted = counted.saturating_add(page.len());
         if !full {
             break;
         }
@@ -125,23 +161,217 @@ pub(super) async fn count_ttl(
 // scp:did:
 // ---------------------------------------------------------------------------
 
+/// One stored key-event frame of a [`HeldLog`]: its admission counter, its
+/// `blob_id`, and the event digests it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HeldFrame {
+    pub(super) admission: u64,
+    pub(super) blob_id: [u8; 32],
+    pub(super) digests: Vec<[u8; 32]>,
+}
+
 /// One identifier's key-event log as the node holds it: the chains it
-/// retains under §9.7.4.2 R9, built by admitting its stored frames in the
-/// order the node admitted them, and each stored frame's event digests.
+/// retains under §9.7.4.2 R9, built by admitting its stored frames in
+/// admission order, and those frames.
+///
+/// The log is always the result of admitting `frames`, in order, onto an
+/// empty [`RetainedLog`]: [`Self::admit_frame`] is the one path that
+/// changes either, and it changes both or neither.
+#[derive(Debug, Clone)]
 pub(super) struct HeldLog {
-    /// The log after every stored frame.
-    pub(super) log: RetainedLog,
-    /// Each stored frame's `blob_id` and the event digests it carries.
-    pub(super) frames: Vec<([u8; 32], Vec<[u8; 32]>)>,
+    log: RetainedLog,
+    frames: Vec<HeldFrame>,
 }
 
 impl HeldLog {
+    /// The log of `identifier` before any frame.
+    const fn empty(identifier: Identifier) -> Self {
+        Self {
+            log: RetainedLog::new(identifier),
+            frames: Vec::new(),
+        }
+    }
+
+    /// Admits `frame`, stored as `blob_id` under `admission`, onto the log,
+    /// validating each of its events once against the chain it extends.
+    ///
+    /// # Errors
+    ///
+    /// The [`FrameRefusal`] the log returns; the held log is then unchanged.
+    pub(super) fn admit_frame(
+        &mut self,
+        admission: u64,
+        blob_id: [u8; 32],
+        frame: &KeyEventFrame<'_>,
+    ) -> Result<HoldOutcome, FrameRefusal> {
+        let units: Vec<&[u8]> = frame.events().iter().map(FrameEvent::unit).collect();
+        let outcome = self.log.admit(&units)?;
+        self.frames.push(HeldFrame {
+            admission,
+            blob_id,
+            digests: frame.events().iter().map(FrameEvent::digest).collect(),
+        });
+        Ok(outcome)
+    }
+
+    /// The frames the log was admitted from, in admission order.
+    pub(super) fn frames(&self) -> &[HeldFrame] {
+        &self.frames
+    }
+
+    /// The admission counter of the last frame admitted.
+    pub(super) fn last_admission(&self) -> Option<u64> {
+        self.frames.last().map(|frame| frame.admission)
+    }
+
     /// Every chain the log retains under R9, accepted and suffix, as the
     /// store-held key state admission and selection read (`03-identity.md`
     /// §3.10.10, §9.10.12).
     pub(super) fn retained(&self) -> Vec<RetainedChain> {
         self.log.retained()
     }
+
+    /// Whether this log's frames are the first frames of `stored`, by
+    /// admission counter and `blob_id`.
+    fn is_prefix_of(&self, stored: &[StoredBlob]) -> bool {
+        self.frames.len() <= stored.len()
+            && self.frames.iter().zip(stored).all(|(frame, blob)| {
+                blob.blob_id == frame.blob_id && blob.lifetime.admission() == Some(frame.admission)
+            })
+    }
+}
+
+/// The replayed key-event logs of the most recently replayed identities, at
+/// most `capacity` of them, oldest evicted first.
+///
+/// An entry is a replay of the frames it names and is used only where those
+/// frames are the first frames the store holds for the identity, so a frame
+/// the store gained is admitted onto it incrementally and a frame the store
+/// dropped (by selection, by another process, by a reload) discards it. The
+/// cache therefore never changes what a replay from storage selects; it
+/// spares only the signature checks of frames already replayed.
+#[derive(Debug)]
+pub(super) struct LogCache {
+    capacity: usize,
+    entries: std::sync::Mutex<CachedLogs>,
+}
+
+#[derive(Debug, Default)]
+struct CachedLogs {
+    logs: HashMap<Identifier, HeldLog>,
+    order: VecDeque<Identifier>,
+}
+
+impl LogCache {
+    /// An empty cache of at most `capacity` logs.
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: std::sync::Mutex::new(CachedLogs::default()),
+        }
+    }
+
+    fn get(&self, identifier: &Identifier) -> Option<HeldLog> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .logs
+            .get(identifier)
+            .cloned()
+    }
+
+    /// Caches `log` as `identifier`'s, evicting the oldest entry past the
+    /// capacity. A log shorter than the one cached does not replace it.
+    pub(super) fn put(&self, identifier: Identifier, log: HeldLog) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .put(identifier, log, self.capacity);
+    }
+}
+
+impl CachedLogs {
+    /// Holds `log` as `identifier`'s unless a longer log is held, evicting the
+    /// oldest entry past `capacity`.
+    fn put(&mut self, identifier: Identifier, log: HeldLog, capacity: usize) {
+        match self.logs.entry(identifier) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                if held.get().frames.len() <= log.frames.len() {
+                    held.insert(log);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(log);
+                self.order.push_back(identifier);
+                while self.order.len() > capacity {
+                    if let Some(evicted) = self.order.pop_front() {
+                        self.logs.remove(&evicted);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `identifier`'s held log over `stored`, the retained records at its
+/// `scp:did:` routing id in admission order: the cached log where its frames
+/// are `stored`'s first frames, with only the rest admitted onto it, and a
+/// replay of every stored frame otherwise. The result is cached.
+///
+/// Admission held each frame's predecessor before it stored the frame, so
+/// admission order replays every frame onto the chain it extends.
+///
+/// # Errors
+///
+/// `5000` for a stored frame that does not decode or that the log no longer
+/// admits in admission order.
+pub(super) fn held_log_from(
+    logs: &LogCache,
+    identifier: &Identifier,
+    stored: &[StoredBlob],
+) -> Result<HeldLog, PublicRecordRefusal> {
+    let mut held = logs
+        .get(identifier)
+        .filter(|cached| cached.is_prefix_of(stored))
+        .unwrap_or_else(|| HeldLog::empty(*identifier));
+    let replayed = held.frames.len();
+    if replayed == stored.len() {
+        return Ok(held);
+    }
+    for blob in &stored[replayed..] {
+        let frame = decode_key_event_frame(&blob.blob).map_err(|e| corrupt("key-event", &e))?;
+        let admission = blob.lifetime.admission().ok_or_else(|| {
+            PublicRecordRefusal::internal(
+                "loading a held key-event log",
+                &"a held key-event frame has no counter",
+            )
+        })?;
+        // The outcome is not read: the selection reads what the log retains.
+        held.admit_frame(admission, blob.blob_id, &frame)
+            .map(drop)
+            .map_err(|e| PublicRecordRefusal::internal("loading a held key-event log", &e))?;
+    }
+    logs.put(*identifier, held.clone());
+    Ok(held)
+}
+
+/// `identifier`'s held log, read from the frames stored at its `scp:did:`
+/// routing id ([`held_log_from`]).
+///
+/// # Errors
+///
+/// `5000` on a storage failure, a stored frame that does not decode, or a
+/// stored frame the log no longer admits.
+pub(super) async fn held_log(
+    storage: &dyn BlobStorage,
+    logs: &LogCache,
+    identifier: &Identifier,
+) -> Result<HeldLog, PublicRecordRefusal> {
+    let stored = load_retained(storage, &routing_id(RoutingKind::KeyEvents, identifier)).await?;
+    held_log_from(logs, identifier, &stored)
 }
 
 /// The node's refusal of a key-event frame the log refuses (§9.10.12, the
@@ -155,89 +385,18 @@ pub(super) fn frame_refusal(refusal: &FrameRefusal) -> PublicRecordRefusal {
         | FrameRefusal::FirstHeld
         | FrameRefusal::Unanchored => code::DID_RECORD_REJECTED,
         FrameRefusal::InceptionInvalid(_) | FrameRefusal::Illegal { .. } => code::KEY_EVENT_ILLEGAL,
-        FrameRefusal::Hold(_) => code::INTERNAL_ERROR,
+        FrameRefusal::Hold(_) => {
+            return PublicRecordRefusal::internal("holding a key-event frame", refusal);
+        }
     };
     PublicRecordRefusal::new(code, refusal.to_string())
-}
-
-/// Replays the key-event frames stored for `identifier` into a
-/// [`RetainedLog`], one frame at a time, so the log's "held earliest" moment
-/// of each chain is the order the node admitted it in (§9.7.4.2 R9).
-///
-/// Stored order is (`stored_at`, `blob_id`), and `stored_at` has one-second
-/// resolution, so two frames admitted in one second can come back with an
-/// extension ahead of the frame holding its predecessor. Admission held each
-/// frame's predecessor (or the frame is an inception), so the replay admits
-/// the earliest stored frame the log anchors: that order is the admission
-/// order up to same-second ties.
-///
-/// # Errors
-///
-/// `5000` on a storage failure, a stored frame that does not decode, or a
-/// stored frame no replay order admits.
-pub(super) async fn held_log(
-    storage: &dyn BlobStorage,
-    identifier: &Identifier,
-) -> Result<HeldLog, PublicRecordRefusal> {
-    let stored = load_retained(storage, &routing_id(RoutingKind::KeyEvents, identifier)).await?;
-    let mut held = HeldLog {
-        log: RetainedLog::new(*identifier),
-        frames: Vec::with_capacity(stored.len()),
-    };
-    let mut pending = stored
-        .iter()
-        .map(|blob| {
-            decode_key_event_frame(&blob.blob)
-                .map(|frame| (blob.blob_id, frame))
-                .map_err(|e| corrupt("key-event", &e))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    while !pending.is_empty() {
-        let next = pending.iter().position(|(_, frame)| {
-            frame.first().is_some_and(|first| {
-                first.kind() == EventKind::Inception
-                    || first
-                        .sequence()
-                        .checked_sub(1)
-                        .is_some_and(|position| held.log.holds(position, first.predecessor()))
-            })
-        });
-        let Some(next) = next else {
-            return Err(PublicRecordRefusal::new(
-                code::INTERNAL_ERROR,
-                "a stored key-event frame extends no event the node holds",
-            ));
-        };
-        let (blob_id, frame) = pending.remove(next);
-        let units: Vec<&[u8]> = frame
-            .events()
-            .iter()
-            .map(scp_protocol::node::FrameEvent::unit)
-            .collect();
-        // The outcome is not read: the selection reads what the log retains.
-        held.log.admit(&units).map(drop).map_err(|e| {
-            PublicRecordRefusal::new(
-                code::INTERNAL_ERROR,
-                format!("a stored key-event frame no longer admits: {e}"),
-            )
-        })?;
-        held.frames.push((
-            blob_id,
-            frame
-                .events()
-                .iter()
-                .map(scp_protocol::node::FrameEvent::digest)
-                .collect(),
-        ));
-    }
-    Ok(held)
 }
 
 /// The key-event frames the did selection keeps: every frame carrying at
 /// least one event of a chain the log retains, accepted or suffix.
 pub(super) fn select_key_events(
     retained: &[RetainedChain],
-    frames: &[([u8; 32], Vec<[u8; 32]>)],
+    frames: &[HeldFrame],
 ) -> BTreeSet<[u8; 32]> {
     let kept: BTreeSet<[u8; 32]> = retained
         .iter()
@@ -245,8 +404,8 @@ pub(super) fn select_key_events(
         .collect();
     frames
         .iter()
-        .filter(|(_, digests)| digests.iter().any(|digest| kept.contains(digest)))
-        .map(|(blob_id, _)| *blob_id)
+        .filter(|frame| frame.digests.iter().any(|digest| kept.contains(digest)))
+        .map(|frame| frame.blob_id)
         .collect()
 }
 
@@ -278,7 +437,7 @@ pub(super) fn designated_service_keys(chains: &[RetainedChain]) -> BTreeSet<[u8;
 /// (`03-identity.md` §3.10.13 "last writer wins on the record's own
 /// sequence"). A record no held chain designates a key for is not kept.
 ///
-/// `records` are in stored order.
+/// `records` are in admission order.
 pub(super) fn select_service_records(
     records: &[([u8; 32], ServiceRecordFrame)],
     designated: &BTreeSet<[u8; 33]>,
@@ -432,23 +591,24 @@ pub(super) fn select_node_lists(records: &[HeldNodeList]) -> BTreeSet<[u8; 32]> 
     best.into_values().map(|(_, blob_id)| blob_id).collect()
 }
 
-/// Loads the node-list records at `routing_id` with each one's signing key
-/// resolved from the governor chains the node holds.
+/// The node-list records `stored` at one routing id, in admission order,
+/// with each one's signing key resolved from the governor chains the node
+/// holds.
 ///
 /// # Errors
 ///
 /// `5000` on a storage failure or a stored record that does not decode.
 pub(super) async fn held_node_lists(
     storage: &dyn BlobStorage,
-    routing_id: &[u8; 32],
+    logs: &LogCache,
+    stored: &[StoredBlob],
 ) -> Result<Vec<HeldNodeList>, PublicRecordRefusal> {
-    let stored = load_retained(storage, routing_id).await?;
     let mut chains: HashMap<Identifier, Vec<RetainedChain>> = HashMap::new();
     let mut held = Vec::with_capacity(stored.len());
     for blob in stored {
         let record = decode_node_list_frame(&blob.blob).map_err(|e| corrupt("node-list", &e))?;
         if let std::collections::hash_map::Entry::Vacant(e) = chains.entry(record.governor) {
-            let log = held_log(storage, &record.governor).await?;
+            let log = held_log(storage, logs, &record.governor).await?;
             e.insert(log.retained());
         }
         let signing = chains
@@ -483,6 +643,7 @@ pub(super) struct BoundWitness {
 /// `5000` on a storage failure.
 pub(super) async fn bound_witnesses(
     storage: &dyn BlobStorage,
+    logs: &LogCache,
     records: &[NodeListRecord],
 ) -> Result<HashMap<NodeId, BoundWitness>, PublicRecordRefusal> {
     let mut chains: HashMap<Identifier, Vec<RetainedChain>> = HashMap::new();
@@ -490,7 +651,7 @@ pub(super) async fn bound_witnesses(
     for entry in records.iter().flat_map(|record| record.entries.iter()) {
         let operator = entry.binding.operator;
         if let std::collections::hash_map::Entry::Vacant(e) = chains.entry(operator) {
-            let log = held_log(storage, &operator).await?;
+            let log = held_log(storage, logs, &operator).await?;
             e.insert(log.retained());
         }
         let admitted = chains.get(&operator).and_then(|chains| {
@@ -556,7 +717,7 @@ pub(super) fn statement_admissible(
 /// the admissible statement with the highest `observed_at`, the one held
 /// earliest on a tie. A frame is kept while one of its statements wins.
 ///
-/// `frames` are in stored order.
+/// `frames` are in admission order.
 pub(super) fn select_conflicts(
     frames: &[ConflictFrame],
     subject: &Identifier,

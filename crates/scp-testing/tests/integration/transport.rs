@@ -244,6 +244,7 @@ async fn blob_storage_roundtrip() {
         .query(
             &routing_id,
             scp_transport::native::storage::QueryCursor::All,
+            scp_transport::native::storage::LifetimeFilter::Any,
             100,
         )
         .await
@@ -263,6 +264,7 @@ async fn blob_storage_roundtrip() {
         .query(
             &routing_id,
             scp_transport::native::storage::QueryCursor::All,
+            scp_transport::native::storage::LifetimeFilter::Any,
             100,
         )
         .await

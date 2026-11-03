@@ -1131,7 +1131,16 @@ async fn handle_client_message(
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(ref_id.clone(), *blob_id, ip, tx, storage, rate_limiter).await;
+            handle_delete(
+                ref_id.clone(),
+                *blob_id,
+                ip,
+                tx,
+                storage,
+                config,
+                rate_limiter,
+            )
+            .await;
         }
         ClientMessage::Ack { .. } => {
             // ACK is fire-and-forget. No response.
@@ -1558,19 +1567,27 @@ async fn handle_delete(
     ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
     storage: &Arc<BlobStorageBackend>,
+    config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
 ) {
-    let reply =
-        match public_records::delete_blob(storage.as_ref(), &blob_id, rate_limiter, ip).await {
-            Ok(()) => RelayMessage::Ok {
-                ref_id,
-                blob_id: None,
-            },
-            Err(refusal) => {
-                let (code, msg) = refusal.into_parts();
-                RelayMessage::Err { ref_id, code, msg }
-            }
-        };
+    let reply = match public_records::delete_blob(
+        &config.public_records,
+        storage.as_ref(),
+        &blob_id,
+        rate_limiter,
+        ip,
+    )
+    .await
+    {
+        Ok(()) => RelayMessage::Ok {
+            ref_id,
+            blob_id: None,
+        },
+        Err(refusal) => {
+            let (code, msg) = refusal.into_parts();
+            RelayMessage::Err { ref_id, code, msg }
+        }
+    };
     let _ = tx.send(reply).await;
 }
 
@@ -3802,7 +3819,12 @@ mod tests {
             assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED, "{label}");
             assert!(
                 storage
-                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .query(
+                        &rid,
+                        crate::native::storage::QueryCursor::All,
+                        crate::native::storage::LifetimeFilter::Any,
+                        100
+                    )
                     .await
                     .unwrap()
                     .is_empty(),
@@ -3825,6 +3847,7 @@ mod tests {
                 .query(
                     &fixture.bridge_own_id,
                     crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
                     100
                 )
                 .await
@@ -4079,7 +4102,12 @@ mod tests {
                 );
                 assert!(
                     storage
-                        .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                        .query(
+                            &rid,
+                            crate::native::storage::QueryCursor::All,
+                            crate::native::storage::LifetimeFilter::Any,
+                            100
+                        )
                         .await
                         .unwrap()
                         .is_empty()

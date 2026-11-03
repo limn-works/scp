@@ -33,5 +33,5 @@ fn make_local_cache() -> (LocalBlobCache<InMemoryBlobStorage>, Arc<AtomicU64>) {
     (cache, clock)
 }
 
-// 11 blob store conformance tests (spec section 17.7).
+// The blob store conformance suite (spec section 17.11).
 scp_testing::blob_store_conformance!(make_local_cache());

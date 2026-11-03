@@ -722,6 +722,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
     ) -> Result<RelayMessage, WebTransportSessionError> {
         Ok(
             match public_records::delete_blob(
+                &self.config.public_records,
                 self.storage.as_ref(),
                 &blob_id,
                 &self.publish_rate_limiter,
@@ -1524,7 +1525,12 @@ mod tests {
         ));
         assert!(
             storage
-                .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                .query(
+                    &rid,
+                    crate::native::storage::QueryCursor::All,
+                    crate::native::storage::LifetimeFilter::Any,
+                    100
+                )
                 .await
                 .unwrap()
                 .is_empty()
