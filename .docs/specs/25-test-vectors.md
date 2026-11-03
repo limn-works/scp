@@ -3331,28 +3331,32 @@ SHA-256(plaintext), the pending digest:
 
 A conforming implementation accepts the signature under the reference key. It refuses it under the secondary key, after any one preimage field changes, and with `s` replaced by `n − s`.
 
-### Vector 97: the request key and an item key
+### Vector 97: the request key, the nonce and an item key
 
-`request_key_7 = MLS-Exporter("SCP request key", group_id, 16)` at epoch 7, which is `ExpandWithLabel(DeriveSecret(exporter_secret, "SCP request key"), "exported", SHA-256(group_id), 16)`, and `item_key = ExpandWithLabel(request_key_7, "SCP request item", nonce, 16)`. `ExpandWithLabel` is RFC 9420 §8's, whose `KDFLabel` carries the 2-byte length, the label prefixed with `"MLS 1.0 "`, and the context, each vector with its RFC 9420 §2.1.2 variable-length prefix.
+The item is sealed at epoch 6. `request_key_6 = MLS-Exporter("SCP request key", group_id, 32)` at epoch 6, which is `ExpandWithLabel(DeriveSecret(exporter_secret, "SCP request key"), "exported", SHA-256(group_id), 32)`. The nonce is `ExpandWithLabel(request_key_6, "SCP request nonce", signer_key_hash ‖ BE64(counter), 12)`, over Vector 96's `signer_key_hash` and `counter` 3, and `item_key = ExpandWithLabel(request_key_6, "SCP request item", nonce, 16)`. `ExpandWithLabel` is RFC 9420 §8's, whose `KDFLabel` carries the 2-byte length, the label prefixed with `"MLS 1.0 "`, and the context, each vector with its RFC 9420 §2.1.2 variable-length prefix. The request key is 32 bytes, the hash length of SHA-256, because `ExpandWithLabel` is HKDF-Expand and RFC 5869 §2.3 requires a PRK of at least that length.
 
 ```
 group_id:
   9c88b1c5fef7c07079576f126532c77a7f9ee18235af6f6181309312f67278b9
-exporter_secret (fixture), epoch 7:
-  7fb0e09117fc5d228a06b0cd621634219e9d116e034abfd1316120cbc526dcf3
+exporter_secret (fixture), epoch 6:
+  11e320174584da88c90088d0073467864954c6b708459c3e6f3f8ec39b24402c
 DeriveSecret(exporter_secret, "SCP request key"):
-  2052631ebaed918e2cf4094735b18ef29c170e05df95656c0b82853a38ed4b64
-request_key_7:
-  3b4852850f2b659f08a34b9b9861a43d
-nonce (fixture):
-  7fb47a619cd38e2645598f14
+  a9061702759705ce98460a4e2d960ed57eeac8d89eba1070385906d019c856bf
+request_key_6 (32 bytes):
+  fd0fc57e0c0dba3a2c5af9f51d4f981ed65e32b9b60d5390b282c3c02917939e
+signer_key_hash (Vector 96), counter 3:
+  c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612dd6ced2ad218
+nonce:
+  29090a06d5f3d3e48afdf346
+nonce at counter 4, the same signing key:
+  e78586fa5df868bdf22a94f0
 item_key:
-  f82e3c56f126786f962ce0cb09960e0a
+  2db8e45ad296b4d22cc2a1ee9a6c38a6
 ```
 
 ### Vector 98: the sealed item
 
-The sender pads Vector 96's plaintext to the 256-byte bucket of `09-security-model.md` §9.10.3, whose last 4 bytes are the big-endian unpadded length, and seals it under Vector 97's item key and nonce. The AAD is `"SCP-REQUEST-ITEM-V1"` ‖ `BE32(32)` ‖ `group_id` ‖ `BE64(7)` ‖ class `0x01`, re-join. The sealed item is the MessagePack array `[epoch, class, nonce, ciphertext]`.
+The sender pads Vector 96's plaintext to the 256-byte bucket of `09-security-model.md` §9.10.3, whose last 4 bytes are the big-endian unpadded length, and seals it under Vector 97's item key and nonce. The AAD is `"SCP-REQUEST-ITEM-V1"` ‖ `BE32(32)` ‖ `group_id` ‖ `BE64(6)` ‖ class `0x01`, re-join. The sealed item is the MessagePack array `[epoch, class, nonce, ciphertext]`.
 
 ```
 padded plaintext (256 bytes):
@@ -3366,28 +3370,28 @@ padded plaintext (256 bytes):
   972d912ed64a23fc1cf4ea0000000000000000000000000000000000000000eb
 aad (64 bytes):
   5343502d524551554553542d4954454d2d5631000000209c88b1c5fef7c07079
-  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000701
+  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000601
 ciphertext with tag (272 bytes):
-  abc70e0bbea04238e7f550b55a75cb054de717435448755fcc2ddafd7f141313
-  33fbd0fcbf91845ccfbe289ed36384d5f6d03b11e525fefa167c1543b74197e6
-  e40e6bc442f5accaeee04e64c3d44c6d20b5b92cd45fb3edb30d476f2fac0f9c
-  6f28704dad080825fd2c2ca4b5e5494826151b767e1a2e542bf72e3ca76435d8
-  da4d4c3985fa0a9734fd7ebb453fe7752a1c76846f9085c59cdaa6773fc4f304
-  b9f644d5c60a238a7b31a959136d51ca553dc57f43d265b20b4b529632329058
-  cad2de124c36da3804ef37e6eca2daafcb2bb3418f8e78f94e21a9aff37580ba
-  a85681c0b6c1976df70c3865c79add28daec5b00a0bfbf1de4fb8b2b2f1ffd8b
-  ce4010cd495970134b7ec6f181679674
+  1d7ca2be2fb96a574d8b16ba4d6debd4bddd7dfdba1d9bd6f747639c48da7064
+  6d0576df4e182ad72d32cce2577a670f1f45ee430b38f25f4ce445dd1322d0c7
+  4a3aeccc6d7ee8b7f725d630e8a3ec0054c65b9a5700f793767edc26e32cb2e1
+  8de36325e42727640b884e668d2bfd750eb235bc8c15b1c0d9bb3e1f6eca9b4b
+  a8a4abf2213c0722bcdbc4c99b863ae88b5f67d5ca690df191bd8c70f590c505
+  0847cb91dc36247a2cb9ed21866a5e7746a1894ca0c83c846abe853f4616a3ae
+  b328491c59abca9ec2d54a8a794e4ee8f883f6c08dbc62d4c9940d54fe1db5b6
+  d90e4dbe506b6543d49877cfda1888bfb16be6bd95a6677e74cedc4af29654b6
+  8195f6062876ddc30dddaa29e10ad849
 sealed item (292 bytes):
-  940701c40c7fb47a619cd38e2645598f14c50110abc70e0bbea04238e7f550b5
-  5a75cb054de717435448755fcc2ddafd7f14131333fbd0fcbf91845ccfbe289e
-  d36384d5f6d03b11e525fefa167c1543b74197e6e40e6bc442f5accaeee04e64
-  c3d44c6d20b5b92cd45fb3edb30d476f2fac0f9c6f28704dad080825fd2c2ca4
-  b5e5494826151b767e1a2e542bf72e3ca76435d8da4d4c3985fa0a9734fd7ebb
-  453fe7752a1c76846f9085c59cdaa6773fc4f304b9f644d5c60a238a7b31a959
-  136d51ca553dc57f43d265b20b4b529632329058cad2de124c36da3804ef37e6
-  eca2daafcb2bb3418f8e78f94e21a9aff37580baa85681c0b6c1976df70c3865
-  c79add28daec5b00a0bfbf1de4fb8b2b2f1ffd8bce4010cd495970134b7ec6f1
-  81679674
+  940601c40c29090a06d5f3d3e48afdf346c501101d7ca2be2fb96a574d8b16ba
+  4d6debd4bddd7dfdba1d9bd6f747639c48da70646d0576df4e182ad72d32cce2
+  577a670f1f45ee430b38f25f4ce445dd1322d0c74a3aeccc6d7ee8b7f725d630
+  e8a3ec0054c65b9a5700f793767edc26e32cb2e18de36325e42727640b884e66
+  8d2bfd750eb235bc8c15b1c0d9bb3e1f6eca9b4ba8a4abf2213c0722bcdbc4c9
+  9b863ae88b5f67d5ca690df191bd8c70f590c5050847cb91dc36247a2cb9ed21
+  866a5e7746a1894ca0c83c846abe853f4616a3aeb328491c59abca9ec2d54a8a
+  794e4ee8f883f6c08dbc62d4c9940d54fe1db5b6d90e4dbe506b6543d49877cf
+  da1888bfb16be6bd95a6677e74cedc4af29654b68195f6062876ddc30dddaa29
+  e10ad849
 ```
 
 A node that rewrites the class to `0x00` in the clear leaves the ciphertext unchanged, and the member's open then fails, because the AAD differs. The ciphertext the sender would have produced under class `0x00`, which differs from Vector 98's only in the tag:
@@ -3395,41 +3399,42 @@ A node that rewrites the class to `0x00` in the clear leaves the ciphertext unch
 ```
 aad, class 0x00:
   5343502d524551554553542d4954454d2d5631000000209c88b1c5fef7c07079
-  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000700
+  576f126532c77a7f9ee18235af6f6181309312f67278b9000000000000000600
 ciphertext with tag, class 0x00:
-  abc70e0bbea04238e7f550b55a75cb054de717435448755fcc2ddafd7f141313
-  33fbd0fcbf91845ccfbe289ed36384d5f6d03b11e525fefa167c1543b74197e6
-  e40e6bc442f5accaeee04e64c3d44c6d20b5b92cd45fb3edb30d476f2fac0f9c
-  6f28704dad080825fd2c2ca4b5e5494826151b767e1a2e542bf72e3ca76435d8
-  da4d4c3985fa0a9734fd7ebb453fe7752a1c76846f9085c59cdaa6773fc4f304
-  b9f644d5c60a238a7b31a959136d51ca553dc57f43d265b20b4b529632329058
-  cad2de124c36da3804ef37e6eca2daafcb2bb3418f8e78f94e21a9aff37580ba
-  a85681c0b6c1976df70c3865c79add28daec5b00a0bfbf1de4fb8b2b2f1ffd8b
-  e4993ff8540bdbcf228f7f9f56b5d75c
+  1d7ca2be2fb96a574d8b16ba4d6debd4bddd7dfdba1d9bd6f747639c48da7064
+  6d0576df4e182ad72d32cce2577a670f1f45ee430b38f25f4ce445dd1322d0c7
+  4a3aeccc6d7ee8b7f725d630e8a3ec0054c65b9a5700f793767edc26e32cb2e1
+  8de36325e42727640b884e668d2bfd750eb235bc8c15b1c0d9bb3e1f6eca9b4b
+  a8a4abf2213c0722bcdbc4c99b863ae88b5f67d5ca690df191bd8c70f590c505
+  0847cb91dc36247a2cb9ed21866a5e7746a1894ca0c83c846abe853f4616a3ae
+  b328491c59abca9ec2d54a8a794e4ee8f883f6c08dbc62d4c9940d54fe1db5b6
+  d90e4dbe506b6543d49877cfda1888bfb16be6bd95a6677e74cedc4af29654b6
+  b9d6cc8ac5fe7c8b258400f5fc5a0073
 ```
 
-A conforming implementation opens the sealed item under Vector 97's item key and refuses it under `request_key_7` itself, under the item key of any other nonce, with the class or the epoch changed, and with any ciphertext byte changed.
+A conforming implementation opens the sealed item under Vector 97's item key and refuses it under `request_key_6` itself, under the item key of any other nonce, with the class or the epoch changed, and with any ciphertext byte changed. A member that opens the item checks that its clear nonce equals the nonce that its plaintext's `signer_key_hash` and `counter` derive, and the item fails entry when it does not: the same plaintext sealed under the counter-4 nonce of Vector 97, or another plaintext sealed under Vector 97's nonce by a sender whose `signer_key_hash` or `counter` differs, opens under its item key and fails entry check 1 (`07-trust-validation-and-capabilities.md` §7.3.1.1).
 
 ### Vector 99: retained-key commitments and the joiner's secrets
 
-The governance state lists, for each retained epoch, the triple `[epoch, close_time, commitment]`, with `commitment = SHA-256("SCP-REQUEST-KEY-COMMIT" ‖ BE64(epoch) ‖ request_key)`. The Commit that opens epoch 7 and adds the joiner has t_b 1767225600. That t_b is epoch 6's close time, and `05-contexts.md` §5.9.1.1, "Commitment", gives it to epoch 7's entry too, so both entries carry it. The `0xFF06` body is the TLS presentation `ScpRequestSecrets{RetainedEpochKey epoch_keys<V>; PendingItemKey item_keys<V>}`, each vector with its RFC 9420 §2.1.2 variable-length prefix, carrying the two epoch keys and Vector 97's item key for a pending item at chain position 40.
+The Commit that opens epoch 7 and adds the joiner is the Commit for epoch 6, with t_b 1767225600, so `05-contexts.md` §5.9.1.1, "Commitment", applies with N = 6. Its `retained_request_keys` lists epoch 6 with its own t_b as close time, and epoch 5, closed at 1767225000, inside `REQUEST_ENTRY_WINDOW` of that t_b, and no entry for epoch 7, whose key the joiner derives itself from its own epoch. Each entry is the triple `[epoch, close_time, commitment]`, with `commitment = SHA-256("SCP-REQUEST-KEY-COMMIT" ‖ BE64(epoch) ‖ request_key)` over the 32-byte key. The `0xFF06` body is the TLS presentation `ScpRequestSecrets{RetainedEpochKey epoch_keys<V>; PendingItemKey item_keys<V>}`, each vector with its RFC 9420 §2.1.2 variable-length prefix, carrying the two epoch keys and Vector 97's item key for the pending item at chain position 40, which the member sealed at epoch 6 before the Commit's cover position.
 
 ```
-exporter_secret (fixture), epoch 6:
-  11e320174584da88c90088d0073467864954c6b708459c3e6f3f8ec39b24402c
-request_key_6:
-  4b04d0f7f3912b697c3fb84afedccc0c
+exporter_secret (fixture), epoch 5:
+  dada1b2f230541225309d45aefcd04e08116bc2ab691c606e8a12c423ceb62e2
+request_key_5:
+  d2c65f29abec089de2a751856b57bf99273115a81566e2c61cc0a4360749f1e3
+commitment, epoch 5:
+  7a67def3bc29dc9b6e44d60e2a72c52a53ba4ffc4b2454fc70603e8b9d6e6e53
 commitment, epoch 6:
-  cb062e2a69c82f0e5c98626e3324b97dfb2095a63c60844f8eb1a7f9c9ab3494
-commitment, epoch 7:
-  7ff4170fcdb0b49eed54dd2ac36a8408c318f9af3f2230c2505628dffc7b3bdc
-ScpRequestSecrets (91 bytes = 2-byte prefix + 2 × 32 + 1-byte prefix + 24):
-  40400000000000000006000000006955b9004b04d0f7f3912b697c3fb84afedc
-  cc0c0000000000000007000000006955b9003b4852850f2b659f08a34b9b9861
-  a43d180000000000000028f82e3c56f126786f962ce0cb09960e0a
+  95829b6c532efaae6d689bd928561978cbabc49482223e8be3fcf4dda06ddafc
+ScpRequestSecrets (123 bytes = 2-byte prefix + 2 × 48 + 1-byte prefix + 24):
+  40600000000000000005000000006955b6a8d2c65f29abec089de2a751856b57
+  bf99273115a81566e2c61cc0a4360749f1e30000000000000006000000006955
+  b900fd0fc57e0c0dba3a2c5af9f51d4f981ed65e32b9b60d5390b282c3c02917
+  939e1800000000000000282db8e45ad296b4d22cc2a1ee9a6c38a6
 ```
 
-A conforming joiner accepts the body against the two commitments and refuses it with either key changed, with the entries out of epoch order, or with a close time that differs from the governance state's.
+A conforming joiner accepts the body against the two commitments and refuses it with either key changed, with the entries out of epoch order, with an entry for epoch 7 added, or with a close time that differs from the governance state's.
 
 ### Vector 100: a head record
 

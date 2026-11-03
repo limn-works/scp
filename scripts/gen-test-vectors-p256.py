@@ -4341,13 +4341,17 @@ REQUEST_RESEAT_IDENTIFIER = fixture_identifier("re-seated member")
 REQUEST_KEY_PACKAGE = sha256(b"scp-25-request-fixture-key-package-1") + sha256(
     b"scp-25-request-fixture-key-package-2"
 )
-REQUEST_EPOCH = 7
-REQUEST_PREVIOUS_EPOCH = 6
-REQUEST_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-7")
-REQUEST_PREVIOUS_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-6")
-REQUEST_NONCE = sha256(b"scp-25-request-item-nonce")[:12]
+# The item is sealed at epoch 6, and the Commit that opens epoch 7 is the
+# Commit for epoch 6 (05 §5.9.1.1 "Commitment", N = 6): it lists epochs 5 and
+# 6, gives epoch 6 its own t_b as close time, and lists no entry for epoch 7,
+# whose key the joiner derives itself.
+REQUEST_EPOCH = 6
+REQUEST_PREVIOUS_EPOCH = 5
+REQUEST_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-6")
+REQUEST_PREVIOUS_EXPORTER_SECRET = sha256(b"scp-25-request-exporter-secret-epoch-5")
 REQUEST_ITEM_POSITION = 40
 REQUEST_COVER_TIME = 1_767_225_600
+REQUEST_PREVIOUS_CLOSE_TIME = 1_767_225_000
 HEAD_RECORD_POSITION = 44
 HEAD_RECORD_HEAD_HASH = sha256(b"scp-25-head-record-chain-entry-44")
 HEAD_RECORD_LAST_SENT_SEQ = 12
@@ -4390,7 +4394,13 @@ def mls_exporter(exporter_secret: bytes, label: bytes, context: bytes, length: i
 
 
 def request_key(exporter_secret: bytes) -> bytes:
-    return mls_exporter(exporter_secret, b"SCP request key", REQUEST_GROUP_ID, 16)
+    return mls_exporter(exporter_secret, b"SCP request key", REQUEST_GROUP_ID, 32)
+
+
+def item_nonce(epoch_key: bytes, signer_key_hash: bytes, counter: int) -> bytes:
+    return expand_with_label(
+        epoch_key, b"SCP request nonce", signer_key_hash + u64(counter), 12
+    )
 
 
 def item_key(epoch_key: bytes, nonce: bytes) -> bytes:
@@ -4479,15 +4489,24 @@ def emit_request_queue() -> None:
 
     # Vector 97: the epoch request key and the item key.
     epoch_key = request_key(REQUEST_EXPORTER_SECRET)
+    assert len(epoch_key) == 32
     derived = expand_with_label(REQUEST_EXPORTER_SECRET, b"SCP request key", b"", 32)
-    key = item_key(epoch_key, REQUEST_NONCE)
-    assert key != epoch_key
+    nonce = item_nonce(epoch_key, signer_key_hash, REQUEST_COUNTER)
+    key = item_key(epoch_key, nonce)
+    assert len(nonce) == 12 and len(key) == 16
+    # Another counter under the same signing key derives another nonce, so
+    # two items that enter never share an item key.
+    other_nonce = item_nonce(epoch_key, signer_key_hash, REQUEST_COUNTER + 1)
+    assert other_nonce != nonce
     emit_hex("vector_97.group_id", REQUEST_GROUP_ID)
     emit("vector_97.epoch", REQUEST_EPOCH)
     emit_hex("vector_97.exporter_secret", REQUEST_EXPORTER_SECRET)
     emit_hex("vector_97.derived_secret", derived)
     emit_hex("vector_97.request_key", epoch_key)
-    emit_hex("vector_97.nonce", REQUEST_NONCE)
+    emit_hex("vector_97.signer_key_hash", signer_key_hash)
+    emit("vector_97.counter", REQUEST_COUNTER)
+    emit_hex("vector_97.nonce", nonce)
+    emit_hex("vector_97.nonce_counter_4", other_nonce)
     emit_hex("vector_97.item_key", key)
 
     # Vector 98: the padded plaintext, the AAD and the sealed item.
@@ -4495,12 +4514,12 @@ def emit_request_queue() -> None:
     assert len(padded) == 256, len(padded)
     aad = request_item_aad(REQUEST_EPOCH, REQUEST_CLASS_REJOIN)
     assert len(aad) == 19 + 4 + 32 + 8 + 1, len(aad)
-    ciphertext = aes128_gcm_encrypt(key, REQUEST_NONCE, padded, aad)
+    ciphertext = aes128_gcm_encrypt(key, nonce, padded, aad)
     sealed = mp_array(
         [
             mp_uint(REQUEST_EPOCH),
             mp_uint(REQUEST_CLASS_REJOIN),
-            mp_bin(REQUEST_NONCE),
+            mp_bin(nonce),
             mp_bin(ciphertext),
         ]
     )
@@ -4515,13 +4534,13 @@ def emit_request_queue() -> None:
     emit_hex("vector_98.class_0_aad", other_aad)
     emit_hex(
         "vector_98.class_0_ciphertext",
-        aes128_gcm_encrypt(key, REQUEST_NONCE, padded, other_aad),
+        aes128_gcm_encrypt(key, nonce, padded, other_aad),
     )
 
     # Vector 99: the retained-key commitments and the 0xFF06 body.
     previous_key = request_key(REQUEST_PREVIOUS_EXPORTER_SECRET)
     retained = [
-        (REQUEST_PREVIOUS_EPOCH, REQUEST_COVER_TIME, previous_key),
+        (REQUEST_PREVIOUS_EPOCH, REQUEST_PREVIOUS_CLOSE_TIME, previous_key),
         (REQUEST_EPOCH, REQUEST_COVER_TIME, epoch_key),
     ]
     epoch_keys = b""
@@ -4531,10 +4550,10 @@ def emit_request_queue() -> None:
         emit(f"vector_99.epoch_{epoch}.close_time", close_time)
         emit_hex(f"vector_99.epoch_{epoch}.commitment", commitment)
         epoch_keys += u64(epoch) + u64(close_time) + epoch_secret
-    emit_hex("vector_99.epoch_6.exporter_secret", REQUEST_PREVIOUS_EXPORTER_SECRET)
+    emit_hex("vector_99.epoch_5.exporter_secret", REQUEST_PREVIOUS_EXPORTER_SECRET)
     item_keys = u64(REQUEST_ITEM_POSITION) + key
     secrets = mls_vector(epoch_keys) + mls_vector(item_keys)
-    assert len(secrets) == 2 + 64 + 1 + 24, len(secrets)
+    assert len(secrets) == 2 + 2 * 48 + 1 + 24, len(secrets)
     emit("vector_99.item_position", REQUEST_ITEM_POSITION)
     emit("vector_99.scp_request_secrets_len", len(secrets))
     emit_hex("vector_99.scp_request_secrets", secrets)
