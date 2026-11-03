@@ -131,42 +131,50 @@ def dep_info_inputs(msg: dict) -> set[str]:
     return inputs
 
 
-def reverse_deps() -> dict[str, set[str]]:
+def load_package_names() -> None:
     meta = json.loads(
         subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--offline"],
+            ["cargo", "metadata", "--format-version", "1", "--offline", "--no-deps"],
             cwd=ROOT,
             capture_output=True,
             text=True,
             check=True,
         ).stdout
     )
-    names = {p["id"]: p["name"] for p in meta["packages"] if p["source"] is None}
-    PACKAGE_NAMES.update(names)
-    rdeps: dict[str, set[str]] = {n: set() for n in names.values()}
-    for node in meta["resolve"]["nodes"]:
-        if node["id"] not in names:
-            continue
-        for dep in node["deps"]:
-            # A normal edge only: a dev-dependency reaches the dependent's test units alone.
-            if dep["pkg"] in names and any(k["kind"] is None for k in dep["dep_kinds"]):
-                rdeps[names[dep["pkg"]]].add(names[node["id"]])
-    closed: dict[str, set[str]] = {}
-    for n in rdeps:
-        seen: set[str] = set()
-        stack = [n]
-        while stack:
-            for r in rdeps[stack.pop()]:
-                if r not in seen:
-                    seen.add(r)
-                    stack.append(r)
-        closed[n] = seen
-    return closed
+    PACKAGE_NAMES.update({p["id"]: p["name"] for p in meta["packages"]})
 
 
-def expected_rebuilt(
-    baseline: list[dict], planted: str, rdeps: dict[str, set[str]]
-) -> set[str]:
+def dependents(pkg: str) -> set[str]:
+    """Workspace packages that link `pkg` in this build's own resolved graph.
+
+    `cargo metadata` unifies every feature of the workspace, so it lists optional
+    edges this build never activates; `cargo tree -i` over COMMANDS' package and
+    features lists only the edges cargo compiles here.
+    """
+    cmd = COMMANDS[0]
+    selection = cmd[cmd.index("-p") :]
+    out = subprocess.run(
+        [
+            "cargo",
+            "tree",
+            "--offline",
+            *selection,
+            "-e",
+            "normal,dev",
+            "--prefix",
+            "none",
+        ]
+        + ["--format", "{p}", "-i", pkg],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    workspace = set(PACKAGE_NAMES.values())
+    return {line.split()[0] for line in out.splitlines() if line.strip()} & workspace
+
+
+def expected_rebuilt(baseline: list[dict], planted: str) -> set[str]:
     direct = {unit_key(m) for m in baseline if planted in dep_info_inputs(m)}
     lib_pkgs = {
         pkg_name(m)
@@ -177,7 +185,7 @@ def expected_rebuilt(
     }
     widened = set(lib_pkgs)
     for pkg in lib_pkgs:
-        widened |= rdeps.get(pkg, set())
+        widened |= dependents(pkg)
     # A rebuilt library leaves its dependents' build-script compile units alone: those
     # link the build-dependencies, never the package's own dependencies.
     return direct | {
@@ -243,7 +251,7 @@ def flip_byte(rel: str, old: bytes, new: bytes) -> bytes:
 
 
 def main() -> int:
-    rdeps = reverse_deps()
+    load_package_names()
     baseline = build()
     print(f"baseline: {len({unit_key(m) for m in baseline})} workspace units")
     libs: dict[str, int] = {}
@@ -274,7 +282,7 @@ def main() -> int:
         ("include-byte", INCLUDE_FILE, b" ", b"\t"),
     )
     for label, rel, old, new in plants:
-        expected = expected_rebuilt(baseline, rel, rdeps)
+        expected = expected_rebuilt(baseline, rel)
         if not expected:
             fail(
                 f"{label}: no unit lists {rel} as an input, so the plant tests nothing"
