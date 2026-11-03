@@ -908,6 +908,7 @@ mod tests {
             "tls": {"kind": "plaintext"},
             "dht": {"kind": "disabled"},
             "cors_origins": {"kind": "any_origin"},
+            "node_binding": {"kind": "unbound"},
             "bind_addr": "127.0.0.1:0",
         });
         edit(&mut cfg);
@@ -1150,6 +1151,52 @@ mod tests {
         );
         node.shutdown();
         assert!(node.is_shutdown());
+    }
+
+    /// A `node_binding` of `installed` for this instance's node key starts
+    /// the node bound (`09-security-model.md` §9.6.3 step 4), and the same
+    /// binding on another instance, whose node key differs, is refused with
+    /// `SCP-STORAGE-8007`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_installs_a_binding_for_the_instance_node_key_only() {
+        use scp_ffi_common::test_helpers::{FIXTURE_NODE_URL, node_binding_json_for};
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let binding_json = rt()
+            .block_on(node_binding_json_for(
+                &crate::runtime::protocol_repository(&scp.inner).instance_storage(),
+            ))
+            .unwrap();
+        let installed = |c: &mut serde_json::Value| {
+            c["node_binding"] = serde_json::json!({
+                "kind": "installed",
+                "binding_json": binding_json,
+                "url": FIXTURE_NODE_URL,
+            });
+        };
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let node = rt()
+            .block_on(scp.node_start(start_json(&identity.did(), installed), &identity))
+            .expect("a binding of the instance's own node key installs");
+        node.shutdown();
+
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(other.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let reason = start_error(
+            rt().block_on(other.node_start(start_json(&identity.did(), installed), &identity)),
+            "foreign binding",
+        );
+        assert_coded(
+            &reason,
+            "validation",
+            codes::STORAGE_8007,
+            "foreign binding",
+        );
     }
 
     /// A relay URL on a loopback port nothing listens on, so a connect to it

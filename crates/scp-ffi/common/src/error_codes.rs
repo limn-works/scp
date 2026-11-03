@@ -2209,7 +2209,7 @@ mod server_error_tests {
                 Validation,
             ),
             (
-                E::Node(N::NodeKey(scp_node::node_key::NodeKeyStoreError::Malformed)),
+                E::Node(N::NodeKey(scp_node::node_key::NodeKeyStoreError::NoKey)),
                 STORAGE_8009,
                 Validation,
             ),

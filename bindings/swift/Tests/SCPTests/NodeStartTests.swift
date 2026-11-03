@@ -127,6 +127,13 @@
         }
     }
 
+    private func wire(_ binding: FfiNodeBinding) -> [String: Any] {
+        switch binding {
+        case .unbound: ["kind": "unbound"]
+        case let .installed(bindingJson, url): ["kind": "installed", "binding_json": bindingJson, "url": url]
+        }
+    }
+
     private func wire(_ nat: FfiNat) -> [String: Any] {
         switch nat {
         case .auto: ["kind": "auto"]
@@ -144,6 +151,7 @@
             "tls": wire(config.tls),
             "dht": wire(config.dht),
             "cors_origins": wire(config.corsOrigins),
+            "node_binding": wire(config.nodeBinding),
             "bind_addr": orNull(config.bindAddr),
             "http_bind_addr": orNull(config.httpBindAddr),
             "nat": orNull(config.nat.map(wire)),
@@ -167,6 +175,13 @@
         "dht.disabled": { _ in FfiDhtMode.disabled },
         "cors_origins.any_origin": { _ in FfiCorsOrigins.anyOrigin },
         "cors_origins.allowlist": { FfiCorsOrigins.allowlist(origins: $0["origins"] as? [String] ?? []) },
+        "node_binding.unbound": { _ in FfiNodeBinding.unbound },
+        "node_binding.installed": {
+            FfiNodeBinding.installed(
+                bindingJson: $0["binding_json"] as? String ?? "",
+                url: $0["url"] as? String ?? ""
+            )
+        },
         "nat.auto": { _ in FfiNat.auto }
     ]
 
@@ -188,6 +203,7 @@
         case let tls as FfiTlsMode where field == "tls": return wire(tls)
         case let dht as FfiDhtMode where field == "dht": return wire(dht)
         case let cors as FfiCorsOrigins where field == "cors_origins": return wire(cors)
+        case let binding as FfiNodeBinding where field == "node_binding": return wire(binding)
         case let nat as FfiNat where field == "nat": return wire(nat)
         default: throw FixtureError(description: "\(value) is not an arm of \(field)")
         }
@@ -213,6 +229,7 @@
             tls: typed(armOf("tls"), "tls"),
             dht: typed(armOf("dht"), "dht"),
             corsOrigins: typed(armOf("cors_origins"), "cors_origins"),
+            nodeBinding: typed(armOf("node_binding"), "node_binding"),
             bindAddr: typed(config["bind_addr"] as Any, "bind_addr"),
             httpBindAddr: typed(config["http_bind_addr"] as Any, "http_bind_addr"),
             nat: typed(armOf("nat"), "nat"),
@@ -234,6 +251,7 @@
             tls: .plaintext,
             dht: .disabled,
             corsOrigins: .anyOrigin,
+            nodeBinding: .unbound,
             bindAddr: bindAddr
         )
     }
@@ -331,7 +349,8 @@
                 blobStorage: full.blobStorage,
                 tls: full.tls,
                 dht: full.dht,
-                corsOrigins: full.corsOrigins
+                corsOrigins: full.corsOrigins,
+                nodeBinding: full.nodeBinding
             )
             var expected = try object(fixture["config"], "config")
             expected["identity"] = identity.did()
@@ -349,7 +368,7 @@
             let fixture = try loadWire()
             let arms = try object(fixture["arms"], "arms")
             let optionalArmFields = try object(fixture["optional_arm_fields"], "optional_arm_fields")
-            #expect(Set(arms.keys) == ["reach", "blob_storage", "tls", "dht", "cors_origins", "nat"])
+            #expect(Set(arms.keys) == ["reach", "blob_storage", "tls", "dht", "cors_origins", "node_binding", "nat"])
             for (field, entries) in arms {
                 guard let entries = entries as? [[String: Any]] else {
                     Issue.record("arms.\(field) is not a list of objects")

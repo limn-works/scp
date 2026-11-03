@@ -44,7 +44,9 @@ from scp_sdk.server import (
     DhtDisabled,
     NatAuto,
     Node,
+    NodeInstalled,
     NodeStartConfig,
+    NodeUnbound,
     ReachDomain,
     ReachLocal,
     TlsAcme,
@@ -561,6 +563,7 @@ def _config(identity: Identity, **overrides: Any) -> NodeStartConfig:
         "tls": TlsPlaintext(),
         "dht": DhtDisabled(),
         "cors_origins": CorsAnyOrigin(),
+        "node_binding": NodeUnbound(),
         "bind_addr": "127.0.0.1:0",
     }
     fields.update(overrides)
@@ -674,6 +677,8 @@ def test_node_start_config_rejects_an_identity_that_is_not_an_identity(identity:
         ("tls", ReachLocal()),
         ("reach", "local"),
         ("cors_origins", None),
+        ("node_binding", None),
+        ("node_binding", CorsAnyOrigin()),
         ("dht", {"kind": "disabled"}),
         ("nat", TlsPlaintext()),
     ],
@@ -855,6 +860,27 @@ async def test_node_start_starts_and_stops_a_node_on_the_extension(
     finally:
         await node.shutdown()
     assert node.is_shutdown is True
+
+
+@pytest.mark.asyncio
+async def test_node_start_carries_an_installed_binding_to_the_bridge(
+    scp: Any, operator: Identity
+) -> None:
+    """An installed node binding reaches the node, which refuses one that is
+    not a binding's canonical JSON with StorageError SCP-STORAGE-8007 and
+    starts no node."""
+    config = _config(
+        operator,
+        node_binding=NodeInstalled(binding_json="{}", url="wss://node.example.org/scp/v1"),
+    )
+    assert json.loads(config._to_json())["node_binding"] == {
+        "kind": "installed",
+        "binding_json": "{}",
+        "url": "wss://node.example.org/scp/v1",
+    }
+    raised = await _start_error(scp, config)
+    assert isinstance(raised, StorageError)
+    assert raised.code == "SCP-STORAGE-8007"
 
 
 @pytest.mark.asyncio

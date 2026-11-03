@@ -283,3 +283,60 @@ pub fn custody_failure(kind: scp_crypto::CustodyFailureKind) -> scp_crypto::Cust
         detail: "custody detail".to_owned(),
     }
 }
+
+/// The canonical URL [`node_binding_json_for`] binds.
+#[cfg(feature = "server")]
+pub const FIXTURE_NODE_URL: &str = "wss://node.example.org/scp/v1";
+
+/// Runs `09-security-model.md` §9.6.3 steps 1 to 3 against an instance's
+/// storage and returns the binding's canonical JSON for
+/// [`FIXTURE_NODE_URL`].
+///
+/// It does what an operator does before it starts a bound node: draws the
+/// node key a start would draw, has the node sign `possession_sig` as its
+/// local `sign-binding` command does, and signs `operator_sig` with a fixed
+/// operator key.
+///
+/// # Errors
+///
+/// The step that failed, as text.
+#[cfg(feature = "server")]
+pub async fn node_binding_json_for(
+    storage: &crate::server::InstanceStorage,
+) -> Result<String, String> {
+    use crate::server::InstanceStorage;
+    match storage {
+        InstanceStorage::InMemoryEncrypted(s) => binding_json_on(std::sync::Arc::clone(s)).await,
+        InstanceStorage::Sqlite(s) => binding_json_on(std::sync::Arc::clone(s)).await,
+    }
+}
+
+#[cfg(feature = "server")]
+async fn binding_json_on<S: scp_platform::EncryptedStorage>(storage: S) -> Result<String, String> {
+    use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
+    use scp_node::node_key;
+
+    let repository = scp_core::store::ProtocolRepository::new(storage);
+    node_key::load_or_generate(&repository)
+        .await
+        .map_err(|e| format!("draw the node key: {e}"))?;
+    let operator = scp_did::Identifier::from_bytes([0x0a; 32]);
+    let key_state_head = [0x0b; 32];
+    let url = scp_did::NodeUrl::new(FIXTURE_NODE_URL).map_err(|e| e.to_string())?;
+    let grant = node_key::sign_possession(&repository, &operator, &url, &key_state_head)
+        .await
+        .map_err(|e| format!("sign possession: {e}"))?;
+    let mut binding = scp_protocol::node::NodeBinding {
+        operator,
+        node_key: grant.node_key,
+        url_hash: grant.url_hash,
+        key_state_head,
+        operator_sig: [0; 64],
+        possession_sig: grant.possession_sig,
+    };
+    let operator_key = P256SecretKey::from_scalar_bytes(&[0x0c; 32]).map_err(|e| e.to_string())?;
+    binding.operator_sig =
+        sign_prehash_rfc6979(&operator_key, &binding.digest()).map_err(|e| e.to_string())?;
+    let json = binding.to_canonical_json().map_err(|e| e.to_string())?;
+    String::from_utf8(json).map_err(|e| e.to_string())
+}

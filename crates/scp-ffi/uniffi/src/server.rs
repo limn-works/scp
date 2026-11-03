@@ -683,6 +683,22 @@ pub enum FfiNat {
     Auto,
 }
 
+/// The node binding the node starts with; mirrors
+/// `scp_ffi_common::node_start_config::FfiNodeBinding`
+/// (`09-security-model.md` §9.6.3 step 4).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiNodeBinding {
+    /// No binding: QUERY responses carry no node proof.
+    Unbound,
+    /// The finished binding and the node's canonical URL.
+    Installed {
+        /// The binding's RFC 8785 canonical JSON.
+        binding_json: String,
+        /// The node's canonical URL.
+        url: String,
+    },
+}
+
 /// The `UniFFI` form of `scp_ffi_common::node_start_config::NodeStartConfig`.
 ///
 /// construction.md §"Node start — `NodeStartConfig`", ADR-052. `identity` is
@@ -705,6 +721,8 @@ pub struct NodeStartConfig {
     pub dht: FfiDhtMode,
     /// The HTTP CORS origins the node allows.
     pub cors_origins: FfiCorsOrigins,
+    /// The node binding the node starts with.
+    pub node_binding: FfiNodeBinding,
     /// The relay's bind address (`host:port`); the core picks one when `None`.
     #[uniffi(default = None)]
     pub bind_addr: Option<String>,
@@ -752,6 +770,7 @@ fn lower_node_start_config(
         tls,
         dht,
         cors_origins,
+        node_binding,
         bind_addr,
         http_bind_addr,
         nat,
@@ -781,6 +800,12 @@ fn lower_node_start_config(
         cors_origins: match cors_origins {
             FfiCorsOrigins::AnyOrigin => common::FfiCorsOrigins::AnyOrigin {},
             FfiCorsOrigins::Allowlist { origins } => common::FfiCorsOrigins::Allowlist { origins },
+        },
+        node_binding: match node_binding {
+            FfiNodeBinding::Unbound => common::FfiNodeBinding::Unbound {},
+            FfiNodeBinding::Installed { binding_json, url } => {
+                common::FfiNodeBinding::Installed { binding_json, url }
+            }
         },
         bind_addr: parse_addr("bind_addr", bind_addr)?,
         http_bind_addr: parse_addr("http_bind_addr", http_bind_addr)?,
@@ -1208,6 +1233,7 @@ mod tests {
             tls: FfiTlsMode::Plaintext,
             dht: FfiDhtMode::Disabled,
             cors_origins: FfiCorsOrigins::AnyOrigin,
+            node_binding: FfiNodeBinding::Unbound,
             bind_addr: Some("127.0.0.1:0".to_owned()),
             http_bind_addr: None,
             nat: None,
@@ -1444,6 +1470,49 @@ mod tests {
         );
         node.shutdown();
         assert!(node.is_shutdown());
+    }
+
+    /// A `node_binding` of `Installed` for this instance's node key starts
+    /// the node bound (`09-security-model.md` §9.6.3 step 4), and the same
+    /// binding on another instance, whose node key differs, is refused with
+    /// `SCP-STORAGE-8007`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_installs_a_binding_for_the_instance_node_key_only() {
+        use scp_ffi_common::test_helpers::{FIXTURE_NODE_URL, node_binding_json_for};
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let binding_json = rt()
+            .block_on(node_binding_json_for(
+                &scp.inner.protocol_repository().instance_storage(),
+            ))
+            .unwrap();
+        let installed = || FfiNodeBinding::Installed {
+            binding_json: binding_json.clone(),
+            url: FIXTURE_NODE_URL.to_owned(),
+        };
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let mut cfg = start_config(identity);
+        cfg.node_binding = installed();
+        let node = rt()
+            .block_on(scp.node_start(cfg))
+            .expect("a binding of the instance's own node key installs");
+        node.shutdown();
+
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(other.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let mut cfg = start_config(identity);
+        cfg.node_binding = installed();
+        let err = start_error(rt().block_on(other.node_start(cfg)), "foreign binding");
+        assert_eq!(
+            class_and_code(&err),
+            ("storage", codes::STORAGE_8007),
+            "{err:?}"
+        );
     }
 
     /// A relay URL on a loopback port nothing listens on, so a connect to it

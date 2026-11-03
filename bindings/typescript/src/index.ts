@@ -213,6 +213,7 @@ export type {
   CorsOrigins,
   DhtMode,
   Nat,
+  NodeBinding,
   NodeStartConfig,
   Reach,
   TlsMode,

@@ -88,6 +88,18 @@ export type CorsOrigins =
   | { readonly kind: "allowlist"; readonly origins: readonly string[] };
 
 /**
+ * The node binding the node starts with (spec §9.6.3 step 4). `unbound` keeps
+ * the node key and sends no node proof; `installed` carries the binding's
+ * RFC 8785 canonical JSON and the node's canonical URL, and the node refuses
+ * at start a binding whose node key is not its own, whose `possession_sig`
+ * fails, or whose `url_hash` is not the SHA-256 of `url`. Arm fields keep the
+ * bridge's wire names.
+ */
+export type NodeBinding =
+  | { readonly kind: "unbound" }
+  | { readonly kind: "installed"; readonly binding_json: string; readonly url: string };
+
+/**
  * NAT strategy. The core's `Custom` and `Tuned` arms carry trait objects and
  * are not exposed.
  */
@@ -129,6 +141,11 @@ export interface NodeStartConfig {
    * would mean the permissive `*` origin.
    */
   readonly corsOrigins: CorsOrigins;
+  /**
+   * The node binding the node starts with. Required, so no binding is left
+   * out by omission.
+   */
+  readonly nodeBinding: NodeBinding;
   /** Relay bind address such as `"127.0.0.1:0"`; absent binds `127.0.0.1:0`. */
   readonly bindAddr?: string | null;
   /** Public HTTP bind address; absent selects the core default. */
@@ -179,6 +196,7 @@ export const NODE_START_ARMS: {
   readonly tls: ArmTable<TlsMode>;
   readonly dht: ArmTable<DhtMode>;
   readonly cors_origins: ArmTable<CorsOrigins>;
+  readonly node_binding: ArmTable<NodeBinding>;
   readonly nat: ArmTable<Nat>;
 } = {
   reach: { domain: { domain: "string" }, nat_traversal: {}, local: {} },
@@ -186,6 +204,7 @@ export const NODE_START_ARMS: {
   tls: { self_signed: {}, acme: { email: "optional_string" }, plaintext: {}, terminated: {} },
   dht: { disabled: {} },
   cors_origins: { any_origin: {}, allowlist: { origins: "string_list" } },
+  node_binding: { unbound: {}, installed: { binding_json: "string", url: "string" } },
   nat: { auto: {} },
 };
 
@@ -221,6 +240,7 @@ const FIELD_SPECS: {
   tls: { wire: "tls", type: "arm", optional: false },
   dht: { wire: "dht", type: "arm", optional: false },
   corsOrigins: { wire: "cors_origins", type: "arm", optional: false },
+  nodeBinding: { wire: "node_binding", type: "arm", optional: false },
   bindAddr: { wire: "bind_addr", type: "string", optional: true },
   httpBindAddr: { wire: "http_bind_addr", type: "string", optional: true },
   nat: { wire: "nat", type: "arm", optional: true },

@@ -12014,6 +12014,10 @@ public struct NodeStartConfig {
      */
     public var corsOrigins: FfiCorsOrigins
     /**
+     * The node binding the node starts with.
+     */
+    public var nodeBinding: FfiNodeBinding
+    /**
      * The relay's bind address (`host:port`); the core picks one when `None`.
      */
     public var bindAddr: String?
@@ -12052,6 +12056,9 @@ public struct NodeStartConfig {
          * The HTTP CORS origins the node allows.
          */corsOrigins: FfiCorsOrigins, 
         /**
+         * The node binding the node starts with.
+         */nodeBinding: FfiNodeBinding, 
+        /**
          * The relay's bind address (`host:port`); the core picks one when `None`.
          */bindAddr: String? = nil, 
         /**
@@ -12069,6 +12076,7 @@ public struct NodeStartConfig {
         self.tls = tls
         self.dht = dht
         self.corsOrigins = corsOrigins
+        self.nodeBinding = nodeBinding
         self.bindAddr = bindAddr
         self.httpBindAddr = httpBindAddr
         self.nat = nat
@@ -12095,6 +12103,7 @@ public struct FfiConverterTypeNodeStartConfig: FfiConverterRustBuffer {
                 tls: FfiConverterTypeFfiTlsMode.read(from: &buf), 
                 dht: FfiConverterTypeFfiDhtMode.read(from: &buf), 
                 corsOrigins: FfiConverterTypeFfiCorsOrigins.read(from: &buf), 
+                nodeBinding: FfiConverterTypeFfiNodeBinding.read(from: &buf), 
                 bindAddr: FfiConverterOptionString.read(from: &buf), 
                 httpBindAddr: FfiConverterOptionString.read(from: &buf), 
                 nat: FfiConverterOptionTypeFfiNat.read(from: &buf), 
@@ -12109,6 +12118,7 @@ public struct FfiConverterTypeNodeStartConfig: FfiConverterRustBuffer {
         FfiConverterTypeFfiTlsMode.write(value.tls, into: &buf)
         FfiConverterTypeFfiDhtMode.write(value.dht, into: &buf)
         FfiConverterTypeFfiCorsOrigins.write(value.corsOrigins, into: &buf)
+        FfiConverterTypeFfiNodeBinding.write(value.nodeBinding, into: &buf)
         FfiConverterOptionString.write(value.bindAddr, into: &buf)
         FfiConverterOptionString.write(value.httpBindAddr, into: &buf)
         FfiConverterOptionTypeFfiNat.write(value.nat, into: &buf)
@@ -15319,6 +15329,123 @@ public func FfiConverterTypeWakeFailureInfo_lower(_ value: WakeFailureInfo) -> R
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What the platform reported for a `largeBlob` write.
+ *
+ * It is a platform fact, never a clearing act. The bridge maps each fact to
+ * the act that clears a write that did not land (`09-security-model.md`
+ * §9.7.4.2 R10; ADR-054 §Assertion-arm and store-set host interfaces), so
+ * the host never picks one.
+ */
+
+public enum BlobWriteOutcome {
+    
+    /**
+     * The platform reported `largeBlob: { written: true }`.
+     */
+    case landed
+    /**
+     * The platform reported `largeBlob: { written: false }` with no error.
+     * The bridge reads it as the authenticator's large-blob array at
+     * capacity, cleared by removing the credential that consumed it. A
+     * credential that does not support `largeBlob` also reports it; its
+     * store never holds a handle or a marker, so it never stops a ceremony.
+     */
+    case notWritten
+    /**
+     * The assertion returned no `largeBlob` output: the client or route did
+     * not process the extension. The bridge reads it as cleared by a retry
+     * through a route that processes it, never by a plain retry.
+     */
+    case noOutput
+    /**
+     * The user declined or cancelled the verification gesture. The bridge
+     * reads it as cleared by a retry.
+     */
+    case verificationDeclined(
+        /**
+         * The cause the platform reported, where it reported one.
+         */cause: String?
+    )
+}
+
+
+#if compiler(>=6)
+extension BlobWriteOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBlobWriteOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = BlobWriteOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BlobWriteOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .landed
+        
+        case 2: return .notWritten
+        
+        case 3: return .noOutput
+        
+        case 4: return .verificationDeclined(cause: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: BlobWriteOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .landed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .notWritten:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .noOutput:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .verificationDeclined(cause):
+            writeInt(&buf, Int32(4))
+            FfiConverterOptionString.write(cause, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobWriteOutcome_lift(_ buf: RustBuffer) throws -> BlobWriteOutcome {
+    return try FfiConverterTypeBlobWriteOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobWriteOutcome_lower(_ value: BlobWriteOutcome) -> RustBuffer {
+    return FfiConverterTypeBlobWriteOutcome.lower(value)
+}
+
+
+extension BlobWriteOutcome: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Ceiling mutability policy. Declared at creation, immutable thereafter.
  *
  * See ADR-008 and spec §5.3.
@@ -16333,6 +16460,97 @@ public func FfiConverterTypeFfiNat_lower(_ value: FfiNat) -> RustBuffer {
 
 
 extension FfiNat: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The node binding the node starts with; mirrors
+ * `scp_ffi_common::node_start_config::FfiNodeBinding`
+ * (`09-security-model.md` §9.6.3 step 4).
+ */
+
+public enum FfiNodeBinding {
+    
+    /**
+     * No binding: QUERY responses carry no node proof.
+     */
+    case unbound
+    /**
+     * The finished binding and the node's canonical URL.
+     */
+    case installed(
+        /**
+         * The binding's RFC 8785 canonical JSON.
+         */bindingJson: String, 
+        /**
+         * The node's canonical URL.
+         */url: String
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiNodeBinding: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiNodeBinding: FfiConverterRustBuffer {
+    typealias SwiftType = FfiNodeBinding
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNodeBinding {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unbound
+        
+        case 2: return .installed(bindingJson: try FfiConverterString.read(from: &buf), url: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiNodeBinding, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unbound:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .installed(bindingJson,url):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(bindingJson, into: &buf)
+            FfiConverterString.write(url, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNodeBinding_lift(_ buf: RustBuffer) throws -> FfiNodeBinding {
+    return try FfiConverterTypeFfiNodeBinding.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNodeBinding_lower(_ value: FfiNodeBinding) -> RustBuffer {
+    return FfiConverterTypeFfiNodeBinding.lower(value)
+}
+
+
+extension FfiNodeBinding: Equatable, Hashable {}
 
 
 
@@ -17704,6 +17922,236 @@ extension WakeOutcome: Equatable, Hashable {}
 
 
 
+
+
+
+
+/**
+ * Callback for the pre-rotation credential's `WebAuthn` `largeBlob` store.
+ *
+ * It is one member of the credential's store set (`09-security-model.md`
+ * §9.7.4.2 R10; ADR-054 §Assertion-arm and store-set host interfaces).
+ *
+ * The Swift and Kotlin SDKs implement it over the platform passkey API's
+ * `largeBlob` extension.
+ *
+ * The bridge encodes and decodes every byte; the host passes them through
+ * unread, and reads and writes the store of `credential_id` and no other.
+ *
+ * Host contract (ADR-054):
+ * - `write_blob` reports what the platform reported and never picks a
+ * clearing act. It returns [`BlobWriteOutcome::Landed`] only where the
+ * platform reports `written: true`; the store set reads no `largeBlob`
+ * write back, so a false `Landed` leaves a member behind the ceremony.
+ * `written: false` with no error is `NotWritten`, a missing `largeBlob`
+ * output is `NoOutput`, and a declined or cancelled verification gesture
+ * is `VerificationDeclined`.
+ * - `read_blob` returns `nil`/`null` only where the platform reports the
+ * store holds nothing, and throws on every other failure.
+ * - Freshness (ADR-054, one rule for both store-set hosts): `read_blob`
+ * returns the platform's current value, read through a `largeBlob` read
+ * assertion on that call, and never a cache or the bytes of the host's
+ * last write.
+ * - A host that cannot answer throws `ScpError.Storage` with the code
+ * `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+ * any other error a callback throws, and the bridge reads only the text.
+ * A thrown `write_blob` reaches the store set as a write that did not
+ * land, cleared by a retry.
+ *
+ * # SAFETY: Thread execution context
+ *
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+ * NOT assume main-thread execution.
+ *
+ * See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+ */
+public protocol CredentialBlobProvider: AnyObject, Sendable {
+    
+    /**
+     * Read the bytes `credential_id`'s `largeBlob` store holds, or `None`
+     * where it holds none.
+     */
+    func readBlob(credentialId: Data) async throws  -> Data?
+    
+    /**
+     * Write `entry` into `credential_id`'s `largeBlob` store and report
+     * what the platform reported.
+     */
+    func writeBlob(credentialId: Data, entry: Data) async throws  -> BlobWriteOutcome
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceCredentialBlobProvider {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceCredentialBlobProvider] = [UniffiVTableCallbackInterfaceCredentialBlobProvider(
+        readBlob: { (
+            uniffiHandle: UInt64,
+            credentialId: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCredentialBlobProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.readBlob(
+                     credentialId: try FfiConverterData.lift(credentialId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterOptionData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        writeBlob: { (
+            uniffiHandle: UInt64,
+            credentialId: RustBuffer,
+            entry: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> BlobWriteOutcome in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCredentialBlobProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.writeBlob(
+                     credentialId: try FfiConverterData.lift(credentialId),
+                     entry: try FfiConverterData.lift(entry)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: BlobWriteOutcome) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterTypeBlobWriteOutcome_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceCredentialBlobProvider.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface CredentialBlobProvider: handle missing in uniffiFree")
+            }
+        }
+    )]
+}
+
+private func uniffiCallbackInitCredentialBlobProvider() {
+    uniffi_scp_ffi_uniffi_fn_init_callback_vtable_credentialblobprovider(UniffiCallbackInterfaceCredentialBlobProvider.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceCredentialBlobProvider {
+    fileprivate static let handleMap = UniffiHandleMap<CredentialBlobProvider>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceCredentialBlobProvider : FfiConverter {
+    typealias SwiftType = CredentialBlobProvider
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceCredentialBlobProvider_lift(_ handle: UInt64) throws -> CredentialBlobProvider {
+    return try FfiConverterCallbackInterfaceCredentialBlobProvider.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceCredentialBlobProvider_lower(_ v: CredentialBlobProvider) -> UInt64 {
+    return FfiConverterCallbackInterfaceCredentialBlobProvider.lower(v)
+}
 
 
 
@@ -19350,6 +19798,229 @@ public func FfiConverterCallbackInterfaceStorageProvider_lift(_ handle: UInt64) 
 #endif
 public func FfiConverterCallbackInterfaceStorageProvider_lower(_ v: StorageProvider) -> UInt64 {
     return FfiConverterCallbackInterfaceStorageProvider.lower(v)
+}
+
+
+
+
+/**
+ * Callback for the platform account's synced store.
+ *
+ * It is the platform-account member of the pre-rotation credential's store
+ * set (`09-security-model.md` §9.7.4.2 R10; ADR-054 §Assertion-arm and
+ * store-set host interfaces).
+ *
+ * Swift SDK: a synchronizable generic-password Keychain item
+ * (`kSecAttrSynchronizable`) in the application's access group. A host
+ * whose row of the R10 platform-account host table is Absent (Android, the
+ * browser, headless) implements none.
+ *
+ * The bridge forms every key and encodes every value; the host stores the
+ * bytes unread.
+ *
+ * Host contract (ADR-054):
+ * - `get` returns `nil`/`null` only where the platform reports the item
+ * absent, and throws on every other platform failure, so a store that
+ * failed to answer is never read as an empty one.
+ * - Freshness (ADR-054, one rule for both store-set hosts): `get` returns
+ * the platform's current value, read from the platform store on that
+ * call, and never a cache: the store set merges every member's current
+ * value and reads each write back to check it.
+ * - `put` returns only after the platform reports the item stored.
+ * - A host that cannot answer throws `ScpError.Storage` with the code
+ * `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+ * any other error a callback throws, and the bridge reads only the text.
+ *
+ * # SAFETY: Thread execution context
+ *
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+ * NOT assume main-thread execution.
+ *
+ * See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+ */
+public protocol SyncedStoreProvider: AnyObject, Sendable {
+    
+    /**
+     * Read the bytes stored under `key`, or `None` where the platform
+     * reports the item absent.
+     */
+    func get(key: String) async throws  -> Data?
+    
+    /**
+     * Store `value` under `key`, replacing any value there.
+     */
+    func put(key: String, value: Data) async throws 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceSyncedStoreProvider {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceSyncedStoreProvider] = [UniffiVTableCallbackInterfaceSyncedStoreProvider(
+        get: { (
+            uniffiHandle: UInt64,
+            key: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceSyncedStoreProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.get(
+                     key: try FfiConverterString.lift(key)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterOptionData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        put: { (
+            uniffiHandle: UInt64,
+            key: RustBuffer,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceSyncedStoreProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.put(
+                     key: try FfiConverterString.lift(key),
+                     value: try FfiConverterData.lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceSyncedStoreProvider.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface SyncedStoreProvider: handle missing in uniffiFree")
+            }
+        }
+    )]
+}
+
+private func uniffiCallbackInitSyncedStoreProvider() {
+    uniffi_scp_ffi_uniffi_fn_init_callback_vtable_syncedstoreprovider(UniffiCallbackInterfaceSyncedStoreProvider.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceSyncedStoreProvider {
+    fileprivate static let handleMap = UniffiHandleMap<SyncedStoreProvider>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceSyncedStoreProvider : FfiConverter {
+    typealias SwiftType = SyncedStoreProvider
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceSyncedStoreProvider_lift(_ handle: UInt64) throws -> SyncedStoreProvider {
+    return try FfiConverterCallbackInterfaceSyncedStoreProvider.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceSyncedStoreProvider_lower(_ v: SyncedStoreProvider) -> UInt64 {
+    return FfiConverterCallbackInterfaceSyncedStoreProvider.lower(v)
 }
 
 #if swift(>=5.8)
@@ -21712,6 +22383,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_testingcallbackcustody_new() != 20187) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_credentialblobprovider_read_blob() != 41109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_credentialblobprovider_write_blob() != 6121) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21775,12 +22452,20 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_exists() != 22544) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_syncedstoreprovider_get() != 44528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_syncedstoreprovider_put() != 17005) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitCredentialBlobProvider()
     uniffiCallbackInitDeviceAttestationProvider()
     uniffiCallbackInitKeyCustodyProvider()
     uniffiCallbackInitMessageListener()
     uniffiCallbackInitPushProvider()
     uniffiCallbackInitStorageProvider()
+    uniffiCallbackInitSyncedStoreProvider()
     return InitializationResult.ok
 }()
 

@@ -196,6 +196,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 | `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
 | `dht` | `FfiDhtMode{Disabled}` | required; `Disabled` only, by keri's scope ruling of 2026-10-13 |
 | `cors_origins` | `FfiCorsOrigins{AnyOrigin, Allowlist{origins}}` | required |
+| `node_binding` | `FfiNodeBinding{Unbound, Installed{binding_json, url}}` | required |
 | `bind_addr`, `http_bind_addr` | `Option<SocketAddr>` | optional |
 | `nat` | `{Auto}` | optional |
 | `projection_rate_limit` | `Option<u32>`, greater than 0 | optional |
@@ -206,6 +207,7 @@ Field rules:
 - **No storage field.** `node_start` takes the `SCP` instance's own storage handle (`17-persistence-and-storage.md` §17.6, first-party storage adapters). A second store on the same directory fails, because `SqliteStorage::new` takes a non-blocking exclusive lock on `scp.db.lock` in that directory. When the instance store is in-memory, `node_start` logs a warning that the node loses all state on drop.
 - **`tls` and `dht` are required at the FFI layer, although the core `NodeConfig` defaults both.** The PyO3 and napi-rs bridges read untyped input, so an optional field with a default would let a misspelled key select that default.
 - **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it. The listed arm is `Allowlist`, not `List`: UniFFI generates a Kotlin data class per data arm, and a class named `List` shadows `kotlin.collections.List` in its own `origins` field, so the Kotlin bindings do not compile.
+- **`node_binding` is required, so no node starts unbound because a field was omitted.** `Unbound` starts the node with its node key and no binding, and its QUERY responses carry no node proof (`09-security-model.md` §9.10.12). `Installed` carries a binding's RFC 8785 canonical JSON and the node's canonical URL, the two values `SCP_NODE_BINDING` and `SCP_NODE_URL` give the `scp-node` binary (§9.6.3 step 4). The bridge reads both with `scp_node::node_key::binding_slot_from`, the same function the binary uses, so JSON that is not a binding or a URL that is not canonical returns `SCP-STORAGE-8007` before any file exists. At start the node refuses a binding whose `node_key` is not its own, whose `possession_sig` fails, or whose `url_hash` is not the SHA-256 of `url`, also with `SCP-STORAGE-8007`. Arm fields keep the wire names, so the TypeScript arm is `{kind: "installed", binding_json, url}`.
 - **Validation finishes before any directory or file exists.** `node_start` runs `scp_node::validate_reach_and_tls` and the field checks first, and creates the blob directory and files only after both pass.
 - **`internal_relay_url` uses the relay's bound address,** not a hardcoded `ws://127.0.0.1:{port}`.
 

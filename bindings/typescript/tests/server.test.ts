@@ -291,6 +291,7 @@ function localConfig(
     tls: { kind: "plaintext" },
     dht: { kind: "disabled" },
     corsOrigins: { kind: "any_origin" },
+    nodeBinding: { kind: "unbound" },
     bindAddr: "127.0.0.1:0",
     ...overrides,
   };
@@ -400,6 +401,18 @@ describe("NodeStartConfig wire shape (SCP-324)", () => {
     ["a fractional rate limit", { projectionRateLimit: 1.5 }],
     ["a rate limit above u32", { projectionRateLimit: 2 ** 32 }],
     ["an origin list with a non-string", { corsOrigins: { kind: "allowlist", origins: [1] } }],
+    [
+      "an installed binding without its URL",
+      { nodeBinding: { kind: "installed", binding_json: "{}" } },
+    ],
+    [
+      "an unbound binding with a URL",
+      { nodeBinding: { kind: "unbound", url: "wss://n.example.org" } },
+    ],
+    [
+      "a binding JSON that is not a string",
+      { nodeBinding: { kind: "installed", binding_json: {}, url: "wss://n.example.org" } },
+    ],
   ])("rejects %s with SCP-STORAGE-8007", (_label, override) => {
     const { scp } = mountMockScp();
     const config = { ...localConfig(mockIdentity(scp)), ...override };

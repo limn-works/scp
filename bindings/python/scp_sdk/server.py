@@ -207,6 +207,31 @@ Nat: TypeAlias = NatAuto
 
 
 @dataclass(frozen=True, kw_only=True)
+class NodeUnbound(_Arm):
+    """No node binding: the node still keeps its node key, and its QUERY
+    responses carry no node proof (spec §9.10.12)."""
+
+    _KIND: ClassVar[str] = "unbound"
+
+
+@dataclass(frozen=True, kw_only=True)
+class NodeInstalled(_Arm):
+    """A finished node binding and the node's canonical URL (spec §9.6.3 step
+    4). ``binding_json`` is the binding's RFC 8785 canonical JSON; at start the
+    node refuses a binding whose node key is not its own, whose
+    ``possession_sig`` fails, or whose ``url_hash`` is not the SHA-256 of
+    ``url``."""
+
+    _KIND: ClassVar[str] = "installed"
+    binding_json: str
+    url: str
+
+
+#: The node binding the node starts with.
+NodeBinding: TypeAlias = NodeUnbound | NodeInstalled
+
+
+@dataclass(frozen=True, kw_only=True)
 class NodeStartConfig:
     """The flat config :meth:`scp_sdk.SCP.node_start` starts a production node
     from (construction.md §"Node start — ``NodeStartConfig``", ADR-052).
@@ -233,6 +258,10 @@ class NodeStartConfig:
         dht: DID-document publication; :class:`DhtDisabled` is the only arm.
         cors_origins: CORS origins for the public endpoints. Required, because
             an absent list would mean the permissive ``*`` origin.
+        node_binding: The node binding the node starts with:
+            :class:`NodeUnbound`, or :class:`NodeInstalled` with the binding's
+            canonical JSON and the node's canonical URL. Required, so no
+            binding is left out by omission.
         bind_addr: Relay bind address such as ``"127.0.0.1:0"``; ``None``
             binds ``127.0.0.1:0``.
         http_bind_addr: Public HTTP bind address; ``None`` selects the core
@@ -248,6 +277,7 @@ class NodeStartConfig:
     tls: TlsMode
     dht: DhtMode
     cors_origins: CorsOrigins
+    node_binding: NodeBinding
     bind_addr: str | None = None
     http_bind_addr: str | None = None
     nat: Nat | None = None
