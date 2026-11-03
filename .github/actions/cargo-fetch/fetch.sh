@@ -35,8 +35,8 @@
 # compiler to resolve), after `Swatinem/rust-cache` (which restores `~/.cargo/registry`, so a
 # warm fetch downloads only what changed, and which hashes every `CARGO*` variable its step
 # sees into its cache key, so `CARGO_NET_OFFLINE` must not exist yet when it runs), and
-# before every other cargo command. A `cargo install` runs before it, because installing a
-# tool from crates.io needs the network. `scripts/tests/ci-gate/ci_gate_selftest.py` check
+# before every other cargo command. A `cargo install` runs before it, because building a
+# tool from its pinned source downloads the crates that source's Cargo.lock names. `scripts/tests/ci-gate/ci_gate_selftest.py` check
 # `offline-cargo` holds every workflow job to that order.
 #
 # FAILURE IS TYPED, NEVER DEGRADED. Each case below exits non-zero with a `::error::` line
@@ -50,9 +50,10 @@
 #
 # THE `cargo-home` OUTPUT. The step also writes the directory the packages landed in,
 # `$CARGO_HOME` or `$HOME/.cargo`, to `$GITHUB_OUTPUT`. A step that builds inside a container
-# (`PyO3/maturin-action` on a manylinux leg) receives `CARGO_NET_OFFLINE` but none of the
-# runner's files, so it mounts `<cargo-home>/registry` into the container; without that
-# mount the offline build inside it finds no package and fails.
+# (job python-wheels-linux in build-matrix.yml) passes `CARGO_NET_OFFLINE` in, but the
+# container sees none of the runner's files, so it mounts `<cargo-home>/registry` and
+# `<cargo-home>/git` into the container; without both mounts the offline build inside it
+# finds no registry package or git dependency and fails.
 #
 # Usage: fetch.sh <working-directory> [toolchain]
 # Environment:

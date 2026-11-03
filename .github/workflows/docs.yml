@@ -108,8 +108,8 @@ jobs:
     outputs:
       docs: ${{ steps.filter.outputs.docs == 'true' || steps.filter.outputs.toolchain == 'true' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         with:
           filters: |
@@ -159,7 +159,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Every crate Cargo.lock names, downloaded once with retries; `cargo doc` below
       # runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
       - uses: ./.github/actions/cargo-fetch
@@ -167,10 +167,11 @@ jobs:
       # interpreter PYO3_PYTHON names and fails when its version is newer than the
       # newest one pyo3 supports. Without the pin it reads the runner image's default
       # `python3`, which moved to 3.14 past pyo3 0.24's 3.13 ceiling.
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/toolcache-setup
         id: python
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Point PyO3 at Python 3.12
         run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
       - name: Generate rustdoc
@@ -189,7 +190,7 @@ jobs:
         run: |
           cargo doc --workspace --no-deps --document-private-items \
             --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-node/cloud-blobs,scp-relay/cloud-blobs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-rust
           path: target/doc/
@@ -203,12 +204,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - name: Install doc dependencies
-        run: pip install sphinx furo sphinx-autodoc-typehints
+        run: pip install --require-hashes -r .github/requirements/sphinx.txt
       - name: Generate docs
         working-directory: bindings/python
         run: |
@@ -217,7 +219,7 @@ jobs:
           else
             echo "::notice::Sphinx conf.py not found -- skipping Python docs"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-python
           path: bindings/python/docs/_build/html/
@@ -232,15 +234,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/pinned-tool
+        with:
+          tool: bun
       - name: Install dependencies
         working-directory: bindings/typescript
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: Generate docs
         working-directory: bindings/typescript
-        run: bunx typedoc
-      - uses: actions/upload-artifact@v4
+        run: bun run typedoc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-typescript
           path: bindings/typescript/docs/
@@ -255,15 +259,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
+      # this job has no setup-gradle, whose `validate-wrappers` does the same check.
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: temurin
-          java-version: "17"
+          tool: java
+          version: "17"
       - name: Generate Dokka
         working-directory: bindings/kotlin
         run: ./gradlew :scp-kt:dokkaHtml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-kotlin
           path: bindings/kotlin/scp-kt/build/dokka/html/
@@ -282,7 +289,7 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - name: Download all doc artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: docs-*
           path: site/
@@ -306,13 +313,13 @@ jobs:
           HTML
 
       - name: Setup Pages
-        uses: actions/configure-pages@v4
+        uses: actions/configure-pages@1f0c5cde4bc74cd7e1254d0cb4de8d49e9068c7d # v4.0.0
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: site/
 
       - name: Deploy to GitHub Pages
         id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

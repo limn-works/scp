@@ -65,10 +65,11 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -80,7 +81,10 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # rust-test, one command per leg.
       - name: Compile rust-test's legs
         if: steps.cache.outputs.cache-hit != 'true'
@@ -135,10 +139,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -163,10 +168,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -203,10 +209,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -221,7 +228,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin
+          pip install --require-hashes -r .github/requirements/maturin.txt
           cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing
           cd bindings/python
           maturin develop --profile ci-bridge --features testing
@@ -231,11 +238,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/pinned-tool
         with:
-          node-version: "22"
+          tool: bun
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: node
+          version: "22"
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
@@ -246,17 +256,29 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
+      # wasm-pack downloads wasm-bindgen from GitHub unchecked unless PATH holds the
+      # version Cargo.lock names, and wasm-opt unless PATH holds one
+      # (src/install/mod.rs:55-90 and src/wasm_opt.rs at 0.14.0). taiki-e checks both
+      # binaries against its manifest's SHA-256 and pinned-tool checks wasm-opt, so
+      # wasm-pack downloads nothing. Check `verified-download` of
+      # scripts/tests/ci-gate/ci_gate_selftest.py holds every wasm-pack install to this.
       - if: steps.cache.outputs.cache-hit != 'true'
-        name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+        name: Install wasm-pack and wasm-bindgen
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: wasm-pack@0.14.0
+          fallback: none
+          tool: wasm-pack@0.14.0,wasm-bindgen@0.2.114
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Install wasm-opt
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: wasm-opt
       # typescript-wasm-check and scaffold-typescript-web-check.
       - name: Build the wasm package
         if: steps.cache.outputs.cache-hit != 'true'
         working-directory: bindings/typescript-wasm
         run: |
-          bun install
+          bun install --frozen-lockfile
           bun run build
       # wasm-protocol and wasm-test: `-- --list` builds the wasm test binaries and runs
       # none.
@@ -281,10 +303,11 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
@@ -308,10 +331,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -321,7 +345,10 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # rust-test-optional-features's `sqlite-without-memory-management` leg, under the
       # same LIBSQLITE3_FLAGS, which libsqlite3-sys's build script reads.
       - name: Compile scp-sqlite-pools against a SQLite built without ENABLE_MEMORY_MANAGEMENT
@@ -338,10 +365,16 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # No runner image caches CPython 3.10; pinned-tool installs the package
+      # actions/setup-python would download, after checking its digest.
+      - uses: ./.github/actions/pinned-tool
         with:
-          python-version: |
+          tool: python3.10
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: |
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
@@ -354,7 +387,7 @@ jobs:
         uses: ./.github/actions/cargo-fetch
       - name: Install maturin
         if: steps.cache.outputs.cache-hit != 'true'
-        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
+        run: python3.12 -m pip install --require-hashes -r .github/requirements/maturin.txt
       # python-wheel-build.
       - name: Build a debug wheel for CPython 3.10 and 3.12
         if: steps.cache.outputs.cache-hit != 'true'
@@ -366,7 +399,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-toolchain
         with:
@@ -382,7 +415,10 @@ jobs:
         with:
           working-directory: fuzz
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # fuzz-build.
       - name: Check the fuzz crate and compile its library tests
         if: steps.cache.outputs.cache-hit != 'true'
@@ -405,21 +441,12 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: android-actions/setup-android@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "ndk;27.2.12479018"
+          packages: ndk;27.2.12479018
       # The same linker and C toolchain variables kotlin-android-instrumented writes, before
       # rust-cache, which hashes every CARGO* variable into the key.
       - name: Point cargo at the NDK linker
@@ -467,7 +494,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       # uniffi-cdylib-linux builds the cdylib and bindings the Kotlin jobs download; the
       # Gradle tasks below compile against the same bindings.
@@ -480,25 +507,16 @@ jobs:
         run: |
           cargo build -p scp-ffi-uniffi --features testing
           ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
-      - uses: actions/setup-java@v4
+      - uses: ./.github/actions/toolcache-setup
         with:
-          distribution: zulu
-          java-version: "17"
-      - uses: android-actions/setup-android@v3
+          tool: java
+          version: "17"
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why.
+      - uses: ./.github/actions/android-sdk
         with:
-          packages: platform-tools
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses"
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
-      - run: sdkmanager "platforms;android-35"
-      - uses: gradle/actions/setup-gradle@v4
+          packages: platforms;android-35
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
       # Resolves every configuration of every project (the ktlint and detekt tool
       # classpaths among them), and compiles and packages what kotlin-test,
       # kotlin-android-instrumented and kotlin-lint build, so the entry holds their
@@ -522,10 +540,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -535,7 +554,10 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # rust-test-optional-features's four `transport-*` legs.
       - name: Compile every scp-transport feature set the transport legs test
         if: steps.cache.outputs.cache-hit != 'true'
@@ -579,10 +601,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -592,7 +615,10 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
       # rust-test-macos's three legs.
       - name: Compile every scp-transport and scp-platform feature set the macOS legs test
         if: steps.cache.outputs.cache-hit != 'true'
@@ -611,7 +637,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -630,10 +656,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
       - uses: ./.github/actions/rust-toolchain
       - id: cache
         uses: ./.github/actions/rust-cache
@@ -648,6 +675,6 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin
+          pip install --require-hashes -r .github/requirements/maturin.txt
           cd bindings/python
           maturin develop --profile ci-bridge --features testing

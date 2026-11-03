@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The Rust extractor runs `cargo metadata` and the workspace's build scripts while
       # it loads the manifests, and cargo downloads the index and every crate on demand
@@ -62,21 +62,33 @@ jobs:
       # run on every leg.
       - name: Setup Python 3.12
         id: python
-        uses: actions/setup-python@v5
+        uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
 
       - name: Point PyO3 at Python 3.12
         run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+      # init downloads the CodeQL bundle unchecked when the runner's tool cache lacks
+      # the version it wants (src/tools-download.ts:117), so the bundle comes from
+      # pinned-tool, checked against its SHA-256, and init reads it through `tools:`.
+      # The bundle for one language carries that language's extractor and queries.
+      - name: Download the CodeQL bundle
+        id: codeql-bundle
+        uses: ./.github/actions/pinned-tool
         with:
+          tool: codeql-${{ matrix.language }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          tools: ${{ steps.codeql-bundle.outputs.path }}
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           config-file: .github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           category: "/language:${{ matrix.language }}"

@@ -77,12 +77,15 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest
+          fallback: none
 
       - name: Cache Cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -102,9 +105,10 @@ jobs:
       # default `python3`, which moves with the image.
       - name: Setup Python 3.12
         id: python
-        uses: actions/setup-python@v5
+        uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
 
       - name: Point PyO3 at Python 3.12
         run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
@@ -146,7 +150,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Check CHANGELOG.md exists and mentions version
         run: |
@@ -175,7 +179,7 @@ jobs:
       core-tag: ${{ steps.tags.outputs.core-tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0  # Full history for tag operations
 
@@ -253,7 +257,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Download XCFramework
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: swift-xcframework
           path: xcframework/
@@ -279,7 +283,7 @@ jobs:
       # can reach an artifact named `swift-xcframework-signed`. A checkout
       # supplies this script, which the download step above does not.
       - name: Check out this repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           path: repo
 
@@ -307,7 +311,7 @@ jobs:
           done
 
       - name: Upload signed XCFramework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: swift-xcframework-signed
           path: xcframework/
@@ -320,13 +324,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: rust-x86_64-pc-windows-msvc
           path: windows-artifacts/
 
       - name: Download cbindgen Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: cbindgen-x86_64-pc-windows-msvc
           path: windows-cbindgen/
@@ -335,7 +339,7 @@ jobs:
       # reach an artifact named `windows-signed`. A checkout supplies this
       # script, which the two download steps above do not.
       - name: Check out this repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           path: repo
 
@@ -383,7 +387,7 @@ jobs:
           }
 
       - name: Upload signed Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-signed
           path: |
@@ -398,7 +402,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Download Kotlin AAR artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: kotlin-aar
           path: maven-artifacts/
@@ -416,7 +420,7 @@ jobs:
       # reach an artifact named `maven-signed`. A checkout supplies this script,
       # which the download step above does not.
       - name: Check out this repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           path: repo
 
@@ -468,7 +472,7 @@ jobs:
           done
 
       - name: Upload signed Maven artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: maven-signed
           path: maven-artifacts/
@@ -494,7 +498,7 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Publish order matters: dependencies first. scp-alloc goes first: it has
       # no dependencies, and scp-node and scp-relay pin it (09-security-model.md
@@ -682,22 +686,35 @@ jobs:
       url: https://pypi.org/project/scp-python/${{ inputs.version }}/
     steps:
       - name: Download all Python wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: python-wheel-*
           path: dist/
           merge-multiple: true
 
       - name: Download Python sdist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: python-sdist
           path: dist/
 
+      # The image pypa/gh-action-pypi-publish v1.14.3 runs, named by digest. The action
+      # itself writes a step that pulls `ghcr.io/pypa/gh-action-pypi-publish:<ref>`, a
+      # tag, whatever commit the action is pinned to (create-docker-action.py:16-20), so
+      # this job runs the image directly. The inputs are every value the action would
+      # pass it, its defaults included; the image reads them as INPUT_* variables.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish:v1.14.3@sha256:a20ee5e9a490ada64fce0c9176418a4fd5afad3b80e70fb4745803c1309dcdfc
         with:
+          user: __token__
+          password: ""
+          repository-url: https://upload.pypi.org/legacy/
           packages-dir: dist/
+          verify-metadata: "true"
+          skip-existing: "false"
+          verbose: "true"
+          print-hash: "true"
+          attestations: "true"
 
   publish-npm:
     name: "Step 6c: Publish to npm"
@@ -707,12 +724,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: ./.github/actions/toolcache-setup
         with:
-          node-version: "24"
+          tool: node
+          version: "24"
           registry-url: "https://registry.npmjs.org"
 
       # setup-node writes //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN} to
@@ -722,9 +740,9 @@ jobs:
         run: echo "@limn-works:registry=https://registry.npmjs.org/" >> ~/.npmrc
 
       - name: Install bun
-        uses: oven-sh/setup-bun@v2
+        uses: ./.github/actions/pinned-tool
         with:
-          bun-version: latest
+          tool: bun
 
       # @limn-works/scp-ts — Node.js/Bun TypeScript SDK wrapper
       - name: Build @limn-works/scp-ts
@@ -755,7 +773,7 @@ jobs:
       # Each artifact (napi-{target}) contains a single index.node binary
       # staged by build-matrix.yml's typescript-napi job.
       - name: Download all NAPI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: napi-*
           path: /tmp/napi-artifacts/
@@ -816,26 +834,29 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
+      # this job has no setup-gradle, whose `validate-wrappers` does the same check.
+      - name: Validate the Gradle wrapper jar
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: ./.github/actions/toolcache-setup
         with:
-          distribution: temurin
-          java-version: "17"
+          tool: java
+          version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # The package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why. The AAR publish
+      # compiles against android-35.
+      - name: Install the Android platform
+        uses: ./.github/actions/android-sdk
         with:
-          # Google withdrew `tools`, the obsolete Android SDK Tools package,
-          # from the SDK repository, and `tools platform-tools` is this
-          # action's default package list, so the action exits 1 and never
-          # puts sdkmanager on PATH. The two Kotlin jobs in ci.yml carry the
-          # same input and state the failure in full.
-          packages: platform-tools
+          packages: platforms;android-35
 
       - name: Download Kotlin AAR artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: kotlin-aar
           path: kotlin-artifacts/
@@ -876,7 +897,7 @@ jobs:
       xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -886,7 +907,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Download signed XCFramework
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: swift-xcframework-signed
           path: xcframework-signed/
@@ -940,7 +961,7 @@ jobs:
           git push origin "scp-swift@${{ env.VERSION }}"
 
       - name: Upload XCFramework zip for GitHub Release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xcframework-zip
           path: ScpFFI-${{ env.VERSION }}.xcframework.zip
@@ -962,22 +983,22 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: scp-release-bundle
           path: release-artifacts/
 
       - name: Download XCFramework zip (produced by publish-spm)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: xcframework-zip
           path: release-artifacts/
 
       - name: Download signed Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-signed
           path: release-artifacts/windows-signed/
@@ -1042,7 +1063,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: scp-release-bundle
           path: release-artifacts/

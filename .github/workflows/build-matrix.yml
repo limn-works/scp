@@ -54,10 +54,10 @@ jobs:
             runner: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Cache Cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -77,9 +77,10 @@ jobs:
       # Python, which moves with the image.
       - name: Setup Python 3.12
         id: python
-        uses: actions/setup-python@v5
+        uses: ./.github/actions/toolcache-setup
         with:
-          python-version: "3.12"
+          tool: python
+          version: "3.12"
 
       - name: Point PyO3 at Python 3.12
         shell: bash
@@ -133,7 +134,7 @@ jobs:
           done
 
       - name: Upload Rust artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rust-${{ matrix.target }}
           path: |
@@ -163,10 +164,11 @@ jobs:
   #     rust-build-pyo3-production in ci.yml checks that split with `cargo tree`.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
-  #   - x86_64 2_28 container ships a minimal perl that openssl-src's
-  #     Configure rejects -> install the full perl distribution. The aarch64
-  #     leg is an Ubuntu-based rust-cross image (complete perl, NO dnf) — a
-  #     dnf attempt there exits 127, so it must get no container prep.
+  #   - The manylinux_2_28 images ship a minimal perl that openssl-src's
+  #     Configure rejects -> install the full perl distribution with dnf,
+  #     which checks each package's signature (`gpgcheck=1`).
+  #   - The Linux legs are job python-wheels-linux, which runs the pypa image
+  #     itself; this job builds only on macOS and Windows.
   #   - Windows installs NASM so the vendored OpenSSL keeps its assembly
   #     routines; without NASM openssl-src builds OpenSSL with `no-asm`.
   #   - No --manifest-path arg: bindings/python/pyproject.toml already carries
@@ -185,34 +187,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            manylinux: 2_28
-            before-script: dnf install -y perl
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            manylinux: 2_28
-            before-script: "true"
           # One universal2 wheel, as ADR phase-3 and `.docs/standards/python.md`
           # name it: maturin compiles x86_64-apple-darwin and
           # aarch64-apple-darwin and joins the two into one fat binary.
           - target: universal2-apple-darwin
             runner: macos-latest
-            manylinux: auto
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            manylinux: auto
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # The macOS and Windows legs build on the runner, so each interpreter `-i`
-      # names below must exist there; the Linux legs build inside the manylinux
-      # container, which carries its own python3.10-python3.13.
-      - name: Setup Python 3.10-3.13
-        uses: actions/setup-python@v5
+      # Both legs build on the runner, so each interpreter `-i` names below must
+      # exist there. No runner image
+      # caches CPython 3.10; pinned-tool installs the package actions/setup-python
+      # would download, after checking its digest.
+      - name: Install Python 3.10
+        uses: ./.github/actions/pinned-tool
         with:
-          python-version: |
+          tool: python3.10
+
+      - name: Setup Python 3.10-3.13
+        uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: |
             3.10
             3.11
             3.12
@@ -220,40 +219,142 @@ jobs:
 
       - name: Setup NASM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: nasm
 
-      # The Linux legs build inside a manylinux container. maturin-action passes every
-      # `CARGO_*` variable into it, CARGO_NET_OFFLINE=true among them, but no file of the
-      # runner's, and the container's cargo home is `/root/.cargo` (both images run as
-      # root and install Rust with rustup's default paths). `docker-options` below mounts
-      # the registry this step filled at that path, so the offline build inside the
-      # container reads the crates fetched here. The macOS and Windows legs build on the
-      # runner and ignore `docker-options`.
+      - name: Install maturin
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: maturin
+
       - name: Fetch crates, then take cargo offline
-        id: cargo-fetch
         uses: ./.github/actions/cargo-fetch
 
       # MACOSX_DEPLOYMENT_TARGET sets the macOS floor the universal2 wheel's tag
       # names, `macosx_11_0_universal2` in `.docs/standards/python.md`; 11.0 is the
       # first release that runs on arm64. rustc and the cc crate read it only when
-      # they compile for an Apple target, so the Linux and Windows legs ignore it.
+      # they compile for an Apple target, so the Windows leg ignores it.
+      # rust-toolchain.toml lists both Apple targets universal2 joins, so the
+      # toolchain step already installed them.
+      # pwsh, not bash: Git Bash puts its MSYS perl first on PATH, and openssl-src's
+      # Configure exits 2 under that perl. Under pwsh, `perl` is the runner image's
+      # Strawberry Perl, a native Windows build, as it was under maturin-action.
       - name: Build wheel
-        uses: PyO3/maturin-action@v1
+        working-directory: bindings/python
+        shell: pwsh
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
-        with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
-          before-script-linux: ${{ matrix.before-script }}
-          docker-options: -v ${{ steps.cargo-fetch.outputs.cargo-home }}/registry:/root/.cargo/registry
-          args: >-
-            --release
-            --out dist
-            -i python3.10 python3.11 python3.12 python3.13
-          working-directory: bindings/python
+          TARGET: ${{ matrix.target }}
+        run: >-
+          maturin build --release --out dist --target $env:TARGET
+          -i python3.10 python3.11 python3.12 python3.13
 
       - name: Upload Python wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Python wheels for Linux, built in the pypa manylinux_2_28 image of the
+  # runner's own architecture, with every input checked:
+  #   - The image is named by digest. Docker checks the manifest and every layer
+  #     against it, so a pull that returns anything else fails.
+  #   - maturin is the binary pinned-tool installed on the runner after checking
+  #     its SHA-256; it is a static musl executable, so it runs in the image.
+  #   - Rust is the toolchain rust-toolchain.toml names, which rustup installed
+  #     on the runner (checking each component against the SHA-256 the channel
+  #     manifest lists) when cargo-fetch first ran cargo. rustup builds its Linux
+  #     toolchains against glibc 2.17, so they run in the 2_28 image unchanged.
+  #     cargo and rustc run straight from the toolchain's `bin`, with no rustup
+  #     in the image to read rust-toolchain.toml or download anything.
+  #   - The crates are the ones cargo-fetch downloaded, under the registry it
+  #     reports; CARGO_NET_OFFLINE keeps cargo from fetching any other.
+  #   - The interpreters are the image's own /opt/python/cp3XX builds.
+  # The aarch64 leg runs on an arm64 runner, so neither leg cross-compiles.
+  # Every mount but the workspace is read-only, the registry and the git checkouts
+  # included: the container's cargo writes its lock and cache bookkeeping under its
+  # own /root/.cargo, outside the mounts.
+  # ---------------------------------------------------------------------------
+  python-wheels-linux:
+    name: Python wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.10.31-1@sha256:43f7ce12d79ed98b6dbfa3291d5afe389efd40a7e76de089959ffe99501b6edf
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.31-1@sha256:724b504247662e1cf122590957c857211ec2d16b113ec134f92c570a2d01250f
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install maturin
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: maturin
+
+      - name: Fetch crates, then take cargo offline
+        id: cargo-fetch
+        uses: ./.github/actions/cargo-fetch
+
+      # A pull that fails, a digest mismatch among them, is retried three times.
+      - name: Pull the manylinux image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          for attempt in 1 2 3 4; do
+            if docker pull "$IMAGE"; then exit 0; fi
+            echo "pulling $IMAGE failed (attempt $attempt of 4)"
+            [ "$attempt" = 4 ] || sleep $((attempt * 10))
+          done
+          echo "::error::$IMAGE: every pull attempt failed"
+          exit 1
+
+      # IN_CONTAINER is the script the image runs; `docker run -e IN_CONTAINER` passes
+      # it in, and bash inside the image expands its variables. The container gets
+      # every `CARGO_*` variable of the runner but CARGO_HOME (a runner path), the
+      # offline switch cargo-fetch wrote to `$GITHUB_ENV` among them, and RUSTFLAGS.
+      # It mounts the registry and the git checkouts (openmls is a git dependency)
+      # cargo-fetch filled, since an offline cargo downloads neither.
+      - name: Build wheel
+        env:
+          IMAGE: ${{ matrix.image }}
+          CARGO_HOME_ON_RUNNER: ${{ steps.cargo-fetch.outputs.cargo-home }}
+          IN_CONTAINER: |
+            dnf install -y --setopt=gpgcheck=1 perl
+            export PATH="/opt/rust/bin:$PATH"
+            for minor in 10 11 12 13; do PATH="$PATH:/opt/python/cp3$minor-cp3$minor/bin"; done
+            maturin --version
+            cargo --version
+            maturin build --release --out dist --compatibility manylinux_2_28 \
+              -i python3.10 python3.11 python3.12 python3.13
+        run: |
+          sysroot="$(rustc --print sysroot)"
+          maturin="$(command -v maturin)"
+          env | command grep -E '^(CARGO_|RUSTFLAGS=)' | command grep -v '^CARGO_HOME=' \
+            > "$RUNNER_TEMP/cargo.env"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/io" \
+            -w /io/bindings/python \
+            -v "$sysroot:/opt/rust:ro" \
+            -v "$maturin:/usr/local/bin/maturin:ro" \
+            -v "$CARGO_HOME_ON_RUNNER/registry:/root/.cargo/registry:ro" \
+            -v "$CARGO_HOME_ON_RUNNER/git:/root/.cargo/git:ro" \
+            --env-file "$RUNNER_TEMP/cargo.env" \
+            -e IN_CONTAINER \
+            "$IMAGE" \
+            bash -euo pipefail -c "$IN_CONTAINER"
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-wheel-${{ matrix.target }}
           path: bindings/python/dist/*.whl
@@ -265,24 +366,25 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      - name: Install maturin
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: maturin
+
       # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: >-
-            --out dist
-          working-directory: bindings/python
+        working-directory: bindings/python
+        run: maturin sdist --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-sdist
           path: bindings/python/dist/*.tar.gz
@@ -318,10 +420,10 @@ jobs:
             npm-platform: win32-x64-msvc
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Cache Cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -364,7 +466,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/scp_ffi_napi.dll" napi-out/index.node
 
       - name: Upload NAPI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: napi-${{ matrix.target }}
           path: napi-out/index.node
@@ -380,7 +482,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -456,7 +558,7 @@ jobs:
             -output bindings/swift/ScpFFI.xcframework
 
       - name: Upload XCFramework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: swift-xcframework
           path: bindings/swift/ScpFFI.xcframework/
@@ -467,7 +569,7 @@ jobs:
         run: swift package generate-documentation --target SCP --output-path docs
 
       - name: Upload Swift docs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docs-swift
           path: bindings/swift/docs/
@@ -483,34 +585,51 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # gradlew runs the wrapper jar committed under bindings/kotlin/gradle/wrapper;
+      # this job has no setup-gradle, whose `validate-wrappers` does the same check.
+      - name: Validate the Gradle wrapper jar
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: ./.github/actions/toolcache-setup
         with:
-          distribution: temurin
-          java-version: "17"
+          tool: java
+          version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # Each package comes from an archive checked against a pinned digest before it is
+      # unpacked; .github/actions/android-sdk/install.py states why. The AAR build
+      # compiles against android-35.
+      - name: Install the Android NDK and platform
+        uses: ./.github/actions/android-sdk
         with:
-          # Google withdrew `tools`, the obsolete Android SDK Tools package,
-          # from the SDK repository, and `tools platform-tools` is this
-          # action's default package list, so the action exits 1 and never
-          # puts sdkmanager on PATH. The two Kotlin jobs in ci.yml carry the
-          # same input and state the failure in full.
-          packages: platform-tools
+          packages: ndk;27.2.12479018 platforms;android-35
 
-      - name: Install Android NDK
-        run: sdkmanager "ndk;27.2.12479018"
-
+      # cc-rs, which ring's build script and the vendored OpenSSL compile C through,
+      # otherwise looks for unversioned `aarch64-linux-android-clang` and
+      # `aarch64-linux-android-ranlib` tools that NDK 27 does not ship, so each triple's
+      # C compiler, archiver and ranlib are named beside its linker. The Android job in
+      # ci.yml names the same four tools for x86_64.
       - name: Set NDK environment
         run: |
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang" >> $GITHUB_ENV
+          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018"
+            for pair in aarch64-linux-android:aarch64-linux-android21 \
+                armv7-linux-androideabi:armv7a-linux-androideabi21 \
+                x86_64-linux-android:x86_64-linux-android21 \
+                i686-linux-android:i686-linux-android21; do
+              triple="${pair%%:*}"
+              clang="$ndk_bin/${pair#*:}-clang"
+              upper="$(echo "$triple" | tr 'a-z-' 'A-Z_')"
+              lower="${triple//-/_}"
+              echo "CARGO_TARGET_${upper}_LINKER=$clang"
+              echo "CC_${lower}=$clang"
+              echo "AR_${lower}=$ndk_bin/llvm-ar"
+              echo "RANLIB_${lower}=$ndk_bin/llvm-ranlib"
+            done
+          } >> "$GITHUB_ENV"
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -556,7 +675,7 @@ jobs:
         run: ./gradlew :scp-kt:jar
 
       - name: Upload Kotlin AAR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kotlin-aar
           path: |
@@ -592,7 +711,7 @@ jobs:
             lib-ext: dll
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Every crate Cargo.lock names, downloaded once with retries; every later cargo
       # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
@@ -614,7 +733,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
 
       - name: Upload C ABI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cbindgen-${{ matrix.target }}
           path: |
@@ -632,6 +751,7 @@ jobs:
     needs:
       - rust
       - python-wheels
+      - python-wheels-linux
       - python-sdist
       - typescript-napi
       - swift-xcframework
@@ -639,7 +759,7 @@ jobs:
       - cbindgen
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-artifacts/
 
@@ -647,7 +767,7 @@ jobs:
         run: find release-artifacts/ -type f | sort
 
       - name: Upload combined release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: scp-release-bundle
           path: release-artifacts/

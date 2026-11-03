@@ -297,8 +297,9 @@ nothing:
                supports. When ubuntu-latest moved its default to 3.14, job
                rust-docs in docs.yml, which ran `cargo doc --workspace` with no
                pinned Python, failed on every pull request. Every step that
-               compiles pyo3 must come after an unconditional
-               `actions/setup-python` step pinned to 3.12 and run with
+               compiles pyo3 must come after an unconditional Python setup
+               step (.github/actions/toolcache-setup with `tool: python`, or
+               `actions/setup-python`) pinned to 3.12 and run with
                PYO3_PYTHON naming that interpreter: the step's `python-path`
                output, or `python3.12` off Windows. A step compiles pyo3 when
                its `run:` text runs cargo with a compiling subcommand that
@@ -307,7 +308,7 @@ nothing:
                `--workspace` excluding none, or no package flag in a directory
                whose nearest manifest builds one, which at the root means a
                default member; or `maturin build|develop` without `-i`; or
-               maturin-action without `-i`; or CodeQL on a job analysing rust,
+               CodeQL on a job analysing rust,
                whose extractor runs build scripts. Controls remove the pin, the
                PYO3_PYTHON write, and the workflow-level key, pin 3.14, guard
                the pin with `if:`, move the write after the build, name
@@ -394,6 +395,42 @@ nothing:
                fails on each tracked path rust-test reads, found by scanning
                `crates/**/*.rs` for include and workspace_root literals, that
                the `rust` output does not select and no always-on step mirrors.
+  verified-download
+               sdkmanager unpacks the archive it downloads with no check that
+               reaches the job: job 118835960956 died on `Error on ZipFile
+               unknown archive` unpacking the NDK, and job 125594057792 printed
+               `Error reading Zip content from a SeekableByteChannel` for the
+               emulator package that reactivecircus/android-emulator-runner
+               installs on every run, then ran no test. Both reruns passed. The
+               check reads every workflow, local action and tracked Dockerfile
+               against a closed structure. A remote action passes only when
+               PERMITTED_ACTIONS lists it with a verdict, named in any case, at
+               a 40-hex commit SHA with its tag in a comment, under the
+               conditions its verdict names: setup-python, setup-node and
+               setup-java only between toolcache-setup's guard.py steps,
+               taiki-e with `fallback: none`, setup-buildx with a buildkit
+               image named by digest, codeql init with `tools:` from an earlier
+               pinned-tool step, setup-gradle with no `gradle-version:`. A local
+               action must be composite. A `run:` step, its env values and a
+               github-script fail on any word in FETCH_WORDS (curl, wget,
+               sdkmanager, gh release download, Invoke-WebRequest, urllib,
+               podman, skopeo and the rest), on pip without --require-hashes,
+               on bun install without --frozen-lockfile, on cargo install
+               without --locked and --path, on a docker subcommand outside
+               DOCKER_SUBCOMMANDS, and on a docker run, create or pull whose
+               image (the first word after the options) has no digest. Job
+               containers, services, `docker://` steps and Dockerfile FROM,
+               COPY --from and syntax lines need a digest, an ADD of a URL needs
+               --checksum, and a wasm-pack install needs the wasm-bindgen
+               Cargo.lock names and a pinned wasm-opt. Every job that runs
+               gradlew must validate the wrapper jar first, every wrapper it
+               runs must pin distributionSha256Sum, and every build it runs
+               must carry gradle/verification-metadata.xml with verify-metadata
+               on and no `<trust>` entry. It also feeds the shared
+               verified_download module a truncated archive and a body cut
+               short, and fails unless the download is retried a bounded number
+               of times and then fails naming the artifact, and runs guard.py
+               against a planted tool cache.
   group-partition
                CI runs `--group docs` on every pull request and `--group rest`
                only under the `code` output, so a check missing from GROUPS
@@ -732,6 +769,8 @@ RUST_FN_NAME = re.compile(r"\bfn\s+(\w+)")
 TOOLCHAIN_ACTION = "dtolnay/rust-toolchain"
 TOOLCHAIN_REFS = {"stable", "beta", "nightly", "master", "clippy", "miri", "comment"}
 TOOLCHAIN_VERSION_TAG = re.compile(r"^1\.\d+(\.\d+)?$")
+# A full commit SHA, the only ref check `verified-download` admits on a remote action.
+COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 # A date-pinned nightly names a toolchain no other date matches, so two
 # workflows pinning two different dates compile the fuzz crate against two
@@ -1328,10 +1367,12 @@ def check_toolchain_refs(path: Path, doc: dict) -> None:
             ref = uses.split("@", 1)[1]
             check(
                 f"{path.name}:{job_id} names a published {TOOLCHAIN_ACTION} ref",
-                ref in TOOLCHAIN_REFS or bool(TOOLCHAIN_VERSION_TAG.match(ref)),
+                ref in TOOLCHAIN_REFS
+                or bool(TOOLCHAIN_VERSION_TAG.match(ref))
+                or bool(COMMIT_SHA.fullmatch(ref)),
                 f"{uses} — that repository publishes {sorted(TOOLCHAIN_REFS)} and a tag "
-                f"per released Rust version; pass a date-pinned nightly through "
-                f"`with: toolchain:` on `@master` instead",
+                f"per released Rust version, and a step may name one of its commits; "
+                f"pass a date-pinned nightly through `with: toolchain:` instead",
             )
 
 
@@ -5542,7 +5583,6 @@ TOOLCHAIN_OR_CACHE_ACTIONS = (
 # An action that runs cargo inside its own step. CodeQL's Rust extractor runs
 # `cargo metadata` and the build scripts while it loads the workspace.
 CARGO_RUNNING_ACTIONS = (
-    "PyO3/maturin-action@",
     "github/codeql-action/init@",
     "github/codeql-action/analyze@",
 )
@@ -5613,9 +5653,23 @@ def command_words(line: str) -> list[tuple[str, list[str]]] | None:
     )
     lexer.whitespace_split = True
     try:
-        tokens = list(lexer)
+        lexed = list(lexer)
     except ValueError:
         return None
+    # shlex joins adjacent punctuation, so `$(seq 60); do docker …` yields `);`, which
+    # is no separator, and the docker after `do` went unread. Split each such run of
+    # separator characters into separators, longest first.
+    tokens = []
+    for token in lexed:
+        if token in SHELL_SEPARATORS or not re.fullmatch(r"[();&|]+", token):
+            tokens.append(token)
+            continue
+        while token:
+            piece = next(
+                (s for s in ("&&", "||", ";;") if token.startswith(s)), token[0]
+            )
+            tokens.append(piece)
+            token = token[len(piece) :]
     found = []
     at_start, index = True, 0
     while index < len(tokens):
@@ -6132,7 +6186,6 @@ CARGO_COMPILING = {
 MATURIN_COMPILING = {"build", "develop", "publish"}
 CODEQL_ACTIONS = ("github/codeql-action/init@", "github/codeql-action/analyze@",
                   "github/codeql-action/autobuild@")
-MATURIN_ACTION = "PyO3/maturin-action@"
 
 
 def is_dynamic(text: str) -> bool:
@@ -6367,8 +6420,7 @@ def step_compiles_pyo3(job: dict, step: dict) -> bool:
 
     CRITERION: the step's `run:` text runs a cargo or maturin command that compiles a
     package depending on pyo3 (cargo_compiles_pyo3, maturin_compiles_pyo3); or it is a CodeQL step for a job whose analysed
-    languages include rust, whose extractor runs the workspace's build scripts; or it
-    runs maturin-action with a command other than `sdist` and no `-i`.
+    languages include rust, whose extractor runs the workspace's build scripts.
     """
     uses = step_uses(step)
     inputs = step.get("with") or {}
@@ -6377,20 +6429,32 @@ def step_compiles_pyo3(job: dict, step: dict) -> bool:
         if "${{" in languages:
             return "rust" in job_matrix_values(job)
         return "rust" in re.split(r"[\s,]+", languages)
-    if uses.startswith(MATURIN_ACTION):
-        args = split_command(str(inputs.get("args") or ""))
-        return str(inputs.get("command") or "build") != "sdist" and not names_interpreters(args)
     script = str(step.get("run") or "")
     return bool(script) and script_compiles_pyo3(script, start_directory(job, step))
+
+
+def python_setup_version_key(step: dict) -> str | None:
+    """The input naming the Python version a setup step installs, or None for any other step.
+
+    The workflows set Python up through TOOLCACHE_ACTION with `tool: python`, which runs
+    setup-python and passes `version` through as its `python-version`.
+    """
+    uses = step_uses(step)
+    if uses.startswith(SETUP_PYTHON_ACTION):
+        return "python-version"
+    if uses == TOOLCACHE_ACTION and str((step.get("with") or {}).get("tool")) == "python":
+        return "version"
+    return None
 
 
 def pinned_setup_steps(steps: list[dict], before: int) -> dict[str, int]:
     """Return {id or '': index} of each unconditional setup-python 3.12 step before `before`."""
     found: dict[str, int] = {}
     for index, step in enumerate(steps[:before]):
-        if not step_uses(step).startswith(SETUP_PYTHON_ACTION) or step.get("if"):
+        key = python_setup_version_key(step)
+        if key is None or step.get("if"):
             continue
-        version = str((step.get("with") or {}).get("python-version") or "").strip()
+        version = str((step.get("with") or {}).get(key) or "").strip()
         if version == PINNED_PYTHON_VERSION:
             found[str(step.get("id") or "")] = index
     return found
@@ -6530,7 +6594,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
 
     def rust_docs(doc: dict) -> tuple[list[dict], int, int]:
         steps = doc["jobs"]["rust-docs"]["steps"]
-        setup = next(i for i, s in enumerate(steps) if step_uses(s).startswith(SETUP_PYTHON_ACTION))
+        setup = next(i for i, s in enumerate(steps) if python_setup_version_key(s))
         writer = next(i for i, s in enumerate(steps) if PYO3_ENV_WRITE.search(str(s.get("run") or "")))
         return steps, setup, writer
 
@@ -6549,7 +6613,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
 
     mutated = copy.deepcopy(docs)
     steps, setup, _ = rust_docs(mutated)
-    steps[setup]["with"]["python-version"] = "3.14"
+    steps[setup]["with"][python_setup_version_key(steps[setup])] = "3.14"
     reported("docs.yml rust-docs pinned to 3.14", "docs.yml", mutated,
              "no unconditional setup-python 3.12 step before it")
 
@@ -6585,7 +6649,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
     mutated = copy.deepcopy(by_name["codeql.yml"])
     mutated["jobs"]["analyze"]["steps"] = [
         step for step in mutated["jobs"]["analyze"]["steps"]
-        if not step_uses(step).startswith(SETUP_PYTHON_ACTION)
+        if not python_setup_version_key(step)
         and not PYO3_ENV_WRITE.search(str(step.get("run") or ""))
     ]
     reported("codeql.yml analyze, whose Rust leg runs build scripts, with no pin",
@@ -6610,7 +6674,7 @@ def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
             not_reported(f"an unpinned job running {label}", "fixture.yml", mutated)
     mutated = {"env": {"PYO3_PYTHON": "python3.12"}, "jobs": {"fixture": copy.deepcopy(fixture)}}
     mutated["jobs"]["fixture"]["steps"] += [
-        {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
+        {"uses": TOOLCACHE_ACTION, "with": {"tool": "python", "version": "3.12"}},
         {"run": "cargo build --workspace"},
     ]
     not_reported("a pinned job running a workspace build", "fixture.yml", mutated)
@@ -9442,10 +9506,16 @@ def check_push_writer_mutants(live: dict) -> None:
     bun["jobs"]["error-codes"].setdefault("steps", []).append(
         {"uses": "oven-sh/setup-bun@v2"}
     )
+    # The workflows install bun through .github/actions/pinned-tool, so no live job
+    # writes the setup-bun cache; this cache-warm stands in for one that does.
+    warm_bun = {
+        "on": {"push": {"branches": ["main"]}},
+        "jobs": {"bun": {"steps": [{"uses": "oven-sh/setup-bun@v2"}]}},
+    }
     check(
         "a setup-bun write in a push-skipped job is not reported while a push writes it",
-        not skipped_writers(bun) and not push_writer_gaps(bun),
-        f"{skipped_writers(bun)} {push_writer_gaps(bun)}",
+        not skipped_writers(bun) and not push_writer_gaps(bun, warm=warm_bun),
+        f"{skipped_writers(bun)} {push_writer_gaps(bun, warm=warm_bun)}",
     )
     for job in bun["jobs"].values():
         for step in job.get("steps") or []:
@@ -9458,9 +9528,8 @@ def check_push_writer_mutants(live: dict) -> None:
                 elif guard is None:
                     job["if"] = "github.event_name != 'push'"
     check(
-        "cache-warm.yml writes the setup-bun executable cache on every push to `main`",
-        "the setup-bun executable cache"
-        in warm_pushed_caches(yaml.safe_load(CACHE_WARM_WORKFLOW.read_text())),
+        "warm_pushed_caches reads a cache-warm job writing the setup-bun cache",
+        "the setup-bun executable cache" in warm_pushed_caches(warm_bun),
     )
     gaps = push_writer_gaps(bun, warm={"on": {"push": {"branches": ["main"]}}, "jobs": {}})
     check(
@@ -11490,6 +11559,1500 @@ def load_inputs() -> Inputs:
     return Inputs(workflow=workflow, jobs=workflow["jobs"], documents=documents)
 
 
+ANDROID_SDK_ACTION = "./.github/actions/android-sdk"
+ANDROID_SDK_INSTALLER = REPO / ".github/actions/android-sdk/install.py"
+PINNED_TOOL_ACTION = "./.github/actions/pinned-tool"
+PINNED_TOOL_INSTALLER = REPO / ".github/actions/pinned-tool/install.py"
+TOOLCACHE_ACTION = "./.github/actions/toolcache-setup"
+TOOLCACHE_ACTION_FILE = ".github/actions/toolcache-setup/action.yml"
+TOOLCACHE_GUARD = REPO / ".github/actions/toolcache-setup/guard.py"
+VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
+# CRITERION for verified-download: every file a CI step fetches from outside the
+# repository is checked against a digest this repository pins before anything unpacks
+# or runs it. The pinned paths: .github/actions/lib/verified_download.py (through
+# PINNED_TOOL_ACTION and ANDROID_SDK_ACTION), pip with `--require-hashes` against a
+# hashed requirements file, an image reference that names `@sha256:`, and a remote
+# action named by its 40-hex commit SHA.
+#
+# NAMED EXCEPTIONS, each fetching against a digest a lockfile or the publisher's
+# signature fixes rather than one this check reads:
+#   rustup    ./.github/actions/rust-toolchain and dtolnay/rust-toolchain: rustup checks
+#             each component against the channel manifest's SHA-256; the manifest
+#             comes over TLS and is pinned nowhere here.
+#   cargo     every crate against the checksum Cargo.lock records: this repository's,
+#             or the one a pinned-tool CRATES source ships (`cargo install --locked
+#             --path`).
+#   bun       every package against the integrity bun.lock records
+#             (`bun install --frozen-lockfile`).
+#   Gradle    the distribution against distributionSha256Sum and every dependency
+#             against gradle/verification-metadata.xml (gradle_gaps below).
+#   SwiftPM   each package at the commit Package.resolved names.
+#   apt-get, dnf, brew
+#             publisher-signed: apt and dnf check GPG signatures against keys the
+#             runner image or the digest-pinned container image holds, and Homebrew
+#             checks each bottle against the SHA-256 in its JWS-signed API.
+#
+# THE STRUCTURE IS CLOSED. A remote action passes only when PERMITTED_ACTIONS lists
+# it, with the verdict on what it fetches recorded there, and only when the conditions
+# that verdict names hold. A remote reference names a full commit SHA. A local action
+# is composite, so its steps are read here as steps. A `docker` command passes only
+# with a subcommand in DOCKER_SUBCOMMANDS, and every image a docker command, a
+# `docker://` step, a job container, a service, a buildx driver or a Dockerfile `FROM`
+# names carries a digest. A wasm-pack install comes with the wasm-bindgen Cargo.lock
+# names and a pinned wasm-opt, so wasm-pack finds both on PATH and downloads neither.
+#
+# INDICATORS, not the criterion: FETCH_WORDS lists commands and libraries that fetch
+# over the network, read case-insensitively anywhere in a step's `run:` text, its env
+# values and a github-script `script:`; each fails outright, because the pinned paths
+# above replace all of them. PIP_INSTALL and CARGO_INSTALL read the two package
+# managers that have a pinned form, and BUN_UNLOCKED the bun commands that resolve
+# outside bun.lock.
+TOOLCACHE_GUARDED = "only inside .github/actions/toolcache-setup, between its guard.py steps"
+PERMITTED_ACTIONS: dict[str, str] = {
+    "actions/checkout": "fetches this repository from GitHub by the commit the event names",
+    "actions/cache": "restores and saves cache entries this repository's jobs wrote",
+    "actions/cache/restore": "restores cache entries this repository's jobs wrote",
+    "actions/cache/save": "saves a cache entry; downloads nothing",
+    "swatinem/rust-cache": "restores and saves cache entries this repository's jobs wrote",
+    "actions/upload-artifact": "uploads; downloads nothing",
+    "actions/download-artifact": (
+        "fetches an artifact a job of the same run uploaded; v4.3.0 compares it with "
+        "the upload's digest but only warns on a mismatch (src/download-artifact.ts:"
+        "188-195), so it trusts GitHub's artifact store as it trusts the runner"
+    ),
+    "actions/upload-pages-artifact": "uploads; downloads nothing",
+    "actions/configure-pages": "reads the Pages configuration; downloads nothing",
+    "actions/deploy-pages": "deploys an uploaded artifact; downloads nothing",
+    "actions/github-script": "runs its `script:`, which the word scan reads",
+    "actions/setup-python": TOOLCACHE_GUARDED,
+    "actions/setup-node": TOOLCACHE_GUARDED,
+    "actions/setup-java": TOOLCACHE_GUARDED,
+    "dorny/paths-filter": "reads the event's changed files from the API; downloads nothing",
+    "docker/login-action": "stores registry credentials; downloads nothing",
+    "docker/setup-buildx-action": (
+        "starts buildkit from the image `driver-opts: image=` names, which must carry a "
+        "digest; without a `version:` input it downloads no buildx binary"
+    ),
+    "docker/build-push-action": (
+        "builds a Dockerfile, whose every `FROM` and `ADD` dockerfile_gaps reads"
+    ),
+    "taiki-e/install-action": (
+        "checks each binary against the SHA-256 in the manifest at its pinned commit "
+        "(main.sh:60-77); `fallback: none` stops it installing a tool the manifest lacks "
+        "through cargo-binstall"
+    ),
+    "github/codeql-action/init": (
+        "unpacks the bundle `tools:` names, the checked file an earlier pinned-tool step "
+        "hands over; with any other `tools:` it downloads a bundle unchecked "
+        "(src/tools-download.ts:117)"
+    ),
+    "github/codeql-action/analyze": "runs the CLI init unpacked; downloads nothing",
+    "dtolnay/rust-toolchain": "the rustup exception",
+    "gradle/actions/setup-gradle": (
+        "validates the wrapper jar and runs the wrapper's distribution; a "
+        "`gradle-version:` input would download a distribution, so none may be given"
+    ),
+    "gradle/actions/wrapper-validation": (
+        "compares the wrapper jar with the checksums services.gradle.org publishes"
+    ),
+}
+# What each kept condition reads, by action.
+TOOLCACHE_ACTIONS = ("actions/setup-python", "actions/setup-node", "actions/setup-java")
+GRADLE_WRAPPER_VALIDATORS = ("gradle/actions/setup-gradle", "gradle/actions/wrapper-validation")
+REMOTE_REF = re.compile(r"^([^@\s]+)@([^\s@]+)$")
+# A `uses:` line of a workflow or action file, with the comment after it.
+USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"#]+)['\"]?\s*(#.*)?$")
+FETCH_WORDS = re.compile(
+    r"(?<![\w.-])("
+    r"curl|wget|aria2c|sdkmanager|invoke-webrequest|iwr|invoke-restmethod|irm"
+    r"|start-bitstransfer|urllib|urlretrieve|urlopen|http\.client|httpx|requests\.get"
+    r"|podman|skopeo|buildah|crane|nerdctl|pipx|uvx|npx|yarn|pnpm|bunx|cargo-binstall"
+    r"|choco|winget|rustup-init|fetch\("
+    r"|gh\s+(?:release|run)\s+download|uv\s+(?:pip|tool|run|add|sync)"
+    r"|bun\s+(?:x|add|update|upgrade|create|pm)|npm\s+(?:install|i|ci|exec|x|update)"
+    r"|go\s+(?:install|get)|gem\s+install|git\s+(?:clone|submodule)"
+    r")(?![\w-])",
+    re.IGNORECASE,
+)
+# The one curl the check admits is a health probe of a server the job itself started: it
+# reads a loopback URL and discards the body, so nothing from outside the runner lands on
+# disk. The exemption is a closed form, not a list of refused options: the options must be
+# `-s`, `-f`, `-sf` or `-o /dev/null`, and the one URL a plain-http 127.0.0.1 address with
+# a port and a path (no userinfo, query, or other host spelling). wget is never exempt.
+PROBE_OPTIONS = frozenset({"-s", "-f", "-sf"})
+PROBE_URL = re.compile(r"http://127\.0\.0\.1:\d+/[A-Za-z0-9._/-]*")
+PIP_INSTALL = re.compile(r"(?<![\w.-])pip(?:3(?:\.\d+)?)?\s+(install|download|wheel)\b", re.I)
+PIP_REQUIREMENT = re.compile(r"(?<!\S)(?:-r|--requirement)(?:\s+|=)(\S+)")
+CARGO_INSTALL = re.compile(r"(?<![\w./-])cargo\s+(?:\+\S+\s+)?install\b")
+BUN_INSTALL = re.compile(r"(?<![\w./-])bun\s+(?:install|i)\b")
+DOCKER_WORD = re.compile(r"(?<![\w./-])docker(?![\w-])", re.IGNORECASE)
+# The docker subcommands a step may run. `run`, `create` and `pull` pull the image they
+# name, which docker_image parses and which must carry a digest; the rest act on
+# images and containers already present and fetch nothing.
+DOCKER_SUBCOMMANDS = {
+    "run": "pulls its image when absent",
+    "create": "pulls its image when absent",
+    "pull": "pulls its image",
+    "inspect": "reads a local object",
+    "images": "lists local images",
+    "ps": "lists local containers",
+    "rm": "removes a container",
+    "rmi": "removes a local image",
+    "logs": "reads a container's log",
+    "exec": "runs a command in a running container, pulling nothing",
+    "info": "reads the daemon's state",
+    "version": "reads the client and daemon versions",
+}
+DOCKER_PULLING = {"run", "create", "pull"}
+# Options of `docker run`/`create`/`pull` that take a value as the next word. Any
+# option in neither table fails, so an option this table misreads cannot hide which
+# word is the image.
+DOCKER_VALUE_FLAGS = {
+    "-v", "--volume", "-w", "--workdir", "-e", "--env", "--env-file", "--name",
+    "-u", "--user", "--entrypoint", "--network", "--platform", "--mount", "-p",
+    "--publish", "--label", "-l", "--cpus", "-m", "--memory", "--shm-size", "-h",
+    "--hostname", "--add-host", "--cap-add", "--cap-drop", "--security-opt", "--ulimit",
+    "--tmpfs", "--device", "--pull",
+}
+DOCKER_BOOLEAN_FLAGS = {
+    "--rm", "-i", "--interactive", "-t", "--tty", "-it", "-d", "--detach", "--init",
+    "--privileged", "--read-only", "-q", "--quiet", "--disable-content-trust",
+}
+PINNED_IMAGE = re.compile(r"@sha256:[0-9a-f]{64}$")
+SHELL_VARIABLE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+MATRIX_EXPRESSION = re.compile(r"^\$\{\{\s*matrix\.([\w-]+)\s*\}\}$")
+STEP_OUTPUT_PATH = re.compile(r"^\$\{\{\s*steps\.([\w-]+)\.outputs\.path\s*\}\}$")
+GRADLEW = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*gradlew)(?![\w.-])")
+GRADLE_PROJECT_DIR = re.compile(r"(?<!\S)(?:-p|--project-dir)[ =]+(\S+)")
+
+
+def action_name(uses: str) -> str:
+    """The action a remote `uses:` names, lower-cased as GitHub resolves it."""
+    return uses.split("@", 1)[0].lower()
+
+
+def runs_guard(step: object, mode: str) -> bool:
+    """Whether a step runs toolcache-setup's guard.py in `mode` (before or after)."""
+    run = str(step.get("run") or "") if isinstance(step, dict) else ""
+    return bool(re.search(rf'\$GITHUB_ACTION_PATH/guard\.py"?\s+{mode}\b', run))
+
+
+def pinned_tool_installs(step: object, tool: str) -> bool:
+    return (
+        isinstance(step, dict)
+        and step_uses(step) == PINNED_TOOL_ACTION
+        and str((step.get("with") or {}).get("tool")) == tool
+    )
+
+
+def load_module(name: str, path: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def locked_version(crate: str) -> str | None:
+    """The version of `crate` the workspace's Cargo.lock records, if it records one."""
+    lock = tomllib.loads((REPO / "Cargo.lock").read_text())
+    versions = {p["version"] for p in lock.get("package", []) if p.get("name") == crate}
+    return versions.pop() if len(versions) == 1 else None
+
+
+def matrix_values(job: dict | None, key: str) -> list[str]:
+    """Every value a job's matrix gives `key`, from its axis and its `include` entries."""
+    matrix = ((job or {}).get("strategy") or {}).get("matrix") or {}
+    if not isinstance(matrix, dict):
+        return []
+    values = [str(v) for v in matrix.get(key) or []] if isinstance(matrix.get(key), list) else []
+    for entry in matrix.get("include") or []:
+        if isinstance(entry, dict) and key in entry:
+            values.append(str(entry[key]))
+    return values
+
+
+def image_values(reference: str, step: dict | None, job: dict | None) -> list[str]:
+    """What an image reference can expand to.
+
+    A `$NAME` or `${NAME}` reads the step's, then the job's, `env:`; a
+    `${{ matrix.KEY }}` reads every matrix value of KEY. Anything else is literal, so
+    a reference this cannot resolve is read as unpinned.
+    """
+    reference = reference.strip().strip("\"'")
+    variable = SHELL_VARIABLE.match(reference)
+    if variable:
+        env = {**((job or {}).get("env") or {}), **((step or {}).get("env") or {})}
+        if variable.group(1) not in env:
+            return [reference]
+        reference = str(env[variable.group(1)]).strip()
+    matrix = MATRIX_EXPRESSION.match(reference)
+    if matrix:
+        return matrix_values(job, matrix.group(1)) or [reference]
+    return [reference]
+
+
+def image_pinned(reference: str, step: dict | None, job: dict | None) -> bool:
+    return all(PINNED_IMAGE.search(v) for v in image_values(reference, step, job))
+
+
+def docker_image(arguments: list[str]) -> tuple[str | None, str | None]:
+    """(the image a `docker run|create|pull` names, None) or (None, why it cannot be read).
+
+    `arguments` starts at the subcommand. The image is the first word after the
+    options, each option read through DOCKER_VALUE_FLAGS and DOCKER_BOOLEAN_FLAGS.
+    """
+    index = 1
+    while index < len(arguments):
+        word = arguments[index]
+        if not word.startswith("-") or word == "-":
+            return word, None
+        flag = word.split("=", 1)[0]
+        if flag in DOCKER_VALUE_FLAGS:
+            index += 1 if "=" in word else 2
+        elif flag in DOCKER_BOOLEAN_FLAGS:
+            index += 1
+        else:
+            return None, f"option {word!r}, which neither docker flag table lists"
+    return None, "no image"
+
+
+def docker_gaps(label: str, script: str, step: dict, job: dict | None) -> list[str]:
+    """Each docker command in a script that is not permitted or pulls an unpinned image."""
+    gaps, parsed = [], 0
+    for line in logical_lines(script):
+        for word, rest in command_words(line) or []:
+            if posixpath.basename(word) != "docker":
+                continue
+            parsed += 1
+            arguments = []
+            for token in rest:
+                if token in SHELL_SEPARATORS:
+                    break
+                arguments.append(token)
+            if arguments[:1] == ["image"] or arguments[:1] == ["container"]:
+                arguments = arguments[1:]
+            subcommand = arguments[0] if arguments else ""
+            if subcommand not in DOCKER_SUBCOMMANDS:
+                gaps.append(
+                    f"{label} runs `docker {subcommand}`, which DOCKER_SUBCOMMANDS does not "
+                    "permit"
+                )
+                continue
+            if subcommand not in DOCKER_PULLING:
+                continue
+            image, why = docker_image(arguments)
+            if image is None:
+                gaps.append(f"{label} runs `docker {subcommand}` whose image is unreadable: {why}")
+            elif not image_pinned(image, step, job):
+                gaps.append(
+                    f"{label} runs `docker {subcommand}` on {image!r}, not named by digest "
+                    "(`@sha256:`), so Docker checks nothing it pulls"
+                )
+    mentioned = len(DOCKER_WORD.findall(script_text(script)))
+    if mentioned != parsed:
+        gaps.append(
+            f"{label} names docker {mentioned} times outside comments but runs "
+            f"{parsed} docker commands the check can read; run each directly, not "
+            "through `bash -c`, a variable or an unsplittable line"
+        )
+    return gaps
+
+
+def script_text(script: str) -> str:
+    """A script's logical lines, comments dropped."""
+    return "\n".join(logical_lines(script))
+
+
+def scanned_text(step: dict) -> str:
+    """Every text of a step the shell or an interpreter runs: `run:`, env values, `script:`."""
+    texts = [script_text(str(step.get("run") or ""))]
+    texts += [str(v) for v in (step.get("env") or {}).values()]
+    script = (step.get("with") or {}).get("script")
+    if script is not None:
+        texts.append(str(script))
+    return "\n".join(texts)
+
+
+def loopback_probe(text: str, match: re.Match) -> bool:
+    """Whether a curl command is exactly the closed health-probe form PROBE_URL admits."""
+    if match.group(1) != "curl":
+        return False
+    command = re.split(r"&&|\|\||[;|\n]", text[match.end() :], maxsplit=1)[0]
+    tokens = command.split()
+    urls = 0
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in PROBE_OPTIONS:
+            i += 1
+        elif token == "-o" and i + 1 < len(tokens) and tokens[i + 1] == "/dev/null":
+            i += 2
+        elif PROBE_URL.fullmatch(token):
+            urls += 1
+            i += 1
+        else:
+            return False
+    return urls == 1
+
+
+def run_gaps(label: str, step: dict, job: dict | None) -> list[str]:
+    """Each fetch in a step's run text that bypasses the pinned paths."""
+    gaps = []
+    text = scanned_text(step)
+    words = sorted({
+        m.group(1).lower() for m in FETCH_WORDS.finditer(text) if not loopback_probe(text, m)
+    })
+    if words:
+        gaps.append(
+            f"{label} runs {', '.join(words)}, which fetches outside the pinned paths; "
+            f"download through {PINNED_TOOL_ACTION} (verified_download.py) instead"
+        )
+    default = ((job or {}).get("defaults") or {}).get("run") or {}
+    cwd = str(step.get("working-directory") or default.get("working-directory") or ".")
+    cwd = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}", ".", cwd)
+    for line in text.splitlines():
+        if PIP_INSTALL.search(line) and "--require-hashes" not in line:
+            gaps.append(
+                f"{label} runs pip without --require-hashes: {line.strip()!r}; install a "
+                "hashed file under .github/requirements/"
+            )
+        # A hashed install fails at run time when its file is missing from the directory
+        # the step runs in, so each requirements path must name a tracked file from there.
+        if PIP_INSTALL.search(line):
+            for req in PIP_REQUIREMENT.findall(line):
+                req = req.strip("\"'")
+                resolved = posixpath.normpath(posixpath.join(cwd, req))
+                if "$" in req or "$" in cwd or not (REPO / resolved).is_file():
+                    gaps.append(
+                        f"{label} installs requirements {req!r} from working directory "
+                        f"{cwd!r}, which names no file in the repository"
+                    )
+        if CARGO_INSTALL.search(line) and not (
+            re.search(r"(?<!\S)--locked(?!\S)", line) and re.search(r"(?<!\S)--path[ =]", line)
+        ):
+            gaps.append(
+                f"{label} runs cargo install without both --locked and --path: "
+                f"{line.strip()!r}; install the source a {PINNED_TOOL_ACTION} CRATES pin "
+                "hands over"
+            )
+        if BUN_INSTALL.search(line) and "--frozen-lockfile" not in line:
+            gaps.append(
+                f"{label} runs bun install without --frozen-lockfile: {line.strip()!r}"
+            )
+    gaps += docker_gaps(label, str(step.get("run") or ""), step, job)
+    return gaps
+
+
+def local_action_gaps(label: str, uses: str) -> list[str]:
+    """A local action must be a composite action, so its steps are read as steps."""
+    if uses.endswith((".yml", ".yaml")):
+        return []
+    directory = REPO / uses.removeprefix("./")
+    files = [directory / "action.yml", directory / "action.yaml"]
+    found = next((f for f in files if f.is_file()), None)
+    if found is None:
+        return [f"{label} uses {uses}, which has no action.yml"]
+    using = str(((yaml.safe_load(found.read_text()) or {}).get("runs") or {}).get("using"))
+    if using != "composite":
+        return [
+            f"{label} uses {uses}, a {using!r} action; only composite local actions are "
+            "read step by step"
+        ]
+    return []
+
+
+def remote_action_gaps(
+    where: str, label: str, step: dict, steps: list, index: int
+) -> list[str]:
+    """A remote action must be on PERMITTED_ACTIONS, at a commit SHA, under its conditions."""
+    uses = step_uses(step)
+    if uses.startswith("docker://"):
+        if image_pinned(uses[len("docker://"):], step, None):
+            return []
+        return [f"{label} uses {uses}, an image not named by digest"]
+    match = REMOTE_REF.match(uses)
+    if not match:
+        return [f"{label} uses {uses!r}, which names no ref"]
+    name, ref = action_name(uses), match.group(2)
+    gaps = []
+    if not COMMIT_SHA.fullmatch(ref):
+        gaps.append(
+            f"{label} uses {uses}, whose ref {ref!r} is not a 40-hex commit SHA, so "
+            "whoever moves it chooses the code that runs"
+        )
+    if name not in PERMITTED_ACTIONS:
+        return gaps + [
+            f"{label} uses {name}, which PERMITTED_ACTIONS does not list; record what it "
+            "fetches there, or replace it with a step that fetches through "
+            f"{PINNED_TOOL_ACTION}"
+        ]
+    inputs = step.get("with") or {}
+    if name in TOOLCACHE_ACTIONS and not (
+        where == TOOLCACHE_ACTION_FILE
+        and any(runs_guard(s, "before") for s in steps[:index])
+        and any(runs_guard(s, "after") for s in steps[index + 1:])
+    ):
+        gaps.append(f"{label} uses {name}, permitted {TOOLCACHE_GUARDED}; use {TOOLCACHE_ACTION}")
+    if name == "docker/setup-buildx-action":
+        image = re.search(r"(?:^|[\s,])image=(\S+)", str(inputs.get("driver-opts") or ""))
+        if image is None or not PINNED_IMAGE.search(image.group(1).rstrip(",")):
+            gaps.append(
+                f"{label} starts buildkit from an image not named by digest; pass "
+                "`driver-opts: image=<ref>@sha256:<digest>`"
+            )
+        if "version" in inputs:
+            gaps.append(f"{label} passes `version:`, which downloads a buildx binary")
+    if name == "taiki-e/install-action":
+        if str(inputs.get("fallback")) != "none":
+            gaps.append(f"{label} omits `fallback: none`, so a tool the manifest lacks installs unchecked")
+        if str(inputs.get("checksum", "true")).lower() == "false":
+            gaps.append(f"{label} turns the checksum off")
+        tools = [t.strip() for t in str(inputs.get("tool") or "").split(",")]
+        if any(t.split("@")[0] == "wasm-pack" for t in tools):
+            gaps += wasm_pack_gaps(label, tools, steps)
+    if name == "github/codeql-action/init":
+        output = STEP_OUTPUT_PATH.match(str(inputs.get("tools") or ""))
+        if output is None or not any(
+            isinstance(s, dict)
+            and str(s.get("id")) == output.group(1)
+            and step_uses(s) == PINNED_TOOL_ACTION
+            for s in steps[:index]
+        ):
+            gaps.append(
+                f"{label} passes `tools:` {inputs.get('tools')!r}, not the `path` output "
+                f"of an earlier {PINNED_TOOL_ACTION} step, so init downloads its bundle "
+                "unchecked"
+            )
+    if name == "gradle/actions/setup-gradle" and "gradle-version" in inputs:
+        gaps.append(f"{label} passes `gradle-version:`, which downloads a distribution unchecked")
+    return gaps
+
+
+def wasm_pack_gaps(label: str, tools: list[str], steps: list) -> list[str]:
+    """wasm-pack must find the locked wasm-bindgen and a pinned wasm-opt on PATH."""
+    gaps = []
+    bindgen = locked_version("wasm-bindgen")
+    if f"wasm-bindgen@{bindgen}" not in tools:
+        gaps.append(
+            f"{label} installs wasm-pack without wasm-bindgen@{bindgen}, the version "
+            "Cargo.lock names, so wasm-pack downloads wasm-bindgen unchecked"
+        )
+    if not any(pinned_tool_installs(s, "wasm-opt") for s in steps):
+        gaps.append(
+            f"{label} installs wasm-pack in a job with no {PINNED_TOOL_ACTION} wasm-opt "
+            "step, so wasm-pack downloads wasm-opt unchecked"
+        )
+    return gaps
+
+
+def unverified_download_gaps(where: str, steps: object, job: dict | None = None) -> list[str]:
+    """Return each way a step under `where` fetches outside the pinned paths.
+
+    `job` is the workflow job the steps belong to, None for a local action; image
+    references resolve against its `env:` and matrix.
+    """
+    gaps = []
+    steps = steps if isinstance(steps, list) else []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        label = f"{where} step {index} ({step.get('name') or step_uses(step) or 'run'})"
+        uses = step_uses(step)
+        if uses.startswith("./"):
+            gaps += local_action_gaps(label, uses)
+        elif uses:
+            gaps += remote_action_gaps(where, label, step, steps, index)
+        gaps += run_gaps(label, step, job)
+    return gaps
+
+
+def job_uses_gaps(where: str, job: dict) -> list[str]:
+    """A job that calls a reusable workflow may call only a local one."""
+    uses = str(job.get("uses") or "")
+    if not uses or uses.startswith("./"):
+        return []
+    return [f"{where} calls the remote workflow {uses}, which PERMITTED_ACTIONS cannot vouch for"]
+
+
+def job_image_gaps(where: str, job: dict) -> list[str]:
+    """A job's `container:` and `services:` images must each be named by digest."""
+    images = []
+    container = job.get("container")
+    if container:
+        images.append(("container", container))
+    for name, service in sorted((job.get("services") or {}).items()):
+        images.append((f"service {name}", service))
+    gaps = []
+    for what, entry in images:
+        image = str(entry.get("image") if isinstance(entry, dict) else entry)
+        if not image_pinned(image, None, job):
+            gaps.append(f"{where} {what} image {image!r} is not named by digest")
+    return gaps
+
+
+def uses_comment_gaps(where: str, text: str) -> list[str]:
+    """Every remote `uses:` line carries the tag its SHA stands for in a comment."""
+    gaps = []
+    for number, line in enumerate(text.splitlines(), 1):
+        match = USES_LINE.match(line)
+        if not match or match.group(1).startswith(("./", "docker://")):
+            continue
+        if not (match.group(2) or "").lstrip("#").strip():
+            gaps.append(f"{where}:{number} names {match.group(1)} with no tag comment")
+    return gaps
+
+
+def dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """(instruction, its arguments) for each instruction, continuations joined."""
+    found, current = [], ""
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.startswith("#"):
+            continue
+        current += " " + stripped.removesuffix("\\")
+        if stripped.endswith("\\"):
+            continue
+        words = current.split(None, 1)
+        found.append((words[0].upper(), words[1] if len(words) > 1 else ""))
+        current = ""
+    return found
+
+
+def dockerfile_gaps(where: str, text: str) -> list[str]:
+    """Every image a Dockerfile names carries a digest, every URL `ADD` a checksum."""
+    gaps, stages, args = [], set(), {}
+    for line in text.splitlines():
+        directive = re.match(r"#\s*syntax\s*=\s*(\S+)", line.strip(), re.I)
+        if directive and not PINNED_IMAGE.search(directive.group(1)):
+            gaps.append(f"{where} names the frontend {directive.group(1)} without a digest")
+    for instruction, rest in dockerfile_instructions(text):
+        words = rest.split()
+        if instruction == "ARG" and words:
+            name, _, default = words[0].partition("=")
+            args[name] = default
+        elif instruction == "FROM":
+            positional = [w for w in words if not w.startswith("--")]
+            image = positional[0] if positional else ""
+            if len(positional) >= 3 and positional[1].lower() == "as":
+                stage = positional[2].lower()
+            else:
+                stage = None
+            if "${TARGETARCH}" in image or "$TARGETARCH" in image:
+                expansions = [
+                    image.replace("${TARGETARCH}", arch).replace("$TARGETARCH", arch)
+                    for arch in ("amd64", "arm64")
+                ]
+                missing = [e for e in expansions if e.lower() not in stages]
+                if missing:
+                    gaps.append(f"{where} FROM {image} expands to {missing}, not earlier stages")
+            elif not (
+                image == "scratch" or image.lower() in stages or PINNED_IMAGE.search(image)
+            ):
+                gaps.append(f"{where} FROM {image} is not named by digest")
+            if stage:
+                stages.add(stage)
+        elif instruction in ("COPY", "ADD"):
+            source = next((w.split("=", 1)[1] for w in words if w.startswith("--from=")), None)
+            if source and not (source.lower() in stages or source.isdigit() or PINNED_IMAGE.search(source)):
+                gaps.append(f"{where} {instruction} --from={source} names an image without a digest")
+            if instruction == "ADD" and any(re.match(r"(https?|git)[:@]", w) for w in words):
+                if not any(w.startswith("--checksum=sha256:") for w in words):
+                    gaps.append(f"{where} ADD fetches a URL with no --checksum=sha256:")
+        elif instruction == "RUN":
+            fetches = sorted({m.group(1).lower() for m in FETCH_WORDS.finditer(rest)})
+            if fetches:
+                gaps.append(f"{where} RUN fetches with {', '.join(fetches)}")
+            if PIP_INSTALL.search(rest) and "--require-hashes" not in rest:
+                gaps.append(f"{where} RUN runs pip without --require-hashes")
+    return gaps
+
+
+def tracked_dockerfiles() -> list[Path]:
+    listed = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z", "--", "*Dockerfile*", "*Containerfile*",
+         "*.dockerfile"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
+    return [REPO / name for name in listed if name]
+
+
+def download_step_lists(
+    documents: list[tuple[Path, dict]],
+) -> list[tuple[str, object, dict | None]]:
+    """Every workflow job's steps, with the job, and every local composite action's steps."""
+    found = []
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            found.append((f"{path.name}:{job_id}", job.get("steps"), job))
+    for action in sorted((REPO / ".github/actions").glob("*/action.y*ml")):
+        doc = yaml.safe_load(action.read_text()) or {}
+        found.append(
+            (str(action.relative_to(REPO)), (doc.get("runs") or {}).get("steps"), None)
+        )
+    return found
+
+
+class GradleRun(NamedTuple):
+    wrapper_dir: str
+    build_root: str
+
+
+def gradle_runs(job: dict, step: dict) -> list[GradleRun]:
+    """Each gradlew a step runs: the wrapper's directory and the build it runs.
+
+    Both are repository-relative: the step's working directory (else the job's) joined
+    with the gradlew path, and with `-p`/`--project-dir` where the line passes one.
+    """
+    default = ((job.get("defaults") or {}).get("run") or {}).get("working-directory")
+    cwd = str(step.get("working-directory") or default or ".")
+    found = []
+    for line in logical_lines(str(step.get("run") or "")):
+        for match in GRADLEW.finditer(line):
+            wrapper = posixpath.normpath(
+                posixpath.join(cwd, posixpath.dirname(match.group(1)))
+            )
+            project = GRADLE_PROJECT_DIR.search(line[match.end() :])
+            root = (
+                posixpath.normpath(posixpath.join(cwd, project.group(1).strip("\"'")))
+                if project
+                else posixpath.normpath(cwd)
+            )
+            found.append(GradleRun(wrapper, root))
+    return found
+
+
+def wrapper_validation_gaps(where: str, job: dict) -> list[str]:
+    """A job that runs gradlew must validate the wrapper jar before the first run."""
+    steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+    for index, step in enumerate(steps):
+        if not gradle_runs(job, step):
+            continue
+        validated = any(
+            action_name(step_uses(s)) in GRADLE_WRAPPER_VALIDATORS
+            and str((s.get("with") or {}).get("validate-wrappers", "true")).lower()
+            != "false"
+            for s in steps[:index]
+        )
+        if not validated:
+            return [
+                f"{where} step {index} runs gradlew with no earlier step using one of "
+                f"{list(GRADLE_WRAPPER_VALIDATORS)} (setup-gradle with validate-wrappers "
+                "on), so an altered wrapper jar would run unchecked"
+            ]
+        return []
+    return []
+
+
+def wrapper_properties_gaps(where: str, text: str | None) -> list[str]:
+    if text is None:
+        return [f"{where} does not exist"]
+    if not re.search(r"(?m)^distributionSha256Sum=[0-9a-f]{64}\s*$", text):
+        return [
+            f"{where} has no distributionSha256Sum, so the wrapper unpacks the "
+            "distribution it downloads unchecked"
+        ]
+    return []
+
+
+def verification_metadata_gaps(where: str, text: str | None) -> list[str]:
+    """gradle/verification-metadata.xml must exist, verify metadata and trust nothing.
+
+    A `<trust>` entry skips the checksum for whatever it matches, whether it names one
+    jar or every artifact, so any entry fails: each artifact carries its own sha256.
+    """
+    import xml.etree.ElementTree as ET
+
+    if text is None:
+        return [
+            f"{where} does not exist, so Gradle resolves every dependency unchecked"
+        ]
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as error:
+        return [f"{where} does not parse: {error}"]
+    namespace = re.match(r"\{[^}]*\}", root.tag)
+    ns = namespace.group(0) if namespace else ""
+    gaps = []
+    verify = root.find(f"{ns}configuration/{ns}verify-metadata")
+    if verify is None or (verify.text or "").strip() != "true":
+        gaps.append(f"{where} does not set verify-metadata to true")
+    for trust in root.iter(f"{ns}trust"):
+        gaps.append(f"{where} trusts an artifact without a checksum: {trust.attrib}")
+    if not any(True for _ in root.iter(f"{ns}sha256")):
+        gaps.append(f"{where} records no sha256 checksum")
+    return gaps
+
+
+def gradle_gaps(documents: list[tuple[Path, dict]]) -> tuple[list[str], int]:
+    """Gradle gaps across every workflow job, and how many gradlew runs were read."""
+    gaps, runs = [], set()
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            gaps += wrapper_validation_gaps(f"{path.name}:{job_id}", job)
+            for step in job.get("steps") or []:
+                if isinstance(step, dict):
+                    runs.update(gradle_runs(job, step))
+    for wrapper in sorted({run.wrapper_dir for run in runs}):
+        properties = REPO / wrapper / "gradle/wrapper/gradle-wrapper.properties"
+        gaps += wrapper_properties_gaps(
+            str(properties.relative_to(REPO)),
+            properties.read_text() if properties.is_file() else None,
+        )
+    for root in sorted({run.build_root for run in runs}):
+        metadata = REPO / root / "gradle/verification-metadata.xml"
+        gaps += verification_metadata_gaps(
+            str(metadata.relative_to(REPO)),
+            metadata.read_text() if metadata.is_file() else None,
+        )
+    return gaps, len(runs)
+
+
+def load_verified_download():
+    """The module both installers import, as they import it."""
+    if str(VERIFIED_DOWNLOAD_LIB) not in sys.path:
+        sys.path.insert(0, str(VERIFIED_DOWNLOAD_LIB))
+    import verified_download
+
+    return verified_download
+
+
+def check_installer_rejects_a_corrupt_archive() -> None:
+    """Feed the shared download a truncated archive and a whole one over file://."""
+    import contextlib
+    import hashlib
+    import io
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    installer = load_module("android_sdk_install", ANDROID_SDK_INSTALLER)
+    pinned = load_module("pinned_tool_install", PINNED_TOOL_INSTALLER)
+    downloads = load_verified_download()
+    check(
+        "both installers download through verified_download.download_verified",
+        installer.download_verified is downloads.download_verified
+        and pinned.download_verified is downloads.download_verified,
+        f"android-sdk uses {installer.download_verified!r}, pinned-tool uses "
+        f"{pinned.download_verified!r}",
+    )
+    # A mismatched attempt prints a `::warning::`; `quiet` keeps it out of the log so
+    # the planted mismatches raise no annotation on the run.
+    quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("pkg/source.properties", "Pkg.Revision=1\n")
+            archive.writestr("pkg/blob", os.urandom(4096))
+        whole = payload.getvalue()
+        good = root / "good.zip"
+        good.write_bytes(whole)
+        truncated = root / "truncated.zip"
+        truncated.write_bytes(whole[: len(whole) // 2])
+        real_fetch = downloads.fetch_once
+        for algorithm in ("sha1", "sha256"):
+            digest = hashlib.new(algorithm, whole).hexdigest()
+            fetched = []
+
+            def counting_fetch(url, destination, algorithm, fetched=fetched):
+                fetched.append(url)
+                return real_fetch(url, destination, algorithm)
+
+            downloads.fetch_once = counting_fetch
+            try:
+                with quiet():
+                    downloads.download_verified(
+                        "planted;truncated",
+                        truncated.as_uri(),
+                        len(whole),
+                        digest,
+                        root / "out-truncated.zip",
+                        algorithm,
+                        attempts=3,
+                        backoff=0,
+                    )
+                error = ""
+            except downloads.InstallError as raised:
+                error = str(raised)
+            check(
+                f"verified_download fails on a truncated archive ({algorithm}), naming "
+                "the artifact and URL",
+                "planted;truncated" in error and truncated.as_uri() in error,
+                f"got {error!r}",
+            )
+            check(
+                f"verified_download retries a mismatched archive ({algorithm}) a "
+                "bounded number of times",
+                len(fetched) == 3 and not (root / "out-truncated.zip").exists(),
+                f"fetched {len(fetched)} times; a mismatched archive must be refetched "
+                "up to `attempts` times and never left on disk",
+            )
+            try:
+                with quiet():
+                    downloads.download_verified(
+                        "planted;whole",
+                        good.as_uri(),
+                        len(whole),
+                        digest,
+                        root / "out-whole.zip",
+                        algorithm,
+                        attempts=3,
+                        backoff=0,
+                    )
+                error = ""
+            except downloads.InstallError as raised:
+                error = str(raised)
+            check(
+                f"verified_download accepts an archive whose size and {algorithm} "
+                "match its pin",
+                not error and (root / "out-whole.zip").read_bytes() == whole,
+                f"got {error!r}",
+            )
+            (root / "out-whole.zip").unlink(missing_ok=True)
+        # A connection that drops mid-body raises http.client.IncompleteRead, an
+        # HTTPException rather than an OSError; the download must retry it like any
+        # other failed attempt.
+        import http.client
+
+        digest = hashlib.sha256(whole).hexdigest()
+        dropped = []
+
+        def dropping_fetch(url, destination, algorithm, dropped=dropped):
+            dropped.append(url)
+            if len(dropped) == 1:
+                raise http.client.IncompleteRead(b"partial", 100)
+            return real_fetch(url, destination, algorithm)
+
+        downloads.fetch_once = dropping_fetch
+        try:
+            with quiet():
+                downloads.download_verified(
+                    "planted;dropped",
+                    good.as_uri(),
+                    len(whole),
+                    digest,
+                    root / "out-dropped.zip",
+                    "sha256",
+                    attempts=3,
+                    backoff=0,
+                )
+            error = ""
+        except Exception as raised:  # noqa: BLE001 - any escape is the failure reported
+            error = f"{type(raised).__name__}: {raised}"
+        check(
+            "verified_download retries a body cut short (http.client.IncompleteRead)",
+            not error
+            and len(dropped) == 2
+            and (root / "out-dropped.zip").read_bytes() == whole,
+            f"fetched {len(dropped)} times, got {error!r}",
+        )
+        downloads.fetch_once = real_fetch
+    # sdkmanager lists the NDK and the emulator only by the package.xml install.py writes
+    # for a pin with a display name; the file must name the package path and revision.
+    wrong = []
+    for package, pin in installer.PINS.items():
+        if pin.display_name is None:
+            continue
+        local = ET.fromstring(installer.package_xml(package, pin)).find("localPackage")
+        revision = local.find("revision") if local is not None else None
+        listed = (
+            ".".join(part.text or "" for part in revision)
+            if revision is not None
+            else None
+        )
+        if local is None or local.get("path") != package or listed != pin.revision:
+            path = local.get("path") if local is not None else None
+            wrong.append(f"{package}: path {path!r}, revision {listed!r}")
+    check(
+        "install.py writes a package.xml naming each generic pin's path and revision",
+        not wrong,
+        "; ".join(wrong),
+    )
+    # Every pinned-tool pin names an https URL and a whole SHA-256, and every archive
+    # and wheel a python-versions package installs from is pinned.
+    malformed = [
+        f"{key}: {archive.url}"
+        for key, archive in [
+            *pinned.PINS.items(),
+            *pinned.BUNDLES.items(),
+            *pinned.CRATES.items(),
+            *(("wheel", w) for w in pinned.WHEELS),
+        ]
+        if not archive.url.startswith("https://")
+        or not re.fullmatch(r"[0-9a-f]{64}", archive.sha256)
+        or archive.size <= 0
+    ]
+    check(
+        "every pinned-tool pin names an https URL, a size and a SHA-256",
+        not malformed,
+        "; ".join(malformed),
+    )
+    with tempfile.TemporaryDirectory() as scratch:
+        environment = dict(
+            os.environ,
+            RUNNER_OS="Plan9",
+            RUNNER_ARCH="X64",
+            RUNNER_TEMP=scratch,
+            RUNNER_TOOL_CACHE=scratch,
+            GITHUB_PATH=str(Path(scratch, "path")),
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", str(PINNED_TOOL_INSTALLER), "bun"],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+    check(
+        "pinned-tool fails, naming the tool, on a runner it has no pin for",
+        result.returncode != 0 and "no pin" in result.stdout and "bun" in result.stdout,
+        f"exit {result.returncode}: {result.stdout.strip()!r}",
+    )
+
+
+def check_toolcache_guard() -> None:
+    """guard.py must refuse a version the cache lacks and an install the action added."""
+    with tempfile.TemporaryDirectory() as scratch:
+        cache = Path(scratch, "cache")
+        (cache / "Python/3.12.7").mkdir(parents=True)
+        (cache / "Python/3.12.7/x64.complete").write_text("")
+        environment = dict(
+            os.environ,
+            RUNNER_TOOL_CACHE=str(cache),
+            RUNNER_ARCH="X64",
+            RUNNER_TEMP=scratch,
+        )
+
+        def guard(*arguments: str) -> int:
+            return subprocess.run(
+                [sys.executable, "-I", str(TOOLCACHE_GUARD), *arguments],
+                env=environment,
+                capture_output=True,
+            ).returncode
+
+        check(
+            "guard.py admits a version the tool cache holds",
+            guard("before", "python", "3.12") == 0,
+        )
+        check(
+            "guard.py refuses a version the tool cache lacks",
+            guard("before", "python", "3.12\n3.10") != 0,
+        )
+        check(
+            "guard.py refuses a version that only shares a prefix",
+            guard("before", "python", "3.1") != 0,
+        )
+        check(
+            "guard.py passes when the action added nothing",
+            guard("after", "python") == 0,
+        )
+        (cache / "Python/3.13.0").mkdir()
+        (cache / "Python/3.13.0/x64.complete").write_text("")
+        check(
+            "guard.py fails when the setup action added an install",
+            guard("after", "python") != 0,
+        )
+
+
+def tree_download_gaps(documents: list[tuple[Path, dict]]) -> list[str]:
+    """Every verified-download gap in the tree's workflows, local actions and Dockerfiles."""
+    gaps = [
+        gap
+        for where, steps, job in download_step_lists(documents)
+        for gap in unverified_download_gaps(where, steps, job)
+        + (job_image_gaps(where, job) + job_uses_gaps(where, job) if job else [])
+    ]
+    texts = [(path.name, path.read_text()) for path, _ in documents]
+    texts += [
+        (str(action.relative_to(REPO)), action.read_text())
+        for action in sorted((REPO / ".github/actions").glob("*/action.y*ml"))
+    ]
+    for where, text in texts:
+        gaps += uses_comment_gaps(where, text)
+    for dockerfile in tracked_dockerfiles():
+        gaps += dockerfile_gaps(str(dockerfile.relative_to(REPO)), dockerfile.read_text())
+    return gaps
+
+
+def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
+    gaps = tree_download_gaps(documents)
+    check(
+        "every workflow, local action and Dockerfile fetches only through a pinned path",
+        not gaps,
+        "; ".join(gaps),
+    )
+    check(
+        "the tree's Dockerfiles are read",
+        any(path.name == "Dockerfile" for path in tracked_dockerfiles()),
+        f"git ls-files found {tracked_dockerfiles()}",
+    )
+    gradle, runs = gradle_gaps(documents)
+    check(
+        "every gradlew run validates the wrapper jar, pins the distribution digest, and "
+        "verifies dependencies",
+        runs > 0 and not gradle,
+        "; ".join(gradle) or "no gradlew run found",
+    )
+    # Planted cases, each of which must be reported, and controls that must not be.
+    sha = "0123456789abcdef" * 2 + "01234567"
+    digest = "@sha256:" + "0" * 64
+    bindgen = locked_version("wasm-bindgen")
+    taiki = f"taiki-e/install-action@{sha}"
+    wasm_opt = {"uses": PINNED_TOOL_ACTION, "with": {"tool": "wasm-opt"}}
+    bundle = {"id": "bundle", "uses": PINNED_TOOL_ACTION, "with": {"tool": "codeql-rust"}}
+    image_job = {
+        "strategy": {"matrix": {"include": [
+            {"image": "quay.io/pypa/manylinux_2_28_x86_64" + digest},
+            {"image": "quay.io/pypa/manylinux_2_28_aarch64:latest"},
+        ]}},
+    }
+    url = "https://example.invalid/a.zip"
+    planted = {
+        # The security review's cases.
+        "curl then sha256sum without -c": [
+            {"run": f"curl -fsSLo a.zip {url} && sha256sum a.zip && unzip a.zip"}
+        ],
+        "curl then a digest of another file": [
+            {"run": f"curl -fsSLo a.zip {url}\nsha256sum README.md\nunzip a.zip"}
+        ],
+        "curl with sha256sum -c": [
+            {"run": f'curl -fsSLo a.zip {url}\necho "$SUM  a.zip" | sha256sum -c -'}
+        ],
+        "curl inside bash -c": [{"run": f"bash -c 'curl -fsSLo a.zip {url}' && unzip a.zip"}],
+        "curl through a variable": [{"run": f"fetch=curl; $fetch -o a.zip {url}"}],
+        "wget in a substitution": [
+            {"run": 'out="$(wget -qO- https://example.invalid/a.tgz | tar xz)"'}
+        ],
+        "a python urlretrieve": [
+            {"run": f"python3 -c \"import urllib.request as u; u.urlretrieve('{url}','a.zip')\""}
+        ],
+        "a urllib fetch in a python step": [
+            {"shell": "python", "run": f"from urllib.request import urlopen\nurlopen('{url}')"}
+        ],
+        "gh release download": [{"run": "gh release download v1 -p '*.zip'"}],
+        "gh run download": [{"run": "gh run download 1 -n wheels"}],
+        "Invoke-WebRequest": [
+            {"shell": "pwsh", "run": f"Invoke-WebRequest -Uri {url} -OutFile a.zip"}
+        ],
+        "iwr": [{"shell": "pwsh", "run": f"iwr {url} -OutFile a.zip"}],
+        "pip install maturin": [{"run": "pip install maturin"}],
+        "python -m pip install of a pinned version": [
+            {"run": "python3 -m pip install maturin==1.16.0"}
+        ],
+        "pip install -r without hashes": [{"run": "pip3 install -r requirements.txt"}],
+        "pip download": [{"run": "pip download -d wheels cffi"}],
+        "a fetch in a step env value": [
+            {"env": {"SCRIPT": f"curl -o a.zip {url}"}, "run": 'bash -c "$SCRIPT"'}
+        ],
+        "a fetch in a github-script": [
+            {"uses": f"actions/github-script@{sha}",
+             "with": {"script": f"await fetch('{url}')"}}
+        ],
+        "mixed-case setup-python": [{"uses": f"Actions/Setup-Python@{sha}"}],
+        "mixed-case setup-bun": [{"uses": f"Oven-sh/setup-bun@{sha}"}],
+        "setup-bun": [{"uses": f"oven-sh/setup-bun@{sha}"}],
+        "setup-android": [{"uses": f"android-actions/setup-android@{sha}"}],
+        "android-emulator-runner": [{"uses": f"reactivecircus/android-emulator-runner@{sha}"}],
+        "setup-nasm": [{"uses": f"ilammy/setup-nasm@{sha}"}],
+        "maturin-action": [{"uses": f"PyO3/maturin-action@{sha}"}],
+        "pypi-publish": [{"uses": f"pypa/gh-action-pypi-publish@{sha}"}],
+        "an action by tag": [{"uses": "actions/checkout@v5"}],
+        "an action by branch": [{"uses": "dtolnay/rust-toolchain@master"}],
+        "an action by a short SHA": [{"uses": "actions/checkout@0123456"}],
+        "an action with no ref": [{"uses": "actions/checkout"}],
+        "setup-python in a workflow": [{"uses": f"actions/setup-python@{sha}"}],
+        "setup-node in a workflow": [{"uses": f"actions/setup-node@{sha}"}],
+        "setup-java in a workflow": [{"uses": f"actions/setup-java@{sha}"}],
+        "docker run with a digest label and a tagged image": [
+            {"run": f"docker run --label x=a{digest} alpine:latest sh"}
+        ],
+        "docker run with a digest env value and a tagged image": [
+            {"run": f"docker run -e IMG=a{digest} alpine:latest sh"}
+        ],
+        "docker run by tag": [
+            {"run": "docker run --rm quay.io/pypa/manylinux_2_28_x86_64:latest true"}
+        ],
+        "docker run with an option the tables lack": [
+            {"run": f"docker run --gpus all alpine{digest} sh"}
+        ],
+        "docker pull of an unset variable": [{"run": 'docker pull "$IMAGE"'}],
+        "docker image pull by tag": [{"run": "docker image pull alpine:3"}],
+        "docker build": [{"run": "docker build -t x ."}],
+        "docker buildx": [{"run": "docker buildx build ."}],
+        "docker inside bash -c": [{"run": f"bash -c 'docker run alpine{digest} true'"}],
+        "podman": [{"run": "podman run alpine:3 true"}],
+        "skopeo": [{"run": "skopeo copy docker://alpine:3 dir:a"}],
+        "a docker:// step by tag": [{"uses": "docker://alpine:3"}],
+        "sdkmanager": [{"run": 'sdkmanager "ndk;27.2.12479018"'}],
+        "sdkmanager --install": [{"run": "yes | sdkmanager --install emulator --channel=0"}],
+        "bun install without --frozen-lockfile": [{"run": "bun install"}],
+        "bunx": [{"run": "bunx typedoc"}],
+        "bun add": [{"run": "bun add left-pad"}],
+        "npx": [{"run": "npx typedoc"}],
+        "cargo install from the registry": [{"run": "cargo install --locked cargo-fuzz"}],
+        "cargo install --path without --locked": [{"run": 'cargo install --path "$CRATE"'}],
+        "cargo +toolchain install from the registry": [
+            {"run": "cargo +nightly install cargo-fuzz"}
+        ],
+        "uv pip": [{"run": "uv pip install maturin"}],
+        "hashed pip of a file missing from the step's directory": [
+            {"working-directory": "bindings/python",
+             "run": "pip install --require-hashes -r .github/requirements/ruff.txt"}
+        ],
+        "hashed pip of a file that does not exist": [
+            {"run": "pip install --require-hashes --requirement=.github/requirements/absent.txt"}
+        ],
+        "unpinned docker run after `$(…); do`": [
+            {"run": "for _ in $(seq 3); do docker run alpine:latest true && break; done"}
+        ],
+        "curl of a loopback and an outside URL": [
+            {"run": "curl -sf http://127.0.0.1:9090/a https://example.invalid/b"}
+        ],
+        "curl of a loopback-looking host": [
+            {"run": "curl -sf http://127.0.0.1.example.invalid/a"}
+        ],
+        "curl of a computed URL": [{"run": 'curl -sf "http://127.0.0.1:$PORT/a"'}],
+        "curl with a URL-less config": [{"run": "curl -K /tmp/urls"}],
+        "loopback-looking curl whose userinfo hides an outside host": [
+            {"run": "curl -o a.zip http://localhost:80@evil.example/a.zip"}
+        ],
+        "127.0.0.1 curl whose userinfo hides an outside host": [
+            {"run": "curl -o a.zip http://127.0.0.1:1@evil.example/a.zip"}
+        ],
+        "loopback curl resolved to an outside address": [
+            {"run": "curl --resolve localhost:80:203.0.113.5 -o a.zip http://localhost/a.zip"}
+        ],
+        "loopback curl through an outside proxy": [
+            {"run": "curl -x evil.example:8080 -o a.zip http://localhost/a.zip"}
+        ],
+        "loopback curl with a config file": [{"run": "curl -K urls.txt http://127.0.0.1/"}],
+        "loopback curl that keeps the body": [
+            {"run": "curl -sf -o probe.out http://127.0.0.1:9090/scp-test"}
+        ],
+        "wget of a loopback probe URL": [{"run": "wget -q http://127.0.0.1:9090/scp-test"}],
+        "loopback curl chained to an outside curl": [
+            {"run": "curl -sf http://127.0.0.1:9090/a && curl -sf https://example.invalid/b"}
+        ],
+        "hashed pip of a computed path": [
+            {"run": 'pip install --require-hashes -r "$REQS"'}
+        ],
+        "git clone": [{"run": "git clone https://example.invalid/a.git"}],
+        "taiki-e without fallback none": [{"uses": taiki, "with": {"tool": "cargo-nextest"}}],
+        "taiki-e with the checksum off": [
+            {"uses": taiki, "with": {"tool": "x", "fallback": "none", "checksum": "false"}}
+        ],
+        "wasm-pack without wasm-bindgen": [
+            {"uses": taiki, "with": {"tool": "wasm-pack@0.14.0", "fallback": "none"}},
+            wasm_opt,
+        ],
+        "wasm-pack with another wasm-bindgen": [
+            {"uses": taiki,
+             "with": {"tool": "wasm-pack@0.14.0,wasm-bindgen@0.0.1", "fallback": "none"}},
+            wasm_opt,
+        ],
+        "wasm-pack without wasm-opt": [
+            {"uses": taiki,
+             "with": {"tool": f"wasm-pack@0.14.0,wasm-bindgen@{bindgen}", "fallback": "none"}}
+        ],
+        "setup-buildx with a tagged buildkit": [
+            {"uses": f"docker/setup-buildx-action@{sha}",
+             "with": {"driver-opts": "image=moby/buildkit:buildx-stable-1"}}
+        ],
+        "setup-buildx with no driver image": [{"uses": f"docker/setup-buildx-action@{sha}"}],
+        "setup-buildx with a version": [
+            {"uses": f"docker/setup-buildx-action@{sha}",
+             "with": {"driver-opts": f"image=moby/buildkit{digest}", "version": "latest"}}
+        ],
+        "codeql init without tools": [{"uses": f"github/codeql-action/init@{sha}"}],
+        "codeql init with a version as tools": [
+            {"uses": f"github/codeql-action/init@{sha}", "with": {"tools": "linked"}}
+        ],
+        "codeql init with tools from a later step": [
+            {"uses": f"github/codeql-action/init@{sha}",
+             "with": {"tools": "${{ steps.bundle.outputs.path }}"}},
+            bundle,
+        ],
+        "setup-gradle with a gradle-version": [
+            {"uses": f"gradle/actions/setup-gradle@{sha}", "with": {"gradle-version": "8.14"}}
+        ],
+        "a local action that is not composite": [{"uses": "./.github/actions/lib"}],
+    }
+    for name, steps in planted.items():
+        check(
+            f"verified-download reports a planted {name} step",
+            bool(unverified_download_gaps("planted", steps)),
+            f"{steps} went unreported",
+        )
+    hashed = {"run": "pip install --require-hashes -r .github/requirements/ruff.txt"}
+    in_bindings = {"defaults": {"run": {"working-directory": "bindings/python"}}}
+    check(
+        "verified-download reports a hashed pip whose file is missing from the job's "
+        "default working directory",
+        bool(run_gaps("planted", hashed, in_bindings)),
+        f"{hashed} under {in_bindings} went unreported",
+    )
+    check(
+        "verified-download accepts the same hashed pip from the repository root",
+        not run_gaps("control", hashed, {}),
+        f"returned {run_gaps('control', hashed, {})}",
+    )
+    guarded = [
+        {"run": '"$py" -I "$GITHUB_ACTION_PATH/guard.py" before "$T" "$V"'},
+        {"uses": f"actions/setup-python@{sha}"},
+        {"run": '"$py" -I "$GITHUB_ACTION_PATH/guard.py" after "$T"'},
+    ]
+    check(
+        "verified-download reports setup-python outside toolcache-setup, guarded or not",
+        bool(unverified_download_gaps("planted", guarded)),
+        f"{guarded} went unreported",
+    )
+    check(
+        "verified-download reports setup-python in toolcache-setup without its after step",
+        bool(unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded[:2])),
+        f"{guarded[:2]} went unreported",
+    )
+    controls = {
+        "the android-sdk action": [{"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}}],
+        "the pinned-tool action": [{"uses": PINNED_TOOL_ACTION, "with": {"tool": "bun"}}],
+        "checkout at a commit SHA": [{"uses": f"actions/checkout@{sha}"}],
+        "pip with --require-hashes": [
+            {"run": "python3 -m pip install --require-hashes -r .github/requirements/ruff.txt"}
+        ],
+        "bun install --frozen-lockfile": [{"run": "bun install --frozen-lockfile"}],
+        "a loopback health probe": [
+            {"run": "for _ in $(seq 60); do curl -sf -o /dev/null "
+                    "http://127.0.0.1:9090/scp-test && break; sleep 1; done"}
+        ],
+        "a bare loopback health probe": [
+            {"run": "curl -sf -o /dev/null http://127.0.0.1:9090/scp-test"}
+        ],
+        "docker exec into a running container": [
+            {"run": "docker exec scp-ci-postgres pg_isready -U postgres"}
+        ],
+        "cargo install of a checked source": [
+            {"run": 'cargo +nightly install --locked --path "$CRATE"'}
+        ],
+        "taiki-e with fallback none": [
+            {"uses": taiki, "with": {"tool": "cargo-nextest", "fallback": "none"}}
+        ],
+        "wasm-pack with the locked wasm-bindgen and wasm-opt": [
+            {"uses": taiki,
+             "with": {"tool": f"wasm-pack@0.14.0,wasm-bindgen@{bindgen}", "fallback": "none"}},
+            wasm_opt,
+        ],
+        "setup-buildx with a buildkit named by digest": [
+            {"uses": f"docker/setup-buildx-action@{sha}",
+             "with": {"driver-opts": f"image=moby/buildkit:buildx-stable-1{digest}\n"}}
+        ],
+        "codeql init with an earlier bundle": [
+            bundle,
+            {"uses": f"github/codeql-action/init@{sha}",
+             "with": {"tools": "${{ steps.bundle.outputs.path }}"}},
+        ],
+        "docker run of an image named by digest": [
+            {"run": f"docker run --rm -v a:/b -e X --env-file e "
+                    f"quay.io/pypa/manylinux_2_28_x86_64{digest} true"}
+        ],
+        "docker inspect, which pulls nothing": [{"run": "docker inspect alpine:3"}],
+        "a docker:// step named by digest": [{"uses": f"docker://alpine{digest}"}],
+        "a word that merely contains a fetch word": [
+            {"run": "echo curly braces; ./scripts/iwrite.sh; cranelift --help"}
+        ],
+    }
+    for name, steps in controls.items():
+        check(
+            f"verified-download does not report {name}",
+            not unverified_download_gaps("control", steps),
+            f"{unverified_download_gaps('control', steps)}",
+        )
+    pinned_pull = {"env": {"IMAGE": "${{ matrix.image }}"}, "run": 'docker pull "$IMAGE"'}
+    check(
+        "verified-download reports docker pull of a matrix image when one matrix value "
+        "has no digest",
+        bool(unverified_download_gaps("planted", [pinned_pull], image_job)),
+        f"{pinned_pull} with {image_job} went unreported",
+    )
+    every_pinned = copy.deepcopy(image_job)
+    every_pinned["strategy"]["matrix"]["include"][1]["image"] = "alpine" + digest
+    check(
+        "verified-download does not report docker pull of a matrix image whose every "
+        "value has a digest",
+        not unverified_download_gaps("control", [pinned_pull], every_pinned),
+        f"{unverified_download_gaps('control', [pinned_pull], every_pinned)}",
+    )
+    for name, job in {
+        "a job container by tag": {"container": "node:22"},
+        "a job container mapping by tag": {"container": {"image": "node:22"}},
+        "a service by tag": {"services": {"db": {"image": "postgres:17"}}},
+        "a matrix container with one unpinned value": {
+            **image_job,
+            "container": "${{ matrix.image }}",
+        },
+    }.items():
+        check(
+            f"verified-download reports {name}",
+            bool(job_image_gaps("planted", job)),
+            f"{job} went unreported",
+        )
+    pinned_job = {
+        "container": {"image": "node" + digest},
+        "services": {"db": {"image": "postgres" + digest}},
+    }
+    check(
+        "verified-download does not report job and service images named by digest",
+        not job_image_gaps("control", pinned_job),
+        f"{job_image_gaps('control', pinned_job)}",
+    )
+    check(
+        "verified-download reports a job calling a remote reusable workflow",
+        bool(job_uses_gaps("planted", {"uses": f"octo/ci/.github/workflows/x.yml@{sha}"})),
+    )
+    check(
+        "verified-download does not report a job calling a local reusable workflow",
+        not job_uses_gaps("control", {"uses": "./.github/workflows/build-matrix.yml"}),
+    )
+    check(
+        "verified-download reports a remote uses: line with no tag comment",
+        bool(uses_comment_gaps("planted", f"      - uses: actions/checkout@{sha}\n")),
+    )
+    check(
+        "verified-download does not report a remote uses: line with its tag comment",
+        not uses_comment_gaps("control", f"      - uses: actions/checkout@{sha} # v5.1.0\n"),
+    )
+    check(
+        "verified-download does not report setup-python between guard.py's steps in "
+        "toolcache-setup",
+        not unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded),
+        f"{unverified_download_gaps(TOOLCACHE_ACTION_FILE, guarded)}",
+    )
+    planted_dockerfiles = {
+        "a FROM by tag": "FROM rust:slim-bookworm\n",
+        "a FROM by tag with a platform": "FROM --platform=$BUILDPLATFORM debian:12 AS base\n",
+        "a FROM of an expansion with a missing stage": (
+            f"FROM alpine{digest} AS deps-amd64\nFROM deps-${{TARGETARCH}}\n"
+        ),
+        "a COPY --from an external image by tag": (
+            f"FROM alpine{digest}\nCOPY --from=busybox:1 /bin/sh /sh\n"
+        ),
+        "an ADD of a URL with no checksum": f"FROM alpine{digest}\nADD {url} /a.zip\n",
+        "a syntax directive by tag": f"# syntax=docker/dockerfile:1\nFROM alpine{digest}\n",
+        "a RUN that fetches with curl": (
+            f"FROM alpine{digest}\nRUN apk add x && \\\n    curl -o a {url}\n"
+        ),
+        "a RUN pip install without hashes": f"FROM python{digest}\nRUN pip install x\n",
+    }
+    for name, text in planted_dockerfiles.items():
+        check(
+            f"verified-download reports a planted Dockerfile with {name}",
+            bool(dockerfile_gaps("planted", text)),
+            f"{text!r} went unreported",
+        )
+    control_dockerfile = (
+        f"# syntax=docker/dockerfile:1{digest}\n"
+        f"FROM rust:slim{digest} AS build\n"
+        f"FROM build AS deps-amd64\nFROM build AS deps-arm64\n"
+        "FROM deps-${TARGETARCH} AS deps\n"
+        f"ADD --checksum=sha256:{'0' * 64} {url} /a.zip\n"
+        "COPY --from=build /a /a\nFROM scratch\n"
+        "RUN apt-get install -y curl-dev\n"
+    )
+    check(
+        "verified-download does not report a Dockerfile whose every image has a digest",
+        not dockerfile_gaps("control", control_dockerfile),
+        f"{dockerfile_gaps('control', control_dockerfile)}",
+    )
+    gradle_job = {
+        "defaults": {"run": {"working-directory": "bindings/kotlin"}},
+        "steps": [{"uses": f"actions/checkout@{sha}"}, {"run": "./gradlew :scp-kt:jar"}],
+    }
+    check(
+        "verified-download reports a planted gradlew job with no wrapper validation",
+        bool(wrapper_validation_gaps("planted", gradle_job)),
+    )
+    disabled = copy.deepcopy(gradle_job)
+    disabled["steps"].insert(
+        1,
+        {"uses": f"gradle/actions/setup-gradle@{sha}", "with": {"validate-wrappers": False}},
+    )
+    check(
+        "verified-download reports a planted gradlew job whose setup-gradle skips "
+        "wrapper validation",
+        bool(wrapper_validation_gaps("planted", disabled)),
+    )
+    validated = copy.deepcopy(gradle_job)
+    validated["steps"].insert(1, {"uses": f"Gradle/Actions/Wrapper-Validation@{sha}"})
+    check(
+        "verified-download does not report a gradlew job after wrapper-validation, "
+        "named in any case",
+        not wrapper_validation_gaps("control", validated),
+    )
+    check(
+        "gradle_runs reads the build a `-p` names relative to the working directory",
+        gradle_runs({}, {"run": "bindings/kotlin/gradlew -p some/runner \\\n  build"})
+        == [GradleRun("bindings/kotlin", "some/runner")],
+        f"{gradle_runs({}, {'run': 'bindings/kotlin/gradlew -p some/runner build'})}",
+    )
+    check(
+        "verified-download reports planted wrapper properties without "
+        "distributionSha256Sum",
+        bool(
+            wrapper_properties_gaps(
+                "planted",
+                "distributionUrl=https\\://services.gradle.org/distributions/"
+                "gradle-8.14.4-bin.zip\n",
+            )
+        ),
+    )
+    metadata = (
+        '<verification-metadata xmlns="https://schema.gradle.org/dependency-'
+        'verification"><configuration><verify-metadata>{}</verify-metadata>'
+        "<trusted-artifacts>{}</trusted-artifacts></configuration><components>"
+        '<component group="g" name="n" version="1"><artifact name="n-1.jar">'
+        '<sha256 value="{}" origin="Generated by Gradle"/></artifact></component>'
+        "</components></verification-metadata>"
+    )
+    planted_metadata = {
+        "missing": None,
+        "with verify-metadata off": metadata.format("false", "", "0" * 64),
+        "trusting every group": metadata.format(
+            "true", '<trust group=".*" regex="true"/>', "0" * 64
+        ),
+        "trusting every file": metadata.format(
+            "true", '<trust file=".*" regex="true"/>', "0" * 64
+        ),
+        "trusting every jar": metadata.format(
+            "true", '<trust file=".*[.]jar" regex="true"/>', "0" * 64
+        ),
+        "trusting one sources jar": metadata.format(
+            "true", '<trust file=".*-sources[.]jar" regex="true"/>', "0" * 64
+        ),
+    }
+    for name, text in planted_metadata.items():
+        check(
+            f"verified-download reports planted verification metadata {name}",
+            bool(verification_metadata_gaps("planted", text)),
+        )
+    verifying = metadata.format("true", "", "0" * 64)
+    check(
+        "verified-download does not report verification metadata that verifies",
+        not verification_metadata_gaps("control", verifying),
+        f"{verification_metadata_gaps('control', verifying)}",
+    )
+    check_installer_rejects_a_corrupt_archive()
+    check_toolcache_guard()
+
+
+def run_verified_download(inputs: Inputs) -> None:
+    print(
+        "verified-download — every archive a CI step downloads is checked before it is "
+        "unpacked"
+    )
+    check_verified_downloads(inputs.documents)
+
+
 def run_timeout(inputs: Inputs) -> None:
     documents = inputs.documents
     print("timeout — every job in every workflow bounds its own runtime")
@@ -12636,6 +14199,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "skip": run_skip,
     "push-skips": run_push_skips,
     "filter-key": run_filter_key,
+    "verified-download": run_verified_download,
 }
 
 # CRITERION for GROUPS: a check belongs to `docs` when a file outside the `code`
@@ -12693,6 +14257,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "skip",
         "push-skips",
         "filter-key",
+        "verified-download",
     ),
 }
 

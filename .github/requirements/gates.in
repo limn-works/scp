@@ -1,0 +1,16 @@
+# Compiled into gates.txt beside this file with every artifact's SHA-256, and CI installs
+# that file with `pip install --require-hashes`, so pip installs only the files hashed
+# there. Regenerate it after any edit here:
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#     .github/requirements/gates.in -o .github/requirements/gates.txt
+# tree-sitter-rust stays below 0.25 and pytest below 10 so an upstream release with a
+# breaking API cannot fail the gates with no change here. ruff matches ruff.in.
+pytest>=8,<10
+tree-sitter
+tree-sitter-rust>=0.21,<0.25
+tree-sitter-python
+tree-sitter-typescript
+tree-sitter-kotlin
+tree-sitter-swift
+ruff==0.15.4
+pyyaml>=6,<7

@@ -1030,7 +1030,7 @@ fi
 # execute proved nothing; this line names the cause so a reader installs the library
 # instead of reading a traceback as an enforcement violation.
 if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
-    printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
+    printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install --require-hashes -r .github/requirements/pyyaml.txt\n' "$PYTHON" >&2
 fi
 # `scripts/check-shipped-feature-graph.sh` runs python3.12 itself, whatever $PYTHON
 # resolved to, and imports `tomllib` under it; `scripts/check-vendored-openssl-scope.sh`

@@ -1,0 +1,8 @@
+# Compiled into maturin.txt beside this file with every artifact's SHA-256, and CI installs
+# that file with `pip install --require-hashes`, so pip installs only the files hashed
+# there. Regenerate it after any edit here:
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#     .github/requirements/maturin.in -o .github/requirements/maturin.txt
+# The version also feeds the bridge artifact cache keys in ci.yml, which read
+# `maturin --version`.
+maturin==1.16.0
