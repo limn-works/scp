@@ -1107,6 +1107,10 @@ pub struct ContextCreator<'a> {
 /// log state persists (atomic from the caller's perspective).
 ///
 /// See ADR-008 acceptance criterion 2.
+///
+/// Core-internal: domain crates reach it only through
+/// [`ActorDeps::create_context`](crate::context::actor::deps::ActorDeps::create_context)
+/// (ADR-070 §4).
 // ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
 // store. The async event-log provider calls (`init_event_log`, `append_event`,
 // `append_membership_change_leaf`) and the async `receipt.rollback` regain real
@@ -1118,7 +1122,7 @@ pub struct ContextCreator<'a> {
 // splitting the sequential phases across helpers would reduce, not improve,
 // readability.
 #[allow(clippy::too_many_lines)]
-pub async fn create_context(
+pub(crate) async fn create_context(
     context_id: String,
     params: ContextParams,
     crypto: &NodeMlsFactory,

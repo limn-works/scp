@@ -18,100 +18,104 @@ use scp_protocol::envelope::inner::MessageType;
 use scp_protocol::provenance::attach::SourceContextInfo;
 use std::sync::Arc;
 
-/// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
-/// wrap → inner-envelope stamp+sign), returning it alongside the canonical
-/// 32-byte context-id digest.
-///
-/// Shared by both seal seams — the deleted pre-PR-7 provider path and the
-/// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
-/// driven from the Class-C view in `scp_runtime_messaging::helpers::encrypt_and_send`, via
-/// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
-/// inner-envelope construction and the sealed wire stays byte-identical across
-/// the flip (the 16 golden byte-identity tests continue to hold).
-///
-/// # Errors
-///
-/// [`ContextError::CryptoFailed`] when the access-key wrap or the content
-/// serialization fails, and the signing error when custody does not sign.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_inner_wire<S: std::hash::BuildHasher + Sync>(
-    clock: &Arc<dyn Clock>,
-    context_id: &str,
-    sender_did: &DID,
-    payload: &[u8],
-    signer: MessageSigner<'_>,
-    recipients_data: &std::collections::HashMap<String, AccessKey, S>,
-    sequence: u64,
-    source_provenance: Option<&SourceContextInfo>,
-    message_type: MessageType,
-) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
-    // ADR-056: key the send-path crypto by the canonical digest (matches
-    // `state.context_id` and the MLS group keyed at creation), not a re-hash
-    // of the hex id.
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    let provenance = source_provenance.map(|source_info| {
-        let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
-        let dp = scp_protocol::provenance::attach::attach_provenance(
-            source_info,
-            &target_context,
-            None,
-            None,
-            None,
-        );
-        scp_protocol::envelope::inner::Provenance {
-            source: dp.source_context,
-            upstream_hash: None,
-        }
-    });
+scp_runtime_types::pub_under_testing! {
+    /// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
+    /// wrap → inner-envelope stamp+sign), returning it alongside the canonical
+    /// 32-byte context-id digest.
+    ///
+    /// Shared by both seal seams — the deleted pre-PR-7 provider path and the
+    /// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
+    /// driven from the Class-C view in `scp_runtime_messaging::helpers::encrypt_and_send`, via
+    /// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
+    /// inner-envelope construction and the sealed wire stays byte-identical across
+    /// the flip (the 16 golden byte-identity tests continue to hold).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] when the access-key wrap or the content
+    /// serialization fails, and the signing error when custody does not sign.
+    ///
+    /// `pub(crate)`; `pub` under `testing`, because `scp-runtime`'s supervisor tests build a wire directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_inner_wire<S: std::hash::BuildHasher + Sync>(
+        clock: &Arc<dyn Clock>,
+        context_id: &str,
+        sender_did: &DID,
+        payload: &[u8],
+        signer: MessageSigner<'_>,
+        recipients_data: &std::collections::HashMap<String, AccessKey, S>,
+        sequence: u64,
+        source_provenance: Option<&SourceContextInfo>,
+        message_type: MessageType,
+    ) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
+        // ADR-056: key the send-path crypto by the canonical digest (matches
+        // `state.context_id` and the MLS group keyed at creation), not a re-hash
+        // of the hex id.
+        let context_id_bytes = state::context_id_to_bytes(context_id);
+        let provenance = source_provenance.map(|source_info| {
+            let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
+            let dp = scp_protocol::provenance::attach::attach_provenance(
+                source_info,
+                &target_context,
+                None,
+                None,
+                None,
+            );
+            scp_protocol::envelope::inner::Provenance {
+                source: dp.source_context,
+                upstream_hash: None,
+            }
+        });
 
-    let recipients: Vec<Recipient<'_>> = recipients_data
-        .iter()
-        .map(|(did, key)| Recipient {
-            did: did.as_str(),
-            access_key: key,
-        })
-        .collect();
+        let recipients: Vec<Recipient<'_>> = recipients_data
+            .iter()
+            .map(|(did, key)| Recipient {
+                did: did.as_str(),
+                access_key: key,
+            })
+            .collect();
 
-    let wrapped = scp_protocol::crypto::access_keys::wrapping::wrap_content(
-        payload,
-        &recipients,
-        context_id,
-        sender_did.as_ref(),
-        0,
-        0,
-    )
-    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let wrapped = scp_protocol::crypto::access_keys::wrapping::wrap_content(
+            payload,
+            &recipients,
+            context_id,
+            sender_did.as_ref(),
+            0,
+            0,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    let wrapped_bytes = rmp_serde::to_vec_named(&wrapped)
-        .map_err(|e| ContextError::CryptoFailed(format!("wrapped content serialization: {e}")))?;
+        let wrapped_bytes = rmp_serde::to_vec_named(&wrapped)
+            .map_err(|e| ContextError::CryptoFailed(format!("wrapped content serialization: {e}")))?;
 
-    let timestamp = clock.now_millis();
-    let params = InnerEnvelopeParams {
-        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-        context_id,
-        sender_did: sender_did.as_ref(),
-        epoch: 0,
-        generation: 0,
-        sequence,
-        timestamp,
-        message_type,
-        payload: &wrapped_bytes,
-        provenance,
-        // ADR-039: stamp the verification method this message is signed under
-        // (`#active` or `#agent`) so the recipient resolves the matching public
-        // key from the sender's DID document. The stamped persona and the
-        // signing key both come from the single `MessageSigner` below, so they
-        // cannot disagree — no longer hardcoded to `#active`.
-        signing_key_id: signer.signing_key_id(),
-    };
+        let timestamp = clock.now_millis();
+        let params = InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id,
+            sender_did: sender_did.as_ref(),
+            epoch: 0,
+            generation: 0,
+            sequence,
+            timestamp,
+            message_type,
+            payload: &wrapped_bytes,
+            provenance,
+            // ADR-039: stamp the verification method this message is signed under
+            // (`#active` or `#agent`) so the recipient resolves the matching public
+            // key from the sender's DID document. The stamped persona and the
+            // signing key both come from the single `MessageSigner` below, so they
+            // cannot disagree — no longer hardcoded to `#active`.
+            signing_key_id: signer.signing_key_id(),
+        };
 
-    // ADR-049 Decision 7a: the canonical hash is signed through custody
-    // within the signing budget; the actor holds no key material.
-    let inner =
-        crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer.signer())
-            .await?;
+        // ADR-049 Decision 7a: the canonical hash is signed through custody
+        // within the signing budget; the actor holds no key material.
+        let inner =
+            crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer.signer())
+                .await?;
 
-    Ok((inner, context_id_bytes))
+        Ok((inner, context_id_bytes))
+    }
 }
 
 /// Builds and seals an application-data send through the ADR-049 PR-7 actor

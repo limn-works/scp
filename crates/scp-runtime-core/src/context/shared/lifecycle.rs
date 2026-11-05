@@ -122,7 +122,7 @@ pub struct FirstStateRollbackInner {
     /// whose actor registry a rollback reads.
     supervisor: crate::context::supervisor::handle::SupervisorHandle,
     /// The context id the first-state records belong to.
-    pub context_id: String,
+    pub(crate) context_id: String,
     /// The snapshot and contact stored before the first write, set once by
     /// [`FirstStateRollback::capture_priors`].
     priors: std::sync::OnceLock<FirstStatePriors>,
@@ -398,34 +398,38 @@ pub struct FirstStateRollback {
 }
 
 impl FirstStateRollback {
-    /// A guard for the first-state writes of `context_id`, over the stores
-    /// `deps` writes to. It claims `context_id` in `pending_first_state`
-    /// until it commits or rolls back, so an operation over an id whose
-    /// earlier rollback is still running fails here, before any write.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ActorBusy`] while another operation's first state of
-    ///   `context_id` is unsettled; it is retryable.
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has
-    ///   dropped.
-    pub fn new(deps: &ActorDeps, context_id: &str) -> Result<Self, ContextError> {
-        deps.supervisor.claim_first_state(context_id)?;
-        Ok(Self {
-            inner: Arc::new(FirstStateRollbackInner {
-                persistence: Arc::clone(&deps.persistence),
-                contacts: deps.supervisor.relay_contact_store()?,
-                supervisor: deps.supervisor.clone(),
-                context_id: context_id.to_owned(),
-                priors: std::sync::OnceLock::new(),
-                contact: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
-                snapshot: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
-                writes_idle: tokio::sync::watch::Sender::new(true),
-                abandoned: std::sync::atomic::AtomicBool::new(false),
-                claimed: std::sync::atomic::AtomicBool::new(true),
-                settled: std::sync::atomic::AtomicBool::new(false),
-            }),
-        })
+    scp_runtime_types::pub_under_testing! {
+        /// A guard for the first-state writes of `context_id`, over the stores
+        /// `deps` writes to. It claims `context_id` in `pending_first_state`
+        /// until it commits or rolls back, so an operation over an id whose
+        /// earlier rollback is still running fails here, before any write.
+        ///
+        /// # Errors
+        ///
+        /// - [`ContextError::ActorBusy`] while another operation's first state of
+        ///   `context_id` is unsettled; it is retryable.
+        /// - [`ContextError::SupervisorShutDown`] when the Supervisor has
+        ///   dropped.
+        ///
+        /// `pub(crate)`; `pub` under `testing`, because the lifecycle crate's and `scp-runtime`'s rollback tests arm a guard directly.
+        pub(crate) fn new(deps: &ActorDeps, context_id: &str) -> Result<Self, ContextError> {
+            deps.supervisor.claim_first_state(context_id)?;
+            Ok(Self {
+                inner: Arc::new(FirstStateRollbackInner {
+                    persistence: Arc::clone(&deps.persistence),
+                    contacts: deps.supervisor.relay_contact_store()?,
+                    supervisor: deps.supervisor.clone(),
+                    context_id: context_id.to_owned(),
+                    priors: std::sync::OnceLock::new(),
+                    contact: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
+                    snapshot: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
+                    writes_idle: tokio::sync::watch::Sender::new(true),
+                    abandoned: std::sync::atomic::AtomicBool::new(false),
+                    claimed: std::sync::atomic::AtomicBool::new(true),
+                    settled: std::sync::atomic::AtomicBool::new(false),
+                }),
+            })
+        }
     }
 
     /// Keeps the written records and releases the claim: the operation's
@@ -731,7 +735,7 @@ pub enum TtlArming {
 #[must_use = "run `finalize` after releasing `bootstrap_spawn_lock`"]
 pub struct SpawnedContext {
     /// The handle of the spawned actor's context.
-    pub handle: ContextHandle,
+    pub(crate) handle: ContextHandle,
     /// How `finalize` arms the context's TTL timer.
     ttl: TtlArming,
 }
@@ -1018,7 +1022,7 @@ fn first_state_writes(
 ///
 /// [`first_state_writes`] builds it before the future, so the last case holds
 /// too.
-pub struct WritesIdleOnDrop(pub Arc<FirstStateRollbackInner>);
+pub(crate) struct WritesIdleOnDrop(pub Arc<FirstStateRollbackInner>);
 
 impl Drop for WritesIdleOnDrop {
     fn drop(&mut self) {

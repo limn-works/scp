@@ -7,12 +7,13 @@
 //! plan section titles in quoted form.
 #![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 //!
-//! Per ADR-049 §5 and plan §"ActorDeps and SupervisorHandle" the handle
-//! must **not** expose any method that returns a
-//! [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle).
-//! Actors cannot reach sibling actors; cross-context work goes through
-//! [`SupervisorHandle::start_saga`]. This is the capability-reduction mechanism:
-//! the inner reference is private and no accessor exposes it.
+//! The inner `Weak<Supervisor>` is private and no accessor returns it or
+//! its upgrade. One method, [`SupervisorHandle::lookup`], returns a
+//! [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle):
+//! the lifecycle and governance crates use it to test whether a context's
+//! actor is registered. Its `send` is `pub`, so the type system does not
+//! stop a holder of the handle from messaging another context's actor;
+//! cross-context work is meant to go through [`SupervisorHandle::start_saga`].
 //!
 //! # `Weak<Supervisor>` back-reference
 //!
@@ -56,12 +57,13 @@ use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
 // ---------------------------------------------------------------------------
 
 /// Capability-reduced view of `Supervisor` held by actors. Cloned into
-/// each actor's `ActorDeps` and never exposed outside `crate::context::`.
+/// each actor's `ActorDeps`; domain crates reach it as
+/// `ActorDeps::supervisor`, and only core mints one (`wrap` is
+/// `pub(in crate::context::supervisor)`).
 ///
-/// **No `ContextActorHandle` accessor.** This is the mechanical contract
-/// that makes "actors cannot reach sibling actors" a type-system
-/// property. The inner `Weak<Supervisor>` field is private; no public
-/// method returns it or its upgrade. Cross-context work MUST go through
+/// The inner `Weak<Supervisor>` field is private; no method returns it or
+/// its upgrade. [`Self::lookup`] is the one `ContextActorHandle` accessor
+/// (see the module doc). Cross-context work goes through
 /// [`Self::start_saga`].
 #[derive(Clone)]
 pub struct SupervisorHandle {
@@ -821,19 +823,13 @@ impl SupervisorHandle {
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — only lifecycle bootstrap callers
-    /// (`crate::context::lifecycle_helpers`) reach this. The
-    /// `private_interfaces` allow mirrors the discipline used by the other
-    /// owned-state `pub(in crate::context)` registry methods on this handle:
-    /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
-    /// method itself is reachable from inside the `context` module
-    /// tree.
+    /// `pub`: the lifecycle crate's create, import and restore bootstraps
+    /// call it. It needs an owned `ActorDeps`, which only core constructs.
     ///
     /// # Errors
     ///
     /// Propagates [`ContextError::CreationFailed`] when an actor is
     /// already registered for this context id (first-writer-wins).
-    #[allow(private_interfaces)]
     pub async fn spawn_actor_with_state(
         &self,
         state: crate::context::actor::state::PerContextState,
@@ -966,7 +962,9 @@ impl SupervisorHandle {
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — reachable by the lifecycle import path only.
+    /// `pub`: the lifecycle crate's import path calls it to replace a
+    /// running context's actor. Any holder of a `SupervisorHandle` can reach
+    /// it, and only core mints one.
     ///
     /// # Errors
     ///
@@ -1017,13 +1015,10 @@ impl SupervisorHandle {
     // finding A3), so no detached timer task resolves actors this way.
     //
     // `lookup` is the ONE place a `SupervisorHandle` yields a
-    // `ContextActorHandle`. It does NOT breach the "actors cannot reach
-    // sibling actors" contract: the callers are supervisor-side dispatch
-    // and bootstrap helpers, not a handler running inside another actor's
-    // dispatch turn. Visibility is `pub(in crate::context)` so only
-    // `crate::context` infra can reach it — handler bodies under
-    // `actor/handlers/` are `pub`-only consumers of the handle and cannot
-    // name this method.
+    // `ContextActorHandle`. It is `pub`: the lifecycle crate's bootstraps
+    // and the governance crate's migration path call it to test whether an
+    // actor is registered. Visibility does not keep a handler from calling
+    // it, and the returned handle's `send` is `pub`.
     // -----------------------------------------------------------------
 
     /// Resolve the actor handle for `context_id` through the lock-free
@@ -1127,27 +1122,31 @@ impl SupervisorHandle {
         .map(|_detached| ())
     }
 
-    /// Claims `context_id` for one operation's first-state writes
-    /// (`Supervisor::pending_first_state`) until
-    /// [`Self::release_first_state`].
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ActorBusy`] while another operation's first state of
-    ///   the id is unsettled; it is retryable.
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub fn claim_first_state(&self, context_id: &str) -> Result<(), ContextError> {
-        if self
-            .upgrade()?
-            .pending_first_state
-            .insert(context_id.to_owned())
-        {
-            return Ok(());
+    scp_runtime_types::pub_under_testing! {
+        /// Claims `context_id` for one operation's first-state writes
+        /// (`Supervisor::pending_first_state`) until
+        /// [`Self::release_first_state`].
+        ///
+        /// # Errors
+        ///
+        /// - [`ContextError::ActorBusy`] while another operation's first state of
+        ///   the id is unsettled; it is retryable.
+        /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+        ///
+        /// `pub(crate)`; `pub` under `testing`, because the broadcast crate's and `scp-runtime`'s tests claim a first state directly.
+        pub(crate) fn claim_first_state(&self, context_id: &str) -> Result<(), ContextError> {
+            if self
+                .upgrade()?
+                .pending_first_state
+                .insert(context_id.to_owned())
+            {
+                return Ok(());
+            }
+            Err(ContextError::ActorBusy(format!(
+                "{context_id}: another create, import or join of this context has not committed or \
+                 rolled back its first state; retry"
+            )))
         }
-        Err(ContextError::ActorBusy(format!(
-            "{context_id}: another create, import or join of this context has not committed or \
-             rolled back its first state; retry"
-        )))
     }
 
     /// Test-only reach into [`Self::release_first_state`] for tests outside this crate.

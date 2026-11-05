@@ -53,7 +53,7 @@ use std::sync::Arc;
 /// answer than the rest of the runtime.
 pub struct KeyResolverDidResolver<'a> {
     /// The resolver that maps a DID's verification method to its public key.
-    pub key_resolver: &'a KeyResolver,
+    pub(crate) key_resolver: &'a KeyResolver,
 }
 
 impl<'a> KeyResolverDidResolver<'a> {
@@ -110,9 +110,10 @@ impl DidResolver for KeyResolverDidResolver<'_> {
 /// set. This is the opposite of a stub: it is the empty case of a real
 /// integration.
 ///
-/// `pub(crate)` so the cross-context outlet-invocation saga handler reuses the
-/// SAME per-context revocation surface for its §7 UCAN re-validation (spec
-/// §6.2.4), backed by the same `revoked_spending_ucan_cids` set.
+/// `pub` so the saga crate's cross-context outlet-invocation handler and the
+/// broadcast crate reuse the SAME per-context revocation surface for the §7
+/// UCAN re-validation (spec §6.2.4), backed by the same
+/// `revoked_spending_ucan_cids` set.
 pub struct ContextRevocationChecker<'a, S = std::collections::hash_map::RandomState> {
     /// The context's revoked spending-UCAN CIDs.
     pub revoked_cids: &'a HashSet<String, S>,
@@ -129,10 +130,9 @@ impl<S: std::hash::BuildHasher> RevocationChecker for ContextRevocationChecker<'
 /// Holds the escrow authorization and evaluated cost so that
 /// `complete_paid_action` and `void_paid_action` can finalize or roll back.
 ///
-/// Field visibility widened to `pub(crate)` in ADR-049 §15
-/// so the hoisted free functions in
-/// `scp_runtime_economy::helpers` can construct / destructure the
-/// token without going through this module.
+/// The fields are `pub` so the economy crate's helpers
+/// (`scp_runtime_economy::helpers`) can construct and destructure the token
+/// (ADR-049 §15, ADR-070).
 pub struct PaidActionAuthorization {
     /// The prepared action containing the authorization envelope.
     pub prepared: integration::PreparedAction,

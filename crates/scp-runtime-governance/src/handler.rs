@@ -740,7 +740,7 @@ async fn handle_apply_pending_economic_policy_change_actor(
 // Sweep handlers (Phase 2A finalization — sweep helper relocation)
 // ---------------------------------------------------------------------------
 
-/// Handle [`GovernanceCommand::EvaluatePeriodicConsequences`] (actor-shape).
+/// Evaluates periodic consequences: phase 4 of [`evaluate_governance_timeouts`] (actor-shape).
 ///
 /// Per-actor body of the relocated sweep. Evaluates consequence rules
 /// against the actor's own `state` and applies any triggered actions
@@ -1087,7 +1087,7 @@ fn apply_commit_retry_outcomes(
     }
 }
 
-/// Handle [`GovernanceCommand::ProcessPendingCommits`] (actor-shape).
+/// Drains the MLS commit retry queue: phase 5 of [`evaluate_governance_timeouts`] (actor-shape).
 ///
 /// Per-actor body of the relocated sweep (PR #1606 C6). Walks
 /// `state.pending_commits`, retries any commits whose `next_attempt_at

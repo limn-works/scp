@@ -68,7 +68,7 @@ use scp_runtime_core::context::ttl::{TtlExtension, TtlTimer};
 ///
 /// 1. **Terminal phase, OUTSIDE any transport timeout.** The FSM transition
 ///    (`Active` → `Expired`) and key destruction are sync/fast
-///    ([`ttl::apply_ttl_terminal_transition`]); the resulting terminal state is
+///    ([`ClassCMut::apply_ttl_terminal_transition`](scp_runtime_core::context::actor::class_s::ClassCMut::apply_ttl_terminal_transition)); the resulting terminal state is
 ///    persisted **FAIL-CLOSED** (keep-direction `commit_class_s_keep`, like
 ///    `close_context_with_key`) BEFORE the actor can tear down. A hostile relay
 ///    can no longer cancel the durable terminal transition (which previously
@@ -78,7 +78,7 @@ use scp_runtime_core::context::ttl::{TtlExtension, TtlTimer};
 ///    `Active`.
 /// 2. **Bounded-I/O phase, INSIDE `timeout(HANDLER_TIMEOUT)`.** Best-effort
 ///    relay deletion + the idempotent `ContextExpired` append
-///    ([`ttl::finish_ttl_expiry_io`]) — the unbounded provider awaits that a
+///    ([`ActorDeps::finish_ttl_expiry_io`]) — the unbounded provider awaits that a
 ///    hung relay could otherwise wedge on.
 ///
 /// # `prior_completed` (retry carry)

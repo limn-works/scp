@@ -14,8 +14,9 @@ use scp_protocol::context::ContextError;
 /// failing — the crypto state is Class M (crash-surviving), so a transient export failure does not
 /// lose security state.
 ///
-/// `pub(crate)` so the `ClassSCommitToken` deferred-persist terminals
-/// (`commit` / `discharge_with`) can build the owned snapshot in their OWN
+/// `pub`: the lifecycle, messaging and saga crates call it. The
+/// `ClassSCommitToken` deferred-persist terminals
+/// (`commit` / `discharge_with`) use it to build the owned snapshot in their OWN
 /// frame and drop the `&PerContextState` borrow BEFORE awaiting
 /// [`persist_snapshot_fail_closed`]. `PerContextState` is `!Sync` (it holds a
 /// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the

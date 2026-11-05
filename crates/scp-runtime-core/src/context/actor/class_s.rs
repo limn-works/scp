@@ -2071,11 +2071,21 @@ pub struct ClassCSplit<'a> {
     /// field-granular view is CLOSED by construction, not merely documented.
     pub role_state: RoleStateClassCMut<'a>,
     /// `&` membership (read-only in the consequence path).
+    /// `pub` under `testing`, so `scp-runtime`'s Class-S tests can read it.
+    #[cfg(any(test, feature = "testing"))]
     pub membership: &'a MembershipState,
+    /// `&` membership (read-only in the consequence path).
+    #[cfg(not(any(test, feature = "testing")))]
+    pub(crate) membership: &'a MembershipState,
     /// `&mut` receive buffer (consequence events are emitted here).
     pub receive_buffer: &'a mut ReceiveBuffer,
     /// `&mut` checkpoint counter (bumped by consequence enforcement).
+    /// `pub` under `testing`, so `scp-runtime`'s Class-S tests can read it.
+    #[cfg(any(test, feature = "testing"))]
     pub checkpoint_events_since: &'a mut u64,
+    /// `&mut` checkpoint counter (bumped by consequence enforcement).
+    #[cfg(not(any(test, feature = "testing")))]
+    pub(crate) checkpoint_events_since: &'a mut u64,
 }
 
 #[allow(
@@ -2186,7 +2196,7 @@ pub struct ConsequenceStateSplit<'a> {
     /// `&` membership (read-only in the consequence path).
     pub membership: &'a MembershipState,
     /// `&mut` receive buffer (consequence events are emitted here).
-    pub receive_buffer: &'a mut ReceiveBuffer,
+    pub(crate) receive_buffer: &'a mut ReceiveBuffer,
     /// `&mut` checkpoint counter (bumped by consequence enforcement).
     pub checkpoint_events_since: &'a mut u64,
 }
