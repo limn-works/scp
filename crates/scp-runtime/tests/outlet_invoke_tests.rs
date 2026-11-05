@@ -170,15 +170,15 @@ fn drain_invoked_events(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod cross_context_036 {
     use scp_runtime_core::context::outlets::invoke::BridgeFaultProbe;
+    use scp_runtime_core::context::outlets::invoke::CrossContextBridgeForTest;
     use scp_runtime_core::context::outlets::invoke::CrossContextVerificationDescriptor;
     use scp_runtime_core::context::outlets::invoke::MAX_CROSS_CONTEXT_STREAM_CHUNKS;
-    use scp_runtime_core::context::outlets::invoke::build_onward_a_leg_open;
-    use scp_runtime_core::context::outlets::invoke::build_streaming_outlet_event;
-    use scp_runtime_core::context::outlets::invoke::cross_context_economy_gate;
-    use scp_runtime_core::context::outlets::invoke::invoke_outlet_cross_context;
-    use scp_runtime_core::context::outlets::invoke::run_cross_context_bridge;
-    use scp_runtime_core::context::outlets::invoke::run_streaming_saga_seal_task;
-    use scp_runtime_core::context::outlets::invoke::verify_forwarded_chunk;
+    use scp_runtime_core::context::outlets::invoke::OutletCrossContextInvokeForTest;
+    use scp_runtime_core::context::outlets::invoke::StreamingOutletEventForTest;
+    use scp_runtime_core::context::outlets::invoke::StreamingSagaSealTaskForTest;
+    use scp_runtime_core::context::outlets::invoke::build_onward_a_leg_open_for_test as build_onward_a_leg_open;
+    use scp_runtime_core::context::outlets::invoke::cross_context_economy_gate_for_test as cross_context_economy_gate;
+    use scp_runtime_core::context::outlets::invoke::verify_forwarded_chunk_for_test as verify_forwarded_chunk;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -234,13 +234,13 @@ mod cross_context_036 {
 
     /// The pinned verification descriptor for B's operator over `B_CTX`.
     fn pinned_descriptor(operator: &SigningKey) -> CrossContextVerificationDescriptor {
-        CrossContextVerificationDescriptor {
-            operator_pk: operator.verifying_key(),
-            operating_context_id: B_CTX.to_owned(),
-            outlet_id: OUTLET.to_owned(),
-            caveats_binding: CB,
-            expected_request_id: RID,
-        }
+        CrossContextVerificationDescriptor::new_for_test(
+            operator.verifying_key(),
+            B_CTX.to_owned(),
+            OUTLET.to_owned(),
+            CB,
+            RID,
+        )
     }
 
     /// The empty JSON Schema — accepts ANY instance (object, array, scalar,
@@ -332,23 +332,26 @@ mod cross_context_036 {
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
         let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
-        let bridge = tokio::spawn(run_cross_context_bridge(
-            inner_rx,
-            outer_tx,
-            descriptor,
-            output_schema,
-            aggregate_schema,
-            a_dyn,
-            A_CTX.to_owned(),
-            DID::from(INVOKER),
-            RID,
-            OUTLET.to_owned(),
-            "input-hash".to_owned(),
-            3,
-            0,
-            MAX_CROSS_CONTEXT_STREAM_CHUNKS,
-            fault_probe,
-        ));
+        let bridge = tokio::spawn(
+            CrossContextBridgeForTest {
+                inner_rx,
+                outer_tx,
+                descriptor,
+                output_schema,
+                aggregate_schema,
+                a_event_log: a_dyn,
+                receiving_context_id: A_CTX.to_owned(),
+                invoker_did: DID::from(INVOKER),
+                request_id: RID,
+                outlet_id: OUTLET.to_owned(),
+                input_hash: "input-hash".to_owned(),
+                governing_chain_depth: 3,
+                timestamp_secs: 0,
+                max_retained_chunks: MAX_CROSS_CONTEXT_STREAM_CHUNKS,
+                fault_probe,
+            }
+            .run(),
+        );
         let producer = tokio::spawn(async move {
             for chunk in chunks {
                 if inner_tx.send(chunk).await.is_err() {
@@ -411,21 +414,22 @@ mod cross_context_036 {
         params: scp_runtime_core::context::outlets::dispatch::OpenStreamParams,
     ) {
         let out: Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> =
-            invoke_outlet_cross_context::<NoOpExecutor>(
+            OutletCrossContextInvokeForTest::<NoOpExecutor> {
                 supervisor,
                 a_event_log,
-                "a",
-                "b",
+                receiving_context_id: "a",
+                operating_context_id: "b",
                 registry,
                 outlet_id,
-                serde_json::json!({}),
+                input: serde_json::json!({}),
                 invoker_did,
-                None,
-                Arc::new(NoOpExecutor),
+                timeout_ms: None,
+                executor: Arc::new(NoOpExecutor),
                 incoming_open,
-                None,
+                caveat_binding: None,
                 params,
-            )
+            }
+            .run()
             .await;
         drop(out);
     }
@@ -480,23 +484,26 @@ mod cross_context_036 {
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
 
-        let bridge = tokio::spawn(run_cross_context_bridge(
-            inner_rx,
-            outer_tx,
-            pinned_descriptor(&op),
-            permissive_schema(),
-            None,
-            a_dyn,
-            A_CTX.to_owned(),
-            DID::from(INVOKER),
-            RID,
-            OUTLET.to_owned(),
-            "input-hash".to_owned(),
-            3,
-            0,
-            MAX_CROSS_CONTEXT_STREAM_CHUNKS,
-            None,
-        ));
+        let bridge = tokio::spawn(
+            CrossContextBridgeForTest {
+                inner_rx,
+                outer_tx,
+                descriptor: pinned_descriptor(&op),
+                output_schema: permissive_schema(),
+                aggregate_schema: None,
+                a_event_log: a_dyn,
+                receiving_context_id: A_CTX.to_owned(),
+                invoker_did: DID::from(INVOKER),
+                request_id: RID,
+                outlet_id: OUTLET.to_owned(),
+                input_hash: "input-hash".to_owned(),
+                governing_chain_depth: 3,
+                timestamp_secs: 0,
+                max_retained_chunks: MAX_CROSS_CONTEXT_STREAM_CHUNKS,
+                fault_probe: None,
+            }
+            .run(),
+        );
 
         // The highest sequence the source has SUCCESSFULLY handed to the
         // inner channel. Because the outer channel is bounded to 1 and the
@@ -757,16 +764,16 @@ mod cross_context_036 {
         // The bridge reassembles the SAME chunks and records A's log through
         // the verified-append boundary. Pin the descriptor to B's real
         // signing context.
-        let descriptor = CrossContextVerificationDescriptor {
-            operator_pk: op.verifying_key(),
-            operating_context_id: b_ctx_id,
-            outlet_id: OUTLET.to_owned(),
-            caveats_binding: CB,
-            // `invoke_outlet` mints its own fresh `request_id`; pin the
-            // descriptor to the stream B actually produced (all chunks share
-            // it) so the §5.4.5 crossing verification accepts B's chunks.
-            expected_request_id: b_chunks[0].request_id,
-        };
+        // `invoke_outlet` mints its own fresh `request_id`; pin the
+        // descriptor to the stream B actually produced (all chunks share
+        // it) so the §5.4.5 crossing verification accepts B's chunks.
+        let descriptor = CrossContextVerificationDescriptor::new_for_test(
+            op.verifying_key(),
+            b_ctx_id,
+            OUTLET.to_owned(),
+            CB,
+            b_chunks[0].request_id,
+        );
         let (received, a_log, a_bytes) = drive_bridge(
             b_chunks.clone(),
             descriptor,
@@ -834,19 +841,10 @@ mod cross_context_036 {
         for c in &chunks {
             terminal.observe(&c.payload);
         }
-        let bad_event = build_streaming_outlet_event(
-            RID,
-            &OUTLET.to_owned(),
-            &DID::from(INVOKER),
-            "input-hash".to_owned(),
-            5,
-            u32::try_from(chunks.len()).unwrap(),
-            5, // WRONG: real billable count is 1.
-            manifest,
-            &terminal,
-            None,
-            None,
-        );
+        let bad_event =
+            StreamingOutletEventForTest { request_id: RID, outlet_id: &OUTLET.to_owned(), invoker_did: &DID::from(INVOKER), input_hash: "input-hash".to_owned(), execution_time_ms: 5, stream_chunk_count: u32::try_from(chunks.len()).unwrap(), chunks_billed: 5, stream_manifest_hash: // WRONG: real billable count is 1.
+            manifest, terminal: &terminal, audit_anomaly: None, cancel_ack_seq: None }
+            .build();
         let err = a_log
             .append_outlet_invoked_verified(
                 scp_runtime_core::context::builder::AppendMode::AfterSideEffect,
@@ -1058,25 +1056,26 @@ mod cross_context_036 {
             Arc::new(|_, _| None),
         );
         if gate_closed {
-            supervisor.close_spawn_gate();
+            supervisor.close_spawn_gate_for_test();
         }
         let (a_log, _a_bytes) = fresh_a_log().await;
         let (params, incoming) = shutdown_gate_inputs();
-        invoke_outlet_cross_context::<NoOpExecutor>(
-            &supervisor,
-            a_log,
-            A_CTX,
-            B_CTX,
-            &OutletRegistry::new(),
-            &OUTLET.to_owned(),
-            serde_json::json!({}),
-            &DID::from(INVOKER),
-            None,
-            Arc::new(NoOpExecutor),
-            &incoming,
-            None,
+        OutletCrossContextInvokeForTest::<NoOpExecutor> {
+            supervisor: &supervisor,
+            a_event_log: a_log,
+            receiving_context_id: A_CTX,
+            operating_context_id: B_CTX,
+            registry: &OutletRegistry::new(),
+            outlet_id: &OUTLET.to_owned(),
+            input: serde_json::json!({}),
+            invoker_did: &DID::from(INVOKER),
+            timeout_ms: None,
+            executor: Arc::new(NoOpExecutor),
+            incoming_open: &incoming,
+            caveat_binding: None,
             params,
-        )
+        }
+        .run()
         .await
     }
 
@@ -1274,23 +1273,26 @@ mod cross_context_036 {
         let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
-        let bridge = tokio::spawn(run_cross_context_bridge(
-            inner_rx,
-            outer_tx,
-            pinned_descriptor(&op),
-            permissive_schema(),
-            None,
-            a_dyn,
-            A_CTX.to_owned(),
-            DID::from(INVOKER),
-            RID,
-            OUTLET.to_owned(),
-            "input-hash".to_owned(),
-            3,
-            0,
-            CAP,
-            None,
-        ));
+        let bridge = tokio::spawn(
+            CrossContextBridgeForTest {
+                inner_rx,
+                outer_tx,
+                descriptor: pinned_descriptor(&op),
+                output_schema: permissive_schema(),
+                aggregate_schema: None,
+                a_event_log: a_dyn,
+                receiving_context_id: A_CTX.to_owned(),
+                invoker_did: DID::from(INVOKER),
+                request_id: RID,
+                outlet_id: OUTLET.to_owned(),
+                input_hash: "input-hash".to_owned(),
+                governing_chain_depth: 3,
+                timestamp_secs: 0,
+                max_retained_chunks: CAP,
+                fault_probe: None,
+            }
+            .run(),
+        );
 
         // Flood the bridge with UNBILLED Progress chunks (never terminal),
         // far past the cap — the pre-fix bridge would retain all of them.
@@ -1535,23 +1537,25 @@ mod cross_context_036 {
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(4);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_streaming_saga_seal_task(
-                std::sync::Weak::new(),
-                B_CTX.to_owned(),
-                scp_runtime_types::context::supervisor::saga_journal::SagaId(
+            StreamingSagaSealTaskForTest {
+                supervisor: std::sync::Weak::new(),
+                target_context_hex: B_CTX.to_owned(),
+                saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId(
                     "saga-dropped-sup".to_owned(),
                 ),
-                scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
-                    operator_key(),
-                ),
+                target_signer:
+                    scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                        operator_key(),
+                    ),
                 inner_rx,
                 outer_tx,
-                ticket,
-                pinned_descriptor(&operator_key()),
-                permissive_schema(),
-                None,
-                a_log as Arc<dyn ContextEventLogProvider>,
-            ),
+                escrow_ticket: ticket,
+                descriptor: pinned_descriptor(&operator_key()),
+                output_schema: permissive_schema(),
+                aggregate_schema: None,
+                a_event_log: a_log as Arc<dyn ContextEventLogProvider>,
+            }
+            .run(),
         )
         .await
         .expect("the seal task returns when the Supervisor has dropped");

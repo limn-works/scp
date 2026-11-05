@@ -41,7 +41,7 @@ use scp_runtime_core::context::outlets::invoke::{
     EconomicPolicySnapshot, MutableInvocation, OutletExecutor, OutletExecutorError,
 };
 use scp_runtime_core::context::supervisor::supervisor::{
-    DurableProviders, SagaAbortReason, SagaError, SagaSigners, Supervisor,
+    DurableProviders, OutletStreamOpenForTest, SagaAbortReason, SagaError, SagaSigners, Supervisor,
 };
 use scp_runtime_types::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
 use scp_runtime_types::context::outlets::stream::{AdmissionCaps, StreamIdentity};
@@ -289,7 +289,7 @@ fn build_ss_supervisor(
 /// `SS_OUTLET` onto a state's governance, so the driver's target-axis
 /// authorize-before-reserve gate passes for a saga with that caller/target.
 fn ss_push_interface(st: &mut PerContextState, source: [u8; 32], target: [u8; 32]) {
-    st.governance.outlet_interfaces.push(
+    st.governance_mut().outlet_interfaces.push(
         scp_protocol::context::outlets::interface::OutletInterface {
             source_context: hex::encode(source),
             target_context: hex::encode(target),
@@ -348,39 +348,41 @@ fn ss_paid_target_state(ctx_id: [u8; 32]) -> PerContextState {
         .expect("active");
     st.role_state.creator_did = ss_creator();
     ss_grant_outlet_caps(&mut st);
-    st.governance.registered_outlets.push(OutletRegistration {
-        outlet_id: SS_OUTLET.to_owned(),
-        kind: OutletKind::Action,
-        name: "Calculator".to_owned(),
-        description: "adds".to_owned(),
-        schema: OutletSchema {
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+    st.governance_mut()
+        .registered_outlets
+        .push(OutletRegistration {
+            outlet_id: SS_OUTLET.to_owned(),
+            kind: OutletKind::Action,
+            name: "Calculator".to_owned(),
+            description: "adds".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": {"type": "number"} }
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: DID("did:dht:z6MkStreamSagaOperator".to_owned()),
+            cost: Some(OutletCost {
+                amount: Amount::new(SS_COST),
+                currency: "USD".to_owned(),
+                payee: DID::from("did:key:stream-saga-payee"),
+                cost_formula: None,
             }),
-            output_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "result": {"type": "number"} }
-            }),
-            aggregate_schema: None,
-        },
-        implementation_hash: [0xAA; 32],
-        test_vectors: vec![],
-        operator_did: DID("did:dht:z6MkStreamSagaOperator".to_owned()),
-        cost: Some(OutletCost {
-            amount: Amount::new(SS_COST),
-            currency: "USD".to_owned(),
-            payee: DID::from("did:key:stream-saga-payee"),
-            cost_formula: None,
-        }),
-        message_catalog: Vec::new(),
-        registered_at: 0,
-        signature: Vec::new(),
-    });
-    st.governance
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        });
+    st.governance_mut()
         .budget_tracker
         .grant(&ss_invoker(), Amount::new(SS_GRANTED));
-    st.governance.economic_policy = Some(ss_policy());
+    st.governance_mut().economic_policy = Some(ss_policy());
     st
 }
 
@@ -719,7 +721,7 @@ async fn xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6() {
     );
 
     let actor = supervisor
-        .lookup(&target_hex)
+        .lookup_for_test(&target_hex)
         .expect("target actor resident");
 
     // The seal durably captured the streaming witness (sealed = Committed).
@@ -860,7 +862,7 @@ async fn open_outlet_stream_refused_by_shutdown_is_typed_and_debits_nothing() {
     let outlet_id: OutletId = SS_OUTLET.to_owned();
     let target_hex = hex::encode(SS_TARGET);
 
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
 
     let result = supervisor
         .open_outlet_stream(
@@ -925,25 +927,26 @@ async fn open_outlet_stream_with_spawner_taken_before_close_opens_after_close() 
     let spawner = supervisor
         .tracked_spawner_for_test("operation begun before close")
         .expect("an open gate issues a spawner");
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
 
-    let result = supervisor
-        .open_outlet_stream_with_spawner(
-            &spawner,
-            &target_hex,
-            &registry,
-            &outlet_id,
-            serde_json::json!({ "a": 1, "b": 2 }),
-            &ss_invoker(),
-            Some(5_000),
-            executor,
-            None,
-            None,
-            None,
-            Some(binding),
-            params,
-        )
-        .await;
+    let result = OutletStreamOpenForTest {
+        supervisor: &supervisor,
+        spawner: &spawner,
+        context_id: &target_hex,
+        registry: &registry,
+        outlet_id: &outlet_id,
+        input: serde_json::json!({ "a": 1, "b": 2 }),
+        invoker_did: &ss_invoker(),
+        timeout_ms: Some(5_000),
+        executor,
+        invoked_event_sink: None,
+        misdeclaration_sink: None,
+        handler_panic_sink: None,
+        caveat_binding: Some(binding),
+        params,
+    }
+    .run()
+    .await;
     assert!(
         result.is_ok(),
         "an open through a spawner taken before close is not refused: {:?}",
@@ -976,7 +979,7 @@ async fn xctx_streaming_saga_refused_by_shutdown_debits_nothing() {
     let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
     let outlet_id: OutletId = SS_OUTLET.to_owned();
 
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
 
     let result = supervisor
         .start_cross_context_streaming_outlet_invocation_saga(
@@ -1052,7 +1055,8 @@ fn streaming_saga_open_shutdown_rejection_keeps_supervisor_shut_down() {
     use scp_runtime_core::context::outlets::dispatch::OpenStreamRejection;
     use scp_runtime_core::context::outlets::invoke::OutletStreamOpenError;
     use scp_runtime_core::context::supervisor::supervisor::{
-        StreamingSagaOpenStep, stream_open_rejection_to_saga_error,
+        StreamingSagaOpenStep,
+        stream_open_rejection_to_saga_error_for_test as stream_open_rejection_to_saga_error,
     };
 
     for (step, named) in [
@@ -1377,7 +1381,7 @@ async fn xctx_streaming_saga_truncated_close_ac7() {
     let saga_id = handle.saga_id.clone();
     let target_hex = hex::encode(SS_TARGET);
     let actor = supervisor
-        .lookup(&target_hex)
+        .lookup_for_test(&target_hex)
         .expect("target actor resident");
 
     // Drain the forwarded prefix. The executor emits 5 Data chunks then wedges,
@@ -1643,7 +1647,7 @@ async fn xctx_streaming_crash_after_witness_before_settle_recovers_exactly_once(
     let saga_id = handle.saga_id.clone();
     let target_hex = hex::encode(SS_TARGET);
     let actor = supervisor
-        .lookup(&target_hex)
+        .lookup_for_test(&target_hex)
         .expect("target actor resident");
 
     // Drain the 5-chunk prefix (the executor wedges before a terminal).
@@ -1899,7 +1903,7 @@ async fn xctx_streaming_concurrent_double_settle_moves_money_exactly_once() {
     let saga_id = handle.saga_id.clone();
     let target_hex = hex::encode(SS_TARGET);
     let actor = supervisor
-        .lookup(&target_hex)
+        .lookup_for_test(&target_hex)
         .expect("target actor resident");
 
     // Drain the 5-chunk prefix (the executor wedges before a terminal).

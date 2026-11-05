@@ -83,6 +83,18 @@ impl<S: Storage> ProtocolRepository<S> {
         Ok(())
     }
 
+    /// Test-only reach into [`Self::load_push_relays`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::load_push_relays`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn load_push_relays_for_test(&self) -> Result<Vec<PushRelayRecord>, StoreError> {
+        Self::load_push_relays(self).await
+    }
+
     /// Every ledger record, in key order.
     ///
     /// # Errors
@@ -92,7 +104,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// [`StoreError::IncompatibleVersion`] if a record does not decode. A
     /// record that does not decode fails the whole load, because skipping it
     /// would leave its relay never deregistered.
-    pub async fn load_push_relays(&self) -> Result<Vec<PushRelayRecord>, StoreError> {
+    pub(crate) async fn load_push_relays(&self) -> Result<Vec<PushRelayRecord>, StoreError> {
         let keys = self.storage.list_keys(PUSH_RELAY_PREFIX).await?;
         let mut records = Vec::with_capacity(keys.len());
         for key in keys {

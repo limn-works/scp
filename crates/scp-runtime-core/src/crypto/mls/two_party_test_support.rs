@@ -82,6 +82,15 @@ pub fn alice_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xA1; 32])
 }
 
+/// Test-only reach into [`bob_signing_key`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn bob_signing_key_for_test() -> SigningKey {
+    bob_signing_key()
+}
+
 /// Bob's (joiner) fixed #active key. Bob's custody imports THIS seed and the
 /// resolver maps `bob_did` to its verifying key, so a bundle sealed to the
 /// resolved #active opens with the identical private key.
@@ -93,8 +102,17 @@ pub fn alice_signing_key() -> SigningKey {
 // `pub(crate)` yet the helper is reached crate-wide.
 #[allow(clippy::redundant_pub_crate)]
 #[must_use]
-pub fn bob_signing_key() -> SigningKey {
+pub(crate) fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
+}
+
+/// Test-only reach into [`pair_resolver`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn pair_resolver_for_test(alice_did: &str, bob_did: &str) -> KeyResolver {
+    pair_resolver(alice_did, bob_did)
 }
 
 /// The shared test resolver over `alice_did` / `bob_did`.
@@ -105,7 +123,7 @@ pub fn bob_signing_key() -> SigningKey {
 /// production `ActorDeps` as a real DID→key resolver (e.g. to verify a §9.16.2
 /// sender-key request signature).
 #[must_use]
-pub fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
+pub(crate) fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
     scp_runtime_types::crypto::mls::test_support::role_resolver(&[
         (DID::from(alice_did), alice_signing_key()),
         (DID::from(bob_did), bob_signing_key()),

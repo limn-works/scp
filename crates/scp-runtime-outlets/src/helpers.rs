@@ -71,8 +71,7 @@ use scp_protocol::trust::caveats::InvocationCaveats;
 use scp_runtime_core::context::ContextHandle;
 use scp_runtime_core::context::actor::deps::ActorDeps;
 use scp_runtime_core::context::outlets::invoke::{
-    self, InvocationError, OutletEconomyContext, economy_pre_check,
-    post_outlet_invocation_bookkeeping,
+    InvocationError, OutletEconomyContext, economy_pre_check, post_outlet_invocation_bookkeeping,
 };
 use scp_runtime_types::economy::adapter::PaymentReceipt;
 
@@ -563,19 +562,19 @@ pub async fn reserve_outlet_economy(
                             "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
                         )
                     })?;
+                    let governance = state.governance_mut();
                     if let Err(err) =
                         scp_runtime_core::context::shared::economy::validate_spending_ucan_or_error(
                             spending,
                             invoker_did,
                             context_id,
-                            &mut state.governance.class_s.spending_nonce_tracker,
-                            &state.governance.revoked_spending_ucan_cids,
+                            &mut governance.class_s.spending_nonce_tracker,
+                            &governance.revoked_spending_ucan_cids,
                             key_resolver,
                             clock,
                         )
                     {
-                        state
-                            .governance
+                        governance
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         // hard rate limit is refunded once in the outer error arm
@@ -587,15 +586,15 @@ pub async fn reserve_outlet_economy(
                     // Budget charge (Class-C). Reversed by `on_persist_failure`
                     // if the persist does not land.
                     if state
-                        .governance
+                        .governance_mut()
                         .budget_tracker
                         .record_spend(invoker_did, action_cost)
                         .is_err()
                     {
                         let remaining =
-                            state.governance.budget_tracker.remaining(invoker_did).0;
+                            state.governance().budget_tracker.remaining(invoker_did).0;
                         state
-                            .governance
+                            .governance()
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         // hard rate limit refunded once in the outer error arm.
@@ -616,17 +615,17 @@ pub async fn reserve_outlet_economy(
                     if let Err(e) =
                         scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
                             spending,
-                            &mut state.governance.class_s.spending_nonce_tracker,
+                            &mut state.governance_mut().class_s.spending_nonce_tracker,
                         )
                     {
                         if let Some(cost) = deducted_cost {
                             state
-                                .governance
+                                .governance_mut()
                                 .budget_tracker
                                 .reverse_spend(invoker_did, cost);
                         }
                         state
-                            .governance
+                            .governance()
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(ContextError::PermissionDenied(format!(
@@ -649,7 +648,7 @@ pub async fn reserve_outlet_economy(
                     if let Some(binding) = caveat_binding
                         && binding.caveats.has_counter_bearing_caveat()
                         && let Err(err) = consume_caveat_counters(
-                            &mut state.class_s.caveat_counters,
+                            &mut state.class_s_mut().caveat_counters,
                             &binding.ucan_cid,
                             &binding.caveats,
                             action_cost,
@@ -658,12 +657,12 @@ pub async fn reserve_outlet_economy(
                     {
                         if let Some(cost) = deducted_cost {
                             state
-                                .governance
+                                .governance_mut()
                                 .budget_tracker
                                 .reverse_spend(invoker_did, cost);
                         }
                         state
-                            .governance
+                            .governance()
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(err);
@@ -727,7 +726,7 @@ pub async fn reserve_outlet_economy(
                 .commit_class_s_keep(deps, context_id, |mut view| {
                     let state = view.rest_mut();
                     consume_caveat_counters(
-                        &mut state.class_s.caveat_counters,
+                        &mut state.class_s_mut().caveat_counters,
                         &binding.ucan_cid,
                         &binding.caveats,
                         action_cost,
@@ -753,15 +752,10 @@ pub async fn reserve_outlet_economy(
     // `class_c_view()` (the paid-path persist already ran in the combinator
     // above; this reserve error arm injects no extra persist).
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
-        (Some(policy), Some(adapter)) => {
-            match invoke::authorize_outlet_payment(
-                adapter.as_ref(),
-                policy,
-                context_id,
-                invoker_did,
-                &metrics,
-            )
-            .await
+        (Some(policy), Some(_)) => {
+            match deps
+                .authorize_outlet_payment(policy, context_id, invoker_did, &metrics)
+                .await
             {
                 Ok(prepared) => prepared,
                 Err(auth_err) => {
@@ -958,7 +952,7 @@ pub async fn reserve_outlet_stream_economy(
                 context_id,
                 |mut view| {
                     let state = view.rest_mut();
-                    let remaining = state.governance.budget_tracker.remaining(invoker_did);
+                    let remaining = state.governance().budget_tracker.remaining(invoker_did);
                     // §19.5 AND-composition: fold the per-action ceiling into the
                     // effective spendable balance when a cap is present.
                     let effective_remaining = max_per_action.map_or(remaining, |cap| {
@@ -970,7 +964,7 @@ pub async fn reserve_outlet_stream_economy(
                         // state); the hard-rate token is refunded once in the
                         // outer arm. No sequence was allocated to roll back.
                         state
-                            .governance
+                            .governance()
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(invocation_error_to_context(
@@ -978,7 +972,7 @@ pub async fn reserve_outlet_stream_economy(
                         ));
                     }
                     if state
-                        .governance
+                        .governance_mut()
                         .budget_tracker
                         .record_spend(invoker_did, reserved)
                         .is_err()
@@ -988,7 +982,7 @@ pub async fn reserve_outlet_stream_economy(
                         // unreachable, but fail closed — roll back the velocity
                         // tick inline (no sequence was allocated).
                         state
-                            .governance
+                            .governance()
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(invocation_error_to_context(
@@ -1149,7 +1143,7 @@ pub async fn reserve_stream_grant_escrow(
         context_id,
         |mut view| {
             let state = view.rest_mut();
-            let remaining = state.governance.budget_tracker.remaining(&member_owned);
+            let remaining = state.governance().budget_tracker.remaining(&member_owned);
             if reserved.value() > remaining.value() {
                 // Insufficient funds: reject BEFORE the debit / record bump.
                 return Err(invocation_error_to_context(
@@ -1157,7 +1151,7 @@ pub async fn reserve_stream_grant_escrow(
                 ));
             }
             if state
-                .governance
+                .governance_mut()
                 .budget_tracker
                 .record_spend(&member_owned, reserved)
                 .is_err()
@@ -1174,7 +1168,7 @@ pub async fn reserve_stream_grant_escrow(
             // covers a stream that reserved zero escrow at open (no record was
             // persisted) — the grant creates an escrow-only record.
             let record = state
-                .class_s
+                .class_s_mut()
                 .stream_reservations
                 .entry(record_key.clone())
                 .or_insert_with(|| {
@@ -1240,10 +1234,10 @@ pub async fn reverse_stream_grant_escrow(
     cell.commit_class_s_keep(deps, context_id, move |mut view| {
         let state = view.rest_mut();
         state
-            .governance
+            .governance_mut()
             .budget_tracker
             .reverse_spend(&member_owned, amount);
-        if let Some(record) = state.class_s.stream_reservations.get_mut(&record_key) {
+        if let Some(record) = state.class_s_mut().stream_reservations.get_mut(&record_key) {
             record.reserved_escrow = record.reserved_escrow.saturating_sub(amount);
         }
         Ok(())
@@ -1469,7 +1463,7 @@ pub async fn settle_outlet_stream(
     // SET stays inside the closure below (money and `settled` land in ONE persist).
     if let Some(sid) = witness_saga_id
         && cell
-            .class_s
+            .class_s()
             .xctx_committed_stream_outputs
             .get(sid)
             .is_some_and(|w| w.settled)
@@ -1638,7 +1632,10 @@ pub async fn settle_outlet_stream(
     // refund is the independent `refund_amount` reverse above; the record is
     // only the crash-recovery figure a clean settle supersedes.
     let request_key = hex::encode(request_id);
-    let has_record = cell.class_s.stream_reservations.contains_key(&request_key);
+    let has_record = cell
+        .class_s()
+        .stream_reservations
+        .contains_key(&request_key);
     // SCP-OUT-046 CRITICAL: a witness-bearing xctx settle ALWAYS persists (even a
     // zero-money settle) so the `settled` flag is flipped atomically with any
     // money move — recovery reads the flag to know the settlement completed. The
@@ -1673,13 +1670,16 @@ pub async fn settle_outlet_stream(
                 // best-effort-once tradeoff, detailed at the capture-failure `Err`
                 // branch below.
                 if let Some(sid) = witness_for_commit.as_ref()
-                    && let Some(w) = state.class_s.xctx_committed_stream_outputs.get_mut(sid)
+                    && let Some(w) = state
+                        .class_s_mut()
+                        .xctx_committed_stream_outputs
+                        .get_mut(sid)
                 {
                     w.settled = true;
                 }
                 if should_release {
                     state
-                        .class_s
+                        .class_s_mut()
                         .caveat_counters
                         .entry(ucan_for_commit)
                         .or_default()
@@ -1687,13 +1687,13 @@ pub async fn settle_outlet_stream(
                 }
                 if refund_amount.value() > 0 {
                     state
-                        .governance
+                        .governance_mut()
                         .budget_tracker
                         .reverse_spend(&invoker_for_commit, refund_amount);
                 }
                 // Unconditionally drop the crash-recovery record on the clean
                 // terminal (no-op if absent) — the double-release guard.
-                state.class_s.stream_reservations.remove(&request_key);
+                state.class_s_mut().stream_reservations.remove(&request_key);
                 Ok(())
             })
             .await;
@@ -1775,12 +1775,7 @@ pub async fn settle_outlet_stream(
                 error: err.to_string(),
                 cost: Some(billed_amount.value()),
             };
-            scp_runtime_core::context::state::emit_event_into(
-                cell.class_c_view().receive_buffer_mut(),
-                event,
-                &context_id,
-                deps.event_tx.as_ref(),
-            );
+            deps.emit_event_into(cell.class_c_view().receive_buffer_mut(), event, &context_id);
             StreamSettleOutcome::Settled(None)
         }
     }
@@ -1824,7 +1819,7 @@ pub async fn reconcile_stream_reservations(
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<usize, ContextError> {
-    let count = cell.class_s.stream_reservations.len();
+    let count = cell.class_s().stream_reservations.len();
     if count == 0 {
         return Ok(0);
     }
@@ -1832,21 +1827,21 @@ pub async fn reconcile_stream_reservations(
         let state = view.rest_mut();
         // Take the map out so the per-record reversal can borrow the sibling
         // governance / caveat-counter state mutably without aliasing.
-        let records = std::mem::take(&mut state.class_s.stream_reservations);
+        let records = std::mem::take(&mut state.class_s_mut().stream_reservations);
         for record in records.into_values() {
             if record.reserved_escrow.value() > 0 {
                 // Refund the FULL open-time escrow hold — the pump is gone and
                 // the billed count is unknown. Saturating (`reverse_spend`), so a
                 // benign over-refund of an already-settled hold is a no-op.
                 state
-                    .governance
+                    .governance_mut()
                     .budget_tracker
                     .reverse_spend(&record.invoker_did, record.reserved_escrow);
             }
             if record.amount_cumulative_reserved > 0 && !record.ucan_cid.is_empty() {
                 // Release the FULL cumulative reserve back to the counter.
                 state
-                    .class_s
+                    .class_s_mut()
                     .caveat_counters
                     .entry(record.ucan_cid)
                     .or_default()
@@ -1889,7 +1884,7 @@ pub async fn reverse_stream_escrow(
     let member_did_owned = member_did.clone();
     cell.commit_class_s_keep(deps, context_id, move |mut view| {
         view.rest_mut()
-            .governance
+            .governance_mut()
             .budget_tracker
             .reverse_spend(&member_did_owned, amount);
         Ok(())
@@ -2012,14 +2007,10 @@ pub async fn settle_outlet_economy_capture(
         ticket.escrow.as_ref(),
         ticket.policy_for_capture.as_ref(),
     ) {
-        (Some(adapter), Some(prepared), policy_opt) => {
-            match invoke::complete_outlet_payment(
-                adapter.as_ref(),
-                policy_opt,
-                prepared,
-                &ticket.metrics_for_capture,
-            )
-            .await
+        (Some(_), Some(prepared), policy_opt) => {
+            match deps
+                .complete_outlet_payment(policy_opt, prepared, &ticket.metrics_for_capture)
+                .await
             {
                 Ok(receipt) => receipt,
                 Err(capture_err) => {
@@ -2323,7 +2314,7 @@ mod tests {
         let state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
         // The helpers take the field-granular `ClassCMut`; wrap the test state in
         // a `ClassSCell` to construct the view.
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
 
         assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
@@ -2332,7 +2323,7 @@ mod tests {
     fn refund_hard_rate_limit_restores_actor_owned_bucket() {
         let did = test_did();
         let state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
 
         for _ in 0..10 {
             assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
@@ -2632,12 +2623,15 @@ mod tests {
                     },
                 );
             }
-            state.governance.consequence_rules.push(ConsequenceRule {
-                trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-                threshold: 1,
-                window: Duration::from_hours(1),
-            });
+            state
+                .governance_mut()
+                .consequence_rules
+                .push(ConsequenceRule {
+                    trigger: ConsequenceTrigger::MessageVelocity,
+                    action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                    threshold: 1,
+                    window: Duration::from_hours(1),
+                });
             state
         }
 
@@ -2647,7 +2641,7 @@ mod tests {
         #[tokio::test]
         async fn outlet_settle_capture_failure_persists_suspension_fail_closed() {
             let deps = build_deps().await;
-            let mut cell = ClassSCell::new(seed_state());
+            let mut cell = ClassSCell::new_for_test(seed_state());
             let ctx_str = hex::encode([CTX_BYTE; 32]);
 
             let request =
@@ -3121,7 +3115,7 @@ mod tests {
         #[test]
         fn caveat_counters_survive_class_s_snapshot_round_trip() {
             let mut state = active_state();
-            state.class_s.caveat_counters.insert(
+            state.class_s_mut().caveat_counters.insert(
                 "cid-snap".to_owned(),
                 CaveatCounters {
                     max_calls_used: 3,
@@ -3129,11 +3123,11 @@ mod tests {
                     rate_window_timestamps: vec![1, 2, 3],
                 },
             );
-            let snap = state.class_s.snapshot();
-            state.class_s.caveat_counters.clear();
-            assert!(state.class_s.caveat_counters.is_empty());
-            state.class_s.restore(snap);
-            let rec = &state.class_s.caveat_counters["cid-snap"];
+            let snap = state.class_s().snapshot_for_test();
+            state.class_s_mut().caveat_counters.clear();
+            assert!(state.class_s().caveat_counters.is_empty());
+            state.class_s_mut().restore_for_test(snap);
+            let rec = &state.class_s().caveat_counters["cid-snap"];
             assert_eq!(rec.max_calls_used, 3);
             assert_eq!(rec.amount_cumulative_used, 42);
             assert_eq!(rec.rate_window_timestamps, vec![1, 2, 3]);
@@ -3157,15 +3151,15 @@ mod tests {
             };
             let mut state = active_state();
             state
-                .class_s
+                .class_s_mut()
                 .stream_reservations
                 .insert("req-snap".to_owned(), expected.clone());
 
-            let snap = state.class_s.snapshot();
-            state.class_s.stream_reservations.clear();
-            assert!(state.class_s.stream_reservations.is_empty());
-            state.class_s.restore(snap);
-            assert_eq!(state.class_s.stream_reservations["req-snap"], expected);
+            let snap = state.class_s().snapshot_for_test();
+            state.class_s_mut().stream_reservations.clear();
+            assert!(state.class_s().stream_reservations.is_empty());
+            state.class_s_mut().restore_for_test(snap);
+            assert_eq!(state.class_s().stream_reservations["req-snap"], expected);
         }
 
         // -------------------------------------------------------------------
@@ -3307,7 +3301,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_free_path_enforces_max_calls() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let caveats = max_calls_caveats(1);
             let cid = "cid-mc";
             let input = serde_json::json!({});
@@ -3339,7 +3333,8 @@ mod tests {
                 "reject must surface the Authorization collapse slug: {err}"
             );
             assert_eq!(
-                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                cell.class_s().caveat_counters[cid].max_calls_used,
+                1,
                 "exactly one call consumed"
             );
         }
@@ -3358,7 +3353,7 @@ mod tests {
                 .await
                 .expect("init log");
             deps.event_log.release_event_log(&ctx_bytes);
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let invoker = DID(INVOKER.to_owned());
             let now = 1_700_000_100;
 
@@ -3371,7 +3366,9 @@ mod tests {
             }
             super::super::refund_hard_rate_limit(cell.class_c_view(), &invoker);
             assert_eq!(
-                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                cell.governance()
+                    .velocity_tracker
+                    .get_velocity(&invoker, now),
                 0
             );
 
@@ -3384,7 +3381,9 @@ mod tests {
             );
 
             assert_eq!(
-                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                cell.governance()
+                    .velocity_tracker
+                    .get_velocity(&invoker, now),
                 0,
                 "the velocity tick is rolled back"
             );
@@ -3408,7 +3407,7 @@ mod tests {
             let deps = build_deps(Box::new(OkPersistence)).await;
             let input = serde_json::json!({});
 
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let caveats = max_calls_caveats(1);
             reserve_step(
                 &mut cell,
@@ -3431,14 +3430,14 @@ mod tests {
             .await
             .expect_err("cap enforced when sourced from the invocation caveats");
 
-            let mut cell2 = ClassSCell::new(active_state());
+            let mut cell2 = ClassSCell::new_for_test(active_state());
             for i in 0..3 {
                 reserve_step(&mut cell2, &deps, None, None, &input, 1_700_000_200 + i)
                     .await
                     .expect("no invocation caveats => always admit");
             }
             assert!(
-                cell2.class_s.caveat_counters.is_empty(),
+                cell2.class_s().caveat_counters.is_empty(),
                 "no caveats resolved => no counter record — reserve never fabricates caveats"
             );
         }
@@ -3449,7 +3448,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_sync_check_precedes_counter_consume() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let mut caveats = InvocationCaveats::empty();
             caveats.max_calls = Some(1);
             caveats.input_schema = Some(serde_json::json!({
@@ -3473,7 +3472,7 @@ mod tests {
                 "must reject on the input_schema sync check: {err}"
             );
             assert!(
-                !cell.class_s.caveat_counters.contains_key(cid),
+                !cell.class_s().caveat_counters.contains_key(cid),
                 "a sync-rejected call must NOT create or consume a counter record"
             );
             reserve_step(
@@ -3489,7 +3488,8 @@ mod tests {
                 "conforming input within max_calls=1 must admit — the rejected call spent nothing",
             );
             assert_eq!(
-                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                cell.class_s().caveat_counters[cid].max_calls_used,
+                1,
                 "the single slot was consumed only by the conforming call"
             );
         }
@@ -3499,7 +3499,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_free_path_enforces_rate_window() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let mut caveats = InvocationCaveats::empty();
             caveats.rate_window = Some(RateWindow {
                 max: 1,
@@ -3540,7 +3540,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_sync_rejects_disallowed_target_did() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let mut caveats = InvocationCaveats::empty();
             caveats.allowed_target_dids = Some(vec![DID::from("did:dht:z6MkOtherTarget")]);
             let err = reserve_step(
@@ -3558,7 +3558,7 @@ mod tests {
                 "target-DID reject must surface a caveat violation: {err}"
             );
             assert!(
-                cell.class_s.caveat_counters.is_empty(),
+                cell.class_s().caveat_counters.is_empty(),
                 "a sync reject touches no counter"
             );
         }
@@ -3569,7 +3569,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_sync_rejects_disallowed_adapter() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let mut caveats = InvocationCaveats::empty();
             caveats.allowed_adapters = Some(vec!["x402".to_owned()]);
             let err = reserve_step(
@@ -3596,7 +3596,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_counter_consume_is_kept_on_persist_failure() {
             let deps = build_deps(Box::new(super::FailOutletPersistence)).await;
-            let mut cell = ClassSCell::new(active_state());
+            let mut cell = ClassSCell::new_for_test(active_state());
             let caveats = max_calls_caveats(1);
             let cid = "cid-keep";
             let err = reserve_step(
@@ -3614,7 +3614,8 @@ mod tests {
                 "expected a fail-closed persistence error: {err}"
             );
             assert_eq!(
-                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                cell.class_s().caveat_counters[cid].max_calls_used,
+                1,
                 "the consumed cap must be KEPT across the persist failure (no un-consume)"
             );
         }
@@ -3814,9 +3815,9 @@ mod tests {
         /// `record_spend` succeeds on the paid branch.
         fn paid_active_state() -> PerContextState {
             let mut state = active_state();
-            state.governance.economic_policy = Some(paid_policy());
+            state.governance_mut().economic_policy = Some(paid_policy());
             state
-                .governance
+                .governance_mut()
                 .budget_tracker
                 .grant(&DID(INVOKER.to_owned()), Amount::new(1_000));
             state
@@ -3884,7 +3885,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_paid_path_enforces_max_calls_and_compensates() {
             let deps = build_deps_paid(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(paid_active_state());
+            let mut cell = ClassSCell::new_for_test(paid_active_state());
             let invoker = DID(INVOKER.to_owned());
             let caveats = max_calls_caveats(1);
             let cid = "cid-paid-mc";
@@ -3894,7 +3895,7 @@ mod tests {
             // `SystemClock`, independent of this value.
             let now = scp_clock::SystemClock.now_secs();
 
-            let remaining_start = cell.governance.budget_tracker.remaining(&invoker).0;
+            let remaining_start = cell.governance().budget_tracker.remaining(&invoker).0;
             assert_eq!(remaining_start, 1_000, "seeded invoker budget");
 
             // FIRST paid reserve: valid signed UCAN, action_cost = 5 (> 0 → paid
@@ -3905,10 +3906,11 @@ mod tests {
                 .await
                 .expect("first paid reserve within max_calls=1 must admit on the PAID branch");
             assert_eq!(
-                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                cell.class_s().caveat_counters[cid].max_calls_used,
+                1,
                 "the PAID path consumed exactly one max_calls slot"
             );
-            let remaining_after_first = cell.governance.budget_tracker.remaining(&invoker).0;
+            let remaining_after_first = cell.governance().budget_tracker.remaining(&invoker).0;
             assert_eq!(
                 remaining_after_first,
                 remaining_start - 5,
@@ -3934,14 +3936,15 @@ mod tests {
             // just-charged budget back inline (outlets_helpers.rs ~852-862), so
             // the net remaining budget is unchanged from after the first
             // (admitted) charge — the rejected call left NO budget stuck.
-            let remaining_after_second = cell.governance.budget_tracker.remaining(&invoker).0;
+            let remaining_after_second = cell.governance().budget_tracker.remaining(&invoker).0;
             assert_eq!(
                 remaining_after_second, remaining_after_first,
                 "the rejected paid reserve rolled back its budget charge (compensation) — \
                  only the first, admitted call's charge stuck"
             );
             assert_eq!(
-                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                cell.class_s().caveat_counters[cid].max_calls_used,
+                1,
                 "a rejected paid reserve does not advance the exhausted counter past its cap"
             );
 
@@ -3979,7 +3982,7 @@ mod tests {
         #[tokio::test]
         async fn reserve_paid_path_enforces_amount_max_cumulative() {
             let deps = build_deps_paid(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(paid_active_state());
+            let mut cell = ClassSCell::new_for_test(paid_active_state());
             let mut caveats = InvocationCaveats::empty();
             // Cap = 12; each paid call charges the per_outlet_call cost (5), so the
             // cumulative sum is 5 -> 10 -> (would-be 15, rejected).
@@ -3993,7 +3996,8 @@ mod tests {
                 .await
                 .expect("first paid reserve: cumulative 5 <= 12 admits");
             assert_eq!(
-                cell.class_s.caveat_counters[cid].amount_cumulative_used, 5,
+                cell.class_s().caveat_counters[cid].amount_cumulative_used,
+                5,
                 "the paid path charged the per_outlet_call cost against the cumulative counter"
             );
 
@@ -4001,7 +4005,10 @@ mod tests {
             paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
                 .await
                 .expect("second paid reserve: cumulative 10 <= 12 admits");
-            assert_eq!(cell.class_s.caveat_counters[cid].amount_cumulative_used, 10);
+            assert_eq!(
+                cell.class_s().caveat_counters[cid].amount_cumulative_used,
+                10
+            );
 
             let spending3 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
             let err = paid_reserve_step(&mut cell, &deps, &spending3, &caveats, cid, &input, now)
@@ -4015,7 +4022,8 @@ mod tests {
             // The rejected call did not advance the cumulative counter past its
             // last admitted value (all-or-nothing consume on a clone).
             assert_eq!(
-                cell.class_s.caveat_counters[cid].amount_cumulative_used, 10,
+                cell.class_s().caveat_counters[cid].amount_cumulative_used,
+                10,
                 "a rejected paid reserve leaves the cumulative counter at its last admitted total"
             );
         }
@@ -4050,7 +4058,7 @@ mod tests {
                     .handle
                     .transition_to(&target)
                     .expect("Active → non-active transition");
-                let mut cell = ClassSCell::new(state);
+                let mut cell = ClassSCell::new_for_test(state);
                 let spending = signed_spending_ucan_for(&invoker);
 
                 let err = paid_reserve_step(
@@ -4091,13 +4099,16 @@ mod tests {
                     "Display MUST NOT leak the raw lifecycle state {target}: {rendered}"
                 );
                 assert_eq!(
-                    cell.governance.budget_tracker.remaining(&invoker).0,
+                    cell.governance().budget_tracker.remaining(&invoker).0,
                     1_000,
                     "the active gate fires BEFORE the paid debit — the funded budget is \
                      untouched ({target})"
                 );
                 assert!(
-                    !cell.class_s.caveat_counters.contains_key("cid-2196-unary"),
+                    !cell
+                        .class_s()
+                        .caveat_counters
+                        .contains_key("cid-2196-unary"),
                     "the gate short-circuits before any caveat-counter mutation ({target})"
                 );
             }
@@ -4261,7 +4272,7 @@ mod tests {
                 .add_member(invoker(), "member".to_owned(), Vec::new());
             if budget > 0 {
                 state
-                    .governance
+                    .governance_mut()
                     .budget_tracker
                     .grant(&invoker(), Amount::new(budget));
             }
@@ -4316,8 +4327,8 @@ mod tests {
         async fn debits_escrow_and_captures_fields() {
             let deps = build_deps(Box::new(OkPersistence)).await;
             let mut state = member_state(1000);
-            state.governance.economic_policy = Some(economic_policy());
-            let mut cell = ClassSCell::new(state);
+            state.governance_mut().economic_policy = Some(economic_policy());
+            let mut cell = ClassSCell::new_for_test(state);
             let generation = cell.generation;
 
             let reservation = reserve(&mut cell, &deps, 10, 4, None)
@@ -4339,7 +4350,7 @@ mod tests {
                 "the reservation snapshots the economic policy at acceptance"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(40),
                 "the 40-unit escrow hold is DEBITED against the invoker's budget"
             );
@@ -4356,7 +4367,7 @@ mod tests {
         #[tokio::test]
         async fn escrow_debits_across_opens_without_touching_sequence() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let _first = reserve(&mut cell, &deps, 10, 2, None)
                 .await
@@ -4366,7 +4377,7 @@ mod tests {
                 .expect("second open");
 
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(50),
                 "both holds (20 + 30) are debited"
             );
@@ -4384,7 +4395,7 @@ mod tests {
         async fn zero_cost_reserves_nothing() {
             let deps = build_deps(Box::new(OkPersistence)).await;
             // No budget at all — a zero-cost open must not consult the balance.
-            let mut cell = ClassSCell::new(member_state(0));
+            let mut cell = ClassSCell::new_for_test(member_state(0));
 
             let reservation = reserve(&mut cell, &deps, 0, 5, None)
                 .await
@@ -4396,7 +4407,7 @@ mod tests {
                 "zero cost → zero hold"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "no debit for a zero-cost stream"
             );
@@ -4412,7 +4423,7 @@ mod tests {
         #[tokio::test]
         async fn overflow_rejects_and_rolls_back() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let err = reserve(&mut cell, &deps, u64::MAX, 2, None)
                 .await
@@ -4423,7 +4434,7 @@ mod tests {
                 "the overflow reject names the escrow-overflow slug: {err}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "overflow rejects BEFORE any debit"
             );
@@ -4440,7 +4451,7 @@ mod tests {
         async fn insufficient_funds_rejects_and_rolls_back() {
             let deps = build_deps(Box::new(OkPersistence)).await;
             // Budget 50, but the reservation wants 10 × 100 = 1000.
-            let mut cell = ClassSCell::new(member_state(50));
+            let mut cell = ClassSCell::new_for_test(member_state(50));
 
             let err = reserve(&mut cell, &deps, 10, 100, None)
                 .await
@@ -4451,7 +4462,7 @@ mod tests {
                 "the reject names the insufficient-funds slug: {err}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "insufficient funds rejects BEFORE any debit"
             );
@@ -4470,7 +4481,7 @@ mod tests {
             let deps = build_deps(Box::new(OkPersistence)).await;
             // Balance 1000, but the per-action cap is 30 while the reservation
             // wants 10 × 5 = 50.
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let err = reserve(&mut cell, &deps, 10, 5, Some(30))
                 .await
@@ -4481,7 +4492,7 @@ mod tests {
                 "the per-action ceiling reject reuses the insufficient-funds slug: {err}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "the capped reservation debits nothing"
             );
@@ -4497,11 +4508,11 @@ mod tests {
                 .transition_to(&ContextState::Active)
                 .expect("transition to Active");
             state
-                .governance
+                .governance_mut()
                 .budget_tracker
                 .grant(&invoker(), Amount::new(1000));
             // NOTE: no `add_member` — the invoker is not on the roster.
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let err = reserve(&mut cell, &deps, 10, 4, None)
                 .await
@@ -4512,7 +4523,7 @@ mod tests {
                 "a non-member open is a permission denial: {err:?}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "a rejected non-member open debits nothing"
             );
@@ -4524,7 +4535,7 @@ mod tests {
         #[tokio::test]
         async fn persist_failure_reverses_budget_and_sequence() {
             let deps = build_deps(Box::new(FailPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let err = reserve(&mut cell, &deps, 10, 4, None)
                 .await
@@ -4535,7 +4546,7 @@ mod tests {
                 "a failed fail-closed persist surfaces PersistenceFailed: {err:?}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "the budget debit is REVERSED when the persist does not land"
             );
@@ -4559,7 +4570,7 @@ mod tests {
         /// has debited an escrow hold. Lets the grant tests assert the record's
         /// `reserved_escrow` tracks `open + Σgrants`.
         fn seed_open_record(state: &mut PerContextState, open_hold: u64) {
-            state.class_s.stream_reservations.insert(
+            state.class_s_mut().stream_reservations.insert(
                 hex::encode(GRANT_REQ),
                 scp_runtime_core::context::outlets::invoke::StreamReservationRecord {
                     invoker_did: invoker(),
@@ -4600,7 +4611,7 @@ mod tests {
             let deps = build_deps(Box::new(OkPersistence)).await;
             let mut state = member_state(1000);
             seed_open_record(&mut state, 50); // open-time hold
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let reserved = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
@@ -4608,12 +4619,12 @@ mod tests {
 
             assert_eq!(reserved, Amount::new(40), "reserved = cost 10 × grant 4");
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(40),
                 "the 40-unit grant hold is DEBITED against the invoker's budget"
             );
             assert_eq!(
-                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                 Amount::new(90),
                 "the crash-recovery record tracks open 50 + grant 40 = 90"
             );
@@ -4625,14 +4636,14 @@ mod tests {
         #[tokio::test]
         async fn grant_creates_record_when_open_reserved_nothing() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000)); // no seeded record
+            let mut cell = ClassSCell::new_for_test(member_state(1000)); // no seeded record
 
             let _ = grant_reserve(&mut cell, &deps, 10, 3)
                 .await
                 .expect("grant reserve");
 
             assert_eq!(
-                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                 Amount::new(30),
                 "the first grant creates the record with reserved_escrow = grant 30"
             );
@@ -4644,7 +4655,7 @@ mod tests {
         #[tokio::test]
         async fn successive_grants_accumulate_debits() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let _a = grant_reserve(&mut cell, &deps, 10, 2)
                 .await
@@ -4654,7 +4665,7 @@ mod tests {
                 .expect("grant b");
 
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(50),
                 "both grant holds (20 + 30) are debited"
             );
@@ -4664,7 +4675,7 @@ mod tests {
         #[tokio::test]
         async fn zero_cost_grant_reserves_nothing() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(0));
+            let mut cell = ClassSCell::new_for_test(member_state(0));
 
             let reserved = grant_reserve(&mut cell, &deps, 0, 5)
                 .await
@@ -4672,7 +4683,7 @@ mod tests {
 
             assert_eq!(reserved, Amount::new(0), "zero cost → zero hold");
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "no debit for a zero-cost grant"
             );
@@ -4683,7 +4694,7 @@ mod tests {
         #[tokio::test]
         async fn zero_grant_reserves_nothing() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let reserved = grant_reserve(&mut cell, &deps, 10, 0)
                 .await
@@ -4691,7 +4702,7 @@ mod tests {
 
             assert_eq!(reserved, Amount::new(0), "grant 0 → zero hold");
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "no debit for a zero-chunk grant"
             );
@@ -4701,7 +4712,7 @@ mod tests {
         #[tokio::test]
         async fn grant_overflow_rejects_before_debit() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut cell = ClassSCell::new_for_test(member_state(1000));
 
             let err = grant_reserve(&mut cell, &deps, u64::MAX, 2)
                 .await
@@ -4712,7 +4723,7 @@ mod tests {
                 "the overflow reject names the escrow-overflow slug: {err}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "overflow rejects BEFORE any debit"
             );
@@ -4723,7 +4734,7 @@ mod tests {
         #[tokio::test]
         async fn grant_insufficient_funds_rejects_before_debit() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(50));
+            let mut cell = ClassSCell::new_for_test(member_state(50));
 
             let err = grant_reserve(&mut cell, &deps, 10, 100)
                 .await
@@ -4734,7 +4745,7 @@ mod tests {
                 "the reject names the insufficient-funds slug: {err}"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "insufficient funds rejects BEFORE any debit"
             );
@@ -4752,18 +4763,18 @@ mod tests {
             let deps = build_deps(Box::new(OkPersistence)).await;
             let mut state = member_state(1000);
             seed_open_record(&mut state, 50);
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let reserved = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
                 .expect("grant reserve");
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(40),
                 "the grant hold is debited"
             );
             assert_eq!(
-                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                 Amount::new(90),
                 "the record is bumped to open 50 + grant 40"
             );
@@ -4780,12 +4791,12 @@ mod tests {
             .expect("reverse the grant hold");
 
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "reverse credits the full hold back — net-zero debit (billed + refund == reserved)"
             );
             assert_eq!(
-                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                 Amount::new(50),
                 "reverse un-bumps the record back to the open-time hold (no double-refund on crash)"
             );
@@ -4804,18 +4815,18 @@ mod tests {
             // The open hold was already debited at open; model that on the state
             // before wrapping it in the cell.
             state
-                .governance
+                .governance_mut()
                 .budget_tracker
                 .record_spend(&invoker(), Amount::new(50))
                 .expect("open-time debit");
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             // A grant tops up escrow by 10 × 4 = 40 (budget + durable record).
             grant_reserve(&mut cell, &deps, 10, 4)
                 .await
                 .expect("grant reserve");
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(90),
                 "open 50 + grant 40 debited"
             );
@@ -4832,13 +4843,13 @@ mod tests {
             assert_eq!(refunded, 1, "one unresolved record reconciled");
 
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "reconcile refunds open 50 + grant 40 = 90 — the invoker is NOT over-charged \
                  the grant top-up (the pre-fix bug refunded only the open 50)"
             );
             assert!(
-                cell.class_s.stream_reservations.is_empty(),
+                cell.class_s().stream_reservations.is_empty(),
                 "the reconciled record is cleared"
             );
         }
@@ -4851,7 +4862,7 @@ mod tests {
             let deps = build_deps(Box::new(FailPersistence)).await;
             let mut state = member_state(1000);
             seed_open_record(&mut state, 50);
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let err = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
@@ -4862,12 +4873,12 @@ mod tests {
                 "a failed fail-closed persist surfaces PersistenceFailed: {err:?}"
             );
             assert_eq!(
-                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                 Amount::new(50),
                 "the record bump is RESTORED on persist failure (back to the open hold)"
             );
             assert_eq!(
-                cell.governance.budget_tracker.total_spent(&invoker()),
+                cell.governance().budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "the grant debit is REVERSED when the persist does not land"
             );
@@ -4909,7 +4920,7 @@ mod tests {
         async fn stream_reserve_gated_on_non_active_context() {
             let deps = build_deps(Box::new(OkPersistence)).await;
             for target in NON_ACTIVE_STATES {
-                let mut cell = ClassSCell::new(non_active_member_state(1000, &target));
+                let mut cell = ClassSCell::new_for_test(non_active_member_state(1000, &target));
 
                 let err = reserve(&mut cell, &deps, 10, 4, None).await.expect_err(
                     "a non-active context must reject the stream open before any debit",
@@ -4933,7 +4944,7 @@ mod tests {
                     "Display must be the structured state-free surface: {rendered}"
                 );
                 assert_eq!(
-                    cell.governance.budget_tracker.total_spent(&invoker()),
+                    cell.governance().budget_tracker.total_spent(&invoker()),
                     Amount::new(0),
                     "the active gate fires BEFORE any escrow debit — nothing is spent ({target})"
                 );
@@ -4950,7 +4961,7 @@ mod tests {
             for target in NON_ACTIVE_STATES {
                 let mut state = non_active_member_state(1000, &target);
                 seed_open_record(&mut state, 50);
-                let mut cell = ClassSCell::new(state);
+                let mut cell = ClassSCell::new_for_test(state);
 
                 let err = grant_reserve(&mut cell, &deps, 10, 4)
                     .await
@@ -4974,12 +4985,12 @@ mod tests {
                     "Display must be the structured state-free surface: {rendered}"
                 );
                 assert_eq!(
-                    cell.governance.budget_tracker.total_spent(&invoker()),
+                    cell.governance().budget_tracker.total_spent(&invoker()),
                     Amount::new(0),
                     "the active gate fires BEFORE any grant debit — nothing is spent ({target})"
                 );
                 assert_eq!(
-                    cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                    cell.class_s().stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
                     Amount::new(50),
                     "the seeded open-time record is left un-bumped ({target})"
                 );
@@ -5005,12 +5016,12 @@ mod tests {
                 .transition_to(&ContextState::Active)
                 .expect("transition to Active");
             state
-                .governance
+                .governance_mut()
                 .budget_tracker
                 .grant(&invoker(), Amount::new(1000));
             // NOTE: no `add_member` — the invoker is not on the roster, so the
             // membership gate (not the active gate) fires with 6089.
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let err = reserve(&mut cell, &deps, 10, 4, None)
                 .await

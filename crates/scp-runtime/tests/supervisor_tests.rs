@@ -40,16 +40,18 @@ use scp_runtime_core::context::supervisor::supervisor::CRASH_POISON_THRESHOLD;
 use scp_runtime_core::context::supervisor::supervisor::CRASH_WINDOW_MS;
 use scp_runtime_core::context::supervisor::supervisor::CallerAbortReversal;
 use scp_runtime_core::context::supervisor::supervisor::CommitInProgressResolution;
-use scp_runtime_core::context::supervisor::supervisor::CrossContextSagaCtx;
 use scp_runtime_core::context::supervisor::supervisor::KP_CRASH_KEY_PREFIX;
 use scp_runtime_core::context::supervisor::supervisor::NoOpSagaJournal;
-use scp_runtime_core::context::supervisor::supervisor::RunSagaError;
 use scp_runtime_core::context::supervisor::supervisor::SpawnerEscrowRefundSink;
 #[cfg(feature = "saga-witness-test-mint")]
 use scp_runtime_core::context::supervisor::supervisor::decode_repair_records_evidence;
-use scp_runtime_core::context::supervisor::supervisor::escrow_reversal_join_failure_message;
-use scp_runtime_core::context::supervisor::supervisor::hard_rate_limit_allow;
+use scp_runtime_core::context::supervisor::supervisor::escrow_reversal_join_failure_message_for_test as escrow_reversal_join_failure_message;
+use scp_runtime_core::context::supervisor::supervisor::hard_rate_limit_allow_for_test as hard_rate_limit_allow;
 use scp_runtime_core::context::supervisor::supervisor::*;
+use scp_runtime_core::context::supervisor::supervisor::{
+    CrossContextSagaCtx, CrossContextSagaCtxTestParts,
+};
+use scp_runtime_core::context::supervisor::supervisor::{RunSagaError, RunSagaErrorTestParts};
 use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 use scp_runtime_core::crypto::mls::two_party_test_support::{TwoPartyPair, stand_up_two_party};
 use scp_runtime_core::crypto::wrapping::WrappingCustodySource;
@@ -166,7 +168,7 @@ async fn durable_providers_from_handle_shares_one_backend() {
 
     // `into_parts` is `pub(crate)`, so this in-crate test can reach the
     // bundled journal to append through it. Out-of-crate callers cannot.
-    let (journal, _mls_storage, _relay_contacts) = durable.into_parts();
+    let (journal, _mls_storage, _relay_contacts) = durable.into_parts_for_test();
 
     let saga = SagaId::new();
     let seq: u64 = 0;
@@ -217,30 +219,30 @@ async fn durable_providers_from_handle_shares_one_backend() {
 #[test]
 fn crash_window_three_in_window_poisons() {
     let mut w = CrashWindow::default();
-    assert!(!w.record(0), "1st crash does not poison");
-    assert!(!w.record(100), "2nd crash does not poison");
-    assert!(w.record(200), "3rd crash within 60s poisons");
-    assert!(w.is_poisoned());
-    assert_eq!(w.crash_count(), CRASH_POISON_THRESHOLD);
+    assert!(!w.record_for_test(0), "1st crash does not poison");
+    assert!(!w.record_for_test(100), "2nd crash does not poison");
+    assert!(w.record_for_test(200), "3rd crash within 60s poisons");
+    assert!(w.is_poisoned_for_test());
+    assert_eq!(w.crash_count_for_test(), CRASH_POISON_THRESHOLD);
 }
 
 #[test]
 fn crash_window_two_then_gap_then_one_does_not_poison() {
     let mut w = CrashWindow::default();
     // Two crashes near t=0.
-    assert!(!w.record(0));
-    assert!(!w.record(1_000));
+    assert!(!w.record_for_test(0));
+    assert!(!w.record_for_test(1_000));
     // A third crash AFTER the window has slid past the first two: at
     // t = 1_000 + 60_001, the entries at 0 and 1_000 are both strictly
     // older than 60s relative to `now_ms` and get evicted, leaving only
     // the newest. Count is 1, so no poison.
     let now = 1_000 + CRASH_WINDOW_MS + 1;
     assert!(
-        !w.record(now),
+        !w.record_for_test(now),
         "the two early crashes evicted; only 1 remains"
     );
-    assert!(!w.is_poisoned());
-    assert_eq!(w.crash_count(), 1);
+    assert!(!w.is_poisoned_for_test());
+    assert_eq!(w.crash_count_for_test(), 1);
 }
 
 #[test]
@@ -248,43 +250,50 @@ fn crash_window_evicts_only_strictly_older_than_window() {
     let mut w = CrashWindow::default();
     // Crash at the exact window edge is RETAINED (eviction is strict
     // `> CRASH_WINDOW_MS`).
-    assert!(!w.record(0));
-    assert!(!w.record(CRASH_WINDOW_MS)); // exactly 60s later: front kept
-    assert_eq!(w.crash_count(), 2, "edge-of-window crash is not evicted");
+    assert!(!w.record_for_test(0));
+    assert!(!w.record_for_test(CRASH_WINDOW_MS)); // exactly 60s later: front kept
+    assert_eq!(
+        w.crash_count_for_test(),
+        2,
+        "edge-of-window crash is not evicted"
+    );
     // A third within the same window poisons (all three within 60s of
     // the newest).
-    assert!(w.record(CRASH_WINDOW_MS), "3rd within window poisons");
+    assert!(
+        w.record_for_test(CRASH_WINDOW_MS),
+        "3rd within window poisons"
+    );
 }
 
 #[test]
 fn crash_window_poison_is_sticky_across_later_eviction() {
     let mut w = CrashWindow::default();
-    w.record(0);
-    w.record(100);
-    assert!(w.record(200), "poisoned at 3 crashes");
+    w.record_for_test(0);
+    w.record_for_test(100);
+    assert!(w.record_for_test(200), "poisoned at 3 crashes");
     // A much-later record evicts the old crashes (count drops) but the
     // sticky flag must stay set — an in-window eviction must NOT
     // silently un-poison.
     let later = 200 + CRASH_WINDOW_MS * 10;
     assert!(
-        w.record(later),
+        w.record_for_test(later),
         "poison persists even after the window slides past the old crashes"
     );
-    assert!(w.is_poisoned());
+    assert!(w.is_poisoned_for_test());
 }
 
 #[test]
 fn crash_window_clear_unpoison_and_resets() {
     let mut w = CrashWindow::default();
-    w.record(0);
-    w.record(100);
-    w.record(200);
-    assert!(w.is_poisoned());
-    w.clear();
-    assert!(!w.is_poisoned(), "clear() un-poisons");
-    assert_eq!(w.crash_count(), 0, "clear() empties the deque");
+    w.record_for_test(0);
+    w.record_for_test(100);
+    w.record_for_test(200);
+    assert!(w.is_poisoned_for_test());
+    w.clear_for_test();
+    assert!(!w.is_poisoned_for_test(), "clear() un-poisons");
+    assert_eq!(w.crash_count_for_test(), 0, "clear() empties the deque");
     // After clear the budget starts fresh: one crash does not re-poison.
-    assert!(!w.record(300));
+    assert!(!w.record_for_test(300));
 }
 
 #[test]
@@ -293,13 +302,13 @@ fn crash_window_deque_is_length_capped() {
     // the window, the deque must stay bounded by the defensive cap.
     let mut w = CrashWindow::default();
     for _ in 0..100 {
-        w.record(0);
+        w.record_for_test(0);
     }
     assert!(
-        w.crash_count() <= CRASH_DEQUE_CAP,
+        w.crash_count_for_test() <= CRASH_DEQUE_CAP,
         "deque length is defensively capped at {CRASH_DEQUE_CAP}"
     );
-    assert!(w.is_poisoned(), "many same-instant crashes poison");
+    assert!(w.is_poisoned_for_test(), "many same-instant crashes poison");
 }
 
 /// In-memory `ContextPersistence` stub for tests only. Returns an
@@ -354,7 +363,7 @@ fn test_supervisor() -> Supervisor {
 #[tokio::test]
 async fn fresh_supervisor_has_empty_registries() {
     let s = test_supervisor();
-    assert!(s.lookup("any-ctx").is_none());
+    assert!(s.lookup_for_test("any-ctx").is_none());
     assert!(s.local_dids_for_test().load().is_empty());
     assert!(s.standing_contexts_for_test().load().is_empty());
 }
@@ -470,7 +479,7 @@ async fn reap_stream_admission_removes_entry_without_invalidating_live_arc() {
     // Hold a live clone across the reap — mirrors an in-flight pump.
     let live = Arc::clone(&before);
 
-    s.reap_stream_admission("ctx-reap");
+    s.reap_stream_admission_for_test("ctx-reap");
 
     // The live Arc is still usable after the registry entry is dropped.
     {
@@ -487,7 +496,7 @@ async fn reap_stream_admission_removes_entry_without_invalidating_live_arc() {
         "after reap, get-or-create allocates a fresh tracker",
     );
     // Reaping an absent context is a harmless no-op.
-    s.reap_stream_admission("never-existed");
+    s.reap_stream_admission_for_test("never-existed");
 }
 
 /// A supervisor whose `mls_storage` view is over `storage` and whose
@@ -544,7 +553,10 @@ async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle
 
     let key = sup.load_wrapping_key_for_test(&alice).await.unwrap();
     assert_eq!(custody.generate_calls(), 1, "one key is generated");
-    assert_eq!(*key.public(), custody_public(&custody, key.handle()).await);
+    assert_eq!(
+        *key.public(),
+        custody_public(&custody, key.handle_for_test()).await
+    );
     let again = sup.load_wrapping_key_for_test(&alice).await.unwrap();
     assert!(Arc::ptr_eq(&key, &again), "one key per identity");
     assert_eq!(
@@ -559,22 +571,22 @@ async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle
     let stored: scp_runtime_core::store::wrapping_key::StoredWrappingKeyHandle =
         scp_platform::store_value::from_stored_value_bytes(&bytes).unwrap();
     assert_eq!(stored.v, 1);
-    assert_eq!(&stored.handle, key.handle());
+    assert_eq!(&stored.handle, key.handle_for_test());
     assert_eq!(stored.public.as_slice(), key.public().as_slice());
-    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle(
+    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle_for_test(
         sup.mls_storage_ref_for_test().unwrap().as_ref(),
         &alice,
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(&record.handle, key.handle());
+    assert_eq!(&record.handle, key.handle_for_test());
     assert_eq!(record.public, *key.public());
 
     let bob_key = sup.load_wrapping_key_for_test(&bob).await.unwrap();
     assert_ne!(
-        bob_key.handle(),
-        key.handle(),
+        bob_key.handle_for_test(),
+        key.handle_for_test(),
         "each identity has its own key"
     );
     assert_ne!(bob_key.public(), key.public());
@@ -591,7 +603,7 @@ async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
 
     let first = supervisor_over_storage(Arc::clone(&storage), &custody);
     let key = first.load_wrapping_key_for_test(&alice).await.unwrap();
-    let (handle, public) = (*key.handle(), *key.public());
+    let (handle, public) = (*key.handle_for_test(), *key.public());
     drop(key);
     first.shutdown_all_contexts().await;
     drop(first);
@@ -599,7 +611,7 @@ async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
     let restarted = supervisor_over_storage(storage, &custody);
     let reloaded = restarted.load_wrapping_key_for_test(&alice).await.unwrap();
     assert_eq!(
-        reloaded.handle(),
+        reloaded.handle_for_test(),
         &handle,
         "a restart loads the stored handle"
     );
@@ -662,7 +674,7 @@ async fn load_wrapping_key_refuses_a_record_whose_public_key_differs_from_the_re
         .await
         .unwrap();
     let swapped = custody_public(&custody, &other).await;
-    scp_runtime_core::store::wrapping_key::store_wrapping_key_handle(
+    scp_runtime_core::store::wrapping_key::store_wrapping_key_handle_for_test(
         sup.mls_storage_ref_for_test().unwrap().as_ref(),
         &did,
         &held,
@@ -691,7 +703,7 @@ fn persisted_own_wrapping_key(
         .expect("context persisted")
         .mls_crypto_state
         .clone();
-    let (owned, _floors) = NodeMlsFactory::build_restored_owned(
+    let (owned, _floors) = NodeMlsFactory::build_restored_owned_for_test(
         &scp_runtime_core::context::state::context_id_to_bytes(context_id),
         &mls_state,
     )
@@ -1356,7 +1368,7 @@ async fn known_context_ids_list_live_and_down_contexts_only() {
     let crash = |id: String, crashes: usize| {
         let mut window = sup.crash_windows_for_test().entry(id).or_default();
         for _ in 0..crashes {
-            window.record(0);
+            window.record_for_test(0);
         }
     };
     crash("poisoned-ctx".to_owned(), CRASH_POISON_THRESHOLD);
@@ -1368,7 +1380,7 @@ async fn known_context_ids_list_live_and_down_contexts_only() {
     sup.crash_windows_for_test()
         .entry("respawning-ctx".to_owned())
         .or_default()
-        .mark_respawning();
+        .mark_respawning_for_test();
     assert_eq!(
         sup.known_context_ids_for_test(),
         vec![live, "poisoned-ctx".to_owned(), "respawning-ctx".to_owned()]
@@ -1624,14 +1636,14 @@ async fn load_wrapping_key_stores_the_generated_key_when_its_caller_is_dropped()
         1,
         "the dropped load's key is the one loaded"
     );
-    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle(
+    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle_for_test(
         sup.mls_storage_ref_for_test().unwrap().as_ref(),
         &did,
     )
     .await
     .unwrap()
     .expect("the dropped load stored its record");
-    assert_eq!(record.handle, *key.handle());
+    assert_eq!(record.handle, *key.handle_for_test());
     assert_eq!(record.public, *key.public());
 }
 
@@ -1734,15 +1746,15 @@ async fn a_record_write_that_commits_and_errors_is_removed_before_its_key_is_des
     storage.clear_fail();
     let key = sup.load_wrapping_key_for_test(&did).await.unwrap();
     assert_eq!(custody.generate_calls(), 2, "the next load creates a key");
-    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle(
+    let record = scp_runtime_core::store::wrapping_key::load_wrapping_key_handle_for_test(
         sup.mls_storage_ref_for_test().unwrap().as_ref(),
         &did,
     )
     .await
     .unwrap()
     .expect("the next load stores its record");
-    assert_eq!(record.handle, *key.handle());
-    assert!(custody_holds(&custody, key.handle()).await);
+    assert_eq!(record.handle, *key.handle_for_test());
+    assert!(custody_holds(&custody, key.handle_for_test()).await);
 }
 
 /// When a record write commits and errors and the record cannot be
@@ -1772,7 +1784,11 @@ async fn a_committed_record_that_cannot_be_removed_keeps_its_key() {
 
     storage.clear_fail();
     let key = sup.load_wrapping_key_for_test(&did).await.unwrap();
-    assert_eq!(*key.handle(), generated[0], "the recorded key loads");
+    assert_eq!(
+        *key.handle_for_test(),
+        generated[0],
+        "the recorded key loads"
+    );
     assert_eq!(custody.generate_calls(), 1, "nothing is regenerated");
 }
 
@@ -1900,7 +1916,7 @@ async fn wrapping_key_reads_the_map_before_the_shutdown_gate() {
     let err = sup.wrapping_key_for_test(&missing).unwrap_err();
     assert!(matches!(err, ContextError::InvalidState(_)), "{err:?}");
 
-    sup.close_spawn_gate();
+    sup.close_spawn_gate_for_test();
     assert!(Arc::ptr_eq(
         &sup.wrapping_key_for_test(&loaded).unwrap(),
         &key
@@ -1963,7 +1979,7 @@ async fn key_package_store_refuses_after_shutdown_and_loads_no_secret() {
 async fn load_racing_shutdown_inserts_nothing() {
     let sup = supervisor_with_providers();
     let did = DID("did:example:wrap-in-flight".to_owned());
-    let guard = sup.write_lock.lock().await;
+    let guard = sup.lock_write_for_test().await;
     let load = tokio::spawn({
         let sup = Arc::clone(&sup);
         let did = did.clone();
@@ -1973,8 +1989,8 @@ async fn load_racing_shutdown_inserts_nothing() {
     // it cannot finish while shutdown holds `write_lock`.
     tokio::task::yield_now().await;
     assert!(!load.is_finished(), "the load waits on write_lock");
-    sup.close_spawn_gate();
-    sup.clear_wrapping_keys(&guard);
+    sup.close_spawn_gate_for_test();
+    sup.clear_wrapping_keys_for_test(&guard);
     drop(guard);
 
     let err = load.await.unwrap().unwrap_err();
@@ -2502,7 +2518,7 @@ async fn spawn_actor_with_state_registers_handle_and_accepts_commands() {
         .expect("spawn_actor_with_state: fresh context id registers");
     // Handle is registered under the hex-encoded context id key.
     assert!(
-        supervisor_arc.lookup(&expected_ctx_key).is_some(),
+        supervisor_arc.lookup_for_test(&expected_ctx_key).is_some(),
         "actor must be registered under hex-encoded context id"
     );
 
@@ -2624,7 +2640,7 @@ async fn actor_owned_ttl_arm_fires_and_despawns_self() {
     );
     // Arm a convergent TTL deadline `TTL_SECS` ahead of the actor's own
     // clock. `reconcile_timers` derives the one-shot sleep from this.
-    state.ttl.timer.deadline_unix_secs = Some(deps.clock.now_secs() + TTL_SECS);
+    state.ttl_mut().timer.deadline_unix_secs = Some(deps.clock.now_secs() + TTL_SECS);
 
     // Clone the shared handle BEFORE moving state into the actor so we
     // can observe the FSM transition. Must be `Active` for the expiry
@@ -2638,9 +2654,9 @@ async fn actor_owned_ttl_arm_fires_and_despawns_self() {
         .spawn_actor_with_state_for_test(state, deps, None)
         .await
         .expect("spawn_actor_with_state: fresh context id registers");
-    assert!(supervisor_arc.lookup(&ctx_key).is_some());
+    assert!(supervisor_arc.lookup_for_test(&ctx_key).is_some());
     assert_eq!(
-        actor_handle.exited_deliberately(),
+        actor_handle.exited_deliberately_for_test(),
         None,
         "a running actor has recorded no exit"
     );
@@ -2676,7 +2692,7 @@ async fn actor_owned_ttl_arm_fires_and_despawns_self() {
     // exits. Poll until the registry entry is gone.
     let mut despawned = false;
     for _ in 0..64 {
-        if supervisor_arc.lookup(&ctx_key).is_none() {
+        if supervisor_arc.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -2692,7 +2708,7 @@ async fn actor_owned_ttl_arm_fires_and_despawns_self() {
     // reporting a lost context.
     let mut recorded = None;
     for _ in 0..64 {
-        recorded = actor_handle.exited_deliberately();
+        recorded = actor_handle.exited_deliberately_for_test();
         if recorded.is_some() {
             break;
         }
@@ -2901,7 +2917,7 @@ async fn restore_rearms_ttl_from_convergent_deadline() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + TTL_SECS);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -2924,7 +2940,7 @@ async fn restore_rearms_ttl_from_convergent_deadline() {
         .await
         .expect("respawn must restore the Active snapshot");
     assert!(
-        sup.lookup(&ctx_key).is_some(),
+        sup.lookup_for_test(&ctx_key).is_some(),
         "restored actor must be resident"
     );
 
@@ -2944,7 +2960,7 @@ async fn restore_rearms_ttl_from_convergent_deadline() {
     tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
     let mut despawned = false;
     for _ in 0..64 {
-        if sup.lookup(&ctx_key).is_none() {
+        if sup.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -3016,7 +3032,7 @@ async fn restore_active_with_no_ttl_remaining() {
     );
     // No recorded deadline: model an Active snapshot persisted before the
     // TTL arm was recorded.
-    state.ttl.timer.deadline_unix_secs = None;
+    state.ttl_mut().timer.deadline_unix_secs = None;
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3049,7 +3065,7 @@ async fn restore_active_with_no_ttl_remaining() {
     tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
     let mut despawned = false;
     for _ in 0..64 {
-        if sup.lookup(&ctx_key).is_none() {
+        if sup.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -3119,7 +3135,7 @@ async fn restore_promoted_context_does_not_re_expire() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + STALE_TTL);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3152,7 +3168,7 @@ async fn restore_promoted_context_does_not_re_expire() {
         tokio::task::yield_now().await;
     }
     assert!(
-        sup.lookup(&ctx_key).is_some(),
+        sup.lookup_for_test(&ctx_key).is_some(),
         "a promoted context (params.ttl == None) must NOT be re-armed and \
              destroyed on restore, even with a pruned log (H1/E2)"
     );
@@ -3203,7 +3219,7 @@ async fn restore_created_full_scope_with_ttl_re_arms() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + TTL_SECS);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3233,7 +3249,7 @@ async fn restore_created_full_scope_with_ttl_re_arms() {
     tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
     let mut despawned = false;
     for _ in 0..64 {
-        if sup.lookup(&ctx_key).is_none() {
+        if sup.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -3301,7 +3317,7 @@ async fn restore_preserves_extended_ttl_deadline() {
         },
     );
     // A prior unanimous extension pushed the deadline out past creation+ttl.
-    state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3338,7 +3354,7 @@ async fn restore_preserves_extended_ttl_deadline() {
     tokio::time::advance(std::time::Duration::from_secs(30)).await; // → T0+55
     let mut despawned = false;
     for _ in 0..64 {
-        if sup.lookup(&ctx_key).is_none() {
+        if sup.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -3416,7 +3432,7 @@ async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
 
         let mut state = PerContextState::new_for_test_encrypted(ctx_id_bytes, T0, admin.clone());
         // A stale absolute deadline lingering from when the context was Active.
-        state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+        state.ttl_mut().timer.deadline_unix_secs = Some(T0 + STALE_TTL);
         state
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3429,7 +3445,7 @@ async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
         sup.spawn_actor_with_state_for_test(state, deps, None)
             .await
             .expect("spawn a terminal-state actor for the reconcile-gate check");
-        assert!(sup.lookup(&ctx_key).is_some());
+        assert!(sup.lookup_for_test(&ctx_key).is_some());
 
         // Advance well past the stale deadline. The `is_active` gate must keep
         // the arm disarmed, so the actor never fires + never despawns.
@@ -3441,7 +3457,7 @@ async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
             tokio::task::yield_now().await;
         }
         assert!(
-            sup.lookup(&ctx_key).is_some(),
+            sup.lookup_for_test(&ctx_key).is_some(),
             "a stale TTL deadline must NOT fire against a terminal context and despawn it (BUG-1)"
         );
         // The distinguishing signal (N3): the expiry pipeline never ran, so
@@ -3476,7 +3492,7 @@ async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
         .entry(admin.0.clone())
         .or_default()
         .insert(Capability::ContextClose);
-    state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + STALE_TTL);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -3484,14 +3500,13 @@ async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
 
     let deps = test_actor_deps(&sup).await;
     let handle_clone = state.handle.clone();
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .lifecycle
-        .close_context(&mut cell, &deps, &handle_clone, &admin)
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_lifecycle::testing_access::close_context(&mut cell, &deps, &handle_clone, &admin)
         .await
         .expect("close_context must succeed for a SingleAdmin context");
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs, None,
+        cell.ttl().timer.deadline_unix_secs,
+        None,
         "the close closure must clear the recorded TTL deadline in memory (BUG-1)"
     );
     // The clear is DURABLE: the fail-closed close persist wrote a snapshot
@@ -3559,27 +3574,25 @@ async fn bilateral_reset_uses_convergent_deadline() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
-    let mut cell = ClassSCell::new(state);
+    state.ttl_mut().timer.deadline_unix_secs = Some(OLD_DEADLINE);
+    let mut cell = ClassSCell::new_for_test(state);
 
-    scp_runtime::domain_handlers()
-        .ttl_close
-        .reset_ttl_timer(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            std::time::Duration::from_secs(ADDITIONAL),
-        )
-        .await
-        .expect("the reset appends its TtlExtended leaf");
+    scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        std::time::Duration::from_secs(ADDITIONAL),
+    )
+    .await
+    .expect("the reset appends its TtlExtended leaf");
 
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs,
+        cell.ttl().timer.deadline_unix_secs,
         Some(OLD_DEADLINE + ADDITIONAL),
         "bilateral reset must record old_deadline + additional (convergent)"
     );
     assert_ne!(
-        cell.ttl.timer.deadline_unix_secs,
+        cell.ttl().timer.deadline_unix_secs,
         Some(T0 + ADDITIONAL),
         "bilateral reset must NOT record now + additional (local-clock, divergent)"
     );
@@ -3657,35 +3670,33 @@ async fn a_reset_whose_append_fails_keeps_the_tally_and_the_deadline() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(OLD_DEADLINE);
     let mut ext = scp_runtime_core::context::ttl::TtlExtension::new(
         std::time::Duration::from_secs(ADDITIONAL),
         2,
     );
     ext.add_consent(DID("did:example:m-alpha".to_owned()));
     ext.add_consent(DID("did:example:m-bravo".to_owned()));
-    state.ttl.extension = Some(ext);
-    let mut cell = ClassSCell::new(state);
+    state.ttl_mut().extension = Some(ext);
+    let mut cell = ClassSCell::new_for_test(state);
 
-    let reset = scp_runtime::domain_handlers()
-        .ttl_close
-        .reset_ttl_timer(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            std::time::Duration::from_secs(ADDITIONAL),
-        )
-        .await;
+    let reset = scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        std::time::Duration::from_secs(ADDITIONAL),
+    )
+    .await;
 
     assert!(
         matches!(reset, Err(ContextError::EventLogFailed(_))),
         "a failed TtlExtended append fails the reset, got {reset:?}"
     );
     assert!(
-        cell.ttl.extension.is_some(),
+        cell.ttl().extension.is_some(),
         "the consent tally survives a reset whose leaf was not logged"
     );
-    assert_eq!(cell.ttl.timer.deadline_unix_secs, Some(OLD_DEADLINE));
+    assert_eq!(cell.ttl().timer.deadline_unix_secs, Some(OLD_DEADLINE));
 }
 
 /// H2 (reset on a no-TTL context, REGRESSION GATE): `reset_ttl_timer` on a
@@ -3720,22 +3731,21 @@ async fn reset_ttl_on_no_ttl_context_does_not_expire() {
 
     let mut state = PerContextState::new_for_test_encrypted(ctx_id_bytes, T0, admin);
     // No recorded deadline: a context with no live TTL arm.
-    state.ttl.timer.deadline_unix_secs = None;
-    let mut cell = ClassSCell::new(state);
+    state.ttl_mut().timer.deadline_unix_secs = None;
+    let mut cell = ClassSCell::new_for_test(state);
 
-    scp_runtime::domain_handlers()
-        .ttl_close
-        .reset_ttl_timer(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            std::time::Duration::from_secs(ADDITIONAL),
-        )
-        .await
-        .expect("the reset appends its TtlExtended leaf");
+    scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        std::time::Duration::from_secs(ADDITIONAL),
+    )
+    .await
+    .expect("the reset appends its TtlExtended leaf");
 
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs, None,
+        cell.ttl().timer.deadline_unix_secs,
+        None,
         "reset on a no-TTL context must NOT arm a deadline (H2); pre-fix it \
              armed `0 + additional ≈ 1970`, an immediate-expiry sleep(0)"
     );
@@ -3794,34 +3804,32 @@ async fn reset_ttl_timer_emits_ttl_extended_leaf() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(OLD_DEADLINE);
     // Record a member's consent so the leaf's `consenting_members` is
     // populated (the propose→reset activation flow).
-    state.ttl.extension = Some(scp_runtime_core::context::ttl::TtlExtension::new(
+    state.ttl_mut().extension = Some(scp_runtime_core::context::ttl::TtlExtension::new(
         std::time::Duration::from_secs(ADDITIONAL),
         1,
     ));
     state
-        .ttl
+        .ttl_mut()
         .extension
         .as_mut()
         .unwrap()
         .add_consent(DID("did:example:reset-consenter".to_owned()));
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
 
-    scp_runtime::domain_handlers()
-        .ttl_close
-        .reset_ttl_timer(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            std::time::Duration::from_secs(ADDITIONAL),
-        )
-        .await
-        .expect("the reset appends its TtlExtended leaf");
+    scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        std::time::Duration::from_secs(ADDITIONAL),
+    )
+    .await
+    .expect("the reset appends its TtlExtended leaf");
 
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs,
+        cell.ttl().timer.deadline_unix_secs,
         Some(NEW_DEADLINE),
         "reset extends the recorded convergent deadline by the duration"
     );
@@ -3899,7 +3907,7 @@ async fn two_members_reset_leaves_are_byte_identical() {
                 ..Default::default()
             },
         );
-        state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+        state.ttl_mut().timer.deadline_unix_secs = Some(OLD_DEADLINE);
         let mut ext = scp_runtime_core::context::ttl::TtlExtension::new(
             std::time::Duration::from_secs(ADDITIONAL),
             2,
@@ -3913,19 +3921,17 @@ async fn two_members_reset_leaves_are_byte_identical() {
             ext.add_consent(bravo);
             ext.add_consent(alpha);
         }
-        state.ttl.extension = Some(ext);
-        let mut cell = ClassSCell::new(state);
+        state.ttl_mut().extension = Some(ext);
+        let mut cell = ClassSCell::new_for_test(state);
 
-        scp_runtime::domain_handlers()
-            .ttl_close
-            .reset_ttl_timer(
-                &mut cell,
-                &deps,
-                &ctx_key,
-                std::time::Duration::from_secs(ADDITIONAL),
-            )
-            .await
-            .expect("the reset appends its TtlExtended leaf");
+        scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(ADDITIONAL),
+        )
+        .await
+        .expect("the reset appends its TtlExtended leaf");
 
         entries_handle
             .lock()
@@ -4011,12 +4017,12 @@ async fn ttl_expiry_aborts_when_convergent_deadline_is_none() {
         },
     );
     // A STALE non-`None` recorded deadline (params.ttl == None ⇒ derive None).
-    state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + STALE_TTL);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let handle = cell.handle.clone();
 
     // ADR-049 floor-registry SAFETY gate (F-1): seed a real registry
@@ -4052,7 +4058,8 @@ async fn ttl_expiry_aborts_when_convergent_deadline_is_none() {
         "the FSM must stay Active — no terminal Expired transition off a None deadline (A3)"
     );
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs, None,
+        cell.ttl().timer.deadline_unix_secs,
+        None,
         "the stale cached deadline must be cleared so reconcile_timers disarms (A3)"
     );
     let expired_leaves = entries_handle
@@ -4121,7 +4128,7 @@ async fn finalize_close_explicit_stamps_actual_close_time() {
         .handle
         .transition_to(&scp_protocol::context::ContextState::Closing)
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let handle = cell.handle.clone();
 
     // ADR-049 floor-registry prune (F-1): seed a real registry floor for
@@ -4304,14 +4311,15 @@ async fn a_checkpoint_whose_prune_fails_returns_the_error() {
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
-    state.governance.pruning_policy = Some(scp_protocol::context::governance::PruningPolicy {
-        size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
-            max_event_count: 2,
-            max_storage_bytes: u64::MAX,
-        }),
-        ..Default::default()
-    });
-    let mut cell = ClassSCell::new(state);
+    state.governance_mut().pruning_policy =
+        Some(scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 2,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        });
+    let mut cell = ClassSCell::new_for_test(state);
 
     faulty.fail_nth_store(1);
     let checkpoint =
@@ -4417,12 +4425,12 @@ async fn retry_stamps_convergent_leaf_timestamp() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(CONVERGENT_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(CONVERGENT_DEADLINE);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let handle = cell.handle.clone();
 
     // ADR-049 floor-registry prune (F-1): seed a real registry floor and
@@ -4459,7 +4467,8 @@ async fn retry_stamps_convergent_leaf_timestamp() {
              leak on the TTL-expiry teardown path"
     );
     assert_eq!(
-        cell.ttl.timer.deadline_unix_secs, None,
+        cell.ttl().timer.deadline_unix_secs,
+        None,
         "Phase 1 clears the recorded convergent deadline"
     );
 
@@ -4558,12 +4567,12 @@ async fn retry_stamps_reset_extended_convergent_deadline() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let handle = cell.handle.clone();
 
     let out1 = scp_runtime::domain_handlers()
@@ -4648,12 +4657,12 @@ async fn an_unreadable_log_at_expiry_stamps_no_shortened_deadline() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+    state.ttl_mut().timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let handle = cell.handle.clone();
     let expired_leaves = || -> Vec<u64> {
         event_log
@@ -4733,7 +4742,7 @@ async fn reconcile_timers_idempotent_no_rearm_when_deadline_unchanged() {
             ..Default::default()
         },
     );
-    state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+    state.ttl_mut().timer.deadline_unix_secs = Some(T0 + TTL_SECS);
     state
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -4761,7 +4770,7 @@ async fn reconcile_timers_idempotent_no_rearm_when_deadline_unchanged() {
     tokio::time::advance(std::time::Duration::from_secs(TTL_SECS)).await;
     let mut despawned = false;
     for _ in 0..64 {
-        if sup.lookup(&ctx_key).is_none() {
+        if sup.lookup_for_test(&ctx_key).is_none() {
             despawned = true;
             break;
         }
@@ -4805,7 +4814,7 @@ async fn spawn_actor_with_state_rejects_duplicate_context_id() {
         .spawn_actor_with_state_for_test(state1, deps1, None)
         .await
         .expect("first spawn of a fresh context id registers");
-    assert!(supervisor_arc.lookup(&ctx_key).is_some());
+    assert!(supervisor_arc.lookup_for_test(&ctx_key).is_some());
 
     let state2 = PerContextState::new_for_test_encrypted(
         ctx_id_bytes,
@@ -4826,7 +4835,7 @@ async fn spawn_actor_with_state_rejects_duplicate_context_id() {
         "duplicate spawn must be rejected with CreationFailed"
     );
     // The original actor is still the registered one.
-    assert!(supervisor_arc.lookup(&ctx_key).is_some());
+    assert!(supervisor_arc.lookup_for_test(&ctx_key).is_some());
 
     // Shut down the survivor to avoid a leaked task.
     let _ = h1.send_shutdown().await;
@@ -4862,28 +4871,25 @@ async fn shutdown_all_contexts_deregisters_every_actor() {
             .expect("fresh context id registers");
     }
     assert_eq!(
-        supervisor_arc.actor_ids().len(),
+        supervisor_arc.actor_ids_for_test().len(),
         2,
         "both actors must be registered before shutdown"
     );
 
-    scp_runtime::domain_handlers()
-        .lifecycle
-        .shutdown_all_contexts(&supervisor_arc)
-        .await;
+    supervisor_arc.shutdown_all_contexts().await;
 
     // Every actor must be deregistered: no zombie handles remain.
     assert!(
-        supervisor_arc.actor_ids().is_empty(),
+        supervisor_arc.actor_ids_for_test().is_empty(),
         "actor_ids must be empty after shutdown_all_contexts, got {:?}",
-        supervisor_arc.actor_ids()
+        supervisor_arc.actor_ids_for_test()
     );
     assert!(
-        supervisor_arc.lookup(&key_a).is_none(),
+        supervisor_arc.lookup_for_test(&key_a).is_none(),
         "context A must not be discoverable after shutdown"
     );
     assert!(
-        supervisor_arc.lookup(&key_b).is_none(),
+        supervisor_arc.lookup_for_test(&key_b).is_none(),
         "context B must not be discoverable after shutdown"
     );
 }
@@ -4929,7 +4935,7 @@ async fn spawn_tracked_on_after_close_admits_only_tracked_callers() {
         })
         .expect("an open gate accepts the parent");
 
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
     assert!(
         matches!(
             supervisor.spawn_tracked_on_for_test(SinkHandoff::StreamSettlement, async {}, &runtime),
@@ -4945,7 +4951,7 @@ async fn spawn_tracked_on_after_close_admits_only_tracked_callers() {
         .expect("a closed gate accepts spawn_tracked_on from a tracked caller");
 
     let drain_supervisor = Arc::clone(&supervisor);
-    let drain = tokio::spawn(async move { drain_supervisor.await_tracked_tasks().await });
+    let drain = tokio::spawn(async move { drain_supervisor.await_tracked_tasks_for_test().await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         !drain.is_finished(),
@@ -4971,7 +4977,7 @@ async fn close_spawn_gate_cancels_the_pump_shutdown_token() {
         !supervisor.shutdown_token_for_test().is_cancelled(),
         "the token is live while the gate is open"
     );
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
     assert!(
         supervisor.shutdown_token_for_test().is_cancelled(),
         "closing the gate cancels the token"
@@ -5031,7 +5037,7 @@ async fn spawn_tracked_on_after_close_accepts_each_handoff_kind_from_a_tracked_c
         })
         .expect("an open gate accepts the parent");
 
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
     go_tx.send(()).expect("the parent is waiting");
     for (kind, result) in parent.await.expect("the parent does not panic") {
         assert!(
@@ -5041,7 +5047,7 @@ async fn spawn_tracked_on_after_close_accepts_each_handoff_kind_from_a_tracked_c
     }
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        supervisor.await_tracked_tasks(),
+        supervisor.await_tracked_tasks_for_test(),
     )
     .await
     .expect("the drain finishes once the hand-off tasks exit");
@@ -5064,7 +5070,7 @@ async fn spawn_after_close_outside_the_handoff_exception_is_refused() {
     let supervisor = supervisor_with_providers();
     let runtime = tokio::runtime::Handle::current();
     let ran = Arc::new(AtomicUsize::new(0));
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
 
     let ran_in = Arc::clone(&ran);
     assert!(
@@ -5099,7 +5105,7 @@ async fn spawn_after_close_outside_the_handoff_exception_is_refused() {
             "a closed gate refuses {kind:?} from a caller outside the tracker, got {result:?}"
         );
     }
-    supervisor.await_tracked_tasks().await;
+    supervisor.await_tracked_tasks_for_test().await;
     assert_eq!(ran.load(Ordering::SeqCst), 0, "no refused future ran");
 }
 
@@ -5113,7 +5119,7 @@ async fn tracked_exception_is_per_supervisor_and_spawner_holds_the_drain() {
     let b = supervisor_with_providers();
     let runtime = tokio::runtime::Handle::current();
 
-    b.close_spawn_gate();
+    b.close_spawn_gate_for_test();
     assert!(
         matches!(
             b.tracked_spawner_for_test("outside caller after close"),
@@ -5149,10 +5155,10 @@ async fn tracked_exception_is_per_supervisor_and_spawner_holds_the_drain() {
     let spawner = a
         .tracked_spawner_for_test("operation begun before close")
         .expect("an open gate issues a spawner");
-    a.close_spawn_gate();
+    a.close_spawn_gate_for_test();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let a_in_child = Arc::clone(&a);
-    let child = spawner.spawn(async move {
+    let child = spawner.spawn_for_test(async move {
         let nested = a_in_child.tracked_spawner_for_test("nested").map(drop);
         let _ = release_rx.await;
         nested
@@ -5160,7 +5166,7 @@ async fn tracked_exception_is_per_supervisor_and_spawner_holds_the_drain() {
     drop(spawner);
 
     let drain_supervisor = Arc::clone(&a);
-    let drain = tokio::spawn(async move { drain_supervisor.await_tracked_tasks().await });
+    let drain = tokio::spawn(async move { drain_supervisor.await_tracked_tasks_for_test().await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         !drain.is_finished(),
@@ -5612,7 +5618,7 @@ async fn prepare_for_replace_succeeds_for_replaceable_context() {
     );
 
     // Handle is still registered until the import path despawns it.
-    assert!(supervisor_arc.lookup(&ctx_key).is_some());
+    assert!(supervisor_arc.lookup_for_test(&ctx_key).is_some());
 }
 
 // -----------------------------------------------------------------
@@ -6263,26 +6269,6 @@ async fn spawn_live_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]
     hex::encode(ctx_id_bytes)
 }
 
-/// The standing-direct Outcome sketch keeps a Supervisor shutdown typed,
-/// and still records an error it has no arm for as a crypto failure.
-#[test]
-fn standing_sketch_keeps_supervisor_shut_down_typed() {
-    let sketch = scp_runtime_core::context::supervisor::supervisor::standing_outcome_error_sketch(
-        &ContextError::SupervisorShutDown("gone".to_owned()),
-    );
-    assert!(
-        matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-        "got {sketch:?}"
-    );
-    let unmapped = scp_runtime_core::context::supervisor::supervisor::standing_outcome_error_sketch(
-        &ContextError::ActorBusy("busy".to_owned()),
-    );
-    assert!(
-        matches!(unmapped, ContextError::CryptoFailed(_)),
-        "got {unmapped:?}"
-    );
-}
-
 /// A caller that drops `release_stream_escrow` after its first poll leaves
 /// the reversal running as a tracked task and gets no second refund from
 /// the ticket's `Drop`. Awaiting the reversal inside the caller's future
@@ -6314,11 +6300,11 @@ async fn release_stream_escrow_dropped_mid_reversal_does_not_refund_again() {
         .expect("drive live context to Active");
     // The open-time hold this release reverses: 50 of 100 spent.
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&member, scp_protocol::economy::types::Amount::new(100));
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .record_spend(&member, scp_protocol::economy::types::Amount::new(50))
         .expect("the grant covers the hold");
@@ -6415,11 +6401,11 @@ async fn escrow_ticket_dropped_after_shutdown_began_refunds_through_the_spawner(
         .expect("drive live context to Active");
     // Two open-time holds of 25 each: 50 of 100 spent.
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&member, scp_protocol::economy::types::Amount::new(100));
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .record_spend(&member, scp_protocol::economy::types::Amount::new(50))
         .expect("the grant covers the holds");
@@ -6440,12 +6426,12 @@ async fn escrow_ticket_dropped_after_shutdown_began_refunds_through_the_spawner(
                 scp_protocol::economy::types::Amount::new(25),
             )
         };
-    let through_spawner = ticket(Arc::new(SpawnerEscrowRefundSink::new(
+    let through_spawner = ticket(Arc::new(SpawnerEscrowRefundSink::new_for_test(
         &supervisor,
         &spawner,
     )));
 
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
     assert_eq!(
         remaining(&supervisor, &context_id, &member).await,
         50,
@@ -6988,7 +6974,7 @@ async fn import_rejects_future_dated_creation_timestamp() {
     );
     // No poisoned base persisted: the rejected import leaves no resident actor.
     assert!(
-        sup.lookup(context_id).is_none(),
+        sup.lookup_for_test(context_id).is_none(),
         "a rejected future-dated import must not leave a resident actor"
     );
     // F2: the reject is SIDE-EFFECT-FREE — the foreign event log was NOT
@@ -7172,7 +7158,7 @@ async fn assert_import_refuses_committed_t0(seed: u8, committed: CommittedT0, re
         "{reason}"
     );
     assert!(
-        sup.lookup(&context_id).is_none(),
+        sup.lookup_for_test(&context_id).is_none(),
         "no actor may be registered"
     );
     assert!(contexts.is_empty(), "no snapshot may be persisted");
@@ -7307,7 +7293,7 @@ async fn a_refused_import_leaves_a_replaceable_prior_actor_live() {
         "expected the rule-9 refusal, got {err:?}"
     );
     assert!(
-        sup.lookup(&context_id).is_some(),
+        sup.lookup_for_test(&context_id).is_some(),
         "the refused import must not despawn the prior actor"
     );
     let member_count: Result<Option<usize>, ContextError> = prior_handle
@@ -7479,7 +7465,7 @@ async fn assert_restore_refuses_committed_t0(
         "{reason}"
     );
     assert!(
-        sup.lookup(&context_id).is_none(),
+        sup.lookup_for_test(&context_id).is_none(),
         "no actor may be registered"
     );
     assert_eq!(contexts.len(), 1, "no other snapshot may be persisted");
@@ -8146,7 +8132,7 @@ async fn kp_actor_watchdog_records_panic_and_respawns() {
         supervisor
             .crash_windows_for_test()
             .get(&poison_key)
-            .is_some_and(|w| w.crash_count() >= 1),
+            .is_some_and(|w| w.crash_count_for_test() >= 1),
         "watchdog must record the KP-actor panic"
     );
     assert!(
@@ -8694,7 +8680,7 @@ async fn spawn_active_with_snapshot(
         .unwrap();
     // Persist a snapshot so a respawn can rehydrate the context.
     let snap = scp_runtime_core::context::manager_methods::snapshot_context(&state);
-    sup.persistence_ref()
+    sup.persistence_ref_for_test()
         .expect("test supervisor has persistence")
         .persist_context(&ctx_key, &snap)
         .await
@@ -8784,7 +8770,7 @@ async fn three_crashes_poison_and_stop_respawning() {
         );
         clock.advance_millis(100);
         handle = sup
-            .lookup(&ctx_key)
+            .lookup_for_test(&ctx_key)
             .expect("respawned responsive actor is registered");
     }
 
@@ -8798,7 +8784,7 @@ async fn three_crashes_poison_and_stop_respawning() {
 
     // The poisoned context's dead handle is despawned (lookup None).
     let despawned = wait_until(std::time::Duration::from_secs(5), || {
-        sup.lookup(&ctx_key).is_none()
+        sup.lookup_for_test(&ctx_key).is_none()
     })
     .await;
     assert!(despawned, "a poisoned context's actor must be despawned");
@@ -8830,7 +8816,7 @@ async fn three_crashes_poison_and_stop_respawning() {
     clock.advance_millis(1_000);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a poisoned context must NOT be respawned"
     );
 }
@@ -8861,7 +8847,9 @@ async fn clear_poison_recovers_a_poisoned_context() {
         .await;
         assert!(respawned, "watchdog must respawn below the threshold");
         clock.advance_millis(100);
-        handle = sup.lookup(&ctx_key).expect("respawned actor registered");
+        handle = sup
+            .lookup_for_test(&ctx_key)
+            .expect("respawned actor registered");
     }
     induce_panic(&handle, "SECRET_SENTINEL_clear").await;
     let poisoned = wait_until(std::time::Duration::from_secs(5), || {
@@ -8920,7 +8908,7 @@ async fn clear_poison_wait_for_the_spawn_lock_reads_as_poisoned_not_absent() {
     sup.crash_windows_for_test()
         .entry(ctx_key.clone())
         .or_default()
-        .poisoned = true;
+        .poison_for_test();
 
     // Another lifecycle operation holds the global spawn lock.
     let spawn_guard = sup.lock_bootstrap_spawn_for_test().await;
@@ -8964,7 +8952,7 @@ async fn failed_bootstrap_restores_the_prior_crash_window() {
     sup.crash_windows_for_test()
         .entry(poisoned.clone())
         .or_default()
-        .poisoned = true;
+        .poison_for_test();
 
     let window = sup.begin_bootstrap_window_for_test(&poisoned);
     assert!(
@@ -9060,7 +9048,7 @@ fn poison_crash_window(sup: &Supervisor, id: &str) {
     sup.crash_windows_for_test()
         .entry(id.to_owned())
         .or_default()
-        .poisoned = true;
+        .poison_for_test();
 }
 
 /// A `CreateContext` command for `id` with `params`, and its reply receiver.
@@ -9274,7 +9262,7 @@ async fn a_checked_read_racing_failed_bootstraps_never_reads_a_poisoned_id_as_ab
     sup.crash_windows_for_test()
         .entry(poisoned.clone())
         .or_default()
-        .poisoned = true;
+        .poison_for_test();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flipper = {
@@ -9319,7 +9307,7 @@ async fn clear_poison_without_snapshot_records_one_failure_no_loop() {
             .entry(ctx_key.clone())
             .or_default();
         // Drive it to poisoned by recording the budget's worth of crashes.
-        entry.mark_respawn_failed();
+        entry.mark_respawn_failed_for_test();
     }
 
     // clear_poison clears the window and attempts ONE respawn, which fails
@@ -9338,7 +9326,7 @@ async fn clear_poison_without_snapshot_records_one_failure_no_loop() {
         "a single failed retry must NOT immediately re-poison (no loop)"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "no actor is registered after a failed no-snapshot respawn"
     );
 }
@@ -9489,7 +9477,7 @@ async fn a_crash_under_an_unsettled_first_state_is_respawned_after_the_rollback(
     );
 
     claim
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .expect("the operation rolls back");
     let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
@@ -10131,18 +10119,14 @@ fn recv_floor_gate_blocks_reorder_and_replay_e2e() {
         panic!("expected encrypted mode")
     };
     let mut open = |msg: &[u8]| {
-        rt.block_on(
-            scp_runtime::domain_handlers()
-                .messaging
-                .decrypt_and_dispatch(
-                    &bob_deps,
-                    Some(&mut *bob_cs),
-                    ctx_str,
-                    &ctx_bytes,
-                    msg,
-                    &std::collections::HashSet::new(),
-                ),
-        )
+        rt.block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            msg,
+            &std::collections::HashSet::new(),
+        ))
         .map(|dispatched| match dispatched {
             Dispatched::Envelope(env) => Some(*env),
             _ => None,
@@ -10271,7 +10255,7 @@ fn actor_merges_add_under_receiver_clock(
         .expect("serialize Carol's KeyPackage");
 
     let commit = alice_actor
-        .add_member(carol, Some(&carol_kp), &SystemClock)
+        .add_member_for_test(carol, Some(&carol_kp), &SystemClock)
         .expect("Alice adds Carol")
         .commit_bytes;
 
@@ -10300,18 +10284,14 @@ fn actor_merges_add_under_receiver_clock(
         .epoch()
         .expect("Bob's epoch");
     let opened = rt
-        .block_on(
-            scp_runtime::domain_handlers()
-                .messaging
-                .decrypt_and_dispatch(
-                    &bob_deps,
-                    Some(&mut *bob_cs),
-                    ctx_str,
-                    &ctx_bytes,
-                    &commit,
-                    &std::collections::HashSet::new(),
-                ),
-        )
+        .block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &commit,
+            &std::collections::HashSet::new(),
+        ))
         .expect("Bob merges the add-Carol Commit");
     assert!(
         matches!(opened, Dispatched::Commit { .. }),
@@ -10391,15 +10371,20 @@ fn recv_floor_gate_catch_up_after_epoch_rotation_e2e() {
         .build()
         .unwrap();
     alice_actor.rotate_sender_key(ALICE, None).unwrap();
-    alice_actor.distribute_sender_key(ALICE, ALICE, None).ok();
-    for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
+    alice_actor
+        .distribute_sender_key_for_test(ALICE, ALICE, None)
+        .ok();
+    for (_t, msg) in alice_actor
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap()
+    {
         if let Ok((key, _epoch)) = rt.block_on(NodeMlsFactory::open_incoming_sender_key_bytes(
             &bob_wrapping,
             &bob_actor.context_id,
             ALICE,
             &msg,
         )) {
-            bob_actor.set_sender_key_unchecked(ALICE, key);
+            bob_actor.set_sender_key_unchecked_for_test(ALICE, key);
         }
     }
 
@@ -10434,18 +10419,14 @@ fn recv_floor_gate_catch_up_after_epoch_rotation_e2e() {
         }
     };
     let opened = rt
-        .block_on(
-            scp_runtime::domain_handlers()
-                .messaging
-                .decrypt_and_dispatch(
-                    &bob_deps,
-                    Some(bob_cs),
-                    ctx_str,
-                    &ctx_bytes,
-                    &sealed,
-                    &std::collections::HashSet::new(),
-                ),
-        )
+        .block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+            &bob_deps,
+            Some(bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+            &std::collections::HashSet::new(),
+        ))
         .expect("a recv at the just-advanced epoch must open");
     let Dispatched::Envelope(opened) = opened else {
         panic!("an Application envelope must surface, got {opened:?}");
@@ -10514,7 +10495,9 @@ async fn key_response_opens_through_custody_dh_agree() {
     );
     alice_actor.rotate_sender_key(ALICE, None).unwrap();
     let rotated_epoch = alice_actor.local_sender_key_epoch();
-    let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+    let msgs = alice_actor
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
     let sealed = alice_actor
         .mode
@@ -10524,18 +10507,16 @@ async fn key_response_opens_through_custody_dh_agree() {
         .expect("alice MLS-wraps the KeyResponse");
 
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("bob opens the KeyResponse through custody");
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("bob opens the KeyResponse through custody");
     assert!(
         matches!(opened, Dispatched::Handled),
         "a KeyResponse surfaces no envelope, got {opened:?}"
@@ -10553,18 +10534,16 @@ async fn key_response_opens_through_custody_dh_agree() {
         rotated_epoch,
         b"after-key-response",
     );
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &app,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the installed sender key opens alice's message");
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &app,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the installed sender key opens alice's message");
     let Dispatched::Envelope(opened) = opened else {
         panic!("an Application envelope must surface, got {opened:?}");
     };
@@ -10620,7 +10599,9 @@ async fn key_response_public_checks_run_before_custody() {
     );
     alice_actor.rotate_sender_key(ALICE, None).unwrap();
     let rotated_epoch = alice_actor.local_sender_key_epoch();
-    let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+    let msgs = alice_actor
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
     let SenderKeyDistributionMessage::KeyResponse(response) =
         SenderKeyDistributionMessage::from_bytes(&msgs[0].1).unwrap()
@@ -10649,17 +10630,15 @@ async fn key_response_public_checks_run_before_custody() {
     let genuine_sealed = wrap(&msgs[0].1);
 
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    let wrong_sender = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &forged_sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+    let wrong_sender = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &forged_sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await;
     assert!(
         matches!(&wrong_sender, Err(ContextError::CryptoFailed(m)) if m.contains("sender DID mismatch")),
         "a response naming another sender fails closed: {wrong_sender:?}"
@@ -10674,17 +10653,15 @@ async fn key_response_public_checks_run_before_custody() {
             MAX_EPOCH_ADVANCE,
         )
         .expect("bob's floor for alice reaches the rotated epoch");
-    let stale = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &genuine_sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+    let stale = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &genuine_sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await;
     assert!(
         matches!(&stale, Err(ContextError::CryptoFailed(m)) if m.contains("equals the floor with another key")),
         "a response at the recorded floor whose key is not the installed key fails closed: \
@@ -10750,7 +10727,9 @@ fn rotate_for(
 ) -> (Vec<u8>, u64) {
     alice_actor.rotate_sender_key(alice, None).unwrap();
     let epoch = alice_actor.local_sender_key_epoch();
-    let mut msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+    let mut msgs = alice_actor
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1, "one distribution for Bob");
     (msgs.remove(0).1, epoch)
 }
@@ -10784,17 +10763,15 @@ async fn a_distribution_delivered_twice_is_handled_once() {
 
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
     for (n, sealed) in [first, second].iter().enumerate() {
-        let got = scp_runtime::domain_handlers()
-            .messaging
-            .decrypt_and_dispatch(
-                &bob_deps,
-                Some(&mut *bob_cs),
-                ctx_str,
-                &ctx_bytes,
-                sealed,
-                &std::collections::HashSet::new(),
-            )
-            .await;
+        let got = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            sealed,
+            &std::collections::HashSet::new(),
+        )
+        .await;
         assert!(
             matches!(got, Ok(Dispatched::Handled)),
             "delivery {n} of the same distribution is handled: {got:?}"
@@ -10806,18 +10783,16 @@ async fn a_distribution_delivered_twice_is_handled_once() {
         "the duplicate leaves the floor at the epoch"
     );
     let app = alice_seals_content(&mut alice_actor, ctx_str, ALICE, epoch, b"after-duplicate");
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &app,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the installed key opens alice's message");
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &app,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the installed key opens alice's message");
     assert!(matches!(opened, Dispatched::Envelope(_)));
 }
 
@@ -10849,29 +10824,25 @@ async fn an_older_distribution_after_a_newer_one_is_refused() {
     let older_sealed = wrap(&older);
 
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &newer_sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the newer distribution installs");
-    let late = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &older_sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+    scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &newer_sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the newer distribution installs");
+    let late = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &older_sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await;
     assert!(
         matches!(&late, Err(ContextError::CryptoFailed(_))),
         "a distribution below the floor fails closed: {late:?}"
@@ -10881,18 +10852,16 @@ async fn an_older_distribution_after_a_newer_one_is_refused() {
         newer_epoch
     );
     let app = alice_seals_content(&mut alice_actor, ctx_str, ALICE, newer_epoch, b"after-late");
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &app,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the newer key stays installed");
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &app,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the newer key stays installed");
     assert!(matches!(opened, Dispatched::Envelope(_)));
 }
 
@@ -10988,7 +10957,9 @@ fn alice_rotates_for_bob(
 ) -> (Vec<u8>, u64) {
     alice_actor.rotate_sender_key(KR_ALICE, None).unwrap();
     let epoch = alice_actor.local_sender_key_epoch();
-    let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+    let msgs = alice_actor
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
     let sealed = alice_actor
         .mode
@@ -11025,18 +10996,16 @@ async fn key_response_fails_closed_when_custody_cannot_agree() {
 
     let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor);
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    let err = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect_err("a KeyResponse custody cannot open fails closed");
+    let err = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect_err("a KeyResponse custody cannot open fails closed");
     assert!(
         matches!(&err, ContextError::Custody(f) if f.is_key_not_found()),
         "{err:?}"
@@ -11054,17 +11023,15 @@ async fn key_response_fails_closed_when_custody_cannot_agree() {
         rotated_epoch,
         b"after-refused-key-response",
     );
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &app,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &app,
+        &std::collections::HashSet::new(),
+    )
+    .await;
     assert!(
         !matches!(opened, Ok(Dispatched::Envelope(_))),
         "no rotated sender key was installed: {opened:?}"
@@ -11097,18 +11064,16 @@ async fn key_response_opens_then_a_reload_reports_the_wrapping_handle_invalid() 
 
     let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor);
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &sealed,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the KeyResponse opens before the key is lost");
+    scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &sealed,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the KeyResponse opens before the key is lost");
     let app = alice_seals_content(
         &mut alice_actor,
         ctx_str,
@@ -11116,36 +11081,32 @@ async fn key_response_opens_then_a_reload_reports_the_wrapping_handle_invalid() 
         rotated_epoch,
         b"after-key-response",
     );
-    let opened = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &app,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("the installed sender key opens alice's message");
+    let opened = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &app,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect("the installed sender key opens alice's message");
     let Dispatched::Envelope(opened) = opened else {
         panic!("an Application envelope must surface, got {opened:?}");
     };
     assert_eq!(opened.receive_floor.epoch, rotated_epoch);
 
     let (second, _) = alice_rotates_for_bob(&mut alice_actor);
-    let err = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &second,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect_err("the lost key cannot open the next KeyResponse");
+    let err = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        Some(&mut *bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &second,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect_err("the lost key cannot open the next KeyResponse");
     assert!(
         matches!(&err, ContextError::Custody(f) if f.is_key_not_found()),
         "{err:?}"
@@ -11196,7 +11157,7 @@ async fn a_removed_senders_past_epoch_key_response_installs_nothing() {
     let key_of = |actor: &scp_runtime_core::context::actor::PerContextState, did: &str| {
         actor
             .mode
-            .crypto()
+            .crypto_for_test()
             .expect("encrypted context")
             .sender_key_store
             .get(&sender_key_ctx, did)
@@ -11210,18 +11171,16 @@ async fn a_removed_senders_past_epoch_key_response_installs_nothing() {
     bob_actor
         .remove_member(KR_BOB, KR_ALICE, &scp_clock::SystemClock)
         .expect("bob removes alice's leaf");
-    let err = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            bob_actor.mode.crypto_mut(),
-            ctx_str,
-            &ctx_bytes,
-            &blank_leaf,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect_err("a KeyResponse from a blank leaf is refused");
+    let err = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        bob_actor.mode.crypto_mut(),
+        ctx_str,
+        &ctx_bytes,
+        &blank_leaf,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect_err("a KeyResponse from a blank leaf is refused");
     assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
 
     // Bob adds Carol, who takes the blank leaf; the KeyResponse is still
@@ -11241,20 +11200,18 @@ async fn a_removed_senders_past_epoch_key_response_installs_nothing() {
         .tls_serialize_detached()
         .expect("serialize carol's key package");
     bob_actor
-        .add_member(CAROL, Some(&carol_kp), &scp_clock::SystemClock)
+        .add_member_for_test(CAROL, Some(&carol_kp), &scp_clock::SystemClock)
         .expect("bob adds carol into alice's blank leaf");
-    let err = scp_runtime::domain_handlers()
-        .messaging
-        .decrypt_and_dispatch(
-            &bob_deps,
-            bob_actor.mode.crypto_mut(),
-            ctx_str,
-            &ctx_bytes,
-            &reused_leaf,
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect_err("a KeyResponse from a leaf another member now holds is refused");
+    let err = scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &bob_deps,
+        bob_actor.mode.crypto_mut(),
+        ctx_str,
+        &ctx_bytes,
+        &reused_leaf,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .expect_err("a KeyResponse from a leaf another member now holds is refused");
     assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
 
     assert_eq!(key_of(&bob_actor, KR_ALICE), alice_key, "alice's key kept");
@@ -11332,7 +11289,10 @@ async fn create_context_fails_closed_without_the_owners_wrapping_custody() {
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     assert!(sup.wrapping_keys_for_test().is_empty(), "no key is loaded");
 }
 
@@ -11404,7 +11364,10 @@ async fn create_restore_and_import_return_a_wrapping_key_load_failure_before_any
         matches!(err, ContextError::WrappingKeyCustodyUnavailable),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
 
     let err = tokio::time::timeout(
         budget,
@@ -11418,7 +11381,7 @@ async fn create_restore_and_import_return_a_wrapping_key_load_failure_before_any
         "{err:?}"
     );
     assert!(
-        sup.lookup(&exported_ctx).is_none(),
+        sup.lookup_for_test(&exported_ctx).is_none(),
         "no imported actor is registered"
     );
     assert!(sup.wrapping_keys_for_test().is_empty(), "no key is loaded");
@@ -11573,7 +11536,10 @@ async fn create_stores_the_first_relay_contact_and_restore_keeps_it() {
     assert!(sup.despawn_actor(&ctx).await);
     sup.wrapping_keys_for_test().clear();
     sup.restore_context(&ctx, &handle).await.unwrap();
-    assert!(sup.lookup(&ctx).is_some(), "the context is restored");
+    assert!(
+        sup.lookup_for_test(&ctx).is_some(),
+        "the context is restored"
+    );
     assert_eq!(
         contacts.load_last_relay_contact(&ctx).await.unwrap(),
         Some(offline_since),
@@ -11610,8 +11576,13 @@ async fn create_fails_without_an_actor_when_the_first_contact_write_fails() {
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
-    let persistence = sup.persistence_ref().expect("persistence installed");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
+    let persistence = sup
+        .persistence_ref_for_test()
+        .expect("persistence installed");
     assert!(
         persistence.load_context(&ctx).await.unwrap().is_none(),
         "the first snapshot is deleted"
@@ -11678,7 +11649,10 @@ async fn create_and_import_fail_without_an_actor_when_the_first_snapshot_write_f
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "create registers no actor");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "create registers no actor"
+    );
 
     let imported = hex::encode([0xE6u8; 32]);
     let (export, signing_key) = first_contact_export(&imported).await;
@@ -11686,7 +11660,10 @@ async fn create_and_import_fail_without_an_actor_when_the_first_snapshot_write_f
         .await
         .unwrap_err();
     assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
-    assert!(sup.lookup(&imported).is_none(), "import registers no actor");
+    assert!(
+        sup.lookup_for_test(&imported).is_none(),
+        "import registers no actor"
+    );
 
     let contacts = sup.relay_contact_store();
     for id in [&ctx, &imported] {
@@ -11725,7 +11702,7 @@ async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_nev
     state
         .membership
         .add_member(admin.clone(), "admin".to_owned(), vec![]);
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let pid = [0xE8u8; 32];
     let destination = migration_destination_id(&ctx, &pid);
 
@@ -11747,26 +11724,22 @@ async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_nev
     });
     parked_rx.await.unwrap();
 
-    let result = scp_runtime::domain_handlers()
-        .governance
-        .execute_propose_context_migration(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::ProposeMigrationRequest {
-                context_id: &ctx,
-                new_context_params: &first_contact_params(),
-                reason: "fixture",
-                grace_period_secs: 60,
-                auto_invite: false,
-                meta: CommitMeta {
-                    pid,
-                    actor_did: admin.as_ref(),
-                    timestamp_secs: FIRST_CONTACT_NOW,
-                },
-                bootstrap,
-            },
-        )
-        .await;
+    let result = scp_runtime_governance::testing_access::execute_propose_context_migration(
+        &mut cell,
+        &deps,
+        &ctx,
+        &first_contact_params(),
+        "fixture",
+        60,
+        false,
+        CommitMeta {
+            pid,
+            actor_did: admin.as_ref(),
+            timestamp_secs: FIRST_CONTACT_NOW,
+        },
+        bootstrap,
+    )
+    .await;
 
     assert!(
         matches!(
@@ -11785,7 +11758,10 @@ async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_nev
         None,
         "the destination's first contact is removed before the call returns"
     );
-    assert!(sup.lookup(&destination).is_none(), "no destination runs");
+    assert!(
+        sup.lookup_for_test(&destination).is_none(),
+        "no destination runs"
+    );
     assert_eq!(
         cell.handle.state(),
         scp_protocol::context::ContextState::Active,
@@ -11794,7 +11770,7 @@ async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_nev
     deps.supervisor
         .claim_first_state(&destination)
         .expect("the rollback released the destination's claim");
-    deps.supervisor.release_first_state(&destination);
+    deps.supervisor.release_first_state_for_test(&destination);
     tokio::time::timeout(std::time::Duration::from_secs(5), acquired_rx)
         .await
         .expect("the parked bootstrap gets the lock once the call returns")
@@ -11815,7 +11791,10 @@ async fn import_stores_the_first_relay_contact() {
     Box::pin(importer.import_context(export, &signing_key.verifying_key(), None))
         .await
         .unwrap();
-    assert!(importer.lookup(&ctx).is_some(), "the context is imported");
+    assert!(
+        importer.lookup_for_test(&ctx).is_some(),
+        "the context is imported"
+    );
     assert_eq!(
         importer
             .relay_contact_store()
@@ -11840,8 +11819,13 @@ async fn import_fails_without_an_actor_when_the_first_contact_write_fails() {
         .await
         .unwrap_err();
     assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
-    assert!(importer.lookup(&ctx).is_none(), "no actor is registered");
-    let persistence = importer.persistence_ref().expect("persistence installed");
+    assert!(
+        importer.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
+    let persistence = importer
+        .persistence_ref_for_test()
+        .expect("persistence installed");
     assert!(
         persistence.load_context(&ctx).await.unwrap().is_none(),
         "the first snapshot is deleted"
@@ -11914,7 +11898,7 @@ impl ContextPersistence for FaultyPersistence {
             .get()
             .and_then(std::sync::Weak::upgrade)
         {
-            sup.close_spawn_gate();
+            sup.close_spawn_gate_for_test();
         }
         Ok(())
     }
@@ -11982,7 +11966,10 @@ async fn import_over_a_tombstone_with_a_failing_contact_write_keeps_the_tombston
         .await
         .unwrap_err();
     assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
-    assert!(importer.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        importer.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     let kept = persistence.contexts.get(&ctx).map(|s| s.state.clone());
     assert_eq!(
         kept,
@@ -12028,7 +12015,10 @@ async fn a_failed_snapshot_write_over_an_existing_snapshot_keeps_it_and_its_cont
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     assert_eq!(persistence.created_at(&ctx), Some(PRIOR_CREATED_AT));
     assert_eq!(
         contacts.load_last_relay_contact(&ctx).await.unwrap(),
@@ -12067,7 +12057,7 @@ async fn a_rollback_whose_snapshot_delete_fails_keeps_the_contact() {
     .await
     .unwrap_err();
     let err = guard
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .unwrap_err();
     assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
@@ -12119,7 +12109,10 @@ async fn a_timed_out_create_whose_write_lands_late_rolls_back_both_records() {
     );
     // Long past the late write, which has landed by now if it ever will.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     assert!(
         !persistence.contexts.contains_key(&ctx),
         "the late snapshot is deleted"
@@ -12165,7 +12158,10 @@ async fn a_timed_out_create_whose_write_never_finishes_keeps_its_records_and_say
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     assert_eq!(
         contacts.load_last_relay_contact(&ctx).await.unwrap(),
         Some(FIRST_CONTACT_NOW),
@@ -12279,7 +12275,10 @@ async fn a_timed_out_create_drains_its_writes_with_the_bootstrap_lock_released()
     );
     let err = create.await.unwrap().unwrap_err();
     assert!(err.to_string().contains("exceeded"), "{err:?}");
-    assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor is registered"
+    );
     assert!(
         !persistence.contexts.contains_key(&ctx),
         "the late snapshot is deleted"
@@ -12329,10 +12328,10 @@ async fn a_restore_or_respawn_of_an_unsettled_first_state_is_busy() {
         matches!(&err, ContextError::ActorBusy(msg) if msg.contains("retry")),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor started");
+    assert!(sup.lookup_for_test(&ctx).is_none(), "no actor started");
 
     guard
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .unwrap();
     assert!(
@@ -12378,7 +12377,10 @@ async fn an_in_turn_recovery_send_needing_a_respawn_is_busy_while_the_lock_is_he
         matches!(&err, ContextError::ActorBusy(msg) if msg.contains("retry")),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_none(), "no actor was respawned");
+    assert!(
+        sup.lookup_for_test(&ctx).is_none(),
+        "no actor was respawned"
+    );
 }
 
 /// Shutdown ends while a first-state snapshot write hangs: after shutdown
@@ -12420,7 +12422,7 @@ async fn shutdown_ends_while_a_first_state_write_hangs() {
     assert!(shutdown.is_ok(), "shutdown ends while the write hangs");
 
     let err = guard
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .unwrap_err();
     assert!(
@@ -12476,7 +12478,10 @@ async fn a_create_over_a_running_context_keeps_its_snapshot_and_contact() {
         ),
         "{err:?}"
     );
-    assert!(sup.lookup(&ctx).is_some(), "the first context still runs");
+    assert!(
+        sup.lookup_for_test(&ctx).is_some(),
+        "the first context still runs"
+    );
     assert!(
         persistence.contexts.contains_key(&ctx),
         "the snapshot is kept"
@@ -12564,7 +12569,7 @@ impl LockCheckingCustody {
         let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade) else {
             return;
         };
-        let under_write = sup.write_lock.try_lock().is_err();
+        let under_write = sup.write_lock_is_held_for_test();
         let under_spawn = !sup.bootstrap_spawn_lock_is_free_for_test();
         let found = [
             under_write.then(|| format!("{call} under write_lock")),
@@ -12753,7 +12758,7 @@ async fn drive_join_open_before_spawn_lock(
     });
     sup.key_package_stores_for_test().insert(
         identity.clone(),
-        KeyPackageStoreHandle::from_sender(store_tx),
+        KeyPackageStoreHandle::from_sender_for_test(store_tx),
     );
     sup.wrapping_keys_for_test().clear();
     let join_ctx = hex::encode([0xD2u8; 32]);
@@ -12800,7 +12805,7 @@ async fn no_wrapping_custody_call_runs_under_write_lock_or_bootstrap_spawn_lock(
     let (sup, custody) = lock_checking_supervisor();
     // Control: a call made while `write_lock` is held is recorded.
     {
-        let _guard = sup.write_lock.lock().await;
+        let _guard = sup.lock_write_for_test().await;
         custody.check("control");
     }
     assert_eq!(
@@ -13004,13 +13009,13 @@ impl DeliverFixture {
         let bob_access_key =
             scp_protocol::crypto::access_keys::generate_access_key(ctx_str, Self::BOB);
         bob_state
-            .access
+            .access_mut()
             .access_key_store
             .set(ctx_str, Self::BOB, bob_access_key.clone());
 
         Self {
             rt,
-            bob_cell: ClassSCell::new(bob_state),
+            bob_cell: ClassSCell::new_for_test(bob_state),
             bob_deps,
             bob_sup,
             alice_state,
@@ -13042,18 +13047,22 @@ impl DeliverFixture {
             .expect("encrypted context");
         self.rt
             .block_on(
-                scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor(
+                scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor_for_test(
                     &clock,
                     crypto,
                     Self::ALICE,
-                    ctx_str,
-                    &DID::from(claimed_sender),
-                    payload,
-                    scp_runtime_core::context::supervisor::MessageSigner::Active(&signer),
-                    &recipients,
-                    aad_sequence,
-                    None,
-                    scp_protocol::envelope::inner::MessageType::Content,
+                    scp_runtime_core::context::shared::messaging::EncryptedEnvelopeRequest {
+                        context_id: ctx_str,
+                        sender_did: &DID::from(claimed_sender),
+                        payload,
+                        signer: scp_runtime_core::context::supervisor::MessageSigner::Active(
+                            &signer,
+                        ),
+                        recipients_data: &recipients,
+                        aad_sequence,
+                        source_provenance: None,
+                        message_type: scp_protocol::envelope::inner::MessageType::Content,
+                    },
                 ),
             )
             .expect("alice seals the application message")
@@ -13166,10 +13175,11 @@ fn deliver_incoming_rejects_inner_sender_other_than_mls_sender() {
 
     let lookups = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&lookups);
-    let inner_resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(
-        DeliverFixture::ALICE,
-        DeliverFixture::BOB,
-    );
+    let inner_resolver =
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
     let resolver: KeyResolver = Arc::new(move |did: &DID, kid| {
         counted.fetch_add(1, Ordering::SeqCst);
         inner_resolver(did, kid)
@@ -13212,7 +13222,7 @@ fn deliver_incoming_rejects_inner_sender_other_than_mls_sender() {
 #[test]
 fn deliver_incoming_failed_verification_does_not_burn_the_floor() {
     let ctx_str = "deliver-incoming-floor-after-verify";
-    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(
+    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(
         DeliverFixture::ALICE,
         DeliverFixture::BOB,
     );
@@ -13267,7 +13277,7 @@ fn deliver_incoming_failed_verification_does_not_burn_the_floor() {
 #[test]
 fn deliver_incoming_rejects_a_payload_altered_after_signing() {
     let ctx_str = "deliver-incoming-altered-payload";
-    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(
+    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(
         DeliverFixture::ALICE,
         DeliverFixture::BOB,
     );
@@ -13291,7 +13301,7 @@ fn deliver_incoming_rejects_a_payload_altered_after_signing() {
 #[test]
 fn deliver_incoming_rejects_a_signed_payload_hash_that_does_not_match_the_payload() {
     let ctx_str = "deliver-incoming-mismatched-payload-hash";
-    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(
+    let resolver = scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(
         DeliverFixture::ALICE,
         DeliverFixture::BOB,
     );
@@ -13391,18 +13401,14 @@ fn decrypt_and_dispatch_rejects_application_message_from_own_did() {
     let sealed = alice_actor.seal(ALICE, &inner).expect("alice seals");
 
     let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-    let result = rt.block_on(
-        scp_runtime::domain_handlers()
-            .messaging
-            .decrypt_and_dispatch(
-                &own_did_deps,
-                Some(bob_cs),
-                ctx_str,
-                &ctx_bytes,
-                &sealed,
-                &std::collections::HashSet::new(),
-            ),
-    );
+    let result = rt.block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &own_did_deps,
+        Some(bob_cs),
+        ctx_str,
+        &ctx_bytes,
+        &sealed,
+        &std::collections::HashSet::new(),
+    ));
     assert!(
         matches!(&result, Err(ContextError::CryptoFailed(m)) if m == "application message from own DID"),
         "an application message from the local DID must be rejected, got {result:?}"
@@ -13461,7 +13467,7 @@ fn send_heartbeat_handler_reports_mutated() {
         ALICE.to_owned(),
         std::collections::HashSet::from([Capability::MessagesWrite]),
     );
-    let mut cell = ClassSCell::new(alice_state);
+    let mut cell = ClassSCell::new_for_test(alice_state);
 
     rt.block_on(async {
         // Send a heartbeat as Alice. The encrypted seal advances the MLS
@@ -13559,7 +13565,7 @@ fn stalled_custody_fails_signing_handler_with_custody_timeout() {
         ALICE.to_owned(),
         std::collections::HashSet::from([Capability::MessagesWrite]),
     );
-    let mut cell = ClassSCell::new(alice_state);
+    let mut cell = ClassSCell::new_for_test(alice_state);
     let public_key = scp_runtime_core::crypto::mls::two_party_test_support::alice_signing_key()
         .verifying_key()
         .to_bytes()
@@ -13632,7 +13638,7 @@ fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
     // #active key so the request signature check can run.
     let alice_sup = supervisor_with_crypto_and_resolver(
         Arc::clone(&alice_crypto),
-        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(ALICE, BOB),
     );
     let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Alice's ActorDeps from a sync #[test]; not a production async bridge
         .enable_all()
@@ -13644,7 +13650,7 @@ fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
 
     // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
     // ephemeral wrapping key, wrapped in the distribution-message envelope.
-    let bob_sk = scp_runtime_core::crypto::mls::two_party_test_support::bob_signing_key();
+    let bob_sk = scp_runtime_core::crypto::mls::two_party_test_support::bob_signing_key_for_test();
     let build_request = |requester_did: &str,
                          nonce: [u8; 16]|
      -> (Vec<u8>, zeroize::Zeroizing<[u8; 32]>) {
@@ -13706,18 +13712,14 @@ fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
     };
 
     // BLACK-P7-1: the mismatch is rejected, and NO answer is enqueued.
-    let reject = rt.block_on(
-        scp_runtime::domain_handlers()
-            .messaging
-            .decrypt_and_dispatch(
-                &alice_deps,
-                Some(&mut *alice_cs),
-                ctx_str,
-                &ctx_bytes,
-                &mismatch_sealed,
-                &std::collections::HashSet::new(),
-            ),
-    );
+    let reject = rt.block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+        &alice_deps,
+        Some(&mut *alice_cs),
+        ctx_str,
+        &ctx_bytes,
+        &mismatch_sealed,
+        &std::collections::HashSet::new(),
+    ));
     assert!(
         matches!(
             &reject,
@@ -13733,18 +13735,14 @@ fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
 
     // BLACK-P7-2: the well-formed request is answered.
     let ok = rt
-        .block_on(
-            scp_runtime::domain_handlers()
-                .messaging
-                .decrypt_and_dispatch(
-                    &alice_deps,
-                    Some(&mut *alice_cs),
-                    ctx_str,
-                    &ctx_bytes,
-                    &ok_sealed,
-                    &std::collections::HashSet::new(),
-                ),
-        )
+        .block_on(scp_runtime_messaging::testing_access::decrypt_and_dispatch(
+            &alice_deps,
+            Some(&mut *alice_cs),
+            ctx_str,
+            &ctx_bytes,
+            &ok_sealed,
+            &std::collections::HashSet::new(),
+        ))
         .expect("a well-formed request is accepted on the receive path");
     assert!(
         matches!(ok, Dispatched::Handled),
@@ -13982,10 +13980,10 @@ async fn panic_after_shutdown_began_records_no_crash_and_does_not_respawn() {
     let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
     let (handle, ctx_key) = spawn_active_with_snapshot(&sup, [0xC7u8; 32]).await;
 
-    sup.close_spawn_gate();
+    sup.close_spawn_gate_for_test();
     induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
     let despawned = wait_until(std::time::Duration::from_secs(5), || {
-        sup.lookup(&ctx_key).is_none()
+        sup.lookup_for_test(&ctx_key).is_none()
     })
     .await;
     assert!(despawned, "the watchdog must despawn the dead handle");
@@ -13996,7 +13994,7 @@ async fn panic_after_shutdown_began_records_no_crash_and_does_not_respawn() {
         "a panic after shutdown began must record no crash"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a panic after shutdown began must not respawn the actor"
     );
 }
@@ -14019,7 +14017,7 @@ async fn respawn_failure_after_shutdown_began_records_nothing() {
     assert!(
         sup.crash_windows_for_test()
             .get("no-snapshot-before")
-            .is_some_and(|w| w.last_respawn_failed() && w.crash_count() == 1),
+            .is_some_and(|w| w.last_respawn_failed_for_test() && w.crash_count_for_test() == 1),
         "a respawn failure before shutdown must be recorded"
     );
 
@@ -14033,13 +14031,13 @@ async fn respawn_failure_after_shutdown_began_records_nothing() {
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
     let snap = scp_runtime_core::context::manager_methods::snapshot_context(&state);
-    sup.persistence_ref()
+    sup.persistence_ref_for_test()
         .expect("test supervisor has persistence")
         .persist_context(&ctx_key, &snap)
         .await
         .unwrap();
 
-    sup.close_spawn_gate();
+    sup.close_spawn_gate_for_test();
     let refused = sup.respawn_from_snapshot_for_test(&ctx_key, &owner).await;
     assert!(
         matches!(refused, Err(ContextError::SupervisorShutDown(_))),
@@ -14075,17 +14073,17 @@ async fn shutdown_reaps_a_crash_window_whose_actor_left_before_the_sweep() {
         .respawn_from_snapshot_for_test("unswept-crash", &owner)
         .await;
     assert!(matches!(failed, Err(ContextError::ActorCrashed(_))));
-    assert!(sup.lookup("unswept-crash").is_none());
+    assert!(sup.lookup_for_test("unswept-crash").is_none());
     assert!(
         sup.crash_windows_for_test()
             .get("unswept-crash")
-            .is_some_and(|w| w.crash_count() == 1 && !w.is_poisoned()),
+            .is_some_and(|w| w.crash_count_for_test() == 1 && !w.is_poisoned_for_test()),
         "the crash is recorded before shutdown"
     );
     sup.crash_windows_for_test()
         .entry("unswept-poison".to_owned())
         .or_default()
-        .poisoned = true;
+        .poison_for_test();
 
     sup.shutdown_all_contexts().await;
 
@@ -14096,7 +14094,7 @@ async fn shutdown_reaps_a_crash_window_whose_actor_left_before_the_sweep() {
     assert!(
         sup.crash_windows_for_test()
             .get("unswept-poison")
-            .is_some_and(|w| w.is_poisoned()),
+            .is_some_and(|w| w.is_poisoned_for_test()),
         "a poisoned window survives shutdown"
     );
 }
@@ -14188,7 +14186,7 @@ async fn failed_respawn_counts_as_crash() {
     let recorded = wait_until(std::time::Duration::from_secs(5), || {
         sup.crash_windows_for_test()
             .get(&ctx_key)
-            .is_some_and(|w| w.crash_count() >= 2)
+            .is_some_and(|w| w.crash_count_for_test() >= 2)
     })
     .await;
     assert!(
@@ -14197,7 +14195,7 @@ async fn failed_respawn_counts_as_crash() {
              (1 panic + 1 failed respawn = 2 crashes)"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a context with no recoverable snapshot must not be resurrected"
     );
 }
@@ -14269,7 +14267,7 @@ async fn respawn_skips_terminal_snapshot() {
         scp_protocol::context::ContextState::Closing,
         "fixture must persist a terminal snapshot"
     );
-    sup.persistence_ref()
+    sup.persistence_ref_for_test()
         .expect("test supervisor has persistence")
         .persist_context(&ctx_key, &snap)
         .await
@@ -14282,7 +14280,7 @@ async fn respawn_skips_terminal_snapshot() {
         "respawn of a terminal snapshot must surface ContextClosed, got {result:?}"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a terminal snapshot must NOT be resurrected into a live actor"
     );
     assert!(
@@ -14386,13 +14384,13 @@ async fn standing_context_revives_a_context_past_a_failed_respawn() {
         "a standing context past a failed respawn must be recreated, got {revived:?}"
     );
     assert!(
-        sup.lookup(&ctx_key).is_some(),
+        sup.lookup_for_test(&ctx_key).is_some(),
         "the recreate must register an actor for the standing id"
     );
     assert!(
         !sup.crash_windows_for_test()
             .get(&ctx_key)
-            .is_some_and(|w| w.last_respawn_failed() || w.is_respawning()),
+            .is_some_and(|w| w.last_respawn_failed_for_test() || w.is_respawning_for_test()),
         "the revive must drop the failed-respawn record and the bootstrap marker"
     );
     assert!(
@@ -14436,7 +14434,7 @@ async fn standing_context_restores_a_dormant_window_when_the_recreate_fails() {
             .entry(Supervisor::kp_crash_key_for_test(&local))
             .or_default();
         for _ in 0..CRASH_POISON_THRESHOLD {
-            entry.record(1_700_000_000);
+            entry.record_for_test(1_700_000_000);
         }
     }
 
@@ -14453,7 +14451,7 @@ async fn standing_context_restores_a_dormant_window_when_the_recreate_fails() {
         matches!(failed, Err(ContextError::TransportFailed(_))),
         "a recreate that registers no actor must surface the create error, got {failed:?}"
     );
-    assert!(sup.lookup(&ctx_key).is_none());
+    assert!(sup.lookup_for_test(&ctx_key).is_none());
     assert!(
         matches!(
             sup.read_context_state_checked(&ctx_key).await,
@@ -14482,7 +14480,7 @@ async fn standing_context_restores_a_dormant_window_when_the_recreate_fails() {
             .entry(ctx_key.clone())
             .or_default();
         for _ in 0..CRASH_POISON_THRESHOLD {
-            entry.record(1_700_000_000);
+            entry.record_for_test(1_700_000_000);
         }
     }
     assert!(sup.is_context_poisoned_for_test(&ctx_key));
@@ -14529,7 +14527,7 @@ async fn standing_context_after_shutdown_keeps_supervisor_shut_down() {
     sup.key_package_store_for_loaded(&local)
         .await
         .expect("a key-package actor spawns before shutdown");
-    sup.close_spawn_gate();
+    sup.close_spawn_gate_for_test();
     let peer = DID("did:example:peer-standing-after-shutdown-spawn".to_owned());
     let spawn_refused = sup
         .standing_context_for_test(&local, &peer, Vec::new())
@@ -14540,7 +14538,7 @@ async fn standing_context_after_shutdown_keeps_supervisor_shut_down() {
     );
 
     // No key-package actor, so the refusal comes from `build_actor_deps`.
-    sup.stop_key_package_actors().await;
+    sup.stop_key_package_actors_for_test().await;
     let peer = DID("did:example:peer-standing-after-shutdown-deps".to_owned());
     let deps_refused = sup
         .standing_context_for_test(&local, &peer, Vec::new())
@@ -14572,8 +14570,10 @@ async fn standing_context_returns_the_error_for_a_present_unreachable_context() 
     // `ActorBusy`, and the get-or-create returns it.
     let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     drop(rx);
-    sup.actors_for_test()
-        .insert(ctx_key.clone(), ContextActorHandle::from_sender(tx));
+    sup.actors_for_test().insert(
+        ctx_key.clone(),
+        ContextActorHandle::from_sender_for_test(tx),
+    );
     let busy = sup
         .standing_context_for_test(&local, &peer, Vec::new())
         .await;
@@ -14582,7 +14582,7 @@ async fn standing_context_returns_the_error_for_a_present_unreachable_context() 
         "a standing context whose actor does not answer must surface ActorBusy, got {busy:?}"
     );
     assert!(
-        sup.lookup(&ctx_key).is_some(),
+        sup.lookup_for_test(&ctx_key).is_some(),
         "the unreachable actor must stay registered, not be replaced"
     );
     assert!(
@@ -14616,8 +14616,10 @@ async fn an_unreachable_actor_reads_as_actor_busy_not_as_an_absent_context() {
     // `REPLY_TIMEOUT` elapses.
     let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     drop(rx);
-    sup.actors_for_test()
-        .insert(ctx_key.to_owned(), ContextActorHandle::from_sender(tx));
+    sup.actors_for_test().insert(
+        ctx_key.to_owned(),
+        ContextActorHandle::from_sender_for_test(tx),
+    );
 
     let checked = sup.read_context_state_checked(ctx_key).await;
     assert!(
@@ -14758,12 +14760,12 @@ async fn a_timed_out_actor_reads_as_actor_busy_from_both_checked_reads() {
     let (state_tx, _state_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     sup.actors_for_test().insert(
         "ctx-state-wedged".to_owned(),
-        ContextActorHandle::from_sender(state_tx),
+        ContextActorHandle::from_sender_for_test(state_tx),
     );
     let (role_tx, _role_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     sup.actors_for_test().insert(
         "ctx-role-wedged".to_owned(),
-        ContextActorHandle::from_sender(role_tx),
+        ContextActorHandle::from_sender_for_test(role_tx),
     );
 
     for (label, budget, form) in [
@@ -14812,7 +14814,7 @@ async fn lookup_miss_during_respawn_window_is_actor_crashed() {
     sup.crash_windows_for_test()
         .entry(ctx_key.clone())
         .or_default()
-        .mark_respawning();
+        .mark_respawning_for_test();
     assert!(
         !sup.is_context_poisoned_for_test(&ctx_key),
         "a mid-respawn context must not be poisoned"
@@ -14828,7 +14830,7 @@ async fn lookup_miss_during_respawn_window_is_actor_crashed() {
     // Clearing the marker returns the window to a non-signalling state, so
     // the lookup-miss falls back to ContextNotRegistered.
     if let Some(mut entry) = sup.crash_windows_for_test().get_mut(&ctx_key) {
-        entry.clear_respawning();
+        entry.clear_respawning_for_test();
     }
     let after = sup.lookup_miss_error_for_test(&ctx_key, "context not registered: z".to_owned());
     assert!(
@@ -14866,7 +14868,7 @@ async fn state_read_that_misses_a_respawning_actor_reads_the_replacement() {
     sup.crash_windows_for_test()
         .entry(ctx_key.clone())
         .or_default()
-        .mark_respawning();
+        .mark_respawning_for_test();
     let (_, actor) = sup
         .actors_for_test()
         .remove(&ctx_key)
@@ -14885,7 +14887,7 @@ async fn state_read_that_misses_a_respawning_actor_reads_the_replacement() {
     // reader runs on a worker, misses the lookup, and blocks on the shard.
     std::thread::sleep(std::time::Duration::from_millis(200));
     sup.actors_for_test().insert(ctx_key.clone(), actor);
-    window_guard.clear_respawning();
+    window_guard.clear_respawning_for_test();
     drop(window_guard);
 
     let read = reader.await.expect("reader task must not panic");
@@ -14914,7 +14916,10 @@ async fn import_replace_gap_reads_as_actor_crashed_until_the_window_ends() {
         sup.despawn_for_replace_for_test(&ctx_key).await,
         "the live actor must be despawned"
     );
-    assert!(sup.lookup(&ctx_key).is_none(), "no actor serves the gap");
+    assert!(
+        sup.lookup_for_test(&ctx_key).is_none(),
+        "no actor serves the gap"
+    );
     let in_gap = sup.read_context_state_checked(&ctx_key).await;
     assert!(
         matches!(in_gap, Err(ContextError::ActorCrashed(_))),
@@ -14931,7 +14936,7 @@ async fn import_replace_gap_reads_as_actor_crashed_until_the_window_ends() {
     sup.crash_windows_for_test()
         .entry(with_history.clone())
         .or_default()
-        .record(now_ms);
+        .record_for_test(now_ms);
     sup.despawn_for_replace_for_test(&with_history).await;
     sup.end_bootstrap_window_for_test(&with_history);
     let window = sup
@@ -14939,10 +14944,14 @@ async fn import_replace_gap_reads_as_actor_crashed_until_the_window_ends() {
         .get(&with_history)
         .expect("a window with crash history must survive the replace");
     assert!(
-        !window.is_respawning(),
+        !window.is_respawning_for_test(),
         "the replace marker must be cleared"
     );
-    assert_eq!(window.crash_count(), 1, "the crash history must be kept");
+    assert_eq!(
+        window.crash_count_for_test(),
+        1,
+        "the crash history must be kept"
+    );
 }
 
 /// `Supervisor::import_context` over a replaceable actor marks the replace
@@ -15001,7 +15010,7 @@ async fn import_over_replaceable_actor_marks_and_ends_the_replace_gap() {
     )
     .await;
 
-    let write_guard = sup.write_lock.lock().await;
+    let write_guard = sup.lock_write_for_test().await;
     let import = {
         let sup = Arc::clone(&sup);
         tokio::spawn(async move { sup.import_context(export, &verifying_key, None).await })
@@ -15011,7 +15020,7 @@ async fn import_over_replaceable_actor_marks_and_ends_the_replace_gap() {
             if sup
                 .crash_windows_for_test()
                 .get(&ctx_key)
-                .is_some_and(|window| window.is_respawning())
+                .is_some_and(|window| window.is_respawning_for_test())
             {
                 return;
             }
@@ -15078,7 +15087,7 @@ async fn respawn_marker_reaped_on_clean_terminal_skip() {
         .transition_to(&scp_protocol::context::ContextState::Closing)
         .unwrap();
     let snap = scp_runtime_core::context::manager_methods::snapshot_context(&state);
-    sup.persistence_ref()
+    sup.persistence_ref_for_test()
         .expect("test supervisor has persistence")
         .persist_context(&ctx_key, &snap)
         .await
@@ -15114,7 +15123,7 @@ async fn successful_respawn_clears_unrecoverable_flag() {
     assert!(
         sup.crash_windows_for_test()
             .get(&ctx_key)
-            .is_some_and(|w| w.last_respawn_failed()),
+            .is_some_and(|w| w.last_respawn_failed_for_test()),
         "a failed respawn must set the unrecoverable flag"
     );
 
@@ -15133,7 +15142,7 @@ async fn successful_respawn_clears_unrecoverable_flag() {
     assert!(
         !sup.crash_windows_for_test()
             .get(&ctx_key)
-            .is_some_and(|w| w.last_respawn_failed()),
+            .is_some_and(|w| w.last_respawn_failed_for_test()),
         "a successful respawn must clear the unrecoverable flag"
     );
 }
@@ -15161,7 +15170,7 @@ async fn poisoned_context_state_reads_as_poisoned() {
         "fixture must poison the context"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a poisoned context's actor must be despawned"
     );
 
@@ -15209,7 +15218,7 @@ async fn respawn_preserves_owning_identity_on_multi_did_node() {
         .transition_to(&scp_protocol::context::ContextState::Active)
         .unwrap();
     let snap = scp_runtime_core::context::manager_methods::snapshot_context(&state);
-    sup.persistence_ref()
+    sup.persistence_ref_for_test()
         .expect("test supervisor has persistence")
         .persist_context(&ctx_key, &snap)
         .await
@@ -15240,7 +15249,7 @@ async fn respawn_preserves_owning_identity_on_multi_did_node() {
 
     // Both DIDs remain registered (the respawn did not narrow the node's
     // identity set).
-    let dids = sup.local_dids_ref().load();
+    let dids = sup.local_dids_ref_for_test().load();
     assert!(
         dids.contains(&did_a) && dids.contains(&did_b),
         "respawn must not narrow the node's local DID set"
@@ -15318,24 +15327,22 @@ async fn capability_revocation_survives_crash_before_coalesce() {
     // now reflects the suspension. It takes `&mut ClassSCell`, so wrap the
     // local `state` in a cell for the call, then unwrap it back out for the
     // subsequent `spawn_actor_with_state` hand-off.
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .governance
-        .execute_revoke(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            &target,
-            scp_protocol::context::governance::AccessScope::Both,
-            scp_runtime_core::context::shared::governance::CommitMeta {
-                pid: [1u8; 32],
-                actor_did: admin.as_ref(),
-                timestamp_secs: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("execute_revoke (Both scope) must succeed");
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_governance::testing_access::execute_revoke(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &target,
+        scp_protocol::context::governance::AccessScope::Both,
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [1u8; 32],
+            actor_did: admin.as_ref(),
+            timestamp_secs: 1_700_000_000,
+        },
+    )
+    .await
+    .expect("execute_revoke (Both scope) must succeed");
+    let state = cell.into_inner_for_test();
 
     // Sanity: the just-persisted snapshot already carries the revocation,
     // proving the sync persist happened inside the helper (no coalesce).
@@ -15475,7 +15482,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     // executed_proposals (replay protection).
     let executed_id = [0x11u8; 32];
     state
-        .governance
+        .governance_mut()
         .class_s
         .executed_proposals
         .insert(executed_id, 1_700_000_000);
@@ -15483,7 +15490,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     // revoked_spending_ucan_cids (revocation set).
     let revoked_cid = "bafyClassSRevokedCid".to_owned();
     state
-        .governance
+        .governance_mut()
         .revoked_spending_ucan_cids
         .insert(revoked_cid.clone());
 
@@ -15492,7 +15499,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     let mut nonce_entries = std::collections::HashMap::new();
     nonce_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
     let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-    state.governance.class_s.spending_nonce_tracker =
+    state.governance_mut().class_s.spending_nonce_tracker =
         scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
             hex::encode(ctx_id_bytes),
             nonce_clock,
@@ -15501,7 +15508,10 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
 
     // read-exclusion list (downward access revocation).
     let excluded = DID("did:example:class-s-excluded".to_owned());
-    state.access.read_exclusion_list.insert(excluded.clone());
+    state
+        .access_mut()
+        .read_exclusion_list
+        .insert(excluded.clone());
 
     // saga_pending (ADR-049 §9 line 144 — staged cross-context saga
     // evidence). Stage the cross-context-outlet prepared variant (eight
@@ -15510,7 +15520,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
     let xctx_saga_id = scp_runtime_types::context::supervisor::saga_journal::SagaId(
         "saga-class-s-xctx".to_owned(),
     );
-    state.class_s.saga_pending.insert(
+    state.class_s_mut().saga_pending.insert(
             xctx_saga_id.clone(),
             scp_runtime_core::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextOutletInvocation(
                 scp_runtime_core::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared {
@@ -15550,7 +15560,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
             },
         )
         .expect("Class-S committed receipt signs");
-    state.class_s.xctx_committed_outputs.insert(
+    state.class_s_mut().xctx_committed_outputs.insert(
         committed_saga_id.clone(),
         scp_runtime_core::context::supervisor::saga_prepared_state::CommittedOutletInvocation {
             receipt: committed_receipt.clone(),
@@ -15559,7 +15569,7 @@ fn security_critical_state_is_class_s_or_m_not_coalesced() {
         },
     );
     state
-        .class_s
+        .class_s_mut()
         .xctx_committed_invocations
         .insert(committed_saga_id.clone());
 
@@ -15844,7 +15854,7 @@ async fn spending_nonce_consume_survives_crash_before_coalesce() {
     let mut seed_entries = std::collections::HashMap::new();
     seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
     let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-    state.governance.class_s.spending_nonce_tracker =
+    state.governance_mut().class_s.spending_nonce_tracker =
         scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
             ctx_key.clone(),
             nonce_clock,
@@ -15957,33 +15967,25 @@ async fn send_path_spending_nonce_persist_is_fail_closed() {
     // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
     // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
     // shared `&*cell`) and the Class-C field mutations (via `class_c_view`).
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
 
     // A paid send (spending nonce committed) MUST surface the persist
     // failure — fail-closed.
-    let paid = scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 0,
-                payload: b"paid",
-                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
-                // Paid send: a deferred spending-nonce token whose fail-closed
-                // commit drives the persist (previously the `true` bool).
-                token: Some(
-                    scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(
-                        &ctx_key,
-                    ),
-                ),
-                is_broadcast: false,
-            },
-        )
-        .await;
+    let paid = scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        0,
+        b"paid",
+        scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
+        // Paid send: a deferred spending-nonce token whose fail-closed
+        // commit drives the persist (previously the `true` bool).
+        Some(scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
+        false,
+    )
+    .await;
     assert!(
         matches!(paid, Err(ContextError::PersistenceFailed(_))),
         "a paid send whose spending-nonce consume cannot be persisted MUST \
@@ -15992,25 +15994,21 @@ async fn send_path_spending_nonce_persist_is_fail_closed() {
 
     // A free send (no spending nonce) swallows the same failure — the
     // common path stays best-effort, un-regressed.
-    let free = scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 1,
-                payload: b"free",
-                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
-                // Free send: no token (previously the `false` bool) — keeps the
-                // best-effort persist, un-regressed.
-                token: None,
-                is_broadcast: false,
-            },
-        )
-        .await;
+    let free = scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        1,
+        b"free",
+        scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
+        // Free send: no token (previously the `false` bool) — keeps the
+        // best-effort persist, un-regressed.
+        None,
+        false,
+    )
+    .await;
     assert!(
         free.is_ok(),
         "a free (non-spending) send must keep best-effort persist and \
@@ -16043,53 +16041,45 @@ async fn agent_send_leaves_the_due_checkpoint_to_the_next_active_send() {
     let active_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
     let active = CommandSigner::local_ed25519(active_key.clone());
     let agent = CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     // One more send reaches the 50-event threshold.
     *cell.class_c_view().checkpoint_events_since_mut() = 49;
 
-    scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 0,
-                payload: b"agent",
-                signer: MessageSigner::Agent(&agent),
-                token: None,
-                is_broadcast: false,
-            },
-        )
-        .await
-        .unwrap();
+    scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        0,
+        b"agent",
+        MessageSigner::Agent(&agent),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert!(
-        cell.class_c_view().checkpoints_mut().is_empty(),
+        cell.class_c_view().checkpoints_mut_for_test().is_empty(),
         "an agent-persona send must not build a checkpoint"
     );
     assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 50);
 
-    scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 1,
-                payload: b"active",
-                signer: MessageSigner::Active(&active),
-                token: None,
-                is_broadcast: false,
-            },
-        )
-        .await
-        .unwrap();
-    let checkpoints = cell.class_c_view().checkpoints_mut().clone();
+    scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        1,
+        b"active",
+        MessageSigner::Active(&active),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let checkpoints = cell.class_c_view().checkpoints_mut_for_test().clone();
     assert_eq!(
         checkpoints.len(),
         1,
@@ -16145,12 +16135,12 @@ async fn broadcast_block_persist_is_fail_closed_and_retains_block() {
     let blocked = DID("did:example:bcast-block-target".to_owned());
 
     let state = broadcast_state_with_author(ctx_id_bytes, &author);
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
 
-    let res = scp_runtime::domain_handlers()
-        .broadcast
-        .block_broadcast_subscriber(&mut cell, &deps, &ctx_key, &author, &blocked)
-        .await;
+    let res = scp_runtime_broadcast::testing_access::block_broadcast_subscriber(
+        &mut cell, &deps, &ctx_key, &author, &blocked,
+    )
+    .await;
     assert!(
         matches!(res, Err(ContextError::PersistenceFailed(_))),
         "a broadcast block whose persist fails MUST fail-closed, not return Ok: got {res:?}"
@@ -16188,12 +16178,12 @@ async fn broadcast_unblock_stays_best_effort_on_persist_failure() {
         .unwrap()
         .block_subscriber(author.as_ref(), blocked.as_ref())
         .unwrap();
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
 
-    let res = scp_runtime::domain_handlers()
-        .broadcast
-        .unblock_broadcast_subscriber(&mut cell, &deps, &ctx_key, &author, &blocked)
-        .await;
+    let res = scp_runtime_broadcast::testing_access::unblock_broadcast_subscriber(
+        &mut cell, &deps, &ctx_key, &author, &blocked,
+    )
+    .await;
     assert!(
         res.is_ok(),
         "unblock (upward authorization) must stay best-effort and return Ok on \
@@ -16241,8 +16231,11 @@ async fn broadcast_key_request_denies_read_excluded_even_if_subscriber() {
     state.broadcast_context =
         Some(scp_protocol::context::broadcast::BroadcastContext::from_snapshot(seed));
     // Governance ban wrote the exclusion set (Class-S, fail-closed).
-    state.access.read_exclusion_list.insert(requester.clone());
-    let mut cell = ClassSCell::new(state);
+    state
+        .access_mut()
+        .read_exclusion_list
+        .insert(requester.clone());
+    let mut cell = ClassSCell::new_for_test(state);
 
     let decision = scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
         &mut cell,
@@ -16342,13 +16335,13 @@ async fn broadcast_per_author_block_survives_crash_before_coalesce() {
 
     // Drive the block through the PRODUCTION fail-closed helper (sync-persists
     // atomically into the Class-S snapshot before returning).
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .broadcast
-        .block_broadcast_subscriber(&mut cell, &deps, &ctx_key, &author, &blocked)
-        .await
-        .expect("block must sync-persist and return Ok on a working backend");
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_broadcast::testing_access::block_broadcast_subscriber(
+        &mut cell, &deps, &ctx_key, &author, &blocked,
+    )
+    .await
+    .expect("block must sync-persist and return Ok on a working backend");
+    let state = cell.into_inner_for_test();
 
     // Spawn from the (blocked) state and crash before any coalesce.
     let handle = sup
@@ -16432,24 +16425,22 @@ async fn broadcast_governance_ban_survives_crash_before_coalesce() {
     let pre = scp_runtime_core::context::manager_methods::snapshot_context(&state);
     persistence.persist_context(&ctx_key, &pre).await.unwrap();
 
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .governance
-        .execute_revoke(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            &banned,
-            scp_protocol::context::governance::AccessScope::Read,
-            scp_runtime_core::context::shared::governance::CommitMeta {
-                pid: [2u8; 32],
-                actor_did: author.as_ref(),
-                timestamp_secs: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("governance ban (Read scope) must sync-persist and succeed");
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_governance::testing_access::execute_revoke(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &banned,
+        scp_protocol::context::governance::AccessScope::Read,
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [2u8; 32],
+            actor_did: author.as_ref(),
+            timestamp_secs: 1_700_000_000,
+        },
+    )
+    .await
+    .expect("governance ban (Read scope) must sync-persist and succeed");
+    let state = cell.into_inner_for_test();
 
     let handle = sup
         .spawn_actor_with_state_for_test(state, deps, None)
@@ -16534,24 +16525,22 @@ async fn broadcast_governance_ban_exclusion_and_epoch_advance_are_one_atomic_sna
     let banned = DID("did:example:atomic-banned".to_owned());
 
     let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned);
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .governance
-        .execute_revoke(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            &banned,
-            scp_protocol::context::governance::AccessScope::Read,
-            scp_runtime_core::context::shared::governance::CommitMeta {
-                pid: [3u8; 32],
-                actor_did: author.as_ref(),
-                timestamp_secs: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("governance ban (Read scope) must succeed");
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_governance::testing_access::execute_revoke(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &banned,
+        scp_protocol::context::governance::AccessScope::Read,
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [3u8; 32],
+            actor_did: author.as_ref(),
+            timestamp_secs: 1_700_000_000,
+        },
+    )
+    .await
+    .expect("governance ban (Read scope) must succeed");
+    let state = cell.into_inner_for_test();
 
     // ONE round-trip through the EXACT production sync-persist builder carries
     // BOTH the exclusion set and the epoch advance.
@@ -16615,22 +16604,20 @@ async fn broadcast_governance_ban_persist_is_fail_closed() {
     let banned = DID("did:example:ban-failclosed-target".to_owned());
 
     let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned);
-    let mut cell = ClassSCell::new(state);
-    let res = scp_runtime::domain_handlers()
-        .governance
-        .execute_revoke(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            &banned,
-            scp_protocol::context::governance::AccessScope::Read,
-            scp_runtime_core::context::shared::governance::CommitMeta {
-                pid: [5u8; 32],
-                actor_did: author.as_ref(),
-                timestamp_secs: 1_700_000_000,
-            },
-        )
-        .await;
+    let mut cell = ClassSCell::new_for_test(state);
+    let res = scp_runtime_governance::testing_access::execute_revoke(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &banned,
+        scp_protocol::context::governance::AccessScope::Read,
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [5u8; 32],
+            actor_did: author.as_ref(),
+            timestamp_secs: 1_700_000_000,
+        },
+    )
+    .await;
     assert!(
         matches!(res, Err(ContextError::PersistenceFailed(_))),
         "a governance ban whose persist fails MUST fail-closed, not return Ok: got {res:?}"
@@ -16650,7 +16637,7 @@ async fn broadcast_governance_ban_persist_is_fail_closed() {
     // Keep-direction: the ban is RETAINED in memory (un-banning would be the
     // unsafe re-grant direction). The banned DID stays excluded + blocked.
     assert!(
-        cell.access.read_exclusion_list.contains(&banned),
+        cell.access().read_exclusion_list.contains(&banned),
         "the ban read-exclusion must be RETAINED in memory on persist failure"
     );
     let bc = cell
@@ -16669,23 +16656,21 @@ async fn broadcast_governance_ban_persist_is_fail_closed() {
     let control_ctx_key = hex::encode(control_ctx_bytes);
     let control_deps = test_actor_deps(&sup).await;
     let control_state = ban_ready_broadcast_state(control_ctx_bytes, &author, &banned);
-    let mut control_cell = ClassSCell::new(control_state);
-    scp_runtime::domain_handlers()
-        .governance
-        .execute_revoke(
-            &mut control_cell,
-            &control_deps,
-            &control_ctx_key,
-            &banned,
-            scp_protocol::context::governance::AccessScope::Read,
-            scp_runtime_core::context::shared::governance::CommitMeta {
-                pid: [6u8; 32],
-                actor_did: author.as_ref(),
-                timestamp_secs: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("the control ban with working persistence must succeed");
+    let mut control_cell = ClassSCell::new_for_test(control_state);
+    scp_runtime_governance::testing_access::execute_revoke(
+        &mut control_cell,
+        &control_deps,
+        &control_ctx_key,
+        &banned,
+        scp_protocol::context::governance::AccessScope::Read,
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [6u8; 32],
+            actor_did: author.as_ref(),
+            timestamp_secs: 1_700_000_000,
+        },
+    )
+    .await
+    .expect("the control ban with working persistence must succeed");
     let events: Vec<RecordedEvent> = recorder
         .events
         .lock()
@@ -16735,7 +16720,7 @@ async fn send_path_spending_nonce_consume_survives_crash_before_coalesce() {
     let mut seed_entries = std::collections::HashMap::new();
     seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
     let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-    state.governance.class_s.spending_nonce_tracker =
+    state.governance_mut().class_s.spending_nonce_tracker =
         scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
             ctx_key.clone(),
             nonce_clock,
@@ -16747,32 +16732,24 @@ async fn send_path_spending_nonce_consume_survives_crash_before_coalesce() {
     // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
     // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
     // hand off to `spawn_actor_with_state`.
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 0,
-                payload: b"paid-send",
-                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
-                // Paid send: deferred token whose fail-closed commit persists the
-                // consumed nonce (previously the `true` bool).
-                token: Some(
-                    scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(
-                        &ctx_key,
-                    ),
-                ),
-                is_broadcast: false,
-            },
-        )
-        .await
-        .expect("fail-closed finalize of the send-path consumed nonce must succeed");
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        0,
+        b"paid-send",
+        scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
+        // Paid send: deferred token whose fail-closed commit persists the
+        // consumed nonce (previously the `true` bool).
+        Some(scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
+        false,
+    )
+    .await
+    .expect("fail-closed finalize of the send-path consumed nonce must succeed");
+    let state = cell.into_inner_for_test();
 
     let handle = sup
         .spawn_actor_with_state_for_test(state, deps, None)
@@ -16828,7 +16805,7 @@ async fn executed_proposal_survives_crash_before_coalesce() {
     // handler performs), then sync-persist fail-closed.
     let executed_id = [0x42u8; 32];
     state
-        .governance
+        .governance_mut()
         .class_s
         .executed_proposals
         .insert(executed_id, 1_700_000_000);
@@ -16890,7 +16867,7 @@ async fn spending_ucan_revocation_survives_crash_before_coalesce() {
     // perform), then sync-persist fail-closed.
     let revoked_cid = "bafyRevokedSpendingUcanCid".to_owned();
     state
-        .governance
+        .governance_mut()
         .revoked_spending_ucan_cids
         .insert(revoked_cid.clone());
     let deps = test_actor_deps(&sup).await;
@@ -16978,10 +16955,8 @@ async fn close_to_closing_is_sync_persisted_no_resurrection() {
     // `&mut ClassSCell` (the close fail-closed persist is performed by the
     // Class-S `_keep` combinator), so wrap the bare test state in a cell.
     let handle_clone = state.handle.clone();
-    let mut cell = ClassSCell::new(state);
-    scp_runtime::domain_handlers()
-        .lifecycle
-        .close_context(&mut cell, &deps, &handle_clone, &admin)
+    let mut cell = ClassSCell::new_for_test(state);
+    scp_runtime_lifecycle::testing_access::close_context(&mut cell, &deps, &handle_clone, &admin)
         .await
         .expect("close_context must succeed for a SingleAdmin context");
 
@@ -17006,7 +16981,7 @@ async fn close_to_closing_is_sync_persisted_no_resurrection() {
         "respawn of a sync-persisted Closing snapshot must skip (ContextClosed), got {result:?}"
     );
     assert!(
-        sup.lookup(&ctx_key).is_none(),
+        sup.lookup_for_test(&ctx_key).is_none(),
         "a closed context must NOT be resurrected into a live actor"
     );
 }
@@ -17123,7 +17098,7 @@ async fn executed_proposals_marker_survives_crash_before_coalesce() {
     // arm calls — the marker rides the downward arm's durable persist.
     let proposal_id: scp_protocol::context::governance::ProposalId = [0xABu8; 32];
     state
-        .governance
+        .governance_mut()
         .class_s
         .executed_proposals
         .insert(proposal_id, 1_700_000_000);
@@ -17212,31 +17187,23 @@ async fn finalize_send_rolls_back_sequence_exactly_once_on_persist_failure() {
     // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
     // owning `ClassSCell` for the call, then reclaim it via `into_inner` for
     // the post-send sequence-rollback assertion below.
-    let mut cell = ClassSCell::new(state);
-    let result = scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx_key,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: reserved,
-                payload: b"paid",
-                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
-                // Paid send: deferred token whose fail-closed commit fails here,
-                // driving the sequence-rollback path (previously the `true` bool).
-                token: Some(
-                    scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(
-                        &ctx_key,
-                    ),
-                ),
-                is_broadcast: false,
-            },
-        )
-        .await;
-    let state = cell.into_inner();
+    let mut cell = ClassSCell::new_for_test(state);
+    let result = scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx_key,
+        &ctx_id_bytes,
+        &sender,
+        reserved,
+        b"paid",
+        scp_runtime_core::context::supervisor::MessageSigner::Active(&signing_key),
+        // Paid send: deferred token whose fail-closed commit fails here,
+        // driving the sequence-rollback path (previously the `true` bool).
+        Some(scp_runtime_core::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
+        false,
+    )
+    .await;
+    let state = cell.into_inner_for_test();
     assert!(
         matches!(result, Err(ContextError::PersistenceFailed(_))),
         "a paid send whose fail-closed persist fails must surface the error: got {result:?}"
@@ -17502,7 +17469,7 @@ fn xctx_caller_state(caller_did: &str, creator_did: &str) -> PerContextState {
     // Established (both-approved) outbound interface caller→target for
     // XCTX_OUTLET, so the target-axis authorize-before-reserve gate (gate 2)
     // passes. Source/target ids are the hex id-form §6.2.4 stores.
-    st.governance.outlet_interfaces.push(
+    st.governance_mut().outlet_interfaces.push(
         scp_protocol::context::outlets::interface::OutletInterface {
             source_context: hex::encode(XCTX_CALLER),
             target_context: hex::encode(XCTX_TARGET),
@@ -17549,30 +17516,32 @@ fn xctx_target_state(caller_did: &str, creator_did: &str) -> PerContextState {
             Capability::OutletCallAll,
         ]))
         .expect("well-formed built-in ceiling");
-    st.governance.registered_outlets.push(OutletRegistration {
-        outlet_id: XCTX_OUTLET.to_owned(),
-        kind: scp_protocol::context::outlets::OutletKind::default(),
-        name: "Calculator".to_owned(),
-        description: "adds".to_owned(),
-        schema: OutletSchema {
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
-            }),
-            output_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "result": {"type": "number"} }
-            }),
-            aggregate_schema: None,
-        },
-        implementation_hash: [0xAA; 32],
-        test_vectors: vec![],
-        operator_did: DID(creator_did.to_owned()),
-        cost: None,
-        message_catalog: Vec::new(),
-        registered_at: 0,
-        signature: Vec::new(),
-    });
+    st.governance_mut()
+        .registered_outlets
+        .push(OutletRegistration {
+            outlet_id: XCTX_OUTLET.to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::default(),
+            name: "Calculator".to_owned(),
+            description: "adds".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": {"type": "number"} }
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: DID(creator_did.to_owned()),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        });
     st
 }
 
@@ -18656,9 +18625,10 @@ async fn xctx_saga_closed_participant_mailbox_aborts_participant_unavailable() {
     let target_hex = hex::encode(XCTX_TARGET);
     let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     drop(dead_rx);
-    supervisor
-        .actors_for_test()
-        .insert(target_hex, ContextActorHandle::from_sender(dead_tx));
+    supervisor.actors_for_test().insert(
+        target_hex,
+        ContextActorHandle::from_sender_for_test(dead_tx),
+    );
 
     let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
@@ -18900,13 +18870,13 @@ fn lift_reads_saga_code_structurally_not_from_message() {
     // parse would yield `13050` and this assert would catch the regression.
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-structural".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::PermissionDenied(
                 "SCP-SAGA-13050: a message whose embedded token is NOT the real code".to_owned(),
             ),
             needs_repair: false,
             saga_code: Some(13013),
-        },
+        }),
     );
     assert!(
         matches!(
@@ -18925,14 +18895,14 @@ fn lift_reads_saga_code_structurally_not_from_message() {
     // wrongly recover 13050 here).
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-none".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::InvalidState(
                 "SCP-SAGA-13050: a codeless terminal whose message happens to embed a token"
                     .to_owned(),
             ),
             needs_repair: false,
             saga_code: None,
-        },
+        }),
     );
     assert!(
         matches!(
@@ -18960,11 +18930,11 @@ fn lift_run_saga_error_maps_every_terminal() {
     let saga_id = SagaId("saga-lift-test".to_owned());
     let lifted = Supervisor::lift_run_saga_error_for_test(
         saga_id.clone(),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::InvalidState("commit retries exhausted".to_owned()),
             needs_repair: true,
             saga_code: None,
-        },
+        }),
     );
     match lifted {
         SagaError::NeedsRepair { saga_id: id, .. } => assert_eq!(id, saga_id),
@@ -18976,7 +18946,7 @@ fn lift_run_saga_error_maps_every_terminal() {
     // rides `saga_code`).
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-rl".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::RateLimited {
                 resource: "outlet_interface".to_owned(),
                 message: "per-interface rate limit exceeded".to_owned(),
@@ -18984,7 +18954,7 @@ fn lift_run_saga_error_maps_every_terminal() {
             },
             needs_repair: false,
             saga_code: Some(13023),
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19005,11 +18975,11 @@ fn lift_run_saga_error_maps_every_terminal() {
     // carrying its STRUCTURAL code.
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-rej".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::PermissionDenied("confused-deputy".to_owned()),
             needs_repair: false,
             saga_code: Some(13013),
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19031,13 +19001,13 @@ fn lift_run_saga_error_maps_every_terminal() {
     // never occurred.
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-timeout".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::TransportTimeout(
                 "saga PrepareA exceeded 30s phase budget".to_owned(),
             ),
             needs_repair: false,
             saga_code: None,
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19057,11 +19027,11 @@ fn lift_run_saga_error_maps_every_terminal() {
     // Rejected/13067.
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-participant-unavailable".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::ActorBusy("mailbox full for 30 seconds".to_owned()),
             needs_repair: false,
             saga_code: None,
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19109,11 +19079,11 @@ fn lift_run_saga_error_mark_resolved_failure_is_needs_repair_not_aborted() {
     // double-charging retry). This documents the bug the fix closes.
     let aborted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-mark-resolved-bug".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::InvalidState(mark_resolved_msg.clone()),
             needs_repair: false,
             saga_code: None,
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19134,11 +19104,11 @@ fn lift_run_saga_error_mark_resolved_failure_is_needs_repair_not_aborted() {
     let saga_id = SagaId("saga-mark-resolved-fixed".to_owned());
     let repaired = Supervisor::lift_run_saga_error_for_test(
         saga_id.clone(),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::InvalidState(mark_resolved_msg),
             needs_repair: true,
             saga_code: None,
-        },
+        }),
     );
     match repaired {
         SagaError::NeedsRepair { saga_id: id, .. } => assert_eq!(id, saga_id),
@@ -19159,7 +19129,7 @@ fn lift_run_saga_error_mark_resolved_failure_is_needs_repair_not_aborted() {
 fn lift_run_saga_error_propagates_token_bucket_none_backoff() {
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-token-bucket".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::RateLimited {
                 resource: "outlet_call".to_owned(),
                 message: "SCP-ECON-12090: rate limit exceeded on outlet_call: hard limit"
@@ -19172,7 +19142,7 @@ fn lift_run_saga_error_propagates_token_bucket_none_backoff() {
             // (reason RateLimited via the variant; the §6.2.0.2 sliding-
             // window saga rejects, by contrast, carry Some(130xx)).
             saga_code: None,
-        },
+        }),
     );
     assert!(
         matches!(
@@ -19206,11 +19176,11 @@ fn lift_run_saga_error_propagates_token_bucket_none_backoff() {
 fn lift_run_saga_error_participant_unavailable_is_retryable_not_rejected() {
     let lifted = Supervisor::lift_run_saga_error_for_test(
         SagaId("saga-participant-unavailable".to_owned()),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::ActorBusy("mailbox full for 30 seconds".to_owned()),
             needs_repair: false,
             saga_code: None,
-        },
+        }),
     );
 
     // The reason is the retryable ParticipantUnavailable (carrying a
@@ -19267,13 +19237,13 @@ fn lift_run_saga_error_actor_busy_with_needs_repair_is_needs_repair_not_aborted(
     let saga_id = SagaId("saga-commit-phase-actor-busy".to_owned());
     let lifted = Supervisor::lift_run_saga_error_for_test(
         saga_id.clone(),
-        RunSagaError {
+        RunSagaError::from_test_parts(RunSagaErrorTestParts {
             error: ContextError::ActorBusy(
                 "commit-phase send to participant failed after retries".to_owned(),
             ),
             needs_repair: true,
             saga_code: None,
-        },
+        }),
     );
 
     // A commit-phase ActorBusy (needs_repair == true) MUST be NeedsRepair,
@@ -19331,7 +19301,9 @@ fn saga_error_display_carries_canonical_codes() {
 #[tokio::test(start_paused = true)]
 async fn xctx_saga_stalled_target_custody_fails_commit_with_custody_timeout() {
     use scp_crypto::{DynScpSigner, SigAlg, SignFuture};
-    use scp_runtime_core::context::actor::signer::{SIGN_TIMEOUT, custody_timed_out};
+    use scp_runtime_core::context::actor::signer::{
+        SIGN_TIMEOUT, custody_timed_out_for_test as custody_timed_out,
+    };
 
     /// A signer whose sign never completes, standing in for an
     /// unanswered biometric prompt.
@@ -19485,7 +19457,7 @@ async fn xctx_saga_commit_replay_reemits_without_reinvoke() {
 
     // Re-drive Commit-B reserve for the SAME saga id (the replay path).
     let target = supervisor
-        .lookup(&hex::encode(XCTX_TARGET))
+        .lookup_for_test(&hex::encode(XCTX_TARGET))
         .expect("target actor co-resident");
     let reserve = target
         .send(move |reply| {
@@ -19532,7 +19504,7 @@ fn divergence_ctx<'a>(
     caller_signing: &ed25519_dalek::SigningKey,
     caller_did: &str,
 ) -> CrossContextSagaCtx<'a> {
-    CrossContextSagaCtx {
+    CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -19565,7 +19537,7 @@ fn divergence_ctx<'a>(
         committed: None,
         committed_b_outlet_invoked_event_id: Some(outlet_invoked_event_id),
         reached_needs_repair: false,
-    }
+    })
 }
 
 /// Security regression (black-hat): `divergence_marker_plan` MUST refuse to
@@ -19589,7 +19561,7 @@ fn divergence_marker_plan_refuses_without_verified_commit_b() {
     assert!(Supervisor::divergence_marker_plan_for_test(&ctx).is_some());
     // Synthetic unreachable case: committed event id present but no verified
     // Prepare-B provenance ⇒ refuse to produce a plan (no untrusted fallback).
-    ctx.prepared_b = None;
+    ctx.clear_prepared_b_for_test();
     assert!(Supervisor::divergence_marker_plan_for_test(&ctx).is_none());
 }
 
@@ -19925,7 +19897,9 @@ fn xctx_replay_reconstructs_full_participant_set() {
         recorded_nonce: [0x66u8; 16],
         recorded_chain_depth: 3,
     };
-    let evidence = prepared.to_evidence_bytes().expect("encode evidence");
+    let evidence = prepared
+        .to_evidence_bytes_for_test()
+        .expect("encode evidence");
     let entry = JournalEntry {
         saga_id: SagaId::new(),
         state: SagaState::Committing,
@@ -20380,7 +20354,7 @@ async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
         saga_id: saga_id.clone(),
         state: SagaState::Committing,
         participants: vec![hex::encode(XCTX_CALLER)],
-        evidence: Zeroizing::new(prepared.to_evidence_bytes().expect("encode")),
+        evidence: Zeroizing::new(prepared.to_evidence_bytes_for_test().expect("encode")),
         timestamp_ms: now_ms,
         seq_per_saga: 3,
     };
@@ -20810,7 +20784,7 @@ async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
     // Build a saga ctx and run the REAL Prepare-A so `prepared_a` holds a
     // genuine `#[must_use]` reservation (its ticket's Drop guard fires if it
     // is ever dropped unbalanced).
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -20832,12 +20806,15 @@ async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
     supervisor
         .dispatch_xctx_prepare_a_for_test(&SagaId::new(), &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+    assert!(
+        ctx.prepared_a_for_test().is_some(),
+        "Prepare-A held a reservation"
+    );
 
     // Now the caller actor dies BEFORE Commit-A reaches it.
     let despawned = supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await;
@@ -20875,7 +20852,7 @@ async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
         "Commit-A to a despawned caller must surface the send failure"
     );
     assert!(
-        ctx.prepared_a.is_some(),
+        ctx.prepared_a_for_test().is_some(),
         "the escrow reservation MUST be recovered into ctx for retry (never dropped \
              unbalanced — no ticket-drop panic, no escrow leak)"
     );
@@ -20883,7 +20860,7 @@ async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
     // Drain the recovered reservation cleanly so the test does not itself
     // leak the must-use ticket (mirrors the run_saga tail's void+consume for
     // a Commit-A that never landed).
-    if let Some(reservation) = ctx.prepared_a.take() {
+    if let Some(reservation) = ctx.take_prepared_a_for_test() {
         reservation
             .reservation
             .ticket
@@ -20922,7 +20899,7 @@ async fn xctx_abort_send_failure_voids_ticket_no_panic() {
     // Run the REAL Prepare-A (on the still-live caller actor) so `prepared_a`
     // holds a genuine must-use reservation whose ticket Drop guard fires if
     // it is ever dropped unbalanced.
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -20944,12 +20921,15 @@ async fn xctx_abort_send_failure_voids_ticket_no_panic() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
     supervisor
         .dispatch_xctx_prepare_a_for_test(&SagaId::new(), &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+    assert!(
+        ctx.prepared_a_for_test().is_some(),
+        "Prepare-A held a reservation"
+    );
 
     // REPLACE the live caller handle with a registered-but-DEAD one: a
     // channel whose receiver is dropped. `lookup` now HITS, but the mailbox
@@ -20960,7 +20940,7 @@ async fn xctx_abort_send_failure_voids_ticket_no_panic() {
     drop(dead_rx);
     supervisor.actors_for_test().insert(
         hex::encode(XCTX_CALLER),
-        ContextActorHandle::from_sender(dead_tx),
+        ContextActorHandle::from_sender_for_test(dead_tx),
     );
 
     // Abort: the caller-side send fails on the closed mailbox. The held
@@ -20972,7 +20952,7 @@ async fn xctx_abort_send_failure_voids_ticket_no_panic() {
     // The reservation was taken out of ctx and balanced (voided+consumed) by
     // the abort path — not left in ctx and not dropped unbalanced.
     assert!(
-        ctx.prepared_a.is_none(),
+        ctx.prepared_a_for_test().is_none(),
         "the abort path must take and balance the reservation (no leftover in ctx)"
     );
     // Reaching here without a ticket-drop panic IS the FIX-1 guarantee.
@@ -21056,7 +21036,7 @@ async fn flush_and_read_snapshot(
     use scp_runtime_core::context::actor::commands::LifecycleCommand;
     let hex = hex::encode(context_id);
     let actor = supervisor
-        .lookup(&hex)
+        .lookup_for_test(&hex)
         .expect("actor co-resident for flush");
     actor
         .send(|reply| ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply }))
@@ -21154,13 +21134,15 @@ async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
     // registry pointer for Part 1, then restore this same live handle for the
     // Part 2 re-drive (the actor keeps its consumed token + durable record
     // throughout, exactly as a restored snapshot would carry them).
-    let live_caller = supervisor.lookup(&caller_hex).expect("caller co-resident");
+    let live_caller = supervisor
+        .lookup_for_test(&caller_hex)
+        .expect("caller co-resident");
 
     let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
     let nonce = [0x42u8; 16];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -21182,7 +21164,7 @@ async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     let saga_id = SagaId("wave8-send-fail-saga".to_owned());
     let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
@@ -21194,7 +21176,10 @@ async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
         .dispatch_xctx_prepare_a_for_test(&saga_id, &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+    assert!(
+        ctx.prepared_a_for_test().is_some(),
+        "Prepare-A held a reservation"
+    );
 
     // Baseline: the reserve mutated OWNED state (else the test proves
     // nothing). The hard-rate-limit bucket dropped below full burst and the
@@ -21251,9 +21236,10 @@ async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
     // token + record); we only swapped the registry pointer.
     let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
     drop(dead_rx);
-    supervisor
-        .actors_for_test()
-        .insert(caller_hex.clone(), ContextActorHandle::from_sender(dead_tx));
+    supervisor.actors_for_test().insert(
+        caller_hex.clone(),
+        ContextActorHandle::from_sender_for_test(dead_tx),
+    );
 
     supervisor
         .abort_saga_for_test(
@@ -21435,7 +21421,7 @@ async fn stage_xctx_preparing_b_crash(
         XCTX_OUTLET.to_owned(),
     ];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -21457,7 +21443,7 @@ async fn stage_xctx_preparing_b_crash(
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     // Journal `Initiated` (seq 0) + `PreparingA` (seq 1, empty evidence) then
     // Prepare-A durably stages the caller deduction + reservation record on
@@ -21499,7 +21485,7 @@ async fn stage_xctx_preparing_b_crash(
     };
     // Balance the must-use carrier (lost-reply shape) so its drop guard does
     // not fire; the durable record is what recovery reverses.
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -21553,7 +21539,7 @@ async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
     let saga_id = SagaId("wave15-nonresident-saga".to_owned());
     let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -21575,7 +21561,7 @@ async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     // Real Prepare-A: durably stages the caller deduction + reservation
     // record on the live caller actor. (We balance the returned carrier
@@ -21585,7 +21571,7 @@ async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
         .dispatch_xctx_prepare_a_for_test(&saga_id, &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -21692,7 +21678,7 @@ async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal
     let saga_id = SagaId("wave15-resident-saga".to_owned());
     let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -21714,7 +21700,7 @@ async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     supervisor
         .dispatch_xctx_prepare_a_for_test(&saga_id, &mut ctx)
@@ -21734,7 +21720,7 @@ async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal
         );
         token_after_reserve + 1000 // one token = 1000 milli-tokens
     };
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -21947,7 +21933,7 @@ async fn restore_on_startup_restores_caller_from_persistence_then_delivers_rever
         "despawn the caller so it must be RESTORED FROM PERSISTENCE before the reversal"
     );
     assert!(
-        supervisor.lookup(&caller_hex).is_none(),
+        supervisor.lookup_for_test(&caller_hex).is_none(),
         "the caller is non-resident immediately before restore_on_startup"
     );
 
@@ -21976,7 +21962,7 @@ async fn restore_on_startup_restores_caller_from_persistence_then_delivers_rever
         "the restore leg MUST resurrect the caller from persistence in this pass, got {restored:?}"
     );
     assert!(
-        supervisor.lookup(&caller_hex).is_some(),
+        supervisor.lookup_for_test(&caller_hex).is_some(),
         "the caller actor must be RESIDENT after restore_on_startup (restored from persistence)"
     );
 
@@ -22138,7 +22124,7 @@ async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal
         XCTX_OUTLET.to_owned(),
     ];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -22160,7 +22146,7 @@ async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     // Journal `Initiated` (seq 0) then `PreparingA` (seq 1) with EMPTY
     // evidence — EXACTLY the FSM's pre-dispatch journal shape (the FSM appends
@@ -22196,7 +22182,7 @@ async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal
         );
         token_after_reserve + 1000 // one token = 1000 milli-tokens
     };
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -22284,7 +22270,7 @@ async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
         XCTX_OUTLET.to_owned(),
     ];
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -22306,7 +22292,7 @@ async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     supervisor
         .append_journal_for_test(&saga_id, SagaState::Initiated, &participants, 0, &[])
@@ -22321,7 +22307,7 @@ async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
         .dispatch_xctx_prepare_a_for_test(&saga_id, &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -22426,7 +22412,7 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
     let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
     let saga_id = SagaId("high2-lost-carrier-saga".to_owned());
 
-    let mut ctx = CrossContextSagaCtx {
+    let mut ctx = CrossContextSagaCtx::from_test_parts(CrossContextSagaCtxTestParts {
         caller_context_id: XCTX_CALLER,
         target_context_id: XCTX_TARGET,
         caller_did: DID(caller_did.to_owned()),
@@ -22448,7 +22434,7 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
         committed: None,
         committed_b_outlet_invoked_event_id: None,
         reached_needs_repair: false,
-    };
+    });
 
     // Real Prepare-A: stages the durable record + deduction on the live
     // caller and returns the must-use carrier into `ctx.prepared_a`.
@@ -22456,7 +22442,10 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
         .dispatch_xctx_prepare_a_for_test(&saga_id, &mut ctx)
         .await
         .expect("Prepare-A stages a real reservation");
-    assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+    assert!(
+        ctx.prepared_a_for_test().is_some(),
+        "Prepare-A held a reservation"
+    );
 
     // Baseline: the reserve moved owned state and staged the record.
     let burst_milli = {
@@ -22480,7 +22469,7 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
     // supervisor balances the recovered must-use ticket (void escrow +
     // consume) and leaves `ctx.prepared_a == None` over the real durable
     // deduction. We reproduce exactly that state.
-    if let Some(prepared) = ctx.prepared_a.take() {
+    if let Some(prepared) = ctx.take_prepared_a_for_test() {
         prepared
             .reservation
             .ticket
@@ -22488,7 +22477,7 @@ async fn abort_with_lost_carrier_reconciles_durable_record() {
             .await;
     }
     assert!(
-        ctx.prepared_a.is_none(),
+        ctx.prepared_a_for_test().is_none(),
         "the lost-carrier state has prepared_a == None over a durable deduction"
     );
 
@@ -22551,7 +22540,7 @@ async fn xctx_replay_prepare_in_progress_releases_and_discards() {
     // prepared into `saga_pending`, keyed by the saga id (the session slot
     // the recovery Abort releases).
     let target = supervisor
-        .lookup(&hex::encode(XCTX_TARGET))
+        .lookup_for_test(&hex::encode(XCTX_TARGET))
         .expect("target co-resident");
     let prepare_saga_id = saga_id.clone();
     let prepare_did = DID(caller_did.to_owned());
@@ -22940,4 +22929,123 @@ fn extract_commit_a_reservation_round_trips_the_exact_built_command() {
         .reservation
         .ticket
         .consume_abandoning_escrow();
+}
+
+mod shutdown_sweep_tests {
+    //! ADR-049 Decision 16: the shutdown sweep despawns an actor that never
+    //! replies to `ShutdownSelf`. Moved from `scp-runtime-lifecycle` when the
+    //! sweep moved into core (ADR-070 §4, whole-Supervisor operations live in core).
+
+    use std::sync::Arc;
+
+    use scp_runtime_core::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
+    use scp_runtime_core::context::supervisor::Supervisor;
+
+    fn supervisor() -> Arc<Supervisor> {
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkShutdownSweep".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        scp_runtime::test_supervisor(
+            crypto,
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider),
+            Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new()),
+            Arc::new(|_, _| None),
+        )
+    }
+
+    /// Two actors accept `ShutdownSelf` into a free mailbox slot and never
+    /// reply. The sweep waits `REPLY_TIMEOUT` for each, then despawns both, so
+    /// neither stays registered and the sweep reaches its end.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_despawns_actors_that_never_reply_to_shutdown_self() {
+        let sup = supervisor();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test(
+            "ctx-wedged-a",
+            ContextActorHandle::from_sender_for_test(tx_a),
+        );
+        sup.register_actor_handle_for_test(
+            "ctx-wedged-b",
+            ContextActorHandle::from_sender_for_test(tx_b),
+        );
+
+        let start = tokio::time::Instant::now();
+        sup.shutdown_all_contexts().await;
+        assert!(
+            start.elapsed() >= REPLY_TIMEOUT * 2,
+            "the sweep waits REPLY_TIMEOUT for each unanswered ShutdownSelf"
+        );
+        assert!(
+            sup.actors_for_test().is_empty(),
+            "an actor that never replies to ShutdownSelf is despawned, got {:?}",
+            sup.actors_for_test()
+                .iter()
+                .map(|e| e.key().clone())
+                .collect::<Vec<_>>()
+        );
+        // Each mailbox received the one ShutdownSelf, and the despawn dropped
+        // the last sender, so the inbox reads closed after it.
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
+            assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
+        }
+    }
+
+    /// An actor that never answers `ShutdownSelf` keeps running until the drain
+    /// awaits it. A persist it makes on its way out still reads the context's
+    /// floors from the registry, and only after the drain does the shutdown
+    /// drop the registry entry.
+    #[tokio::test(start_paused = true)]
+    async fn floors_outlive_an_unanswering_actor_until_the_drain_ends() {
+        use scp_runtime_core::context::actor::commands::LifecycleCommand;
+
+        let sup = supervisor();
+        let ctx_id = "ab".repeat(32);
+        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch_for_test(&ctx_bytes, "floor-sender", 7, u64::MAX)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender_for_test(tx));
+        let actor_sup = Arc::clone(&sup);
+        let actor = sup
+            .spawn_tracked_for_test("unanswering actor", async move {
+                let mut held_replies = Vec::new();
+                while let Some(cmd) = rx.recv().await {
+                    if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd
+                    {
+                        held_replies.push(reply);
+                    }
+                }
+                // The inbox closed on the despawn: model the persist of a
+                // command the actor was still running.
+                (
+                    actor_sup.export_sender_key_epochs_for_test(&ctx_bytes),
+                    held_replies,
+                )
+            })
+            .expect("spawn before shutdown");
+
+        sup.shutdown_all_contexts().await;
+
+        assert!(actor.is_finished(), "the drain awaited the actor task");
+        let (seen, held_replies) = actor.await.expect("the actor task does not panic");
+        assert_eq!(
+            held_replies.len(),
+            1,
+            "the actor held the one ShutdownSelf unanswered"
+        );
+        assert_eq!(
+            seen,
+            vec![("floor-sender".to_owned(), 7)],
+            "the actor's last persist read the advanced floor, not an empty export"
+        );
+        assert!(
+            sup.export_sender_key_epochs_for_test(&ctx_bytes).is_empty(),
+            "the shutdown dropped the floor entry after the drain"
+        );
+    }
 }

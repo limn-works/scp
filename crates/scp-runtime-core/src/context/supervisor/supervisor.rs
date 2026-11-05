@@ -466,14 +466,18 @@ pub enum SagaError {
     },
 }
 
-/// The step of a cross-context streaming saga's B-side open that returned an
-/// [`OutletStreamOpenError`](crate::context::outlets::invoke::OutletStreamOpenError).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamingSagaOpenStep {
-    /// Phase 1: the B-side escrow reserve.
-    EscrowReserve,
-    /// Phase 2: the B-side `open_stream_session` call.
-    StreamOpen,
+scp_runtime_types::pub_under_testing! {
+    /// The step of a cross-context streaming saga's B-side open that returned an
+    /// [`OutletStreamOpenError`](crate::context::outlets::invoke::OutletStreamOpenError).
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum StreamingSagaOpenStep {
+        /// Phase 1: the B-side escrow reserve.
+        EscrowReserve,
+        /// Phase 2: the B-side `open_stream_session` call.
+        StreamOpen,
+    }
 }
 
 impl StreamingSagaOpenStep {
@@ -486,13 +490,25 @@ impl StreamingSagaOpenStep {
     }
 }
 
+/// Test-only reach into [`stream_open_rejection_to_saga_error`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn stream_open_rejection_to_saga_error_for_test(
+    rejection: &crate::context::outlets::invoke::OutletStreamOpenError,
+    step: StreamingSagaOpenStep,
+) -> SagaError {
+    stream_open_rejection_to_saga_error(rejection, step)
+}
+
 /// Maps a rejection that `step` of a streaming saga's B-side open returned onto
 /// the saga error surface. A rejection by Supervisor shutdown keeps
 /// `SCP-CTX-2138` as [`SagaError::SupervisorShutDown`] (ADR-049 Decision 16
 /// item 2), the error the saga's own tracker refusal returns; every other
 /// rejection aborts the saga with `SCP-SAGA-13067`.
 #[must_use]
-pub fn stream_open_rejection_to_saga_error(
+fn stream_open_rejection_to_saga_error(
     rejection: &crate::context::outlets::invoke::OutletStreamOpenError,
     step: StreamingSagaOpenStep,
 ) -> SagaError {
@@ -569,25 +585,55 @@ pub enum SagaAbortReason {
     Rejected,
 }
 
-/// Private error of the shared `Supervisor::run_saga` FSM driver. Carries the
-/// FSM's internal [`ContextError`] (the type the saga FSM and the saga
-/// integration tests depend on) PLUS whether the saga reached `NeedsRepair`, so
-/// the boundary methods can lift it: `start_saga` discards the flag and
-/// propagates the `ContextError`; `start_cross_context_outlet_invocation_saga`
-/// lifts both into the typed [`SagaError`]. Not exposed — the FSM contract stays
-/// `ContextError` internally.
-pub struct RunSagaError {
-    /// The FSM's terminal error (abort reject, NeedsRepair commit failure, …).
+scp_runtime_types::pub_under_testing! {
+    /// Private error of the shared `Supervisor::run_saga` FSM driver. Carries the
+    /// FSM's internal [`ContextError`] (the type the saga FSM and the saga
+    /// integration tests depend on) PLUS whether the saga reached `NeedsRepair`, so
+    /// the boundary methods can lift it: `start_saga` discards the flag and
+    /// propagates the `ContextError`; `start_cross_context_outlet_invocation_saga`
+    /// lifts both into the typed [`SagaError`]. Not exposed — the FSM contract stays
+    /// `ContextError` internally.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct RunSagaError {
+        /// The FSM's terminal error (abort reject, NeedsRepair commit failure, …).
+        pub error: ContextError,
+        /// `true` iff the FSM journaled `NeedsRepair` (commit-retry exhaustion).
+        needs_repair: bool,
+        /// The canonical `SCP-SAGA-13xxx` discriminant of a §6.2.4 Prepare-axis
+        /// POLICY reject, carried STRUCTURALLY off the reject path (via
+        /// [`SagaReject`]) so the boundary lift reads it without parsing the message
+        /// string. `None` for a codeless terminal — a mailbox / transport / journal
+        /// failure or a `NeedsRepair` — which lifts to the generic saga-abort code
+        /// `13067` (`NeedsRepair` ignores it: it lifts to `13065`).
+        saga_code: Option<u16>,
+    }
+}
+
+/// Every field of a [`RunSagaError`], for tests outside this crate to build one.
+/// Compiled only under `testing`, so no production or bridge build can
+/// construct a `RunSagaError` outside core (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct RunSagaErrorTestParts {
+    /// [`RunSagaError`]'s field of the same name.
     pub error: ContextError,
-    /// `true` iff the FSM journaled `NeedsRepair` (commit-retry exhaustion).
+    /// [`RunSagaError`]'s field of the same name.
     pub needs_repair: bool,
-    /// The canonical `SCP-SAGA-13xxx` discriminant of a §6.2.4 Prepare-axis
-    /// POLICY reject, carried STRUCTURALLY off the reject path (via
-    /// [`SagaReject`]) so the boundary lift reads it without parsing the message
-    /// string. `None` for a codeless terminal — a mailbox / transport / journal
-    /// failure or a `NeedsRepair` — which lifts to the generic saga-abort code
-    /// `13067` (`NeedsRepair` ignores it: it lifts to `13065`).
+    /// [`RunSagaError`]'s field of the same name.
     pub saga_code: Option<u16>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl RunSagaError {
+    /// Builds a `RunSagaError` from its test parts.
+    #[must_use]
+    pub fn from_test_parts(parts: RunSagaErrorTestParts) -> Self {
+        Self {
+            error: parts.error,
+            needs_repair: parts.needs_repair,
+            saga_code: parts.saga_code,
+        }
+    }
 }
 
 /// The non-`Send` outlet executor the supervisor FSM runs supervisor-side
@@ -625,44 +671,52 @@ type SagaOutletExecutor<'a> = Box<
 type XctxPrepared =
     crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
 
-/// Outcome of a §17.16.4 Commit-in-progress recovery re-drive. The crash
-/// recovery re-drives the idempotent Commit-B and re-acks Commit-A from the
-/// durable witness, then journals the resolved terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitInProgressResolution {
-    /// BOTH sides committed (B re-emitted the stored output AND the A-side
-    /// `xctx_committed_invocations` witness is present): the saga is fully
-    /// committed — resolve to `Committed`, NOT a false `NeedsRepair`.
-    Committed,
-    /// Genuinely unresolvable divergence (B committed but A did not, B never
-    /// landed, or a side is unreachable): stays `NeedsRepair` for operator repair.
-    NeedsRepair,
+scp_runtime_types::pub_under_testing! {
+    /// Outcome of a §17.16.4 Commit-in-progress recovery re-drive. The crash
+    /// recovery re-drives the idempotent Commit-B and re-acks Commit-A from the
+    /// durable witness, then journals the resolved terminal.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CommitInProgressResolution {
+        /// BOTH sides committed (B re-emitted the stored output AND the A-side
+        /// `xctx_committed_invocations` witness is present): the saga is fully
+        /// committed — resolve to `Committed`, NOT a false `NeedsRepair`.
+        Committed,
+        /// Genuinely unresolvable divergence (B committed but A did not, B never
+        /// landed, or a side is unreachable): stays `NeedsRepair` for operator repair.
+        NeedsRepair,
+    }
 }
 
-/// Whether a cross-context saga's CALLER-side LOCAL economy reversal (budget /
-/// velocity / hard-rate-limit, deducted + Class-S-persisted at Prepare-A and
-/// owned by the caller actor) was settled during an abort. This is the sole
-/// input to the coordinator's terminal-marker decision (spec §6.2.4
-/// "Reservation release on every terminal path"): a terminal-`Aborted` journal
-/// asserts "fully compensated" and MUST NOT be written while a caller refund is
-/// still outstanding. Produced by `Supervisor::abort_xctx_participants` (the
-/// live abort path) and by `Supervisor::redrive_xctx_prepare_in_progress` (the
-/// §17.16.4 crash-recovery `PreparingB` re-drive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallerAbortReversal {
-    /// The caller-side LOCAL economy was reversed (the `Abort` was delivered and
-    /// the actor rolled it back), OR there was no caller reservation to reverse.
-    /// The coordinator may write the terminal-`Aborted` marker.
-    SettledOrAbsent,
-    /// The caller-side LOCAL economy reversal could NOT be confirmed: the carrier
-    /// `Abort { Some }` send failed AND the `Abort { None }` re-drive also failed
-    /// (persistent backpressure / closed inbox), the caller actor was
-    /// unreachable (despawned), or the delivered handler errored before durably
-    /// persisting the reversal. The coordinator MUST leave the journal
-    /// non-terminal (`PreparingB`) so the §17.16.4 crash-recovery sweep
-    /// re-drives `Abort { None }` and reverses the LOCAL economy from the durable
-    /// `CallerReservationRecord`.
-    ReversalOutstanding,
+scp_runtime_types::pub_under_testing! {
+    /// Whether a cross-context saga's CALLER-side LOCAL economy reversal (budget /
+    /// velocity / hard-rate-limit, deducted + Class-S-persisted at Prepare-A and
+    /// owned by the caller actor) was settled during an abort. This is the sole
+    /// input to the coordinator's terminal-marker decision (spec §6.2.4
+    /// "Reservation release on every terminal path"): a terminal-`Aborted` journal
+    /// asserts "fully compensated" and MUST NOT be written while a caller refund is
+    /// still outstanding. Produced by `Supervisor::abort_xctx_participants` (the
+    /// live abort path) and by `Supervisor::redrive_xctx_prepare_in_progress` (the
+    /// §17.16.4 crash-recovery `PreparingB` re-drive).
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CallerAbortReversal {
+        /// The caller-side LOCAL economy was reversed (the `Abort` was delivered and
+        /// the actor rolled it back), OR there was no caller reservation to reverse.
+        /// The coordinator may write the terminal-`Aborted` marker.
+        SettledOrAbsent,
+        /// The caller-side LOCAL economy reversal could NOT be confirmed: the carrier
+        /// `Abort { Some }` send failed AND the `Abort { None }` re-drive also failed
+        /// (persistent backpressure / closed inbox), the caller actor was
+        /// unreachable (despawned), or the delivered handler errored before durably
+        /// persisting the reversal. The coordinator MUST leave the journal
+        /// non-terminal (`PreparingB`) so the §17.16.4 crash-recovery sweep
+        /// re-drives `Abort { None }` and reverses the LOCAL economy from the durable
+        /// `CallerReservationRecord`.
+        ReversalOutstanding,
+    }
 }
 
 /// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
@@ -684,118 +738,200 @@ type DivergenceMarkerPlan = (
     u64,
 );
 
-/// Per-saga phase-data context threaded through `Supervisor::run_saga_fsm`
-/// for a `CrossContextOutletInvocation` saga (spec §6.2.4).
-///
-/// The generic FSM (journal, retry, NeedsRepair, abort, gating) stays
-/// data-agnostic; this carrier holds the cross-context-specific inputs the
-/// per-phase dispatch needs and accumulates the Prepare→Commit hand-off
-/// data so each phase sees the prior phase's output:
-///
-/// - the supervisor-side outlet `executor` + the target/caller Active Signing
-///   Keys (the actor holds NO key — ADR-049; the keys are supplied by the
-///   FFI/SDK caller per-call, exactly like `send_heartbeat` /
-///   `build_local_checkpoint`),
-/// - `prepared_a` — the caller-side escrow/rate-limit reservation staged at
-///   Prepare-A and held across the saga (RAII-released on any abort, settled
-///   at Commit-A),
-/// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
-///   re-derived chain depth). Read by `Supervisor::xctx_prepared_evidence_bytes` at
-///   Committing-evidence time: once recorded, B's values OVERRIDE the
-///   caller-asserted nonce / depth / timestamp in the journaled prepared
-///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
-///   re-derives from B's authoritative provenance, not the caller's assertion,
-/// - `committed` — the receipt + output captured at Commit-B, forwarded to
-///   Commit-A and surfaced in [`SagaOutput`].
-///
-/// `executor` is an `Option` so it can be `take`n exactly once at Commit-B.
-pub struct CrossContextSagaCtx<'a> {
-    /// Raw 32-byte caller context id (A's own context).
+scp_runtime_types::pub_under_testing! {
+    /// Per-saga phase-data context threaded through `Supervisor::run_saga_fsm`
+    /// for a `CrossContextOutletInvocation` saga (spec §6.2.4).
+    ///
+    /// The generic FSM (journal, retry, NeedsRepair, abort, gating) stays
+    /// data-agnostic; this carrier holds the cross-context-specific inputs the
+    /// per-phase dispatch needs and accumulates the Prepare→Commit hand-off
+    /// data so each phase sees the prior phase's output:
+    ///
+    /// - the supervisor-side outlet `executor` + the target/caller Active Signing
+    ///   Keys (the actor holds NO key — ADR-049; the keys are supplied by the
+    ///   FFI/SDK caller per-call, exactly like `send_heartbeat` /
+    ///   `build_local_checkpoint`),
+    /// - `prepared_a` — the caller-side escrow/rate-limit reservation staged at
+    ///   Prepare-A and held across the saga (RAII-released on any abort, settled
+    ///   at Commit-A),
+    /// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
+    ///   re-derived chain depth). Read by `Supervisor::xctx_prepared_evidence_bytes` at
+    ///   Committing-evidence time: once recorded, B's values OVERRIDE the
+    ///   caller-asserted nonce / depth / timestamp in the journaled prepared
+    ///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
+    ///   re-derives from B's authoritative provenance, not the caller's assertion,
+    /// - `committed` — the receipt + output captured at Commit-B, forwarded to
+    ///   Commit-A and surfaced in [`SagaOutput`].
+    ///
+    /// `executor` is an `Option` so it can be `take`n exactly once at Commit-B.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct CrossContextSagaCtx<'a> {
+        /// Raw 32-byte caller context id (A's own context).
+        pub caller_context_id: [u8; 32],
+        /// Raw 32-byte target context id (B's own context; where the outlet runs).
+        pub target_context_id: [u8; 32],
+        /// Channel-authenticated caller DID (spec §6.2.4 "Caller authentication").
+        pub caller_did: DID,
+        /// Context-local outlet registration id (indexes B's registry).
+        pub outlet_registration_id: String,
+        /// UCAN proof index into B's store (`None` ⇒ ungated outlet).
+        pub ucan_proof_id: Option<String>,
+        /// Outlet input — validated at Prepare-B, executed at Commit-B.
+        pub input: serde_json::Value,
+        /// Caller-asserted advisory chain depth (freshness/`+1` base only).
+        pub asserted_chain_depth: u8,
+        /// Caller-asserted 16-byte wire nonce (freshness + dual-log join key).
+        pub asserted_nonce: [u8; 16],
+        /// Caller-asserted send-time (ms) — §9.14 skew check only.
+        pub asserted_timestamp_ms: u64,
+        /// The channel-authenticated caller's role in the caller context, resolved
+        /// supervisor-side at initiation (NOT envelope-asserted). Carried to
+        /// Prepare-B so B enforces `InboundPolicy.allowed_source_roles` against the
+        /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
+        /// role assignment.
+        pub caller_source_role: Option<String>,
+        /// The signer for the target context's Active Signing Key — receipt +
+        /// divergence-marker signing (Commit-B / NeedsRepair). The actor holds no
+        /// custody key (ADR-049); the FSM passes a clone of this caller-supplied
+        /// signer with each command, and the actor signs through it in the turn
+        /// (Decision 7a).
+        target_signer: crate::context::actor::signer::CommandSigner,
+        /// The signer for the caller context's Active Signing Key — used ONLY to
+        /// sign the caller-side `CrossContextDivergenceMarker` on a `NeedsRepair`
+        /// outcome (spec §6.2.4 "Dual event-log recording"). Distinct from
+        /// `target_signer`: each side signs its OWN marker into its OWN log under
+        /// its OWN Active Signing Key.
+        caller_signer: crate::context::actor::signer::CommandSigner,
+        /// The supervisor-side outlet executor, taken once at Commit-B.
+        executor: Option<SagaOutletExecutor<'a>>,
+        /// The captured outlet output bytes, stashed the moment the executor runs
+        /// ONCE (Commit-B first execute), so a transient Commit-B SETTLE failure is
+        /// retryable WITHOUT re-invoking the outlet (spec §6.2.4 "Exactly-once
+        /// execution"). On a retry the reserve returns `ReadyToExecute` (the capture
+        /// was rolled back by the failed settle's persist), but the outlet already ran
+        /// and had side effects — so the FSM re-sends `CommitBSettle` with THESE
+        /// stashed bytes rather than calling the (already-taken) executor again.
+        /// `Some` ⇒ the outlet has executed; never call the executor when this is set.
+        executor_output: Option<Vec<u8>>,
+        /// Prepare-A's held reservation (settled at Commit-A, released on abort).
+        prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
+        /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
+        /// Read by `Supervisor::xctx_prepared_evidence_bytes`: once `Some`, these values
+        /// override the caller-asserted nonce / depth / timestamp in the journaled
+        /// prepared evidence (the §17.16.4 replay surface).
+        prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
+        /// Commit-B's captured receipt + output (forwarded to Commit-A + output).
+        committed: Option<CommittedSagaArtifacts>,
+        /// The target side's `OutletInvoked` event id, captured the moment Commit-B
+        /// lands (reserve `AlreadyCommitted` OR a first execution settle). `Some`
+        /// proves the TARGET committed its `OutletInvoked` record even when the saga
+        /// later diverges (Commit-A fails → `NeedsRepair`): the
+        /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) then records
+        /// `committed_side = Target` and this event id (spec §6.2.4
+        /// "Dual event-log recording"). `None` means Commit-B never landed, so no
+        /// side committed and a `NeedsRepair` cannot have diverged the logs.
+        committed_b_outlet_invoked_event_id: Option<String>,
+        /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
+        /// exhaustion). It tells the `Supervisor::run_saga` tail to LEAVE any held
+        /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
+        /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
+        /// auto-voided — only the concurrency slot is released — because the
+        /// operation may have partially committed; the signed
+        /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) + operator repair settles the escrow).
+        /// Every other terminal leaves this `false`, so the tail's void-or-settle
+        /// behaviour is unchanged on Aborted / unreachable-Commit-A paths.
+        reached_needs_repair: bool,
+    }
+}
+
+/// Every field of a [`CrossContextSagaCtx`], for tests outside this crate to build one.
+/// Compiled only under `testing`, so no production or bridge build can
+/// construct a `CrossContextSagaCtx` outside core (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct CrossContextSagaCtxTestParts<'a> {
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub caller_context_id: [u8; 32],
-    /// Raw 32-byte target context id (B's own context; where the outlet runs).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub target_context_id: [u8; 32],
-    /// Channel-authenticated caller DID (spec §6.2.4 "Caller authentication").
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub caller_did: DID,
-    /// Context-local outlet registration id (indexes B's registry).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub outlet_registration_id: String,
-    /// UCAN proof index into B's store (`None` ⇒ ungated outlet).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub ucan_proof_id: Option<String>,
-    /// Outlet input — validated at Prepare-B, executed at Commit-B.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub input: serde_json::Value,
-    /// Caller-asserted advisory chain depth (freshness/`+1` base only).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub asserted_chain_depth: u8,
-    /// Caller-asserted 16-byte wire nonce (freshness + dual-log join key).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub asserted_nonce: [u8; 16],
-    /// Caller-asserted send-time (ms) — §9.14 skew check only.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub asserted_timestamp_ms: u64,
-    /// The channel-authenticated caller's role in the caller context, resolved
-    /// supervisor-side at initiation (NOT envelope-asserted). Carried to
-    /// Prepare-B so B enforces `InboundPolicy.allowed_source_roles` against the
-    /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
-    /// role assignment.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub caller_source_role: Option<String>,
-    /// The signer for the target context's Active Signing Key — receipt +
-    /// divergence-marker signing (Commit-B / NeedsRepair). The actor holds no
-    /// custody key (ADR-049); the FSM passes a clone of this caller-supplied
-    /// signer with each command, and the actor signs through it in the turn
-    /// (Decision 7a).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub target_signer: crate::context::actor::signer::CommandSigner,
-    /// The signer for the caller context's Active Signing Key — used ONLY to
-    /// sign the caller-side `CrossContextDivergenceMarker` on a `NeedsRepair`
-    /// outcome (spec §6.2.4 "Dual event-log recording"). Distinct from
-    /// `target_signer`: each side signs its OWN marker into its OWN log under
-    /// its OWN Active Signing Key.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub caller_signer: crate::context::actor::signer::CommandSigner,
-    /// The supervisor-side outlet executor, taken once at Commit-B.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub executor: Option<SagaOutletExecutor<'a>>,
-    /// The captured outlet output bytes, stashed the moment the executor runs
-    /// ONCE (Commit-B first execute), so a transient Commit-B SETTLE failure is
-    /// retryable WITHOUT re-invoking the outlet (spec §6.2.4 "Exactly-once
-    /// execution"). On a retry the reserve returns `ReadyToExecute` (the capture
-    /// was rolled back by the failed settle's persist), but the outlet already ran
-    /// and had side effects — so the FSM re-sends `CommitBSettle` with THESE
-    /// stashed bytes rather than calling the (already-taken) executor again.
-    /// `Some` ⇒ the outlet has executed; never call the executor when this is set.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub executor_output: Option<Vec<u8>>,
-    /// Prepare-A's held reservation (settled at Commit-A, released on abort).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
-    /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
-    /// Read by `Supervisor::xctx_prepared_evidence_bytes`: once `Some`, these values
-    /// override the caller-asserted nonce / depth / timestamp in the journaled
-    /// prepared evidence (the §17.16.4 replay surface).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
-    /// Commit-B's captured receipt + output (forwarded to Commit-A + output).
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub committed: Option<CommittedSagaArtifacts>,
-    /// The target side's `OutletInvoked` event id, captured the moment Commit-B
-    /// lands (reserve `AlreadyCommitted` OR a first execution settle). `Some`
-    /// proves the TARGET committed its `OutletInvoked` record even when the saga
-    /// later diverges (Commit-A fails → `NeedsRepair`): the
-    /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) then records
-    /// `committed_side = Target` and this event id (spec §6.2.4
-    /// "Dual event-log recording"). `None` means Commit-B never landed, so no
-    /// side committed and a `NeedsRepair` cannot have diverged the logs.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub committed_b_outlet_invoked_event_id: Option<String>,
-    /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
-    /// exhaustion). It tells the `Supervisor::run_saga` tail to LEAVE any held
-    /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
-    /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
-    /// auto-voided — only the concurrency slot is released — because the
-    /// operation may have partially committed; the signed
-    /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) + operator repair settles the escrow).
-    /// Every other terminal leaves this `false`, so the tail's void-or-settle
-    /// behaviour is unchanged on Aborted / unreachable-Commit-A paths.
+    /// [`CrossContextSagaCtx`]'s field of the same name.
     pub reached_needs_repair: bool,
 }
 
-/// The receipt + output captured at Commit-B, forwarded to Commit-A and
-/// surfaced in [`SagaOutput`]. The `SagaId`-stable `OutletInvoked` event id is
-/// carried INSIDE the signed receipt (`receipt`), so it is not duplicated
-/// here — an auditor reads it from the verified receipt.
-pub struct CommittedSagaArtifacts {
-    /// JCS bytes of the target's signed `CrossContextOutletReceipt`.
-    receipt: Vec<u8>,
-    /// The captured outlet output bytes (the receipt's canonical `output_jcs`).
-    output: Vec<u8>,
+#[cfg(any(test, feature = "testing"))]
+impl<'a> CrossContextSagaCtx<'a> {
+    /// Builds a `CrossContextSagaCtx` from its test parts.
+    #[must_use]
+    pub fn from_test_parts(parts: CrossContextSagaCtxTestParts<'a>) -> Self {
+        Self {
+            caller_context_id: parts.caller_context_id,
+            target_context_id: parts.target_context_id,
+            caller_did: parts.caller_did,
+            outlet_registration_id: parts.outlet_registration_id,
+            ucan_proof_id: parts.ucan_proof_id,
+            input: parts.input,
+            asserted_chain_depth: parts.asserted_chain_depth,
+            asserted_nonce: parts.asserted_nonce,
+            asserted_timestamp_ms: parts.asserted_timestamp_ms,
+            caller_source_role: parts.caller_source_role,
+            target_signer: parts.target_signer,
+            caller_signer: parts.caller_signer,
+            executor: parts.executor,
+            executor_output: parts.executor_output,
+            prepared_a: parts.prepared_a,
+            prepared_b: parts.prepared_b,
+            committed: parts.committed,
+            committed_b_outlet_invoked_event_id: parts.committed_b_outlet_invoked_event_id,
+            reached_needs_repair: parts.reached_needs_repair,
+        }
+    }
+}
+
+scp_runtime_types::pub_under_testing! {
+    /// The receipt + output captured at Commit-B, forwarded to Commit-A and
+    /// surfaced in [`SagaOutput`]. The `SagaId`-stable `OutletInvoked` event id is
+    /// carried INSIDE the signed receipt (`receipt`), so it is not duplicated
+    /// here — an auditor reads it from the verified receipt.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct CommittedSagaArtifacts {
+        /// JCS bytes of the target's signed `CrossContextOutletReceipt`.
+        receipt: Vec<u8>,
+        /// The captured outlet output bytes (the receipt's canonical `output_jcs`).
+        output: Vec<u8>,
+    }
 }
 
 /// A supervisor-level divergence repair record (spec §6.2.4 "Dual event-log
@@ -912,10 +1048,14 @@ impl Default for SupervisorConfig {
     }
 }
 
-/// Sliding-window length for the actor respawn budget (ADR-049 §10).
-/// Crashes older than this (relative to the newest crash) are evicted
-/// before the budget is evaluated.
-pub const CRASH_WINDOW_MS: u64 = 60_000;
+scp_runtime_types::pub_under_testing! {
+    /// Sliding-window length for the actor respawn budget (ADR-049 §10).
+    /// Crashes older than this (relative to the newest crash) are evicted
+    /// before the budget is evaluated.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const CRASH_WINDOW_MS: u64 = 60_000;
+}
 
 /// The budget of the supervisor-side outlet executor within one saga Commit
 /// attempt (§6.2.4). The executor runs off the actor mailbox (ADR-049 §3), so
@@ -947,22 +1087,34 @@ const _: () = assert!(
             + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
 );
 
-/// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
-/// (ADR-049 §10): "3 crashes in 60s poisons the context."
-pub const CRASH_POISON_THRESHOLD: usize = 3;
+scp_runtime_types::pub_under_testing! {
+    /// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
+    /// (ADR-049 §10): "3 crashes in 60s poisons the context."
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const CRASH_POISON_THRESHOLD: usize = 3;
+}
 
-/// Defensive upper bound on the retained crash-timestamp deque. The
-/// sliding-window eviction already bounds the deque to crashes within
-/// [`CRASH_WINDOW_MS`], but a pathological clock (non-monotonic, or stuck)
-/// could otherwise let it grow without bound. Capping at the poison
-/// threshold is sufficient: once the threshold is reached the context is
-/// poisoned and never respawned, so no further timestamps accrue. The cap
-/// keeps the structure O(1) in space regardless of clock behaviour.
-pub const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
+scp_runtime_types::pub_under_testing! {
+    /// Defensive upper bound on the retained crash-timestamp deque. The
+    /// sliding-window eviction already bounds the deque to crashes within
+    /// [`CRASH_WINDOW_MS`], but a pathological clock (non-monotonic, or stuck)
+    /// could otherwise let it grow without bound. Capping at the poison
+    /// threshold is sufficient: once the threshold is reached the context is
+    /// poisoned and never respawned, so no further timestamps accrue. The cap
+    /// keeps the structure O(1) in space regardless of clock behaviour.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
+}
 
-/// The `crash_windows` key prefix of a per-identity KeyPackage actor's window
-/// (`Supervisor::kp_crash_key`); no context ID starts with it.
-pub const KP_CRASH_KEY_PREFIX: &str = "kp::";
+scp_runtime_types::pub_under_testing! {
+    /// The `crash_windows` key prefix of a per-identity KeyPackage actor's window
+    /// (`Supervisor::kp_crash_key`); no context ID starts with it.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const KP_CRASH_KEY_PREFIX: &str = "kp::";
+}
 
 /// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
 ///
@@ -986,7 +1138,7 @@ pub struct CrashWindow {
     /// Sticky poison flag. Once set (the budget was exceeded) it stays set
     /// until [`Self::clear`] is called by an explicit operator action — a
     /// later in-window eviction must NOT silently un-poison the context.
-    pub poisoned: bool,
+    poisoned: bool,
     /// Set when the most recent respawn attempt FAILED (lost/corrupt
     /// snapshot, deps build failure, etc.) without the context being
     /// poisoned. Distinguishes "crashed and currently unrecoverable" from
@@ -1015,13 +1167,17 @@ pub struct CrashWindow {
     respawning: bool,
 }
 
-/// The bootstrap scope `Supervisor::begin_bootstrap_window` returns. When
-/// it drops, an id an actor now serves keeps a fresh budget, and an id no
-/// actor serves gets its prior [`CrashWindow`] back.
-pub struct BootstrapCrashWindow<'a> {
-    supervisor: &'a Supervisor,
-    context_id: String,
-    prior: Option<CrashWindow>,
+scp_runtime_types::pub_under_testing! {
+    /// The bootstrap scope `Supervisor::begin_bootstrap_window` returns. When
+    /// it drops, an id an actor now serves keeps a fresh budget, and an id no
+    /// actor serves gets its prior [`CrashWindow`] back.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct BootstrapCrashWindow<'a> {
+        supervisor: &'a Supervisor,
+        context_id: String,
+        prior: Option<CrashWindow>,
+    }
 }
 
 impl Drop for BootstrapCrashWindow<'_> {
@@ -1038,6 +1194,14 @@ impl Drop for BootstrapCrashWindow<'_> {
 }
 
 impl CrashWindow {
+    /// Test-only reach into [`Self::record`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn record_for_test(&mut self, now_ms: u64) -> bool {
+        Self::record(self, now_ms)
+    }
+
     /// Record a crash at `now_ms` and return whether the context is now
     /// poisoned.
     ///
@@ -1053,7 +1217,7 @@ impl CrashWindow {
     ///    threshold. The flag is sticky (never cleared here).
     ///
     /// Returns the (post-update) value of [`Self::is_poisoned`].
-    pub fn record(&mut self, now_ms: u64) -> bool {
+    fn record(&mut self, now_ms: u64) -> bool {
         self.crashes.push_back(now_ms);
         while let Some(&front) = self.crashes.front() {
             if now_ms.saturating_sub(front) > CRASH_WINDOW_MS {
@@ -1073,10 +1237,28 @@ impl CrashWindow {
         self.poisoned
     }
 
+    /// Test-only reach into [`Self::is_poisoned`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn is_poisoned_for_test(&self) -> bool {
+        Self::is_poisoned(self)
+    }
+
     /// Whether the context is poisoned (the respawn budget was exceeded).
     #[must_use]
-    pub const fn is_poisoned(&self) -> bool {
+    const fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Test-only reach into [`Self::last_respawn_failed`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn last_respawn_failed_for_test(&self) -> bool {
+        Self::last_respawn_failed(self)
     }
 
     /// Whether the most recent respawn failed without poisoning the context
@@ -1084,8 +1266,16 @@ impl CrashWindow {
     /// `Supervisor::lookup_miss_error` to surface
     /// [`ContextError::ActorCrashed`] rather than `ContextNotRegistered`.
     #[must_use]
-    pub const fn last_respawn_failed(&self) -> bool {
+    const fn last_respawn_failed(&self) -> bool {
         self.last_respawn_failed
+    }
+
+    /// Test-only reach into [`Self::mark_respawn_failed`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn mark_respawn_failed_for_test(&mut self) {
+        Self::mark_respawn_failed(self);
     }
 
     /// Record that the most recent respawn attempt failed (lost/corrupt
@@ -1094,7 +1284,7 @@ impl CrashWindow {
     /// the orthogonal "currently unrecoverable" signal that drives the
     /// lookup-miss error class. Always paired with a `record` call at the
     /// failure site.
-    pub const fn mark_respawn_failed(&mut self) {
+    const fn mark_respawn_failed(&mut self) {
         self.last_respawn_failed = true;
     }
 
@@ -1114,25 +1304,50 @@ impl CrashWindow {
         self.poisoned || self.last_respawn_failed || self.respawning
     }
 
+    /// Test-only reach into [`Self::is_respawning`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn is_respawning_for_test(&self) -> bool {
+        Self::is_respawning(self)
+    }
+
     /// Whether the context is mid-respawn (despawned, not yet re-registered).
     /// Used by `Supervisor::lookup_miss_error` to surface a retryable
     /// `ActorCrashed` rather than a misleading `ContextNotRegistered` during
     /// the transient respawn gap (ADR-049 §10).
     #[must_use]
-    pub const fn is_respawning(&self) -> bool {
+    const fn is_respawning(&self) -> bool {
         self.respawning
+    }
+
+    /// Test-only reach into [`Self::mark_respawning`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn mark_respawning_for_test(&mut self) {
+        Self::mark_respawning(self);
     }
 
     /// Mark the start of a respawn (set just before the despawn). Paired with
     /// [`Self::clear_respawning`] on every respawn exit.
-    pub const fn mark_respawning(&mut self) {
+    const fn mark_respawning(&mut self) {
         self.respawning = true;
+    }
+
+    /// Test-only reach into [`Self::clear_respawning`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn clear_respawning_for_test(&mut self) {
+        Self::clear_respawning(self);
     }
 
     /// Clear the transient respawn marker once the respawn has completed
     /// (success, failure, or terminal-skip) and the registry once again
     /// reflects the true state.
-    pub const fn clear_respawning(&mut self) {
+    const fn clear_respawning(&mut self) {
         self.respawning = false;
     }
 
@@ -1148,19 +1363,36 @@ impl CrashWindow {
         self.crashes.is_empty() && !self.poisoned && !self.last_respawn_failed
     }
 
+    /// Test-only reach into [`Self::crash_count`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn crash_count_for_test(&self) -> usize {
+        Self::crash_count(self)
+    }
+
     /// Current number of crashes retained in the window. Used by the
     /// watchdog log line so operators can see how close a context is to
     /// the poison threshold.
     #[must_use]
-    pub fn crash_count(&self) -> usize {
+    fn crash_count(&self) -> usize {
         self.crashes.len()
+    }
+
+    /// Test-only reach into [`Self::clear`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn clear_for_test(&mut self) {
+        Self::clear(self);
     }
 
     /// Operator un-poison: clear the recorded crashes and the sticky
     /// poison flag so the context can be respawned again. Distinct from
     /// the automatic window eviction in [`Self::record`], which never
     /// touches `poisoned`.
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.crashes.clear();
         self.poisoned = false;
         self.last_respawn_failed = false;
@@ -1229,12 +1461,21 @@ fn log_watchdog_without_supervisor(
     }
 }
 
+/// Test-only reach into [`escrow_reversal_join_failure_message`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn escrow_reversal_join_failure_message_for_test(err: &tokio::task::JoinError) -> &'static str {
+    escrow_reversal_join_failure_message(err)
+}
+
 /// Log line for a streaming-open escrow reversal task that ended without
 /// returning. A panic is named without its payload (the ADR-049 §10
 /// payload-free rule; a `JoinError`'s `Display` carries the payload), and a
 /// cancellation, such as its runtime shutting down, is named as one.
 #[must_use]
-pub fn escrow_reversal_join_failure_message(err: &tokio::task::JoinError) -> &'static str {
+fn escrow_reversal_join_failure_message(err: &tokio::task::JoinError) -> &'static str {
     match JoinFailure::from_join_error(err) {
         JoinFailure::Panicked => {
             "streaming open escrow reversal task panicked — the hold may stay debited; \
@@ -1423,22 +1664,38 @@ impl SubtaskSpawner {
     }
 }
 
-/// Spawns onto the Supervisor's task tracker for one operation that began
-/// before shutdown, such as a streaming open that starts its pump and its
-/// seal task (ADR-049 Decision 16, item 2). Issued by
-/// `Supervisor::tracked_spawner`. It holds a tracker token, so the tracker
-/// is not empty while the spawner lives: the drain waits for the operation
-/// that holds it and for every task spawned through it.
-#[derive(Clone)]
-pub struct TrackedSpawner {
-    tracker: tokio_util::task::TaskTracker,
-    _token: tokio_util::task::task_tracker::TaskTrackerToken,
+scp_runtime_types::pub_under_testing! {
+    /// Spawns onto the Supervisor's task tracker for one operation that began
+    /// before shutdown, such as a streaming open that starts its pump and its
+    /// seal task (ADR-049 Decision 16, item 2). Issued by
+    /// `Supervisor::tracked_spawner`. It holds a tracker token, so the tracker
+    /// is not empty while the spawner lives: the drain waits for the operation
+    /// that holds it and for every task spawned through it.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Clone)]
+    pub(crate) struct TrackedSpawner {
+        tracker: tokio_util::task::TaskTracker,
+        _token: tokio_util::task::task_tracker::TaskTrackerToken,
+    }
 }
 
 impl TrackedSpawner {
+    /// Test-only reach into [`Self::spawn`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn spawn_for_test<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        Self::spawn(self, future)
+    }
+
     /// Spawns `future` onto the Supervisor's task tracker, marked as a
     /// tracked task (see `tracked_task_marker`).
-    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    pub(in crate::context) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -1464,28 +1721,40 @@ impl TrackedSpawner {
     }
 }
 
-/// The escrow-refund sink of a streaming open's escrow ticket.
-///
-/// It hands the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)'s
-/// `Drop` refund to a task spawned through the open's
-/// [`TrackedSpawner`], so a refund fired after `shutdown_all_contexts` has
-/// begun still runs (ADR-049 Decision 16, item 2, second exception). That
-/// task awaits the [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
-/// refund itself and spawns nothing further.
-pub struct SpawnerEscrowRefundSink {
-    /// The sink the spawned task runs.
-    inner: Arc<crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink>,
-    /// A clone of the open's spawner.
-    spawner: TrackedSpawner,
-    /// Runtime handle captured at construction, so the `Drop`-fired refund
-    /// can spawn even when it runs off a runtime thread.
-    runtime: tokio::runtime::Handle,
+scp_runtime_types::pub_under_testing! {
+    /// The escrow-refund sink of a streaming open's escrow ticket.
+    ///
+    /// It hands the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)'s
+    /// `Drop` refund to a task spawned through the open's
+    /// [`TrackedSpawner`], so a refund fired after `shutdown_all_contexts` has
+    /// begun still runs (ADR-049 Decision 16, item 2, second exception). That
+    /// task awaits the [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
+    /// refund itself and spawns nothing further.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct SpawnerEscrowRefundSink {
+        /// The sink the spawned task runs.
+        inner: Arc<crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink>,
+        /// A clone of the open's spawner.
+        spawner: TrackedSpawner,
+        /// Runtime handle captured at construction, so the `Drop`-fired refund
+        /// can spawn even when it runs off a runtime thread.
+        runtime: tokio::runtime::Handle,
+    }
 }
 
 impl SpawnerEscrowRefundSink {
+    /// Test-only reach into [`Self::new`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test(supervisor: &Arc<Supervisor>, spawner: &TrackedSpawner) -> Self {
+        Self::new(supervisor, spawner)
+    }
+
     /// Builds the sink for an open on `supervisor` that holds `spawner`,
     /// capturing the current runtime handle.
-    pub fn new(supervisor: &Arc<Supervisor>, spawner: &TrackedSpawner) -> Self {
+    fn new(supervisor: &Arc<Supervisor>, spawner: &TrackedSpawner) -> Self {
         Self {
             inner: Arc::new(
                 crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
@@ -1529,15 +1798,19 @@ pub enum DrainWithDeadline<T> {
     TimedOut,
 }
 
-/// The kind of work a tracked task hands to a task of its own through
-/// `Supervisor::spawn_tracked_on`. The variants are the two kinds ADR-049
-/// Decision 16 item 2 admits after the closed flag is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SinkHandoff {
-    /// A streaming settlement routed to the context actor.
-    StreamSettlement,
-    /// The append of a stream's close-time `OutletInvokedEvent`.
-    OutletInvokedEventAppend,
+scp_runtime_types::pub_under_testing! {
+    /// The kind of work a tracked task hands to a task of its own through
+    /// `Supervisor::spawn_tracked_on`. The variants are the two kinds ADR-049
+    /// Decision 16 item 2 admits after the closed flag is set.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SinkHandoff {
+        /// A streaming settlement routed to the context actor.
+        StreamSettlement,
+        /// The append of a stream's close-time `OutletInvokedEvent`.
+        OutletInvokedEventAppend,
+    }
 }
 
 impl SinkHandoff {
@@ -1924,7 +2197,11 @@ pub struct Supervisor {
         clippy::disallowed_types,
         reason = "ADR-049 §Decision 12 allow-list: the ArcSwap+write_lock write-serialization guard. Cold write path (not a per-command read), so the Mutex acquire cost the ban targets does not apply."
     )]
-    pub write_lock: tokio::sync::Mutex<()>,
+    /// Private to this module: every write outside it goes through a method
+    /// here that takes the lock itself ([`Self::insert_local_did`],
+    /// [`Self::insert_standing_context`]), so no caller can hold the guard
+    /// across its own code (ADR-070 §4).
+    write_lock: tokio::sync::Mutex<()>,
     /// Serializes the whole bootstrap-spawn sequence of ALL three lifecycle
     /// bootstrap variants — `create_context`, `import_context`, and
     /// `restore_context` — each of which writes per-context crypto state and
@@ -2437,6 +2714,21 @@ impl DurableProviders {
         Arc::clone(&self.mls_storage)
     }
 
+    /// Test-only reach into [`Self::into_parts`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn into_parts_for_test(
+        self,
+    ) -> (
+        Arc<dyn SagaJournal>,
+        Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        Arc<dyn crate::store::sync::RelayContactStore>,
+    ) {
+        Self::into_parts(self)
+    }
+
     /// Decomposes the pair into its journal + `mls_storage` halves.
     ///
     /// `pub(crate)` — the ONLY consumer is
@@ -2444,7 +2736,7 @@ impl DurableProviders {
     /// crate-private is what prevents an out-of-crate caller from splitting the
     /// pair and re-pairing the halves with divergent backends.
     #[must_use]
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         Arc<dyn SagaJournal>,
@@ -2492,12 +2784,16 @@ struct ProviderBootstrap {
 }
 
 impl Supervisor {
-    /// Per-context lifecycle operation budget (ADR-049 §10). Bounds
-    /// `restore_context` on BOTH the `RestoreContext` dispatch arm and the
-    /// watchdog respawn (`respawn_from_snapshot`) so a hung storage provider
-    /// cannot pin the global `bootstrap_spawn_lock` indefinitely. A single
-    /// associated const keeps the two call sites in lock-step.
-    pub const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    scp_runtime_types::pub_under_testing! {
+        /// Per-context lifecycle operation budget (ADR-049 §10). Bounds
+        /// `restore_context` on BOTH the `RestoreContext` dispatch arm and the
+        /// watchdog respawn (`respawn_from_snapshot`) so a hung storage provider
+        /// cannot pin the global `bootstrap_spawn_lock` indefinitely. A single
+        /// associated const keeps the two call sites in lock-step.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        pub(crate) const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    }
 
     /// Constructs a fresh supervisor.
     ///
@@ -3087,6 +3383,14 @@ impl Supervisor {
         )
     }
 
+    /// Test-only reach into [`Self::reap_stream_admission`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn reap_stream_admission_for_test(&self, context_id: &str) {
+        Self::reap_stream_admission(self, context_id);
+    }
+
     /// Drop the stream admission-tracker registry entry for `context_id` on
     /// PERMANENT context teardown (close / TTL-expiry / discard-join /
     /// shutdown sweep) — the twin of the [`Self::reap_crash_window`] /
@@ -3100,7 +3404,7 @@ impl Supervisor {
     /// registry's `Arc` reference; an in-flight pump holding its own `Arc`
     /// clone of the tracker keeps it alive until the pump ends — this does
     /// not force-drop or invalidate any live tracker.
-    pub fn reap_stream_admission(&self, context_id: &str) {
+    pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
         self.outlet_stream_admission
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3132,9 +3436,9 @@ impl Supervisor {
     // leaves them empty (used by saga + spawn unit tests that don't
     // touch providers).
     //
-    // Direct-state accessors (`local_dids_ref`, `standing_contexts_ref`)
-    // return non-Option references — the underlying fields are eagerly
-    // initialized in [`Self::new`] and always populated.
+    // The direct-state accessor `local_dids_ref` returns a non-Option
+    // reference: the field is eagerly initialized in [`Self::new`] and
+    // always populated.
     //
     // Visibility: `pub(crate)` so hoisted helpers can reach them;
     // external callers go through `SupervisorHandle`.
@@ -3180,13 +3484,22 @@ impl Supervisor {
         self.event_log.get()
     }
 
+    /// Test-only reach into [`Self::persistence_ref`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn persistence_ref_for_test(&self) -> Option<&Arc<dyn ContextPersistence>> {
+        Self::persistence_ref(self)
+    }
+
     /// Cheap reference to the helper-side persistence slot. Returns
     /// `None` only on a test-only constructor that leaves the slot empty
     /// (`Self::new`, `Self::for_query_shim`, or `Self::with_providers` with
     /// `persistence: None`); [`Self::with_providers_and_journal`] always fills
     /// it.
     #[must_use]
-    pub fn persistence_ref(&self) -> Option<&Arc<dyn ContextPersistence>> {
+    pub(crate) fn persistence_ref(&self) -> Option<&Arc<dyn ContextPersistence>> {
         self.helper_persistence.get()
     }
 
@@ -3386,6 +3699,15 @@ impl Supervisor {
     // ADR-049 §15 — direct-state accessors (always populated).
     // -------------------------------------------------------------------
 
+    /// Test-only reach into [`Self::local_dids_ref`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn local_dids_ref_for_test(&self) -> &ArcSwap<HashSet<DID>> {
+        Self::local_dids_ref(self)
+    }
+
     /// Cheap reference to the supervisor's local-DID registry.
     ///
     /// The field is `Arc<ArcSwap<HashSet<DID>>>` per the master plan
@@ -3397,8 +3719,29 @@ impl Supervisor {
     /// the outer `Arc` (which exists only so [`ActorDeps`](crate::context::actor::deps::ActorDeps) can share the
     /// swap cell via `Arc::clone`).
     #[must_use]
-    pub fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
+    pub(crate) fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
         &self.local_dids
+    }
+
+    /// Inserts `did` into the local-DID set. Takes the write lock, clones the
+    /// snapshot, inserts and stores (ADR-049 §Decision 12): reads stay
+    /// lock-free, and serialised writes lose no update against the cloned
+    /// snapshot. Idempotent. Callable within this crate only.
+    pub(crate) async fn insert_local_did(&self, did: DID) {
+        let _guard = self.write_lock.lock().await;
+        let mut updated: HashSet<DID> = (*self.local_dids.load_full()).clone();
+        updated.insert(did);
+        self.local_dids.store(Arc::new(updated));
+    }
+
+    /// Inserts `peer_did` into the standing-context index, under the same
+    /// lock-clone-store discipline as [`Self::insert_local_did`]. Idempotent.
+    /// Callable within this crate only.
+    pub(crate) async fn insert_standing_context(&self, peer_did: DID) {
+        let _guard = self.write_lock.lock().await;
+        let mut updated: HashMap<String, DID> = (*self.standing_contexts.load_full()).clone();
+        updated.insert(peer_did.to_string(), peer_did);
+        self.standing_contexts.store(Arc::new(updated));
     }
 
     /// Cheap `Arc::clone` of the shared `local_dids` swap cell, handed to
@@ -3409,16 +3752,6 @@ impl Supervisor {
     #[must_use]
     pub(crate) fn local_dids_shared(&self) -> Arc<ArcSwap<HashSet<DID>>> {
         Arc::clone(&self.local_dids)
-    }
-
-    /// Cheap reference to the supervisor's standing-context tracking
-    /// map (peer DID string → peer [`DID`]).
-    ///
-    /// `ArcSwap<HashMap<...>>` per the master plan §Supervisor — same
-    /// read/write discipline as [`Self::local_dids_ref`].
-    #[must_use]
-    pub const fn standing_contexts_ref(&self) -> &ArcSwap<HashMap<String, DID>> {
-        &self.standing_contexts
     }
 
     // -------------------------------------------------------------------
@@ -3436,6 +3769,14 @@ impl Supervisor {
     // either. `wrapping_key` is the sync lookup the actor builders use.
     // -------------------------------------------------------------------
 
+    /// Test-only reach into [`Self::clear_wrapping_keys`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn clear_wrapping_keys_for_test(&self, write: &tokio::sync::MutexGuard<'_, ()>) {
+        Self::clear_wrapping_keys(self, write);
+    }
+
     /// Clear every per-identity wrapping key. Used by the shutdown helper,
     /// after it closes the spawn gate, so no wrapping key stays resident past
     /// shutdown.
@@ -3444,7 +3785,7 @@ impl Supervisor {
     /// `Self::insert_wrapping_key`, checks the gate under that same lock, so
     /// an insert either precedes this clear or sees the closed gate and is
     /// refused: no load in flight at shutdown re-inserts a key afterwards.
-    pub fn clear_wrapping_keys(&self, _write: &tokio::sync::MutexGuard<'_, ()>) {
+    pub(crate) fn clear_wrapping_keys(&self, _write: &tokio::sync::MutexGuard<'_, ()>) {
         self.wrapping_keys.clear();
     }
 
@@ -4278,7 +4619,7 @@ impl Supervisor {
                 // code at the bridges, and the two wrapping-key variants keep
                 // their names.
                 if let Err(e) = self.load_wrapping_key(&p.creator_did).await {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(
                         scp_protocol::context::builder::ContextCreationError::StateTransition(e),
                     ));
@@ -4328,7 +4669,7 @@ impl Supervisor {
                 let deps = match self.build_actor_deps(&p.creator_did).await {
                     Ok(deps) => deps,
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         // A shutdown refusal keeps its typed `SCP-CTX-2138`
                         // (ADR-049 Decision 16 item 2), as the import and
                         // restore arms pass `e` through unchanged.
@@ -4425,7 +4766,7 @@ impl Supervisor {
                 ) {
                     Ok(guard) => guard,
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         drop(crash_window);
                         if let Err(_unsent) = reply.send(Err(
                             scp_protocol::context::builder::ContextCreationError::StateTransition(
@@ -4486,7 +4827,7 @@ impl Supervisor {
                                 crate::context::shared::lifecycle::fold_rollback_failure(
                                     &e, &rollback,
                                 );
-                            let sketch = standing_outcome_error_sketch(&folded);
+                            let sketch = crate::context::actor::outcome::outcome_error_sketch(&folded);
                             (
                                 Outcome::err_mutated(sketch),
                                 Err(scp_protocol::context::builder::ContextCreationError::StateTransition(folded)),
@@ -4499,7 +4840,7 @@ impl Supervisor {
                     Ok(spawned) => match spawned.finalize(&deps).await {
                         Ok(handle) => (outcome, Ok(handle)),
                         Err(e) => {
-                            let sketch = standing_outcome_error_sketch(&e);
+                            let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                             (
                                 Outcome::err_mutated(sketch),
                                 Err(scp_protocol::context::builder::ContextCreationError::StateTransition(e)),
@@ -4535,7 +4876,7 @@ impl Supervisor {
                     &export,
                     &verifying_key,
                 ) {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err_mutated(sketch);
                 }
@@ -4545,7 +4886,7 @@ impl Supervisor {
                 let owning_did = match self.node_identity() {
                     Ok(did) => did,
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
                     }
@@ -4572,7 +4913,7 @@ impl Supervisor {
                 // `bootstrap_spawn_lock`. The wrapping key loads first, outside
                 // both locks, so no custody call runs under either.
                 if let Err(e) = self.load_wrapping_key(&owning_did).await {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err_mutated(sketch);
                 }
@@ -4600,7 +4941,7 @@ impl Supervisor {
                         if kp_store_newly_spawned {
                             self.key_package_stores.remove(&owning_did);
                         }
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         drop(crash_window);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
@@ -4621,7 +4962,7 @@ impl Supervisor {
                         if kp_store_newly_spawned {
                             self.key_package_stores.remove(&owning_did);
                         }
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         drop(crash_window);
                         if let Err(_unsent) = reply.send(Err(e)) {
                             tracing::debug!(context_id, "import_context caller dropped its reply");
@@ -4653,7 +4994,7 @@ impl Supervisor {
                         if kp_store_newly_spawned {
                             self.key_package_stores.remove(&owning_did);
                         }
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         (Outcome::err_mutated(sketch), Err(e))
                     }
                     Err(_elapsed) => {
@@ -4663,7 +5004,7 @@ impl Supervisor {
                         let err = ContextError::TransportTimeout(format!(
                             "import_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
                         ));
-                        let sketch = standing_outcome_error_sketch(&err);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
@@ -4680,7 +5021,7 @@ impl Supervisor {
                                 crate::context::shared::lifecycle::fold_rollback_failure(
                                     &e, &rollback,
                                 );
-                            let sketch = standing_outcome_error_sketch(&folded);
+                            let sketch = crate::context::actor::outcome::outcome_error_sketch(&folded);
                             (Outcome::err_mutated(sketch), Err(folded))
                         }
                     },
@@ -4690,7 +5031,7 @@ impl Supervisor {
                     Ok(spawned) => match spawned.finalize(&deps).await {
                         Ok(handle) => (outcome, Ok(handle)),
                         Err(e) => {
-                            let sketch = standing_outcome_error_sketch(&e);
+                            let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                             (Outcome::err_mutated(sketch), Err(e))
                         }
                     },
@@ -4714,7 +5055,7 @@ impl Supervisor {
                 let owner = match owner {
                     Ok(owner) => owner,
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
                     }
@@ -4725,7 +5066,7 @@ impl Supervisor {
                 // A restore must not start an actor from a snapshot a failed
                 // create, import or join wrote and has not yet put back.
                 if let Err(e) = self.refuse_pending_first_state(&p.context_id, &bootstrap_guard) {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
@@ -4733,14 +5074,14 @@ impl Supervisor {
                 if let Err(e) = handle
                     .transition_to(&scp_protocol::context::ContextState::Active)
                 {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
                 let deps = match self.build_actor_deps(&owner).await {
                     Ok(deps) => deps,
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
                     }
@@ -4756,14 +5097,14 @@ impl Supervisor {
                 {
                     Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
                     Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         (Outcome::err_mutated(sketch), Err(e))
                     }
                     Err(_elapsed) => {
                         let err = ContextError::TransportTimeout(format!(
                             "restore_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
                         ));
-                        let sketch = standing_outcome_error_sketch(&err);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
@@ -4782,19 +5123,19 @@ impl Supervisor {
             // `FlushSnapshot`/`ShutdownSelf` never-should-reach arms).
             LifecycleCommand::JoinContext { payload, reply } => {
                 let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
             LifecycleCommand::LeaveContext { payload, reply } => {
                 let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
             LifecycleCommand::CloseContext { payload, reply } => {
                 let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -4802,7 +5143,7 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = self.lookup_miss_error(&context_id, context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -4825,7 +5166,7 @@ impl Supervisor {
             | LifecycleCommand::ClearNeedsReconnect { context_id, reply }
             | LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
                 let err = self.lookup_miss_error(&context_id, context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -4960,13 +5301,7 @@ impl Supervisor {
         // handler-side `dispatch_from_shim` and its `_legacy` body have
         // been deleted; every command's target actor must be spawned
         // before dispatch reaches this method.
-        let Some(ctx_id) = Self::governance_command_context_id(&cmd) else {
-            return Err(ContextError::ContextNotRegistered(
-                "dispatch_governance_command — variant has no per-context routing target \
-                 (sweep / timeout-task use the iterating helpers); mailbox-only after Phase 2A finalization"
-                    .to_owned(),
-            ));
-        };
+        let ctx_id = Self::governance_command_context_id(&cmd);
         let actor = self.lookup(ctx_id).ok_or_else(|| {
             self.lookup_miss_error(
                 ctx_id,
@@ -5347,12 +5682,20 @@ impl Supervisor {
                 .await
                 {
                     Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
+                    Ok(Err(e)) => (
+                        Outcome::err(crate::context::actor::outcome::outcome_error_sketch(&e)),
+                        Err(e),
+                    ),
                     Err(_elapsed) => {
                         let err = ContextError::TransportTimeout(format!(
                             "recovery_notify_contact exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for recovering_did {recovering_did}"
                         ));
-                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
+                        (
+                            Outcome::err(crate::context::actor::outcome::outcome_error_sketch(
+                                &err,
+                            )),
+                            Err(err),
+                        )
                     }
                 };
                 let _ = reply.send(reply_result);
@@ -5370,7 +5713,7 @@ impl Supervisor {
             // `dispatch_lifecycle_direct` per-context arms).
             TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
                 let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err_mutated(sketch)
             }
@@ -5378,13 +5721,13 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
             TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err_mutated(sketch)
             }
@@ -5420,7 +5763,7 @@ impl Supervisor {
                         Outcome::ok(())
                     }
                     Err(e) => {
-                        let sketch = standing_outcome_error_sketch(&e);
+                        let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                         let _ = reply.send(Err(e));
                         Outcome::err(sketch)
                     }
@@ -5582,7 +5925,7 @@ impl Supervisor {
                     Outcome::ok(())
                 }
                 Err(e) => {
-                    let sketch = standing_outcome_error_sketch(&e);
+                    let sketch = crate::context::actor::outcome::outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     Outcome::err(sketch)
                 }
@@ -5736,6 +6079,15 @@ impl Supervisor {
         Outcome::ok(())
     }
 
+    /// Test-only reach into [`Self::lookup`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn lookup_for_test(&self, ctx_id: &str) -> Option<ContextActorHandle> {
+        Self::lookup(self, ctx_id)
+    }
+
     /// Look up the actor handle for a context ID. Lock-free
     /// (`DashMap::get` + `Clone`).
     ///
@@ -5755,8 +6107,17 @@ impl Supervisor {
     /// points in `governance_helpers` / `lifecycle_helpers` can route
     /// per-actor sweep commands through the mailbox.
     #[must_use]
-    pub fn lookup(&self, ctx_id: &str) -> Option<ContextActorHandle> {
+    pub(in crate::context) fn lookup(&self, ctx_id: &str) -> Option<ContextActorHandle> {
         self.actors.get(ctx_id).map(|r| r.value().clone())
+    }
+
+    /// Test-only reach into [`Self::actor_ids`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn actor_ids_for_test(&self) -> Vec<String> {
+        Self::actor_ids(self)
     }
 
     /// Returns a snapshot of every currently-registered actor's
@@ -5773,7 +6134,7 @@ impl Supervisor {
     /// actor registry is the only context map — there is no legacy
     /// `contexts` DashMap.
     #[must_use]
-    pub fn actor_ids(&self) -> Vec<String> {
+    pub(in crate::context) fn actor_ids(&self) -> Vec<String> {
         self.actors.iter().map(|e| e.key().clone()).collect()
     }
 
@@ -7296,7 +7657,7 @@ impl Supervisor {
     /// must preserve the running crash count so the budget accumulates across
     /// respawns (the loop must eventually poison a reliably-crashing
     /// snapshot).
-    pub fn reap_crash_window(&self, context_id: &str) {
+    pub(in crate::context) fn reap_crash_window(&self, context_id: &str) {
         // `remove_if` evaluates the predicate while holding the shard lock and
         // only removes when it returns true — so a concurrent poison-despawn
         // cannot have the entry removed out from under it.
@@ -7410,7 +7771,9 @@ impl Supervisor {
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
                         Ok(Err(e)) => (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                            Outcome::err_mutated(
+                                crate::context::actor::outcome::outcome_error_sketch(&e),
+                            ),
                             Err(e),
                         ),
                         Err(_elapsed) => {
@@ -7418,7 +7781,9 @@ impl Supervisor {
                                 "standing_context exceeded {STANDING_TIMEOUT:?} budget"
                             ));
                             (
-                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                                Outcome::err_mutated(
+                                    crate::context::actor::outcome::outcome_error_sketch(&err),
+                                ),
                                 Err(err),
                             )
                         }
@@ -7458,7 +7823,9 @@ impl Supervisor {
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),
                         Ok(Err(e)) => (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                            Outcome::err_mutated(
+                                crate::context::actor::outcome::outcome_error_sketch(&e),
+                            ),
                             Err(e),
                         ),
                         Err(_elapsed) => {
@@ -7466,7 +7833,9 @@ impl Supervisor {
                                 "reconnect_all_standing exceeded {STANDING_TIMEOUT:?} budget"
                             ));
                             (
-                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                                Outcome::err_mutated(
+                                    crate::context::actor::outcome::outcome_error_sketch(&err),
+                                ),
                                 Err(err),
                             )
                         }
@@ -7547,7 +7916,7 @@ impl Supervisor {
                      reservation not captured"
                 ),
             );
-            let sketch = standing_outcome_error_sketch(&err);
+            let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
             let _ = reply.send(Err(err));
             return Ok(Outcome::err(sketch));
         }
@@ -7564,7 +7933,7 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7601,7 +7970,7 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7611,7 +7980,7 @@ impl Supervisor {
                 // restore and the sweep dispatch — reply the typed infra error
                 // (`Result<usize, _>` reply shape, distinct from the arm above).
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7625,7 +7994,7 @@ impl Supervisor {
                 // pre-check and here — reply with the typed error (no external
                 // escrow to void, unlike the unary settle backstop).
                 let err = ContextError::ContextNotRegistered(settlement.context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7633,7 +8002,7 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7641,7 +8010,7 @@ impl Supervisor {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7653,7 +8022,7 @@ impl Supervisor {
                 // down — the grant cannot be escrowed; reply the typed error so
                 // the bridge surfaces it and does NOT apply the credit grant.
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7663,7 +8032,7 @@ impl Supervisor {
                 // Outer `Result` = infra outcome — a missing actor is an
                 // infrastructure failure, not an admission decision.
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -7681,7 +8050,7 @@ impl Supervisor {
                 // voided synchronously — logged inside `consume_*`).
                 (*request).into_ticket().consume_abandoning_escrow();
                 let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
+                let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
@@ -11997,8 +12366,73 @@ impl Supervisor {
     pub(crate) async fn restore_all_contexts(
         self: &Arc<Self>,
     ) -> Result<RestoredContexts, ContextError> {
-        let ids = self.domains.lifecycle.restore_all_contexts(self).await?;
+        let ids = self.restore_persisted_active_contexts().await?;
         Ok(RestoredContexts::new(ids))
+    }
+
+    /// Restores every persisted `Active` context through [`Self::restore_context`]
+    /// and returns the restored ids. A context in `Closing`, `Closed` or `Expired`
+    /// is skipped. No actor exists before restore, so the sweep iterates
+    /// persistence, not the actor registry. A snapshot that fails to load or a
+    /// context that fails to restore is logged and skipped; the sweep
+    /// continues.
+    ///
+    /// Callable only inside `crate::context::supervisor`: the one caller is
+    /// [`Self::restore_all_contexts`] (ADR-070 §4, whole-Supervisor operations
+    /// live in core).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PersistenceFailed`] if the persistence provider is
+    ///   unconfigured or `list_persisted_contexts` fails.
+    async fn restore_persisted_active_contexts(
+        self: &Arc<Self>,
+    ) -> Result<Vec<String>, ContextError> {
+        let Some(persistence) = self.persistence_ref() else {
+            return Err(ContextError::PersistenceFailed(
+                "no persistence provider configured".into(),
+            ));
+        };
+        let context_ids = persistence.list_persisted_contexts().await.map_err(|e| {
+            ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+        })?;
+
+        let mut restored = Vec::new();
+        for ctx_id in &context_ids {
+            let ctx_snapshot = match persistence.load_context(ctx_id).await {
+                Ok(Some(snap)) => snap,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "failed to load context snapshot during restore"
+                    );
+                    continue;
+                }
+            };
+
+            if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
+                continue;
+            }
+
+            let handle = crate::context::ContextHandle::new(
+                ctx_id.clone(),
+                ctx_snapshot.context_params.clone(),
+            );
+
+            match self.restore_context(ctx_id, &handle).await {
+                Ok(()) => restored.push(ctx_id.clone()),
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "failed to restore context"
+                    );
+                }
+            }
+        }
+        Ok(restored)
     }
 
     /// Single process-startup recovery entry point (ADR-049).
@@ -12227,7 +12661,139 @@ impl Supervisor {
     /// the sweep, because the actor is despawned either way, which closes its
     /// inbox. Returning means the drain finished.
     pub async fn shutdown_all_contexts(&self) {
-        self.domains.lifecycle.shutdown_all_contexts(self).await;
+        let context_ids = self.shutdown_sweep().await;
+        self.await_tracked_tasks().await;
+        let removed_count = self.reap_swept_floors(&context_ids);
+        tracing::info!(
+            removed_count,
+            "shutdown: removed all contexts, stopped key-package actors, and drained every \
+             supervisor task"
+        );
+    }
+
+    /// Steps 1 to 5 of [`Self::shutdown_all_contexts`]; returns the ids of the
+    /// context actors the sweep despawned.
+    ///
+    /// 1. Close the spawn gate.
+    /// 2. Snapshot the actor registry under the write lock. A spawner that
+    ///    passed the gate check registers under the same lock, so the snapshot
+    ///    holds every actor that can still be spawned.
+    /// 3. Send each actor `LifecycleCommand::ShutdownSelf`, which destroys
+    ///    sender keys, the MLS group and the event log in that order, then
+    ///    despawn the actor whether or not the send succeeded and whether or not
+    ///    it replied within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    /// 4. Stop every key-package and challenger-ledger actor.
+    /// 5. Clear the standing-context index, the local-DID registry and the
+    ///    per-identity wrapping keys under one write-lock hold.
+    ///
+    /// Callable only inside this module: the one caller is
+    /// [`Self::shutdown_all_contexts`].
+    async fn shutdown_sweep(&self) -> Vec<String> {
+        use std::collections::{HashMap, HashSet};
+
+        use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+
+        self.close_spawn_gate();
+        let context_ids = {
+            let _guard = self.write_lock.lock().await;
+            self.actor_ids()
+        };
+        for ctx_id in &context_ids {
+            if let Some(actor) = self.lookup(ctx_id) {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
+                match actor
+                    .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                    .await
+                {
+                    Ok(()) => match crate::context::actor::bounded_reply_await(rx).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            context_id = %ctx_id,
+                            error = %e,
+                            "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
+                        ),
+                        Err(crate::context::actor::BoundedReplyError::Dropped) => {
+                            tracing::warn!(
+                                context_id = %ctx_id,
+                                "shutdown: actor exited before replying to ShutdownSelf; despawning"
+                            );
+                        }
+                        Err(crate::context::actor::BoundedReplyError::Elapsed) => {
+                            tracing::warn!(
+                                context_id = %ctx_id,
+                                "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
+                                 despawning"
+                            );
+                        }
+                    },
+                    Err(e) => tracing::warn!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "shutdown: ShutdownSelf not delivered; despawning, which closes the \
+                         actor's inbox and drops its state"
+                    ),
+                }
+            }
+            // `ShutdownSelf` tears down the per-context resources (sender
+            // keys, MLS group, event log, timers) but does NOT break the
+            // actor's `run()` loop — only `LifecycleControlCommand::Shutdown`
+            // and a claimed `PrepareForReplace` do, and neither is sent here.
+            // Despawning removes the handle from `actors` under the write lock,
+            // dropping the last `mpsc::Sender`. That closes the inbox, so the
+            // actor's `run()` loop exits on its inbox-closed (`None`) arm and the
+            // spawned task releases its `PerContextState`. The despawn runs
+            // even when the send failed or the reply did not arrive within
+            // `REPLY_TIMEOUT`, so a full mailbox or a wedged actor cannot keep an
+            // actor registered past shutdown.
+            self.despawn_actor(ctx_id).await;
+            // Clean shutdown: reap the (non-poison) crash-window entry so it does
+            // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
+            // — its dormant-poison signal survives a shutdown so a subsequent
+            // lookup still reports the poison until an operator clears it or the
+            // process restarts.
+            self.reap_crash_window(ctx_id);
+            // The floor-registry entry is dropped in step 7, after the drain.
+            // Drop the per-context stream admission-tracker registry entry on the
+            // same teardown sweep (spec §5.4.5).
+            self.reap_stream_admission(ctx_id);
+        }
+
+        self.stop_key_package_actors().await;
+        self.stop_challenger_ledger_actors().await;
+
+        // Supervisor-level state clear. Acquired under the write_lock once
+        // for the standing_contexts + local_dids stores so a concurrent
+        // reader observes a coherent shutdown rather than a partially-
+        // cleared registry. The wrapping keys clear under the same guard: a
+        // wrapping-key load in flight inserts only under it, after re-checking
+        // the gate closed above, so none re-inserts a secret after this clear.
+        {
+            let guard = self.write_lock.lock().await;
+            self.standing_contexts.store(Arc::new(HashMap::new()));
+            self.local_dids.store(Arc::new(HashSet::new()));
+            self.clear_wrapping_keys(&guard);
+        }
+
+        // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
+        // end with their actor's task. Every other supervisor-held task (actor
+        // watchdogs, the context-gauge refresh, the streaming saga seal task,
+        // the streaming settlement tasks) is on the tracker, which step 6 awaits.
+        context_ids
+    }
+
+    /// Step 7 of [`Self::shutdown_all_contexts`]: drops the floor-registry entry
+    /// of each swept context and returns how many contexts were swept. Runs only
+    /// after the tracker drain has finished, so no actor task is left to persist
+    /// a snapshot that would export the absent entry as empty floors.
+    ///
+    /// Callable only inside this module: the one caller is
+    /// [`Self::shutdown_all_contexts`].
+    fn reap_swept_floors(&self, context_ids: &[String]) -> usize {
+        for ctx_id in context_ids {
+            self.remove_context_floors(&crate::context::state::context_id_to_bytes(ctx_id));
+        }
+        context_ids.len()
     }
 
     /// Runs [`Self::shutdown_all_contexts`] and then `after_drain` on a task
@@ -12466,11 +13032,19 @@ impl Supervisor {
         Some((poisoned, count))
     }
 
+    /// Test-only reach into [`Self::close_spawn_gate`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn close_spawn_gate_for_test(&self) {
+        Self::close_spawn_gate(self);
+    }
+
     /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
     /// every live `SpawnPermit` drops, and a permit is never held across an
     /// `.await`, so the wait is bounded by one synchronous spawn. Then cancels
     /// the shutdown token every streaming pump selects on.
-    pub fn close_spawn_gate(&self) {
+    pub(in crate::context) fn close_spawn_gate(&self) {
         *self
             .spawn_gate
             .write()
@@ -12489,7 +13063,7 @@ impl Supervisor {
     /// (ADR-049 Decision 16, step 3), as [`Self::stop_key_package_actors`]
     /// does for the key-package actors. The ledger is durable, so a stopped
     /// actor loses only its in-memory grading leases.
-    pub async fn stop_challenger_ledger_actors(&self) {
+    pub(in crate::context) async fn stop_challenger_ledger_actors(&self) {
         let handles: Vec<(
             String,
             crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
@@ -12515,13 +13089,21 @@ impl Supervisor {
         }
     }
 
+    /// Test-only reach into [`Self::stop_key_package_actors`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn stop_key_package_actors_for_test(&self) {
+        Self::stop_key_package_actors(self).await;
+    }
+
     /// Stops every key-package actor and clears `key_package_stores`
     /// (ADR-049 Decision 16, step 3). The map is drained under the write lock
     /// so no resolver observes a half-cleared map; the shutdown commands are
     /// sent after the lock drops. A send that fails (inbox closed or full) is
     /// logged and is not fatal: dropping the last handle closes the actor's
     /// inbox, and the actor's run loop exits on the closed inbox.
-    pub async fn stop_key_package_actors(&self) {
+    pub(in crate::context) async fn stop_key_package_actors(&self) {
         let handles: Vec<(DID, KeyPackageStoreHandle)> = {
             let _guard = self.write_lock.lock().await;
             let drained = self
@@ -12544,6 +13126,14 @@ impl Supervisor {
         }
     }
 
+    /// Test-only reach into [`Self::await_tracked_tasks`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn await_tracked_tasks_for_test(&self) {
+        Self::await_tracked_tasks(self).await;
+    }
+
     /// Closes the task tracker and waits until every tracked task has exited
     /// (ADR-049 Decision 16, step 3). Call only after the closed flag is set
     /// and every actor was told to stop.
@@ -12554,7 +13144,7 @@ impl Supervisor {
     /// respawn task can despawn its actor before the sweep's snapshot, or
     /// write a window after the sweep, and no such task remains once the wait
     /// returns.
-    pub async fn await_tracked_tasks(&self) {
+    pub(in crate::context) async fn await_tracked_tasks(&self) {
         self.task_tracker.close();
         self.task_tracker.wait().await;
         self.crash_windows.retain(|_, window| window.is_poisoned());
@@ -15332,7 +15922,7 @@ impl Supervisor {
     /// The rejections [`Self::open_outlet_stream`] returns, except the
     /// shutdown refusal of its spawner check.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub async fn open_outlet_stream_with_spawner<E>(
+    pub(in crate::context) async fn open_outlet_stream_with_spawner<E>(
         self: &Arc<Self>,
         spawner: &TrackedSpawner,
         context_id: &str,
@@ -18730,7 +19320,7 @@ impl Supervisor {
     /// expose the embedded `context_id`. Every variant carries a routable
     /// `context_id` (the former `FireTimer` variant was retired — TTL
     /// expiry is now an actor-owned arm, ADR-049 finding A3), so this is
-    /// total (unlike the sibling `governance_command_context_id`).
+    /// total, like the sibling `governance_command_context_id`.
     const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> &str {
         match cmd {
             TtlCloseCommand::ExtendTtl { context_id, .. } => context_id.as_str(),
@@ -18746,9 +19336,9 @@ impl Supervisor {
     /// Every per-context variant — including the boxed-payload propose
     /// / vote / execute variants — surfaces its `context_id` so the
     /// dispatch helper can route through the per-context actor's
-    /// mailbox. The sweep / timeout-task variants return `None` (no
-    /// routable target — see the arm comment).
-    fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
+    /// mailbox. Every variant carries a routable `context_id`, so this is
+    /// total.
+    const fn governance_command_context_id(cmd: &GovernanceCommand) -> &str {
         match cmd {
             GovernanceCommand::GetProposal { context_id, .. }
             | GovernanceCommand::ListProposals { context_id, .. }
@@ -18757,32 +19347,19 @@ impl Supervisor {
             | GovernanceCommand::TombstoneMigratedContext { context_id, .. }
             | GovernanceCommand::MigrationState { context_id, .. }
             | GovernanceCommand::AcknowledgeCommitFault { context_id, .. }
-            | GovernanceCommand::WithdrawGovernanceVote { context_id, .. } => {
-                Some(context_id.as_str())
-            }
+            | GovernanceCommand::WithdrawGovernanceVote { context_id, .. } => context_id.as_str(),
             GovernanceCommand::ProposeGovernanceAction { payload, .. }
             | GovernanceCommand::ProposeGovernanceActionChecked { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
             GovernanceCommand::VoteOnProposal { payload, .. }
             | GovernanceCommand::ApproveGovernanceProposal { payload, .. }
             | GovernanceCommand::RejectGovernanceProposal { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
             GovernanceCommand::ExecuteGovernanceAction { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
-            // Sweep commands are dispatched per-actor by the supervisor's
-            // iterating entry points in `governance_helpers`; the variant
-            // carries no `context_id` field because the routing target is
-            // decided at the iteration site (one command per known
-            // actor). Returning `None` here keeps `dispatch_governance_command`
-            // from accepting them — sweeps must use the iterating helpers.
-            // (The former `EvaluateTimeouts` / `StartTimeoutTask` variants
-            // were retired: governance timeouts are now an actor-owned arm,
-            // ADR-049 finding A3.)
-            GovernanceCommand::EvaluatePeriodicConsequences { .. }
-            | GovernanceCommand::ProcessPendingCommits { .. } => None,
         }
     }
 
@@ -18891,32 +19468,9 @@ fn reply_lookup_miss<T>(
     reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
     err: ContextError,
 ) -> Outcome<()> {
-    let sketch = standing_outcome_error_sketch(&err);
+    let sketch = crate::context::actor::outcome::outcome_error_sketch(&err);
     let _ = reply.send(Err(err));
     Outcome::err(sketch)
-}
-
-/// A copy of `err` for the outcome while `err` itself goes on the reply
-/// channel. A variant with no field-wise copy becomes `CryptoFailed` carrying
-/// the error text.
-#[must_use]
-pub fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
-        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
-        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19129,6 +19683,17 @@ fn current_timestamp_ms() -> u64 {
     ms
 }
 
+/// Test-only reach into [`hard_rate_limit_allow`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub const fn hard_rate_limit_allow_for_test(
+    reply: &Result<Result<bool, ContextError>, BoundedReplyError>,
+) -> bool {
+    hard_rate_limit_allow(reply)
+}
+
 /// Maps a bounded hard-rate-limit reply into an allow (`true`) / deny
 /// (`false`) decision for `Supervisor::try_consume_hard_rate_limit`.
 ///
@@ -19143,7 +19708,7 @@ fn current_timestamp_ms() -> u64 {
 /// - `Err(Dropped)` — the actor terminated (reply channel closed): no bucket.
 /// - `Err(Elapsed)` — the actor is alive but wedged: bucket unreachable → DENY.
 #[must_use]
-pub const fn hard_rate_limit_allow(
+const fn hard_rate_limit_allow(
     reply: &Result<Result<bool, ContextError>, BoundedReplyError>,
 ) -> bool {
     match reply {
@@ -19429,4 +19994,128 @@ fn recovery_notification_target_is_real(context_id: &str) -> Result<(), ContextE
 #[cfg(any(test, feature = "testing"))]
 pub fn leak_for_test(supervisor: &Arc<Supervisor>) {
     std::mem::forget(Arc::clone(supervisor));
+}
+
+/// Test-only reach into fields that stay private to this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches them (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl CrossContextSagaCtx<'_> {
+    /// Whether Prepare-A holds a reservation.
+    #[must_use]
+    pub const fn prepared_a_for_test(
+        &self,
+    ) -> Option<&crate::context::actor::commands::PreparedAFields> {
+        self.prepared_a.as_ref()
+    }
+
+    /// Takes Prepare-A's reservation out of the saga.
+    pub const fn take_prepared_a_for_test(
+        &mut self,
+    ) -> Option<crate::context::actor::commands::PreparedAFields> {
+        self.prepared_a.take()
+    }
+
+    /// Drops Prepare-B's reservation from the saga.
+    pub const fn clear_prepared_b_for_test(&mut self) {
+        self.prepared_b = None;
+    }
+}
+
+/// Test-only reach into a crash window's poison flag (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl CrashWindow {
+    /// Marks the window poisoned.
+    pub const fn poison_for_test(&mut self) {
+        self.poisoned = true;
+    }
+}
+
+/// Test-only reach into [`Supervisor::open_outlet_stream_with_spawner`], one named field per argument.
+///
+/// For tests outside this crate. Compiled only under `testing`, so no
+/// production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct OutletStreamOpenForTest<'a, E: ?Sized> {
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub supervisor: &'a Arc<Supervisor>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub spawner: &'a TrackedSpawner,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub context_id: &'a str,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub registry: &'a scp_protocol::context::outlets::registry::OutletRegistry,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub outlet_id: &'a scp_protocol::context::outlets::OutletId,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub input: serde_json::Value,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub invoker_did: &'a DID,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub timeout_ms: Option<u32>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub executor: Arc<E>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub invoked_event_sink:
+        Option<Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub misdeclaration_sink:
+        Option<Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub caveat_binding: Option<crate::context::outlets::invoke::InvocationCaveatBinding>,
+    /// See [`Supervisor::open_outlet_stream_with_spawner`].
+    pub params: crate::context::outlets::dispatch::OpenStreamParams,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static>
+    OutletStreamOpenForTest<'_, E>
+{
+    /// Calls [`Supervisor::open_outlet_stream_with_spawner`] with these arguments.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Supervisor::open_outlet_stream_with_spawner`] returns.
+    pub async fn run(
+        self,
+    ) -> Result<
+        crate::context::outlets::dispatch::StreamSessionHandle,
+        crate::context::outlets::invoke::OutletStreamOpenError,
+    > {
+        Supervisor::open_outlet_stream_with_spawner(
+            self.supervisor,
+            self.spawner,
+            self.context_id,
+            self.registry,
+            self.outlet_id,
+            self.input,
+            self.invoker_did,
+            self.timeout_ms,
+            self.executor,
+            self.invoked_event_sink,
+            self.misdeclaration_sink,
+            self.handler_panic_sink,
+            self.caveat_binding,
+            self.params,
+        )
+        .await
+    }
+}
+
+/// Test-only reach into the Supervisor's write lock (ADR-070 §4). Neither
+/// method hands out the lock itself, so a test can hold or probe it but not
+/// keep a reference past the call.
+#[cfg(any(test, feature = "testing"))]
+impl Supervisor {
+    /// Waits for and holds the lock that serialises Supervisor writes.
+    pub async fn lock_write_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().await
+    }
+
+    /// Whether some task holds the lock that serialises Supervisor writes.
+    #[must_use]
+    pub fn write_lock_is_held_for_test(&self) -> bool {
+        self.write_lock.try_lock().is_err()
+    }
 }

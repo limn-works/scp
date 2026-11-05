@@ -4,7 +4,7 @@
 //! [`StandingDomain`](scp_runtime_core::context::domains::StandingDomain) implementation
 //! that the assembly crate `scp-runtime` installs in
 //! [`DomainHandlers`](scp_runtime_core::context::domains::DomainHandlers). Every other item is
-//! private to the crate, except the `testing`-gated `testing_access` module.
+//! private to the crate.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]

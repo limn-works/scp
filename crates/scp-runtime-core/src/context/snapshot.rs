@@ -66,6 +66,17 @@ pub fn build_snapshot_for_persist(
     Ok(snapshot)
 }
 
+/// Test-only reach into [`welcome_snapshot_crypto_is_durable`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn welcome_snapshot_crypto_is_durable_for_test(
+    export: &Result<zeroize::Zeroizing<Vec<u8>>, ContextError>,
+) -> bool {
+    welcome_snapshot_crypto_is_durable(export)
+}
+
 /// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
 ///
 /// [`build_snapshot_for_persist`] is deliberately FAIL-OPEN for existing
@@ -86,7 +97,7 @@ pub fn build_snapshot_for_persist(
 /// The sole caller is `Supervisor::spawn_actor_from_welcome`, which the FFI
 /// slice (pull request #2036) wired to production bridge consumers.
 #[must_use]
-pub fn welcome_snapshot_crypto_is_durable(
+pub(super) fn welcome_snapshot_crypto_is_durable(
     export: &Result<zeroize::Zeroizing<Vec<u8>>, ContextError>,
 ) -> bool {
     matches!(export, Ok(blob) if !blob.is_empty())
@@ -417,7 +428,7 @@ pub fn build_snapshot_from_state(
 /// broadcast / ttl-close / trust-recovery / manager copies) routes through
 /// THIS one helper, so a saga in flight is dropped by none of them.
 #[must_use]
-pub fn saga_pending_snapshot(
+pub(in crate::context) fn saga_pending_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -446,7 +457,7 @@ pub fn saga_pending_snapshot(
 /// — the snapshot stores it directly via `Clone`. Used at every snapshot builder so a crash between
 /// Commit-B capture and the next coalesced write cannot lose the durable output (which would
 /// re-invoke the outlet on replay).
-pub fn xctx_committed_outputs_snapshot(
+pub(in crate::context) fn xctx_committed_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -464,7 +475,7 @@ pub fn xctx_committed_outputs_snapshot(
 /// directly via `Clone`. Used at every snapshot builder so a crash between the seal-close capture
 /// and the next coalesced write cannot lose the durable witness (which would re-invoke the outlet
 /// on replay).
-pub fn xctx_committed_stream_outputs_snapshot(
+pub(in crate::context) fn xctx_committed_stream_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -485,7 +496,7 @@ pub fn xctx_committed_stream_outputs_snapshot(
 /// `xctx_caller_reservations_snapshot` / `xctx_nonce_dedup_snapshot`) — no Class-S saga field is
 /// centralized by convention alone. Without persisting it, a crash that rolled the witness back
 /// behind an acked Commit-A would double-settle the caller escrow on replay.
-pub fn xctx_committed_invocations_snapshot(
+pub(in crate::context) fn xctx_committed_invocations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashSet<scp_runtime_types::context::supervisor::saga_journal::SagaId> {
     state.class_s.xctx_committed_invocations.clone()
@@ -505,7 +516,7 @@ pub fn xctx_committed_invocations_snapshot(
 /// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by convention alone. Without
 /// persisting it, a `PreparingB`-window crash could never reverse the caller's deduction or void
 /// the escrow from the durable record, durably over-charging the caller.
-pub fn xctx_caller_reservations_snapshot(
+pub(in crate::context) fn xctx_caller_reservations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -523,7 +534,7 @@ pub fn xctx_caller_reservations_snapshot(
 /// a fresh-`SagaId` replay of a `CrossContextOutletInvoke` (BLACK-624-01). Same-node restore
 /// rehydrates it; cross-node export/import drops it to empty (B's freshness state has no authority
 /// on a foreign node).
-pub fn xctx_nonce_dedup_snapshot(
+pub(in crate::context) fn xctx_nonce_dedup_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<[u8; 16], u64> {
     state.class_s.xctx_nonce_dedup.entries()
@@ -537,7 +548,7 @@ pub fn xctx_nonce_dedup_snapshot(
 /// exactly like its siblings — no Class-S field is centralized by convention alone. Without
 /// persisting it, a crash that rolled a consumed cap back behind an acked invocation would re-open
 /// the spend/rate window the counter closes.
-pub fn caveat_counters_snapshot(
+pub(in crate::context) fn caveat_counters_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters> {
     state.class_s.caveat_counters.clone()
@@ -553,7 +564,7 @@ pub fn caveat_counters_snapshot(
 /// exactly like its siblings. Without persisting it, a crash while a stream's off-mailbox pump is
 /// mid-flight would strand the open-time escrow hold + cumulative counter reserve (the pump's
 /// close-time settle lands on the respawned generation and is dropped).
-pub fn stream_reservations_snapshot(
+pub(in crate::context) fn stream_reservations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<String, crate::context::outlets::invoke::StreamReservationRecord> {
     state.class_s.stream_reservations.clone()

@@ -233,9 +233,18 @@ impl IdentityWrappingKey {
         &self.public
     }
 
+    /// Test-only reach into [`Self::handle`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn handle_for_test(&self) -> &KeyHandle {
+        Self::handle(self)
+    }
+
     /// The custody handle of the private key.
     #[must_use]
-    pub const fn handle(&self) -> &KeyHandle {
+    pub(crate) const fn handle(&self) -> &KeyHandle {
         &self.handle
     }
 

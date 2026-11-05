@@ -37,6 +37,10 @@ use scp_protocol::context::membership::KeyPackage;
 use scp_runtime_core::context::ContextHandle;
 use scp_runtime_core::context::supervisor::faulty_storage::FaultyStorage;
 use scp_runtime_core::push::*;
+use scp_runtime_core::push::{
+    backoff_delay_for_test as backoff_delay, log_outcome_for_test as log_outcome,
+    token_hash_for_test as token_hash,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1130,7 +1134,7 @@ async fn trigger_does_not_retry_4xxx_and_stops_on_shutdown() -> TestResult {
     }
 
     shutdown.cancel();
-    let commands = task.commands.clone();
+    let commands = task.commands_for_test().clone();
     tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
     let (reply, _answer) = oneshot::channel();
     let refused = commands
@@ -1693,7 +1697,7 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
         registrar
             .stale_runs_for_test()
             .get(&relay_a_key())
-            .map(|run| run.first_millis),
+            .map(scp_runtime_core::push::StaleRun::first_millis_for_test),
         Some(late)
     );
     Ok(())
@@ -1781,7 +1785,7 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
         registrar
             .stale_runs_for_test()
             .get(&relay_a_key())
-            .map(|run| run.first_millis),
+            .map(scp_runtime_core::push::StaleRun::first_millis_for_test),
         Some(restart)
     );
     Ok(())
@@ -1810,8 +1814,8 @@ async fn deregistration_skew_refusal_survives_refresh_until_deregister_all() -> 
             .refused_for_test()
             .get(&relay_a_key())
             .is_some_and(|refusal| {
-                refusal.request == Request::Deregistration
-                    && refusal.cause == RefusalCause::StaleBeyondSkew
+                *refusal.request_for_test() == Request::Deregistration
+                    && *refusal.cause_for_test() == RefusalCause::StaleBeyondSkew
             })
     };
     assert!(skew_refusal(&registrar));
@@ -1891,7 +1895,7 @@ async fn wall_clock_step_does_not_count_toward_a_stale_run() -> TestResult {
         registrar
             .stale_runs_for_test()
             .get(&relay_a_key())
-            .map(|run| run.first_millis),
+            .map(scp_runtime_core::push::StaleRun::first_millis_for_test),
         Some(first),
         "the step neither ends nor restarts the run"
     );
@@ -2006,7 +2010,7 @@ async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
     assert!(
         registrar
             .storage_for_test()
-            .load_push_relays()
+            .load_push_relays_for_test()
             .await?
             .is_empty(),
         "the accepted deregistration clears the ledger"
@@ -2169,7 +2173,7 @@ async fn restarted_registrar_deregisters_a_recorded_relay() -> TestResult {
         .ok_or("nothing reached relay A")?;
     assert_eq!(verified_deregistration(at_a, &public_key)?.token, TOKEN);
     let recorded: Vec<String> = storage
-        .load_push_relays()
+        .load_push_relays_for_test()
         .await?
         .into_iter()
         .map(|record| record.relay_url)
@@ -2238,7 +2242,7 @@ async fn deregister_all_stops_registering_until_register() -> TestResult {
         verified_deregistration(published, &public_key)?;
     }
     assert!(
-        storage.load_push_relays().await?.is_empty(),
+        storage.load_push_relays_for_test().await?.is_empty(),
         "the ledger is clear"
     );
 

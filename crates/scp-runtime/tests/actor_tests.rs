@@ -2,6 +2,7 @@
 //! `Supervisor`, which needs the domain handlers only `scp-runtime` assembles.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use scp_runtime_core::context::actor::ttl_expiry_retry_backoff_for_test as ttl_expiry_retry_backoff;
 use scp_runtime_core::context::actor::*;
 use tokio::sync::mpsc;
 
@@ -58,7 +59,7 @@ async fn actor_pause_acks_ok_and_keeps_running() {
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_handle = tokio::spawn(actor.run());
 
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
     handle.send_pause().await.unwrap();
     // Actor is still running; a subsequent read query answers off
     // owned state (empty test fixture ⇒ exact roster count 0).
@@ -92,7 +93,7 @@ async fn actor_shutdown_command_exits_loop_promptly() {
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_handle = tokio::spawn(actor.run());
 
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
     handle.send_shutdown().await.unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(2), actor_handle)
@@ -353,7 +354,7 @@ async fn actor_with_state_answers_read_query() {
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
 
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
     // The state-owning actor answers a read-only query on owned state,
     // proving the run loop picks commands up from the inbox and routes
     // them through the actor-shape queries handler.
@@ -527,7 +528,7 @@ async fn coalesced_class_c_mutation_is_durable_across_final_drain() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     install_access_key_via_mailbox(&handle, &ctx, member).await;
 
@@ -568,7 +569,7 @@ async fn an_actor_persists_under_its_handle_id_when_the_id_is_not_hex() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
     // The shutdown handler marks the actor dirty, so the final drain
     // runs the same `persist_snapshot` as the coalesce tick.
     handle.send_shutdown().await.expect("shutdown acks");
@@ -602,7 +603,7 @@ async fn coalesced_class_c_mutation_is_durable_across_coalesce_tick() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     install_access_key_via_mailbox(&handle, &ctx, member).await;
 
@@ -652,7 +653,7 @@ async fn a_flush_leaves_no_coalesced_write_pending() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     install_access_key_via_mailbox(&handle, &ctx, member).await;
     handle
@@ -703,7 +704,7 @@ async fn a_failed_flush_replies_with_the_error_and_the_next_tick_retries() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     recorder.set_failing(true);
     install_access_key_via_mailbox(&handle, &ctx, member).await;
@@ -754,7 +755,7 @@ async fn a_failed_coalesced_write_stays_dirty_until_a_tick_lands() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     recorder.set_failing(true);
     install_access_key_via_mailbox(&handle, &ctx, member).await;
@@ -817,7 +818,7 @@ async fn coalesced_seed_peer_pseudonym_is_durable_across_coalesce_tick() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     // Record a peer pseudonym — a coalesced Class-C mutation with NO co-located
     // persist (routes through `class_c_view`). Awaiting the reply also proves
@@ -903,7 +904,7 @@ async fn coalesced_test_insert_member_is_durable_across_coalesce_tick() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     // Insert a second member — a coalesced Class-C structural mutation with NO
     // co-located persist. Awaiting the reply proves the live insert succeeded.
@@ -1130,7 +1131,7 @@ fn active_state_with_past_ttl(ctx_byte: u8, now_secs: u64) -> state::PerContextS
         .transition_to(&scp_protocol::context::ContextState::Active)
         .expect("transition test handle to Active");
     // Deadline in the past ⇒ `reconcile_timers` derives `remaining = 0`.
-    state.ttl.timer.deadline_unix_secs = Some(now_secs.saturating_sub(1));
+    state.ttl_mut().timer.deadline_unix_secs = Some(now_secs.saturating_sub(1));
     state
 }
 
@@ -1160,7 +1161,7 @@ async fn ttl_expiry_persists_before_despawn_with_stalling_transport() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     // The fail-closed Phase-1 persist runs BEFORE (and outside) the stalling
     // I/O, so it lands without any `advance`. A bounded virtual guard turns a
@@ -1236,7 +1237,7 @@ async fn incomplete_cleanup_keeps_actor_alive_and_retries() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     // First attempt fires immediately: transition Expired + fail-closed
     // persist land, but the event-log append fails ⇒ incomplete ⇒ retry
@@ -1319,7 +1320,7 @@ async fn execute_ttl_close_transitions_real_context_state() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     handle
         .send(|reply| {
@@ -1503,7 +1504,7 @@ async fn phase1_persist_failure_defers_leaf_append_until_durable() {
     let (tx, rx) = mpsc::channel::<ContextCommand>(4);
     let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
     let actor_task = tokio::spawn(actor.run());
-    let handle = ContextActorHandle::from_sender(tx);
+    let handle = ContextActorHandle::from_sender_for_test(tx);
 
     // First attempt fires immediately: transition Expired + key destruction
     // land, but the fail-closed Expired persist FAILS ⇒ Phase 2 (leaf append)

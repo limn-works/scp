@@ -842,7 +842,7 @@ fn validate_outbound_caller(
     // Outbound policy: the interface whose source outlet is this registration.
     // `allowed_callers` empty ⇒ any member with the capability above.
     if let Some(interface) = state
-        .governance
+        .governance()
         .outlet_interfaces
         .iter()
         .find(|i| i.outlet_id == outlet_registration_id)
@@ -1347,7 +1347,7 @@ fn validate_ucan_rebind(
     // The ceiling URI set + B's context-creator are taken from B's role state.
     let ceiling = state.role_state.ceiling().to_ucan_string_set();
     let creator_did = state.role_state.creator_did.clone();
-    let revoked = state.governance.revoked_spending_ucan_cids.clone();
+    let revoked = state.governance().revoked_spending_ucan_cids.clone();
 
     let did_resolver = KeyResolverDidResolver::new(&deps.key_resolver);
     let revocation_checker = ContextRevocationChecker {
@@ -1423,7 +1423,7 @@ fn validate_inbound_policy(
     req: &PrepareBRequest,
 ) -> Result<(), SagaReject> {
     let Some(interface) = state
-        .governance
+        .governance()
         .outlet_interfaces
         .iter()
         .find(|i| i.outlet_id == req.outlet_registration_id)
@@ -1484,7 +1484,7 @@ fn validate_input_specificity(
     };
 
     let Some(registration) = state
-        .governance
+        .governance()
         .registered_outlets
         .iter()
         .find(|t| t.outlet_id == req.outlet_registration_id)
@@ -1583,7 +1583,7 @@ fn validate_freshness(
     // no Class-S `&mut` mutation happens during the read-only check phase.
     let now_secs = deps.clock.now_secs();
     if state
-        .class_s
+        .class_s()
         .xctx_nonce_dedup
         .is_replayed_read(&req.asserted_nonce, now_secs)
     {
@@ -1650,7 +1650,7 @@ fn commit_b_reserve(
     reply: CommitBReserveReply,
 ) -> Outcome<()> {
     // Replay short-circuit: a prior Commit-B already captured the output.
-    if let Some(committed) = state.class_s.xctx_committed_outputs.get(saga_id) {
+    if let Some(committed) = state.class_s().xctx_committed_outputs.get(saga_id) {
         let receipt = match jcs_receipt_bytes(&committed.receipt) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -1669,7 +1669,7 @@ fn commit_b_reserve(
 
     // Not yet committed: the staged prepared MUST be present (Prepare-B ran).
     if let Some(SagaPreparedState::CrossContextOutletInvocation(_)) =
-        state.class_s.saga_pending.get(saga_id)
+        state.class_s().saga_pending.get(saga_id)
     {
         let _ = reply.send(Ok(CommitBReserveOutcome::ReadyToExecute));
         return Outcome::ok(());
@@ -1705,7 +1705,7 @@ async fn commit_b_settle(
     reply: CommitBSettleReply,
 ) -> Outcome<()> {
     // Replay: re-emit the stored capture byte-for-byte; never re-invoke / re-sign.
-    if let Some(committed) = cell.class_s.xctx_committed_outputs.get(saga_id) {
+    if let Some(committed) = cell.class_s().xctx_committed_outputs.get(saga_id) {
         return reemit_committed_settle(committed, reply);
     }
 
@@ -1810,7 +1810,7 @@ async fn commit_b_first_settle(
     // as the prior inline remove+match did (the authoritative move-out happens
     // inside `f` below).
     let Some(SagaPreparedState::CrossContextOutletInvocation(peek)) =
-        cell.class_s.saga_pending.get(saga_id)
+        cell.class_s().saga_pending.get(saga_id)
     else {
         return Err((
             false,
@@ -2244,7 +2244,7 @@ fn stream_settle_check_witness(
 ) -> Outcome<()> {
     use scp_runtime_core::context::actor::commands::StreamWitnessRecoveryStatus;
     let generation = cell.generation;
-    let status = match cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
+    let status = match cell.class_s().xctx_committed_stream_outputs.get(saga_id) {
         // Witness absent — seal never landed (or was rolled back).
         None => StreamWitnessRecoveryStatus::Absent,
         // Witness present + settled — the money already moved on the first settle.
@@ -2308,7 +2308,7 @@ async fn stream_capture_append(
     // (slot cleared) or aborted (slot absent) saga silently drops the chunk so
     // the off-mailbox seal task is never wedged by an error on a late chunk.
     let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
-        cell.class_s.saga_pending.get(saga_id)
+        cell.class_s().saga_pending.get(saga_id)
     else {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
@@ -2390,7 +2390,7 @@ async fn stream_stage_counter_reserve(
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
-        cell.class_s.saga_pending.get(saga_id)
+        cell.class_s().saga_pending.get(saga_id)
     else {
         // Sealed / aborted — nothing to fold; a clean no-op.
         let _ = reply.send(Ok(()));
@@ -2459,7 +2459,7 @@ async fn commit_b_stream_settle(
     // counter release.
     let generation = cell.generation;
     // Replay: re-emit the stored capture byte-for-byte; never re-seal / re-sign.
-    if let Some(committed) = cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
+    if let Some(committed) = cell.class_s().xctx_committed_stream_outputs.get(saga_id) {
         return reemit_committed_stream_settle(committed, generation, reply);
     }
 
@@ -2585,7 +2585,7 @@ async fn commit_b_stream_first_settle(
     // Peek to derive the persist `context_id` and reject the no-slot case as
     // `(false, 13042)` with NO persist (the authoritative move-out is inside `f`).
     let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(peek)) =
-        cell.class_s.saga_pending.get(saga_id)
+        cell.class_s().saga_pending.get(saga_id)
     else {
         return Err((
             false,
@@ -3031,7 +3031,7 @@ async fn commit_a(
     // than double-settled. (`xctx_committed_invocations` records committed A-side
     // sagas; absent ⇒ first Commit-A.)
     if cell
-        .class_s
+        .class_s()
         .xctx_committed_invocations
         .contains(&req.saga_id)
     {
@@ -3239,7 +3239,7 @@ fn commit_a_check_witness(
     saga_id: &SagaId,
     reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let recorded = state.class_s.xctx_committed_invocations.contains(saga_id);
+    let recorded = state.class_s().xctx_committed_invocations.contains(saga_id);
     let _ = reply.send(Ok(recorded));
     Outcome::ok(())
 }
@@ -3385,7 +3385,11 @@ async fn abort(
             // record, never re-reversing. Either way LOCAL is reversed exactly
             // once and the record is removed exactly once (the removal is the
             // combinator `f`'s Class-S mutation below).
-            let record = cell.class_s.xctx_caller_reservations.get(saga_id).cloned();
+            let record = cell
+                .class_s()
+                .xctx_caller_reservations
+                .get(saga_id)
+                .cloned();
             let local_ran = if carrier_ran {
                 true
             } else if let Some(ref record) = record {
@@ -3419,7 +3423,12 @@ async fn abort(
             // record is read via a Deref `get().cloned()` (NOT a remove) so the
             // async reverse can run BEFORE the single persist; the actual
             // Class-S removal is hoisted into the combinator `f` below.
-            match cell.class_s.xctx_caller_reservations.get(saga_id).cloned() {
+            match cell
+                .class_s()
+                .xctx_caller_reservations
+                .get(saga_id)
+                .cloned()
+            {
                 Some(record) => {
                     let ran = deps
                         .domains
@@ -3438,7 +3447,7 @@ async fn abort(
     // combinator; the actual clear is the combinator `f`'s Class-S mutation. A
     // missing slot is a clean no-op (the gate skips the combinator, and there is
     // nothing to remove).
-    let had_slot = cell.class_s.saga_pending.contains_key(saga_id);
+    let had_slot = cell.class_s().saga_pending.contains_key(saga_id);
 
     // Persist if the caller-side owned economy was refunded (`local_rollback_ran`),
     // a durable caller record was consumed (`had_caller_record_consumed` — its
@@ -3825,7 +3834,7 @@ mod tests {
     async fn test_fixture_seeds_production_saga_dedup_ttl() {
         let st = target_state(0x5B, OTHER, CALLER).await;
         assert_eq!(
-            st.class_s.xctx_nonce_dedup.ttl_secs(),
+            st.class_s().xctx_nonce_dedup.ttl_secs(),
             scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
             "the test fixture must seed the production saga dedup TTL, not NonceDedup::new()'s \
              default (which is coterminous with the skew tolerance)"
@@ -4257,30 +4266,32 @@ mod tests {
                 Capability::OutletCallAll,
             ]))
             .expect("well-formed built-in ceiling");
-        st.governance.registered_outlets.push(OutletRegistration {
-            outlet_id: OUTLET.to_owned(),
-            kind: scp_protocol::context::outlets::OutletKind::default(),
-            name: "Calculator".to_owned(),
-            description: "adds".to_owned(),
-            schema: OutletSchema {
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
-                }),
-                output_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": { "result": {"type": "number"} }
-                }),
-                aggregate_schema: None,
-            },
-            implementation_hash: [0xAA; 32],
-            test_vectors: vec![],
-            operator_did: DID(creator.to_owned()),
-            cost: None,
-            message_catalog: Vec::new(),
-            registered_at: 0,
-            signature: Vec::new(),
-        });
+        st.governance_mut()
+            .registered_outlets
+            .push(OutletRegistration {
+                outlet_id: OUTLET.to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::default(),
+                name: "Calculator".to_owned(),
+                description: "adds".to_owned(),
+                schema: OutletSchema {
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                    }),
+                    output_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "result": {"type": "number"} }
+                    }),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: DID(creator.to_owned()),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
         st
     }
 
@@ -4366,7 +4377,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4410,7 +4421,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4435,7 +4446,7 @@ mod tests {
         let mut st = target_state(0x11, OTHER, CALLER).await;
         st.role_state.creator_did = CALLER.to_owned();
         // Establish an interface whose allowed_callers excludes the caller.
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4458,7 +4469,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4489,7 +4500,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4520,7 +4531,7 @@ mod tests {
         // No economic policy is configured ⇒ the REGISTERED cost is 0; the
         // reserve must deduct exactly the registered (policy-derived) amount.
         let budget_before = st
-            .governance
+            .governance()
             .budget_tracker
             .remaining(&DID(CALLER.to_owned()))
             .0;
@@ -4532,7 +4543,7 @@ mod tests {
         .await;
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_a(
             &mut st_cell,
             &deps,
@@ -4549,7 +4560,7 @@ mod tests {
         // The registered cost is 0, so the budget is untouched — no
         // caller-asserted positive cost was reserved.
         let budget_after = st_cell
-            .governance
+            .governance()
             .budget_tracker
             .remaining(&DID(CALLER.to_owned()))
             .0;
@@ -4595,7 +4606,7 @@ mod tests {
             Duration::from_secs(1),
             deps.clock.as_ref(),
         );
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4609,7 +4620,7 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4648,7 +4659,7 @@ mod tests {
 
         let zero_caller_budget =
             PerCallerRateLimit::with_burst(0, Duration::from_mins(1), 0, Duration::from_secs(1));
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4662,7 +4673,7 @@ mod tests {
         });
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_a(
             &mut st_cell,
             &deps,
@@ -4705,7 +4716,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x33, Some("proof-1".to_owned()), 2, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         let fields = expect_prepared_b(rx.await.unwrap(), "prepared-B");
@@ -4720,7 +4731,7 @@ mod tests {
         // The eight-field prepared was staged into saga_pending with B-recorded
         // provenance, NOT the caller-asserted advisory depth.
         let staged = st_cell
-            .class_s
+            .class_s()
             .saga_pending
             .get(&SagaId("saga-xctx-1".to_owned()))
             .unwrap();
@@ -4746,7 +4757,7 @@ mod tests {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         // Ungated outlet (no UCAN proof) on the TARGET context 0x55.
         let mut st = target_state(0x55, OTHER, CALLER).await;
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x55; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4772,7 +4783,7 @@ mod tests {
         // The channel-authenticated caller role is "member", NOT in {admin}.
         let req = prepare_b_request_with_role(0x55, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13025));
@@ -4784,7 +4795,7 @@ mod tests {
         // Nothing was staged.
         assert!(
             !st_cell
-                .class_s
+                .class_s()
                 .saga_pending
                 .contains_key(&SagaId("saga-xctx-1".to_owned())),
             "a rejected Prepare-B must not stage a prepared slot"
@@ -4798,7 +4809,7 @@ mod tests {
         use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x56, OTHER, CALLER).await;
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x56; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4823,7 +4834,7 @@ mod tests {
 
         let req = prepare_b_request_with_role(0x56, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "an allowed role must be admitted");
@@ -4834,7 +4845,7 @@ mod tests {
     /// for the inbound-rate consume tests.
     fn push_inbound_interface(st: &mut PerContextState, ctx_byte: u8, inbound_per_min: u32) {
         use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
-        st.governance.outlet_interfaces.push(OutletInterface {
+        st.governance_mut().outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[ctx_byte; 32]),
             outlet_id: OUTLET.to_owned(),
@@ -4871,7 +4882,7 @@ mod tests {
 
         // The consume takes the field-granular `ClassCMut`; wrap the test state
         // in a `ClassSCell` to construct the view per call.
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         // Drain the base + burst budget (1 base + 5 burst = 6 admitted).
         for i in 0..6 {
             consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
@@ -4911,7 +4922,7 @@ mod tests {
         )
         .await;
 
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect_err("an inbound ceiling above the eviction-safe limit must reject");
         assert_eq!(reject.code, Some(13027));
@@ -4922,7 +4933,7 @@ mod tests {
         );
         // The guard fires BEFORE materializing the window — nothing was created.
         let iface = st_cell
-            .governance
+            .governance()
             .outlet_interfaces
             .iter()
             .find(|i| i.outlet_id == OUTLET)
@@ -4949,7 +4960,7 @@ mod tests {
         )
         .await;
 
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect("the maximum safe inbound ceiling must be admitted");
     }
@@ -4974,14 +4985,14 @@ mod tests {
 
         let req = prepare_b_request_with_role(0x5A, None, 2, now_ms, Some("member".to_owned()));
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "prepared-B");
 
         // The inbound window was materialized and one unit consumed.
         let iface = st_cell
-            .governance
+            .governance()
             .outlet_interfaces
             .iter()
             .find(|i| i.outlet_id == OUTLET)
@@ -5021,7 +5032,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x44, Some("proof-other".to_owned()), 1, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(
             out.result.is_err(),
@@ -5035,7 +5046,7 @@ mod tests {
             reject.error
         );
         // Nothing staged — the slot stays empty on rejection.
-        assert!(st_cell.class_s.saga_pending.is_empty());
+        assert!(st_cell.class_s().saga_pending.is_empty());
     }
 
     #[tokio::test]
@@ -5054,7 +5065,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x55, None, 1, stale_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13018));
@@ -5075,13 +5086,13 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         // Pre-seed the dedup cache with the request nonce.
-        st.class_s
+        st.class_s_mut()
             .xctx_nonce_dedup
             .record([0x42; 16], deps.clock.now_secs());
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x66, None, 1, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13019));
@@ -5120,13 +5131,13 @@ mod tests {
         first.saga_id = SagaId("original-saga".to_owned());
         first.asserted_nonce = replay_nonce;
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, first, tx).await;
         assert!(out.result.is_ok(), "first prepare_b: {:?}", out.result);
         expect_prepared_b(rx.await.unwrap(), "first prepare_b accepts");
         assert!(
             st_cell
-                .class_s
+                .class_s()
                 .xctx_nonce_dedup
                 .entries()
                 .contains_key(&replay_nonce),
@@ -5146,7 +5157,7 @@ mod tests {
         // `NonceDedup::from_entries_with_ttl` — the saga dedup TTL, strictly
         // longer than the freshness skew tolerance, is preserved on restore).
         let mut restored = target_state(0x6A, OTHER, CALLER).await;
-        restored.class_s.xctx_nonce_dedup =
+        restored.class_s_mut().xctx_nonce_dedup =
             scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 snapshot.xctx_nonce_dedup,
                 scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
@@ -5159,7 +5170,7 @@ mod tests {
         let _ = now_secs; // freshness uses the clock; nonce dedup is the gate here.
         let (tx, rx) = oneshot::channel();
         let mut restored_cell =
-            scp_runtime_core::context::actor::class_s::ClassSCell::new(restored);
+            scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(restored);
         let out = prepare_b(&mut restored_cell, &deps, replay, tx).await;
         assert!(out.result.is_err(), "fresh-SagaId replay must be rejected");
         let reject = expect_prepare_b_reject(rx.await.unwrap());
@@ -5193,11 +5204,11 @@ mod tests {
         let caller = DID(CALLER.to_owned());
         let saga = SagaId("saga-same-node-restore".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0x6B; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         let staged = st_cell
-            .class_s
+            .class_s()
             .xctx_caller_reservations
             .get(&saga)
             .expect("Prepare-A staged the durable record")
@@ -5229,10 +5240,10 @@ mod tests {
         // directly — caller economy is local, so same-node restore rehydrates it
         // verbatim).
         let mut restored = target_state(0x6B, OTHER, CALLER).await;
-        restored.class_s.xctx_caller_reservations = snapshot.xctx_caller_reservations.clone();
+        restored.class_s_mut().xctx_caller_reservations = snapshot.xctx_caller_reservations.clone();
 
         assert_eq!(
-            restored.class_s.xctx_caller_reservations.get(&saga),
+            restored.class_s().xctx_caller_reservations.get(&saga),
             Some(&staged),
             "the restored state MUST rehydrate the caller-reservation record value-stable"
         );
@@ -5252,7 +5263,7 @@ mod tests {
         // Default max_chain_depth is 8; incoming 8 → 8+1 = 9 > 8 ⇒ reject.
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x77, None, 8, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13020));
@@ -5277,7 +5288,7 @@ mod tests {
         req.target_context_id = [0xEE; 32];
 
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13014));
@@ -5293,7 +5304,7 @@ mod tests {
         // Replace the registered outlet's schemas with degenerate broad ones
         // (zero declared fields on both sides ⇒ below the specificity floor).
         if let Some(reg) = st
-            .governance
+            .governance_mut()
             .registered_outlets
             .iter_mut()
             .find(|t| t.outlet_id == OUTLET)
@@ -5311,7 +5322,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let req = prepare_b_request(0x99, None, 1, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
         let reject = expect_prepare_b_reject(rx.await.unwrap());
         assert_eq!(reject.code, Some(13017));
@@ -5336,13 +5347,13 @@ mod tests {
         // Ungated outlet (no proof) so every other check passes and we reach the
         // Class-S persist, which fails.
         let req = prepare_b_request(0xAA, None, 1, now_ms);
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_err());
         let err = rx.await.unwrap().expect_err("persist must fail-close");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         // The staged slot was rolled back on persist failure.
-        assert!(st_cell.class_s.saga_pending.is_empty());
+        assert!(st_cell.class_s().saga_pending.is_empty());
     }
 
     // --- Commit-B / Commit-A / Abort tests --------------------------------
@@ -5407,7 +5418,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-1".to_owned());
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC1, &saga.0, now_ms).await;
 
         // Reserve: slot present, not yet committed ⇒ ReadyToExecute.
@@ -5443,8 +5454,8 @@ mod tests {
             settled.outlet_invoked_event_id
         );
         // The output was captured durably and the staged slot cleared.
-        assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
-        assert!(st_cell.class_s.saga_pending.is_empty());
+        assert!(st_cell.class_s().xctx_committed_outputs.contains_key(&saga));
+        assert!(st_cell.class_s().saga_pending.is_empty());
     }
 
     #[tokio::test]
@@ -5459,7 +5470,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-replay".to_owned());
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC2, &saga.0, now_ms).await;
 
         let target_key = test_signer(0x66);
@@ -5470,7 +5481,7 @@ mod tests {
         let first = rx.await.unwrap().expect("first settle");
         // Capture the durable event id; a replay must reproduce it.
         let captured_event_id = st_cell
-            .class_s
+            .class_s()
             .xctx_committed_outputs
             .get(&saga)
             .unwrap()
@@ -5523,7 +5534,7 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-commit-b-jcs".to_owned());
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC3, &saga.0, now_ms).await;
 
         let target_key = test_signer(0x88);
@@ -5560,7 +5571,7 @@ mod tests {
         // reservation record staged at Prepare-A is the one Commit-A consumes.
         let saga = SagaId("saga-commit-a-1".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -5589,7 +5600,7 @@ mod tests {
         assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
         rx.await.unwrap().expect("commit-a ack");
         // The committed A-side saga is the idempotency witness.
-        assert!(st_cell.class_s.xctx_committed_invocations.contains(&saga));
+        assert!(st_cell.class_s().xctx_committed_invocations.contains(&saga));
 
         // Replay: a fresh reservation handed back is released (RAII); re-ack
         // without re-settling (the witness short-circuits).
@@ -5648,7 +5659,7 @@ mod tests {
         .await;
         let saga = SagaId("saga-commit-a-witness-failclose".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(
             &mut st_cell,
             &stage_deps,
@@ -5715,7 +5726,7 @@ mod tests {
         );
         // The witness is not left set — a retry re-acks from the absent witness.
         assert!(
-            !st_cell.class_s.xctx_committed_invocations.contains(&saga),
+            !st_cell.class_s().xctx_committed_invocations.contains(&saga),
             "the rolled-back witness must not survive a persist failure"
         );
     }
@@ -5732,16 +5743,16 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-abort-b".to_owned());
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC5, &saga.0, now_ms).await;
-        assert!(!st_cell.class_s.saga_pending.is_empty());
+        assert!(!st_cell.class_s().saga_pending.is_empty());
 
         // Abort on the B side (no reservation): clears the staged slot.
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st_cell, &deps, &saga, None, tx).await;
         assert!(out.result.is_ok(), "abort: {:?}", out.result);
         rx.await.unwrap().expect("abort ack");
-        assert!(st_cell.class_s.saga_pending.is_empty());
+        assert!(st_cell.class_s().saga_pending.is_empty());
 
         // Idempotent: a second abort on the now-terminal saga is a clean no-op.
         let (tx, rx) = oneshot::channel();
@@ -5767,7 +5778,7 @@ mod tests {
         // the durable reservation record Prepare-A staged.
         let saga = SagaId("saga-abort-a".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -5824,18 +5835,18 @@ mod tests {
         // The token-bucket burst capacity, in the limiter's internal milli-token
         // units (1000 milli-tokens per token) — a fresh caller starts FULL and a
         // reserve drains exactly one token; a refund restores it.
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
         // Observe pre-reserve velocity for `caller`.
         let now_secs = deps.clock.now_secs();
         let velocity_before = st
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
 
         // Prepare-A consumes a hard-rate-limit token + records velocity (and
         // persists the deduction once via the spy).
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xC8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
@@ -5843,7 +5854,7 @@ mod tests {
         // nothing): the hard-rate-limit token bucket dropped exactly one token
         // below full burst, and velocity rose.
         let hrl_after_reserve = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -5855,7 +5866,7 @@ mod tests {
              (burst_milli={burst_milli}, after_reserve={hrl_after_reserve})"
         );
         let velocity_after_reserve = st_cell
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
         assert!(
@@ -5888,7 +5899,7 @@ mod tests {
         // (back to full burst) and rolled the velocity back to its pre-reserve
         // value.
         let hrl_after_abort = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -5904,7 +5915,7 @@ mod tests {
              (after_reserve={hrl_after_reserve}, after_abort={hrl_after_abort})"
         );
         let velocity_after_abort = st_cell
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
         assert_eq!(
@@ -5936,7 +5947,7 @@ mod tests {
 
         // Reservation made at the live generation (0).
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(
             &mut st_cell,
             &deps,
@@ -6038,25 +6049,28 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
         let now_secs = deps.clock.now_secs();
         let velocity_before = st
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
 
         let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD2; 32], &caller, OUTLET, tx).await;
         let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // Prepare-A staged the durable record + moved owned economy.
         assert!(
-            st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "Prepare-A must stage a durable caller-reservation record"
         );
         let hrl_after_reserve = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6068,7 +6082,7 @@ mod tests {
         );
         assert!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs)
                 > velocity_before,
@@ -6094,7 +6108,10 @@ mod tests {
 
         // The record was consumed.
         assert!(
-            !st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            !st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "the durable record must be consumed on the mismatch abort"
         );
         // The refund was Class-S persisted (Prepare-A persisted the deduction;
@@ -6106,7 +6123,7 @@ mod tests {
         // CORE: the LOCAL economy IS reversed from the record — hard-rate-limit
         // back to full burst, velocity rolled back. PRE-FIX these stay deducted.
         let hrl_after_abort = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6119,7 +6136,7 @@ mod tests {
         );
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs),
             velocity_before,
@@ -6252,7 +6269,7 @@ mod tests {
         .await;
         let now_ms = ok_deps.clock.now_millis();
         let saga = SagaId("saga-settle-failclose".to_owned());
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &ok_deps, 0xC9, &saga.0, now_ms).await;
 
         let fail_deps = build_deps(
@@ -6275,8 +6292,8 @@ mod tests {
         let err = rx.await.unwrap().expect_err("persist must fail-close");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         // The capture was rolled back; the staged slot restored for a retry.
-        assert!(!st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
-        assert!(st_cell.class_s.saga_pending.contains_key(&saga));
+        assert!(!st_cell.class_s().xctx_committed_outputs.contains_key(&saga));
+        assert!(st_cell.class_s().saga_pending.contains_key(&saga));
     }
 
     /// FIX 3 (provenance-integrity): a Commit-B persist FAILURE followed by a
@@ -6299,7 +6316,7 @@ mod tests {
         )
         .await;
         let now_ms = stage_deps.clock.now_millis();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         stage_prepared_b(&mut st_cell, &stage_deps, 0xCD, &saga.0, now_ms).await;
 
         // Settle deps: a counting event log + a persistence that FAILS the first
@@ -6342,8 +6359,8 @@ mod tests {
             0,
             "a persist failure must NOT append OutletInvoked (append is sequenced after persist)"
         );
-        assert!(!st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
-        assert!(st_cell.class_s.saga_pending.contains_key(&saga));
+        assert!(!st_cell.class_s().xctx_committed_outputs.contains_key(&saga));
+        assert!(st_cell.class_s().saga_pending.contains_key(&saga));
 
         // RETRY settle on the SAME deps (the persistence now succeeds): capture
         // lands, persist succeeds, and `OutletInvoked` appends EXACTLY ONCE.
@@ -6360,8 +6377,8 @@ mod tests {
             1,
             "a persist-failure-then-retry Commit-B must append OutletInvoked EXACTLY ONCE"
         );
-        assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
-        assert!(!st_cell.class_s.saga_pending.contains_key(&saga));
+        assert!(st_cell.class_s().xctx_committed_outputs.contains_key(&saga));
+        assert!(!st_cell.class_s().saga_pending.contains_key(&saga));
     }
 
     /// The Commit-B receipt signed through a custody-backed signer (ADR-049
@@ -6440,7 +6457,7 @@ mod tests {
             recorded_nonce: [0x42; 16],
             recorded_chain_depth: 3,
         };
-        st.class_s.saga_pending.insert(
+        st.class_s_mut().saga_pending.insert(
             saga.clone(),
             SagaPreparedState::CrossContextOutletInvocation(original),
         );
@@ -6454,7 +6471,7 @@ mod tests {
         )
         .await;
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = commit_b_settle(
             &mut st_cell,
             &fail_deps,
@@ -6471,7 +6488,7 @@ mod tests {
         // The restored slot preserves the FULL original — including the
         // `ucan_proof_id` the deleted lossy inverse would have dropped.
         let restored = st_cell
-            .class_s
+            .class_s()
             .saga_pending
             .get(&saga)
             .expect("slot restored");
@@ -6484,7 +6501,7 @@ mod tests {
         );
         assert_eq!(p.recorded_nonce, [0x42; 16]);
         assert_eq!(p.recorded_chain_depth, 3);
-        assert!(!st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
+        assert!(!st_cell.class_s().xctx_committed_outputs.contains_key(&saga));
     }
 
     // -----------------------------------------------------------------------
@@ -6580,10 +6597,10 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
         let now_secs = deps.clock.now_secs();
         let velocity_before = st
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
 
@@ -6591,17 +6608,20 @@ mod tests {
         // `saga`.
         let saga = SagaId("saga-crash-recovery-refund".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // The durable record landed.
         assert!(
-            st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "Prepare-A must stage a durable caller-reservation record"
         );
         // The reservation moved owned economy state.
         let hrl_after_reserve = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6610,7 +6630,7 @@ mod tests {
         assert!(hrl_after_reserve < burst_milli);
         assert!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs)
                 > velocity_before
@@ -6660,13 +6680,16 @@ mod tests {
         );
         // The record is consumed.
         assert!(
-            !st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            !st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "the durable record must be consumed on the recovery abort"
         );
         // The durable deductions are reversed: hard-rate-limit back to full
         // burst, velocity back to its pre-reserve value.
         let hrl_after_abort = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6678,7 +6701,7 @@ mod tests {
         );
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs),
             velocity_before,
@@ -6719,11 +6742,11 @@ mod tests {
         // Seed a deduction we can observe being reversed (record a velocity
         // entry the record will reverse by timestamp).
         let now_secs = deps.clock.now_secs();
-        st.governance
+        st.governance()
             .velocity_tracker
             .record_message(&caller, now_secs);
         let velocity_seeded = st
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
         assert_eq!(velocity_seeded, 1);
@@ -6752,7 +6775,7 @@ mod tests {
 
         // The helper takes the field-granular `ClassCMut`; wrap the test state in
         // a `ClassSCell` to construct the view, then read results back via Deref.
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let ran = scp_runtime_outlets::testing_access::reverse_caller_reservation_record(
             st_cell.class_c_view(),
             &deps,
@@ -6772,7 +6795,7 @@ mod tests {
         // The local velocity entry was reversed by timestamp.
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs),
             0,
@@ -6798,19 +6821,24 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
         let now_secs = deps.clock.now_secs();
         let velocity_before = st
-            .governance
+            .governance()
             .velocity_tracker
             .get_velocity(&caller, now_secs);
 
         let saga = SagaId("saga-live-no-double".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDA; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
-        assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
+        assert!(
+            st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga)
+        );
 
         // Live abort via the carrier.
         let (tx, rx) = oneshot::channel();
@@ -6821,11 +6849,14 @@ mod tests {
         // The record is consumed and the reversal ran EXACTLY once (state back
         // to pre-reserve, not over-refunded).
         assert!(
-            !st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            !st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "the live abort must consume the durable record"
         );
         let hrl_after = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6837,7 +6868,7 @@ mod tests {
         );
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .velocity_tracker
                 .get_velocity(&caller, now_secs),
             velocity_before,
@@ -6857,7 +6888,7 @@ mod tests {
         // State unchanged from the single reversal.
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .hard_rate_limit
                 .snapshot_entries()
                 .get(CALLER)
@@ -6883,17 +6914,22 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
 
         let saga = SagaId("saga-commit-a-consumes".to_owned());
         let (tx, rx) = oneshot::channel();
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDB; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
-        assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
+        assert!(
+            st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga)
+        );
         // After Prepare-A the hard-rate-limit token is consumed (below burst).
         let hrl_after_reserve = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6916,15 +6952,18 @@ mod tests {
         let out = commit_a(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
         rx.await.unwrap().expect("commit-a ack");
-        assert!(st_cell.class_s.xctx_committed_invocations.contains(&saga));
+        assert!(st_cell.class_s().xctx_committed_invocations.contains(&saga));
         assert!(
-            !st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            !st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "Commit-A must consume the durable reservation record"
         );
         // Capture the settled hard-rate-limit state (the settle does NOT refund
         // — the token stays consumed for a committed invocation).
         let hrl_after_commit = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)
@@ -6943,7 +6982,7 @@ mod tests {
         rx.await.unwrap().expect("spurious abort ack");
         assert_eq!(
             st_cell
-                .governance
+                .governance()
                 .hard_rate_limit
                 .snapshot_entries()
                 .get(CALLER)
@@ -6988,7 +7027,7 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
-        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let burst_milli = st.governance().hard_rate_limit.config().burst * 1000;
         let saga = SagaId("saga-prepare-a-lost-reply".to_owned());
 
         // The supervisor's reply receiver is already GONE before the handler
@@ -7001,7 +7040,7 @@ mod tests {
 
         // No panic here ⇒ the recovered ticket was balanced. (Pre-fix this
         // unwinds on the debug_assert in `OutletEconomyTicket::drop`.)
-        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(st);
+        let mut st_cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(st);
         let out = prepare_a(&mut st_cell, &deps, &saga, &[0xDC; 32], &caller, OUTLET, tx).await;
         assert!(
             out.result.is_ok(),
@@ -7017,12 +7056,15 @@ mod tests {
         // path (supervisor `prepared_a == None` → `Abort { None }`) owns the
         // single LOCAL reversal, so the deduction must survive here.
         assert!(
-            st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
+            st_cell
+                .class_s()
+                .xctx_caller_reservations
+                .contains_key(&saga),
             "the durable reservation record must survive a lost Prepare-A reply \
              (the abort reverses LOCAL from it)"
         );
         let hrl_after = st_cell
-            .governance
+            .governance()
             .hard_rate_limit
             .snapshot_entries()
             .get(CALLER)

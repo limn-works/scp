@@ -175,7 +175,7 @@ pub async fn scpid_sign(
     #[cfg(not(feature = "testing"))]
     if signed_at_override.is_some() {
         return Err(ScpIdError::InvalidInput(
-            "signed_at_override requires the scp-runtime `testing` feature — \
+            "signed_at_override requires the `scp-runtime-types/testing` feature — \
              not available in production builds"
                 .to_owned(),
         ));

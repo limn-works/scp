@@ -197,12 +197,21 @@ async fn sign_bounded(signer: &CommandSigner, digest: &[u8; 32]) -> Result<[u8; 
     }
 }
 
+/// Test-only reach into [`custody_timed_out`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn custody_timed_out_for_test(operation: &'static str) -> ContextError {
+    custody_timed_out(operation)
+}
+
 /// The failure of a custody call that did not answer within [`SIGN_TIMEOUT`]:
 /// [`ContextError::Custody`] of kind [`CustodyFailureKind::TimedOut`]
 /// (`SCP-CRYPTO-4062`). `operation` names the call in the detail. Every
 /// custody budget in the runtime builds its timeout through this function.
 #[must_use]
-pub fn custody_timed_out(operation: &'static str) -> ContextError {
+pub(crate) fn custody_timed_out(operation: &'static str) -> ContextError {
     ContextError::Custody(CustodyFailure {
         kind: CustodyFailureKind::TimedOut,
         detail: format!("custody did not answer {operation} within {SIGN_TIMEOUT:?}"),

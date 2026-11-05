@@ -42,21 +42,25 @@ fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
     Ok(format!("wrapping_key/{d}"))
 }
 
-/// The stored wrapping key: the custody handle of the private key and its 65-byte uncompressed
-/// public point.
-///
-/// It carries no key material and no identity; the storage key names the identity. A stored point
-/// of any other length fails to decode. `Debug` prints only the public point; the handle stays out
-/// of logs.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredWrappingKeyHandle {
-    /// The record version, `RECORD_VERSION`.
-    pub v: u8,
-    /// The custody handle of the private key.
-    pub handle: KeyHandle,
-    /// The 65-byte uncompressed public point.
-    #[serde(with = "serde_bytes")]
-    pub public: [u8; 65],
+scp_runtime_types::pub_under_testing! {
+    /// The stored wrapping key: the custody handle of the private key and its 65-byte uncompressed
+    /// public point.
+    ///
+    /// It carries no key material and no identity; the storage key names the identity. A stored point
+    /// of any other length fails to decode. `Debug` prints only the public point; the handle stays out
+    /// of logs.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) struct StoredWrappingKeyHandle {
+        /// The record version, `RECORD_VERSION`.
+        pub v: u8,
+        /// The custody handle of the private key.
+        pub handle: KeyHandle,
+        /// The 65-byte uncompressed public point.
+        #[serde(with = "serde_bytes")]
+        pub public: [u8; 65],
+    }
 }
 
 impl std::fmt::Debug for StoredWrappingKeyHandle {
@@ -68,6 +72,23 @@ impl std::fmt::Debug for StoredWrappingKeyHandle {
     }
 }
 
+/// Test-only reach into [`store_wrapping_key_handle`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+///
+/// # Errors
+///
+/// Every error [`store_wrapping_key_handle`] returns.
+#[cfg(any(test, feature = "testing"))]
+pub async fn store_wrapping_key_handle_for_test(
+    storage: &dyn OpenMlsStorageAdapter,
+    did: &DID,
+    handle: &KeyHandle,
+    public: &[u8; 65],
+) -> Result<(), ContextError> {
+    store_wrapping_key_handle(storage, did, handle, public).await
+}
+
 /// Stores `handle` and `public` as the wrapping key record of `did`,
 /// replacing any stored one.
 ///
@@ -75,7 +96,7 @@ impl std::fmt::Debug for StoredWrappingKeyHandle {
 ///
 /// [`ContextError::PersistenceFailed`] if `did` is not a valid key component,
 /// or if serialization or the storage write fails.
-pub async fn store_wrapping_key_handle(
+pub(crate) async fn store_wrapping_key_handle(
     storage: &dyn OpenMlsStorageAdapter,
     did: &DID,
     handle: &KeyHandle,
@@ -113,6 +134,21 @@ pub(crate) async fn delete_wrapping_key_handle(
         .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key delete: {e}")))
 }
 
+/// Test-only reach into [`load_wrapping_key_handle`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+///
+/// # Errors
+///
+/// Every error [`load_wrapping_key_handle`] returns.
+#[cfg(any(test, feature = "testing"))]
+pub async fn load_wrapping_key_handle_for_test(
+    storage: &dyn OpenMlsStorageAdapter,
+    did: &DID,
+) -> Result<Option<StoredWrappingKeyHandle>, ContextError> {
+    load_wrapping_key_handle(storage, did).await
+}
+
 /// Loads the wrapping key record of `did`. Returns `None` if none is stored.
 ///
 /// # Errors
@@ -122,7 +158,7 @@ pub(crate) async fn delete_wrapping_key_handle(
 /// - [`ContextError::CryptoFailed`] if the stored bytes are not a version-1
 ///   record with a 65-byte public point, including bytes that are no record
 ///   at all and the old 32-byte scalar record.
-pub async fn load_wrapping_key_handle(
+pub(crate) async fn load_wrapping_key_handle(
     storage: &dyn OpenMlsStorageAdapter,
     did: &DID,
 ) -> Result<Option<StoredWrappingKeyHandle>, ContextError> {

@@ -314,7 +314,7 @@ impl ContextPersistence for FaultyPersistence {
             .get()
             .and_then(std::sync::Weak::upgrade)
         {
-            sup.close_spawn_gate();
+            sup.close_spawn_gate_for_test();
         }
         Ok(())
     }
@@ -416,10 +416,10 @@ async fn a_failed_spawn_rolls_back_create_and_import() {
         "the create wrote its contact before the spawn"
     );
     guard
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .unwrap();
-    assert!(sup.lookup(&created).is_none(), "no actor started");
+    assert!(sup.lookup_for_test(&created).is_none(), "no actor started");
     assert_eq!(persistence.created_at(&created), Some(PRIOR_CREATED_AT));
     assert_eq!(
         contacts.load_last_relay_contact(&created).await.unwrap(),
@@ -458,10 +458,10 @@ async fn a_failed_spawn_rolls_back_create_and_import() {
         "the import wrote its contact before the spawn"
     );
     guard
-        .rollback(sup.lock_bootstrap_spawn_for_test())
+        .rollback_for_test(sup.lock_bootstrap_spawn_for_test())
         .await
         .unwrap();
-    assert!(sup.lookup(&imported).is_none(), "no actor started");
+    assert!(sup.lookup_for_test(&imported).is_none(), "no actor started");
     assert!(!persistence.contexts.contains_key(&imported));
     assert_eq!(
         contacts.load_last_relay_contact(&imported).await.unwrap(),

@@ -21,7 +21,7 @@
 //! # Helpers
 //!
 //! 1. [`build_inner_wire`](scp_runtime_core::context::shared::messaging::build_inner_wire) (pure: access-key wrap + inner-envelope
-//!    sign+pad) feeding [`build_encrypted_envelope_actor`] — the
+//!    sign+pad) feeding [`ActorDeps::build_encrypted_envelope`] — the
 //!    ADR-049 PR-7 actor seal (sender-key + MLS + outer-envelope)
 //!    against an actor-owned `ContextCryptoState`.
 //! 2. [`enforce_send_economy`] — unified economy enforcement against
@@ -53,7 +53,7 @@
 
 use scp_runtime_core::context::actor::commands::DeliverOutcome;
 use scp_runtime_core::context::shared::messaging::{
-    Dispatched, build_encrypted_envelope_actor, commit_send_nonce_token_on_abort,
+    Dispatched, EncryptedEnvelopeRequest, commit_send_nonce_token_on_abort,
 };
 use scp_runtime_core::context::snapshot::persist_state_best_effort;
 
@@ -83,9 +83,7 @@ use scp_runtime_core::context::actor::class_s::{
     BroadcastContextClassCMut, ClassCMut, ClassSCell, ClassSCommitToken,
 };
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::state::{
-    self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into,
-};
+use scp_runtime_core::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage};
 use scp_runtime_core::context::supervisor::MessageSigner;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
@@ -99,8 +97,8 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001, C8): the `#[cfg(test)]` provider seal twin
 // `build_encrypted_envelope` is DELETED — its last callers (the send-path unit /
 // pipeline / agent-binding fixtures) now drive the production actor seal
-// `build_encrypted_envelope_actor` directly against an actor-owned
-// `ContextCryptoState`. The shared inner-envelope construction below
+// `build_encrypted_envelope_actor` (through its `testing` twin) directly against
+// an actor-owned `ContextCryptoState`. The shared inner-envelope construction below
 // (`build_inner_wire`) is retained; the actor path bottoms out in it, so the
 // sealed wire stays byte-identical across the flip.
 
@@ -140,7 +138,7 @@ pub fn enforce_send_economy(
         let pricing_default =
             scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
         let member_count = state.membership.count();
-        let governance = &mut state.governance;
+        let governance = state.governance_mut();
         let pricing = governance
             .message_pricing
             .as_ref()
@@ -369,7 +367,7 @@ pub fn deliver_plaintext_or_announcement(
                 sender_did: DID(sender_did.to_owned()),
                 payload: plaintext.to_vec(),
             };
-            emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
+            view.emit_event(event, context_id, event_tx);
             None
         }
     }
@@ -545,7 +543,7 @@ fn ingest_pseudonym_announcement(
                     member_did,
                     pseudonym: record.routing_id,
                 };
-                emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
+                view.emit_event(event, context_id, event_tx);
             }
             AnnouncementOutcome::Recorded
         }
@@ -851,13 +849,12 @@ pub async fn send_message(
             }
         };
     // F4: wrap Phase 1 economy state in an EconomyTicket.
-    let ticket = scp_runtime_core::context::shared::economy::EconomyTicket {
-        actor_did: sender_did.clone(),
+    let ticket = scp_runtime_core::context::shared::economy::EconomyTicket::new(
+        sender_did.clone(),
         deducted_cost,
         velocity_token,
-        needs_hard_rate_limit_refund: true,
-        consumed: false,
-    };
+        true,
+    );
 
     // Phase 1 routing/envelope build runs through the non-persisting Class-C
     // view. An abort here owes the keep-direction nonce-token persist (Class-S,
@@ -1548,7 +1545,7 @@ pub async fn encrypt_and_send(
         //
         // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's OWNED
         // field-granular Class-C `&mut ContextCryptoState`
-        // ([`build_encrypted_envelope_actor`]) — every non-broadcast send seam
+        // ([`ActorDeps::build_encrypted_envelope`]) — every non-broadcast send seam
         // (`send_message` / `send_checkpoint` / `send_heartbeat`) now supplies it.
         // The provider `build_encrypted_envelope` twin is deleted. This else-branch
         // is only reached for a non-broadcast encrypted send (a broadcast send took
@@ -1560,20 +1557,21 @@ pub async fn encrypt_and_send(
                     .to_string(),
             )
         })?;
-        let result = build_encrypted_envelope_actor(
-            &deps.clock,
-            cs,
-            deps.crypto.local_did(),
-            context_id,
-            sender_did,
-            payload,
-            signer,
-            recipients_data,
-            sequence,
-            source_provenance,
-            message_type,
-        )
-        .await?;
+        let result = deps
+            .build_encrypted_envelope(
+                cs,
+                EncryptedEnvelopeRequest {
+                    context_id,
+                    sender_did,
+                    payload,
+                    signer,
+                    recipients_data,
+                    aad_sequence: sequence,
+                    source_provenance,
+                    message_type,
+                },
+            )
+            .await?;
         scp_runtime_types::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
     };
@@ -1655,7 +1653,7 @@ pub async fn encrypt_and_send(
 // (no FFI/SDK surface, no bridge-export obligation) with no PR-body exemption.
 // `redundant_pub_crate` is a false positive: the enclosing `messaging_helpers`
 // module is already `pub(crate)`, but this item is genuinely reached crate-wide
-// (same rationale as `build_encrypted_envelope_actor` above).
+// (the same rationale core gives for `build_encrypted_envelope_actor`).
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) async fn send_checkpoint(
     deps: &ActorDeps,
@@ -1687,7 +1685,7 @@ pub(crate) async fn send_checkpoint(
             .map(|reg| reg.values().map(|r| r.routing_id).collect())
             .unwrap_or_default();
         (
-            cell.access.access_key_store.get_all(context_id),
+            cell.access().access_key_store.get_all(context_id),
             peer_pseudonyms,
         )
     };
@@ -1827,7 +1825,7 @@ pub(crate) async fn send_heartbeat(
             .map(|reg| reg.values().map(|r| r.routing_id).collect())
             .unwrap_or_default();
         (
-            cell.access.access_key_store.get_all(context_id),
+            cell.access().access_key_store.get_all(context_id),
             peer_pseudonyms,
         )
     };
@@ -1983,7 +1981,7 @@ fn record_payment_capture_failure(
         error: error_msg.to_owned(),
         cost: cost.map(scp_protocol::economy::types::Amount::value),
     };
-    emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
+    deps.emit_event_into(receive_buffer, event, context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,12 +2141,7 @@ pub async fn finalize_send(
             sequence_number: sequence,
             payload: payload.to_vec(),
         };
-        emit_event_into(
-            view.receive_buffer_mut(),
-            sent_event,
-            context_id,
-            deps.event_tx.as_ref(),
-        );
+        deps.emit_event_into(view.receive_buffer_mut(), sent_event, context_id);
 
         // Consequence enforcement.
         let (send_events, convergent_now) = deps
@@ -2403,13 +2396,22 @@ async fn persist_finalized_send(
 /// [`deliver_incoming`], advances it after the inner envelope verifies.
 /// A `SenderKeyRequest` from an identity in `denied` gets no answer (spec 09
 /// §9.16.10: the read-revoked identities).
-pub async fn decrypt_and_dispatch(
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] when the context has no MLS group, the
+/// envelope fails to open, the application message's MLS sender is the local
+/// DID, or a sender-key management message fails to decode, bind, answer or
+/// open.
+/// Errors from the sender's epoch floor and the identity wrapping key pass
+/// through unchanged.
+pub async fn decrypt_and_dispatch<S: std::hash::BuildHasher + Sync>(
     deps: &ActorDeps,
     crypto_state: Option<&mut scp_runtime_core::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
-    denied: &std::collections::HashSet<String>,
+    denied: &std::collections::HashSet<String, S>,
 ) -> Result<Dispatched, ContextError> {
     let decrypt_start = std::time::Instant::now();
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
@@ -2726,12 +2728,7 @@ pub async fn validate_and_drain_timeouts(
             first_delivered_sequence: gap_info.first_buffered_sequence,
             reason: format!("{:?}", gap_info.reason),
         };
-        emit_event_into(
-            view.receive_buffer_mut(),
-            gap_event,
-            context_id,
-            deps.event_tx.as_ref(),
-        );
+        deps.emit_event_into(view.receive_buffer_mut(), gap_event, context_id);
         for msg in &messages {
             // Re-check membership and capability.
             if !view.membership_class_c_mut().contains(&msg.sender_did)
@@ -2826,12 +2823,7 @@ pub async fn buffer_ahead_message(
             first_delivered_sequence: gap_info.first_buffered_sequence,
             reason: format!("{:?}", gap_info.reason),
         };
-        emit_event_into(
-            view.receive_buffer_mut(),
-            gap_event,
-            context_id,
-            deps.event_tx.as_ref(),
-        );
+        deps.emit_event_into(view.receive_buffer_mut(), gap_event, context_id);
 
         for msg in &messages {
             if !view.membership_class_c_mut().contains(&msg.sender_did)
@@ -3083,12 +3075,7 @@ pub async fn deliver_message_and_drain_buffered(
         sender_did: sender_did_obj,
         payload: plaintext.to_vec(),
     };
-    emit_event_into(
-        view.receive_buffer_mut(),
-        recv_event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    deps.emit_event_into(view.receive_buffer_mut(), recv_event, context_id);
 
     // Drain consecutive buffered (§9.8.5).
     let next_expected = inner.sequence.saturating_add(1);
@@ -3242,7 +3229,7 @@ pub async fn send_pseudonym_announcement(
     let Some(routing_id) = cell.routing.local_pseudonym() else {
         return Err(ContextError::NotPseudonymousContext { context_id });
     };
-    let rotation = cell.class_s.pseudonym_rotation.clone();
+    let rotation = cell.class_s().pseudonym_rotation.clone();
     let payload = encode_local_announcement(sender_did.as_ref(), routing_id, rotation.epoch())?;
     send_message(
         cell,
@@ -3271,7 +3258,7 @@ pub async fn send_pseudonym_announcement(
     // carries a different epoch, and its own announcement clears its flag.
     if rotation.announce_pending() {
         cell.commit_class_s_restore(deps, &context_id, |mut view| {
-            let current = &mut view.rest_mut().class_s.pseudonym_rotation;
+            let current = &mut view.rest_mut().class_s_mut().pseudonym_rotation;
             if current.epoch() == rotation.epoch() {
                 current.announce_pending = false;
             }
@@ -3377,7 +3364,7 @@ pub async fn rotate_pseudonym(
 
     let now_secs = deps.clock.now_secs();
     let policy = handle.params().pseudonym_rotation;
-    let mut rotation = cell.class_s.pseudonym_rotation.clone();
+    let mut rotation = cell.class_s().pseudonym_rotation.clone();
     let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), now_secs) else {
         return Err(ContextError::InvalidState(
             "no pseudonym rotation is due: the context has no rotation policy, no trigger has \
@@ -3426,7 +3413,7 @@ pub async fn rotate_pseudonym(
         |mut view| {
             let state = view.rest_mut();
             state.routing.set_local_pseudonym(new_routing_id);
-            state.class_s.pseudonym_rotation = rotation;
+            state.class_s_mut().pseudonym_rotation = rotation;
             Ok(((), old_routing_id))
         },
         async |old, mut view, _deps| {
@@ -3524,7 +3511,7 @@ mod pseudonym_routing_tests {
         let bytes = announcement_bytes(ALICE, alice_pseudonym);
 
         let result = deliver_plaintext_or_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &bytes,
             &ctx,
@@ -3554,12 +3541,12 @@ mod pseudonym_routing_tests {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
         let victim_pseudonym = [0x77u8; 32];
-        ClassCMut::from_state(&mut state)
+        ClassCMut::from_state_for_test(&mut state)
             .routing_mut()
             .set_local_pseudonym(victim_pseudonym);
 
         let result = deliver_plaintext_or_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             BOB,
             &announcement_bytes(BOB, victim_pseudonym),
             &ctx,
@@ -3586,7 +3573,7 @@ mod pseudonym_routing_tests {
         // the registry update below is the observable effect.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut ClassCMut::from_state(&mut state),
+                &mut ClassCMut::from_state_for_test(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, first),
                 &ctx,
@@ -3597,7 +3584,7 @@ mod pseudonym_routing_tests {
         // Same DID re-announces a rotated routing ID — legitimate key rotation.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut ClassCMut::from_state(&mut state),
+                &mut ClassCMut::from_state_for_test(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, rotated),
                 &ctx,
@@ -3643,7 +3630,7 @@ mod pseudonym_routing_tests {
 
         // (1) First contact — a NEW peer: emits.
         ingest_pseudonym_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &announcement_bytes(ALICE, first),
             &ctx,
@@ -3658,7 +3645,7 @@ mod pseudonym_routing_tests {
         // (2) Identical re-announce — SAME value: registry value is unchanged,
         // so NO new event fires (the reciprocal-cascade dedup).
         ingest_pseudonym_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &announcement_bytes(ALICE, first),
             &ctx,
@@ -3672,7 +3659,7 @@ mod pseudonym_routing_tests {
 
         // (3) Rotation — CHANGED value: emits again, surfacing the address change.
         ingest_pseudonym_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &announcement_bytes(ALICE, rotated),
             &ctx,
@@ -3741,7 +3728,13 @@ mod pseudonym_routing_tests {
                 .copied()
         };
         let ingest = |s: &mut PerContextState, bytes: Vec<u8>| {
-            ingest_pseudonym_announcement(&mut ClassCMut::from_state(s), ALICE, &bytes, &ctx, None)
+            ingest_pseudonym_announcement(
+                &mut ClassCMut::from_state_for_test(s),
+                ALICE,
+                &bytes,
+                &ctx,
+                None,
+            )
         };
 
         assert_eq!(
@@ -3816,13 +3809,13 @@ mod pseudonym_routing_tests {
         let old = [0x76u8; 32];
         state.routing.set_local_pseudonym([0x77u8; 32]);
         state
-            .class_s
+            .class_s_mut()
             .pseudonym_rotation
             .record_rotation(1, old, None, 1_000)
             .expect("the rotation records");
 
         let outcome = ingest_pseudonym_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &announcement_v2_bytes(ALICE, 1, old),
             &ctx,
@@ -3847,7 +3840,7 @@ mod pseudonym_routing_tests {
         let forged = announcement_bytes(BOB, [0x42u8; 32]);
 
         let result = deliver_plaintext_or_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             &forged,
             &ctx,
@@ -3873,7 +3866,7 @@ mod pseudonym_routing_tests {
             let bytes = announcement_bytes(ALICE, reserved);
             assert_eq!(
                 deliver_plaintext_or_announcement(
-                    &mut ClassCMut::from_state(&mut state),
+                    &mut ClassCMut::from_state_for_test(&mut state),
                     ALICE,
                     &bytes,
                     &ctx,
@@ -3904,7 +3897,7 @@ mod pseudonym_routing_tests {
         // assertions below distinguish Recorded (inserted) from Rejected.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut ClassCMut::from_state(&mut state),
+                &mut ClassCMut::from_state_for_test(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, shared_rid),
                 &ctx,
@@ -3915,7 +3908,7 @@ mod pseudonym_routing_tests {
         // Bob tries to claim Alice's already-registered routing ID → collision.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut ClassCMut::from_state(&mut state),
+                &mut ClassCMut::from_state_for_test(&mut state),
                 BOB,
                 &announcement_bytes(BOB, shared_rid),
                 &ctx,
@@ -3942,7 +3935,7 @@ mod pseudonym_routing_tests {
         let bytes = announcement_bytes(BOB, [0x42u8; 32]);
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut ClassCMut::from_state(&mut state),
+                &mut ClassCMut::from_state_for_test(&mut state),
                 BOB,
                 &bytes,
                 &ctx,
@@ -3963,7 +3956,7 @@ mod pseudonym_routing_tests {
         let ctx = ctx_hex(0x11);
         let buffered_before = state.receive_buffer.event_log_entries().len();
         let result = deliver_plaintext_or_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             b"hello world",
             &ctx,
@@ -3993,7 +3986,7 @@ mod pseudonym_routing_tests {
         let mut s = encrypted_state();
         assert!(matches!(
             ingest_pseudonym_announcement(
-                &mut ClassCMut::from_state(&mut s),
+                &mut ClassCMut::from_state_for_test(&mut s),
                 ALICE,
                 b"plain",
                 &ctx,
@@ -4006,7 +3999,7 @@ mod pseudonym_routing_tests {
         let mut s = encrypted_state();
         assert!(matches!(
             ingest_pseudonym_announcement(
-                &mut ClassCMut::from_state(&mut s),
+                &mut ClassCMut::from_state_for_test(&mut s),
                 ALICE,
                 &announcement_bytes(ALICE, [9u8; 32]),
                 &ctx,
@@ -4020,7 +4013,7 @@ mod pseudonym_routing_tests {
         let mut s = encrypted_state();
         assert!(matches!(
             ingest_pseudonym_announcement(
-                &mut ClassCMut::from_state(&mut s),
+                &mut ClassCMut::from_state_for_test(&mut s),
                 ALICE,
                 &announcement_bytes(BOB, [9u8; 32]),
                 &ctx,
@@ -4133,12 +4126,15 @@ mod pseudonym_routing_tests {
         // enough to trip threshold 1. The triggered consequence carries non-empty
         // evidence, so `ConsequenceTriggered` is emitted even though the sender is
         // not in the test fixture's (empty) membership set.
-        state.governance.consequence_rules.push(ConsequenceRule {
-            trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-            threshold: 1,
-            window: std::time::Duration::from_hours(1),
-        });
+        state
+            .governance_mut()
+            .consequence_rules
+            .push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: std::time::Duration::from_hours(1),
+            });
 
         let clock = TestClock::new(1_700_000_100);
         let event_log = RecordingEventLog::default();
@@ -4149,7 +4145,7 @@ mod pseudonym_routing_tests {
         // point. It is pushed to the receive buffer but returns `None` (no
         // sender-authenticated Merkle leaf — §9.9.3).
         let event_name = deliver_plaintext_or_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             ALICE,
             b"hello world",
             &ctx,
@@ -4165,7 +4161,7 @@ mod pseudonym_routing_tests {
         // sites now use.
         let mut obligation = None;
         let _suspended = run_buffered_post_delivery(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             &mut obligation,
             &ctx,
             &ctx_bytes,
@@ -4185,7 +4181,7 @@ mod pseudonym_routing_tests {
         );
 
         // (a) Velocity was recorded for the sender.
-        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        let velocity = state.governance().velocity_tracker.snapshot_entries();
         assert!(
             velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
             "buffered application message must record sender velocity (was skipped by the gated bug)"
@@ -4430,12 +4426,15 @@ mod pseudonym_routing_tests {
         // application messages project to `EventType::MessageSent` for
         // consequence purposes, so one buffered app message trips threshold 1
         // and emits `ConsequenceTriggered` (non-empty evidence).
-        state.governance.consequence_rules.push(ConsequenceRule {
-            trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-            threshold: 1,
-            window: std::time::Duration::from_hours(1),
-        });
+        state
+            .governance_mut()
+            .consequence_rules
+            .push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: std::time::Duration::from_hours(1),
+            });
 
         // Pre-buffer an out-of-order APPLICATION message (sequence 2, expected
         // 1) with `received_at = 0` so it is past the gap timeout once we pass a
@@ -4479,7 +4478,7 @@ mod pseudonym_routing_tests {
             scp_runtime_core::context::actor::class_s::ClassSCommitToken,
         > = None;
         validate_and_drain_timeouts(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             &deps,
             &ctx,
             &incoming,
@@ -4496,7 +4495,7 @@ mod pseudonym_routing_tests {
         }
 
         // (a) Velocity recorded for the buffered sender via the drain path.
-        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        let velocity = state.governance().velocity_tracker.snapshot_entries();
         assert!(
             velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
             "buffered-drain call site must record sender velocity (a re-added `if let Some` gate skips it)"
@@ -4621,7 +4620,7 @@ mod pseudonym_routing_tests {
             scp_runtime_core::context::actor::class_s::ClassSCommitToken,
         > = None;
         let consumed = deliver_message_and_drain_buffered(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -4696,7 +4695,7 @@ mod pseudonym_routing_tests {
         // ALICE (this member) holds her own local pseudonym; BOB is a brand-new
         // peer whose announcement ALICE is about to ingest for the first time.
         let alice_pseudonym = [0xA1u8; 32];
-        ClassCMut::from_state(&mut state)
+        ClassCMut::from_state_for_test(&mut state)
             .routing_mut()
             .set_local_pseudonym(alice_pseudonym);
 
@@ -4714,7 +4713,7 @@ mod pseudonym_routing_tests {
 
         let bob_pseudonym = [0xB0u8; 32];
         let outcome = ingest_pseudonym_announcement(
-            &mut ClassCMut::from_state(&mut state),
+            &mut ClassCMut::from_state_for_test(&mut state),
             BOB,
             &announcement_bytes(BOB, bob_pseudonym),
             &ctx,

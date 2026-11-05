@@ -15,7 +15,7 @@ use scp_runtime_core::context::actor::class_s::{ClassSCommitToken, ConsequenceRo
 // the type's `pub(crate)` effective reach within the context module tree without
 // tripping `redundant_pub_crate` (the module itself is private to `context`).
 pub use scp_runtime_core::context::actor::class_s::ConsequenceStateSplit;
-use scp_runtime_core::context::state::{context_id_to_bytes, emit_event_into};
+use scp_runtime_core::context::state::context_id_to_bytes;
 
 // ---------------------------------------------------------------------------
 // Consequence enforcement — synthetic actor DID + shared wire-stable labels
@@ -380,7 +380,7 @@ async fn emit_consequence_triggered(
         trigger_type: trigger_kind.to_owned(),
         action_type: action_type.to_owned(),
     };
-    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    state.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
@@ -422,7 +422,7 @@ async fn emit_absent_member_enforcement_failed(
         action_type: action_type.to_owned(),
         success: false,
     };
-    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    state.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
@@ -461,7 +461,7 @@ async fn emit_consequence_enforced_success(
         action_type: action_type.to_owned(),
         success: true,
     };
-    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    state.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Outcome of a single [`dispatch_enforcement_action`] call.
@@ -734,7 +734,7 @@ async fn emit_failure_escalation(
         action_type: "SuspendAll(escalated)".to_owned(),
         success: true,
     };
-    emit_event_into(state.receive_buffer, event, context_id, args.event_tx);
+    state.emit_event(event, context_id, args.event_tx);
 }
 
 /// Collects event history for consequence evaluation and participation

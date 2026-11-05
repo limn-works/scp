@@ -219,18 +219,18 @@ fn member_state(spent: u64, reserved_counter: u64) -> PerContextState {
         .membership
         .add_member(invoker(), "member".to_owned(), Vec::new());
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
     if spent > 0 {
         state
-            .governance
+            .governance_mut()
             .budget_tracker
             .record_spend(&invoker(), Amount::new(spent))
             .expect("record open-time escrow debit");
     }
     if reserved_counter > 0 {
-        state.class_s.caveat_counters.insert(
+        state.class_s_mut().caveat_counters.insert(
             UCAN_CID.to_owned(),
             CaveatCounters {
                 amount_cumulative_used: reserved_counter,
@@ -301,8 +301,8 @@ async fn settle_releases_refunds_and_captures() {
     let deps = deps_for(&supervisor).await;
 
     let mut state = member_state(100, 50);
-    state.governance.economic_policy = Some(policy());
-    let mut cell = ClassSCell::new(state);
+    state.governance_mut().economic_policy = Some(policy());
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
 
     let outcome = settle_outlet_stream(
@@ -326,12 +326,13 @@ async fn settle_releases_refunds_and_captures() {
     }
     assert_eq!(captured.load(Ordering::SeqCst), 1, "exactly one capture");
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(30),
         "escrow refund of 70 applied: spent 100 − 70 = 30"
     );
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 30,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        30,
         "counter released the unspent 20 of the 50 reserved: 50 − 20 = 30 billed spend"
     );
 }
@@ -366,7 +367,7 @@ async fn already_settled_witness_with_failing_store_does_not_recapture() {
 
     let saga_id = SagaId("saga-already-settled-failstore".to_owned());
     let mut state = member_state(100, 50);
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
 
     // Seed the durable witness ALREADY settled — a prior settle moved the money
     // exactly once. Only `settled == true` + the `SagaId` key are load-bearing
@@ -388,7 +389,7 @@ async fn already_settled_witness_with_failing_store_does_not_recapture() {
                 },
             )
             .expect("receipt signs");
-    state.class_s.xctx_committed_stream_outputs.insert(
+    state.class_s_mut().xctx_committed_stream_outputs.insert(
         saga_id.clone(),
         CommittedStreamingOutletInvocation {
             receipt,
@@ -412,10 +413,10 @@ async fn already_settled_witness_with_failing_store_does_not_recapture() {
         },
     );
 
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
-    let spent_before = cell.governance.budget_tracker.total_spent(&invoker());
-    let counter_before = cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used;
+    let spent_before = cell.governance().budget_tracker.total_spent(&invoker());
+    let counter_before = cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used;
 
     let outcome = settle_outlet_stream(
         &mut cell,
@@ -438,16 +439,17 @@ async fn already_settled_witness_with_failing_store_does_not_recapture() {
              when the persist would fail — no double-bill"
     );
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         spent_before,
         "no refund / reverse_spend ran (money untouched)"
     );
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, counter_before,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        counter_before,
         "no §7.3.8 counter release ran (money untouched)"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_committed_stream_outputs
             .get(&saga_id)
             .is_some_and(|w| w.settled),
@@ -470,7 +472,7 @@ async fn clean_settle_removes_lingering_zero_record() {
     let mut state = member_state(0, 0);
     // Model the grant-created-then-reverse-zeroed crash-recovery record for
     // the settlement's `request_id` ([3u8; 16]).
-    state.class_s.stream_reservations.insert(
+    state.class_s_mut().stream_reservations.insert(
         hex::encode([3u8; 16]),
         scp_runtime_core::context::outlets::invoke::StreamReservationRecord {
             invoker_did: invoker(),
@@ -481,10 +483,10 @@ async fn clean_settle_removes_lingering_zero_record() {
             generation: 0,
         },
     );
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
     assert!(
-        cell.class_s
+        cell.class_s()
             .stream_reservations
             .contains_key(&hex::encode([3u8; 16])),
         "precondition: the lingering 0-record exists before settle"
@@ -506,11 +508,11 @@ async fn clean_settle_removes_lingering_zero_record() {
         "a zero-cost clean settle settles with no receipt: {outcome:?}"
     );
     assert!(
-        cell.class_s.stream_reservations.is_empty(),
+        cell.class_s().stream_reservations.is_empty(),
         "the lingering 0-record is REMOVED on clean settle (no leak to the reconcile sweep)"
     );
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(0),
         "removing the fully-settled 0-record changes no budget"
     );
@@ -528,8 +530,8 @@ async fn generation_mismatch_captures_without_mutation() {
     let deps = deps_for(&supervisor).await;
 
     let mut state = member_state(100, 50);
-    state.governance.economic_policy = Some(policy());
-    let mut cell = ClassSCell::new(state);
+    state.governance_mut().economic_policy = Some(policy());
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
 
     let outcome = settle_outlet_stream(
@@ -551,12 +553,13 @@ async fn generation_mismatch_captures_without_mutation() {
         "no capture without an open-time policy snapshot on a replaced instance"
     );
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(100),
         "budget untouched on a generation mismatch (reserves left for the sweep)"
     );
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 50,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        50,
         "counter untouched on a generation mismatch (reserves left for the sweep)"
     );
 }
@@ -576,8 +579,8 @@ async fn generation_mismatch_with_snapshot_captures_rendered_bill() {
     let mut state = member_state(100, 50);
     // Live policy present — Part 1 MUST ignore it (wrong instance) and use
     // the open-time SNAPSHOT instead.
-    state.governance.economic_policy = Some(policy());
-    let mut cell = ClassSCell::new(state);
+    state.governance_mut().economic_policy = Some(policy());
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
 
     let snapshot = EconomicPolicySnapshot { policy: policy() };
@@ -606,12 +609,13 @@ async fn generation_mismatch_with_snapshot_captures_rendered_bill() {
         "the rendered bill is captured even on a replaced instance (H8)"
     );
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(100),
         "budget untouched on a generation mismatch (reserves left for the sweep)"
     );
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 50,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        50,
         "counter untouched on a generation mismatch (reserves left for the sweep)"
     );
 }
@@ -627,7 +631,7 @@ async fn clean_settle_clears_recovery_record() {
     let mut state = member_state(100, 50);
     // A record persisted at open for this in-flight stream (keyed by the
     // settlement's request_id `[3u8; 16]`).
-    state.class_s.stream_reservations.insert(
+    state.class_s_mut().stream_reservations.insert(
         hex::encode([3u8; 16]),
         StreamReservationRecord {
             invoker_did: invoker(),
@@ -638,7 +642,7 @@ async fn clean_settle_clears_recovery_record() {
             generation: 0,
         },
     );
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
 
     let outcome = settle_outlet_stream(
@@ -655,7 +659,7 @@ async fn clean_settle_clears_recovery_record() {
         "a matching-generation settle runs on owned state"
     );
     assert!(
-        cell.class_s.stream_reservations.is_empty(),
+        cell.class_s().stream_reservations.is_empty(),
         "the clean settle cleared the crash-recovery record"
     );
 }
@@ -671,7 +675,7 @@ async fn reconcile_sweep_refunds_releases_and_clears() {
 
     // Open-time state: escrow hold of 210 debited, cumulative counter at 350.
     let mut state = member_state(210, 350);
-    state.class_s.stream_reservations.insert(
+    state.class_s_mut().stream_reservations.insert(
         hex::encode([7u8; 16]),
         StreamReservationRecord {
             invoker_did: invoker(),
@@ -684,7 +688,7 @@ async fn reconcile_sweep_refunds_releases_and_clears() {
             generation: 99,
         },
     );
-    let mut cell = ClassSCell::new(state);
+    let mut cell = ClassSCell::new_for_test(state);
 
     let reconciled = reconcile_stream_reservations(&mut cell, &deps, &ctx_key())
         .await
@@ -692,16 +696,17 @@ async fn reconcile_sweep_refunds_releases_and_clears() {
 
     assert_eq!(reconciled, 1, "one orphaned record reconciled");
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(0),
         "the FULL escrow hold (210) was refunded"
     );
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 0,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        0,
         "the FULL cumulative reserve (350) was released"
     );
     assert!(
-        cell.class_s.stream_reservations.is_empty(),
+        cell.class_s().stream_reservations.is_empty(),
         "the reconciled record was cleared (no double-release on a later restart)"
     );
 
@@ -712,7 +717,7 @@ async fn reconcile_sweep_refunds_releases_and_clears() {
         .expect("second reconcile is a no-op");
     assert_eq!(again, 0, "the second sweep finds no records");
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(0),
         "no over-refund on the idempotent re-run"
     );
@@ -728,7 +733,7 @@ async fn unspent_release_saturates_and_overflow_fails_closed() {
     let deps = deps_for(&supervisor).await;
 
     // billed 10 × cost 10 = 100 > reserved 40 → unspent saturates to 0.
-    let mut cell = ClassSCell::new(member_state(0, 40));
+    let mut cell = ClassSCell::new_for_test(member_state(0, 40));
     let live_gen = cell.generation;
     let outcome = settle_outlet_stream(
         &mut cell,
@@ -740,12 +745,13 @@ async fn unspent_release_saturates_and_overflow_fails_closed() {
     .await;
     assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 40,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        40,
         "billed ≥ reserve → release nothing"
     );
 
     // billed 2 × cost u64::MAX overflows checked_mul → release nothing.
-    let mut cell = ClassSCell::new(member_state(0, 40));
+    let mut cell = ClassSCell::new_for_test(member_state(0, 40));
     let live_gen = cell.generation;
     let outcome = settle_outlet_stream(
         &mut cell,
@@ -757,7 +763,8 @@ async fn unspent_release_saturates_and_overflow_fails_closed() {
     .await;
     assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
     assert_eq!(
-        cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 40,
+        cell.class_s().caveat_counters[UCAN_CID].amount_cumulative_used,
+        40,
         "billed × cost overflow → release nothing (conservatively over-charged)"
     );
 }
@@ -770,13 +777,13 @@ async fn unspent_release_saturates_and_overflow_fails_closed() {
 async fn escrow_refund_saturates_and_double_refund_is_noop() {
     let supervisor = build_supervisor(None);
     let deps = deps_for(&supervisor).await;
-    let mut cell = ClassSCell::new(member_state(40, 0));
+    let mut cell = ClassSCell::new_for_test(member_state(40, 0));
 
     reverse_stream_escrow(&mut cell, &deps, &ctx_key(), &invoker(), Amount::new(100))
         .await
         .expect("reverse persists");
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(0),
         "reversing more than spent saturates at 0"
     );
@@ -785,7 +792,7 @@ async fn escrow_refund_saturates_and_double_refund_is_noop() {
         .await
         .expect("second reverse persists");
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(0),
         "a double-refund is a no-op"
     );
@@ -800,8 +807,8 @@ async fn capture_failure_records_event_without_reversing_billed() {
     let deps = deps_for(&supervisor).await;
 
     let mut state = member_state(100, 0);
-    state.governance.economic_policy = Some(policy());
-    let mut cell = ClassSCell::new(state);
+    state.governance_mut().economic_policy = Some(policy());
+    let mut cell = ClassSCell::new_for_test(state);
     let live_gen = cell.generation;
 
     let outcome = settle_outlet_stream(
@@ -818,7 +825,7 @@ async fn capture_failure_records_event_without_reversing_billed() {
         "capture failed → no receipt"
     );
     assert_eq!(
-        cell.governance.budget_tracker.total_spent(&invoker()),
+        cell.governance().budget_tracker.total_spent(&invoker()),
         Amount::new(30),
         "the unspent refund (70) applied; the billed 30 is NOT reversed (H8)"
     );
@@ -844,7 +851,7 @@ async fn no_actor_fallback_captures_against_snapshot() {
     let captured = Arc::new(AtomicUsize::new(0));
     let supervisor = build_supervisor(Some(counting(&captured)));
     assert!(
-        supervisor.lookup(&ctx_key()).is_none(),
+        supervisor.lookup_for_test(&ctx_key()).is_none(),
         "context is unregistered — exercises the no-actor path"
     );
 
@@ -872,7 +879,7 @@ async fn settlement_sink_forwards_to_actor() {
     let deps = deps_for(&supervisor).await;
 
     let mut state = member_state(100, 50);
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     supervisor
         .spawn_actor_with_state_for_test(state, deps, None)
         .await
@@ -884,7 +891,7 @@ async fn settlement_sink_forwards_to_actor() {
     // MATCHES (a wrong generation would drop the settlement — no capture).
     let generation = 1;
 
-    let sink = ActorStreamSettlementSink::new(Arc::downgrade(&supervisor), generation);
+    let sink = ActorStreamSettlementSink::new_for_test(Arc::downgrade(&supervisor), generation);
     sink.settle(settlement(30, 70, 3, 10, 50, None));
 
     // The sink spawns the dispatch; poll until the capture lands (bounded).
@@ -919,11 +926,14 @@ async fn reverse_stream_escrow_via_actor_routes_ok() {
         .await
         .expect("reverse routes to the actor and persists");
 
-    let sink = ActorEscrowRefundSink::new(Arc::downgrade(&supervisor));
-    sink.refund(&ctx_key(), &invoker(), Amount::new(10)).await;
+    let sink = ActorEscrowRefundSink::new_for_test(Arc::downgrade(&supervisor));
+    sink.refund_for_test(&ctx_key(), &invoker(), Amount::new(10))
+        .await;
 
-    let orphan = ActorEscrowRefundSink::new(std::sync::Weak::new());
-    orphan.refund(&ctx_key(), &invoker(), Amount::new(10)).await;
+    let orphan = ActorEscrowRefundSink::new_for_test(std::sync::Weak::new());
+    orphan
+        .refund_for_test(&ctx_key(), &invoker(), Amount::new(10))
+        .await;
 }
 
 /// ADR-049 Decision 16: a sink operation spawned before shutdown runs on
@@ -938,7 +948,7 @@ async fn sink_op_is_drained_by_shutdown_and_refused_after_it() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let ran = Arc::new(AtomicUsize::new(0));
     let ran_in = Arc::clone(&ran);
-    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op(
+    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op_for_test(
         &weak,
         &runtime,
         SinkHandoff::StreamSettlement,
@@ -962,7 +972,7 @@ async fn sink_op_is_drained_by_shutdown_and_refused_after_it() {
 
     let late = Arc::new(AtomicUsize::new(0));
     let late_in = Arc::clone(&late);
-    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op(
+    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op_for_test(
         &weak,
         &runtime,
         SinkHandoff::StreamSettlement,
@@ -972,7 +982,7 @@ async fn sink_op_is_drained_by_shutdown_and_refused_after_it() {
     );
     let gone = Arc::new(AtomicUsize::new(0));
     let gone_in = Arc::clone(&gone);
-    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op(
+    scp_runtime_core::context::outlets::stream_settlement_adapter::spawn_supervisor_op_for_test(
         &std::sync::Weak::new(),
         &runtime,
         SinkHandoff::StreamSettlement,

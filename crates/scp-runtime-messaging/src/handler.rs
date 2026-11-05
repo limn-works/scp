@@ -48,7 +48,7 @@ use tokio::sync::oneshot;
 use scp_runtime_core::context::ContextHandle;
 use scp_runtime_core::context::actor::commands::MessagingCommand;
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 use scp_runtime_core::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
 use scp_runtime_types::context::actor::sequence::SequenceReservation;
@@ -1191,7 +1191,7 @@ async fn handle_rotate_pseudonym(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let before = (
-        cell.class_s.pseudonym_rotation.clone(),
+        cell.class_s().pseudonym_rotation.clone(),
         cell.routing.local_pseudonym(),
     );
     let rotate_fut = crate::helpers::rotate_pseudonym(
@@ -1209,7 +1209,7 @@ async fn handle_rotate_pseudonym(
         Ok(Err(err)) => {
             let sketch = outcome_error_sketch(&err);
             let after = (
-                cell.class_s.pseudonym_rotation.clone(),
+                cell.class_s().pseudonym_rotation.clone(),
                 cell.routing.local_pseudonym(),
             );
             if after == before {
@@ -1475,42 +1475,3 @@ async fn handle_send_heartbeat(
 // ---------------------------------------------------------------------------
 // Outcome sink helpers
 // ---------------------------------------------------------------------------
-
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink given a borrowed error that cannot be
-/// cloned. The outcome consumer only reads `mutated` (on the actor's
-/// dispatch loop) — the `result` field carries a representative
-/// variant (preserving the `TransportTimeout` / `TransportFailed` /
-/// `CryptoFailed` classification when recoverable from the
-/// `Display` string). This is a shim workaround; ADR-049 §15 deletes
-/// the two-channel pattern by making `Outcome`'s `Err` consumption
-/// the sole error path.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
-#[cfg(test)]
-mod outcome_sketch_tests {
-    use super::{ContextError, outcome_error_sketch};
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    #[test]
-    fn sketch_keeps_supervisor_shut_down_typed() {
-        let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-        assert!(
-            matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-            "got {sketch:?}"
-        );
-    }
-}

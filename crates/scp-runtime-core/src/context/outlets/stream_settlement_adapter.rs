@@ -47,12 +47,28 @@ use crate::context::outlets::invoke::{
 };
 use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
 
+/// Test-only reach into [`spawn_supervisor_op`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub fn spawn_supervisor_op_for_test<F, Fut>(
+    supervisor: &Weak<Supervisor>,
+    runtime: &tokio::runtime::Handle,
+    kind: SinkHandoff,
+    op: F,
+) where
+    F: FnOnce(Arc<Supervisor>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_supervisor_op(supervisor, runtime, kind, op);
+}
+
 /// Runs `op`, a hand-off of kind `kind`, against the Supervisor in a task on its tracker (ADR-049
 /// Decision 16), on `runtime`.
 ///
 /// The task holds only the `Weak` and upgrades it when it starts. When the Supervisor has dropped,
 /// or shutdown refuses the spawn, `op` does not run and the failure logs at error naming `kind`.
-pub fn spawn_supervisor_op<F, Fut>(
+fn spawn_supervisor_op<F, Fut>(
     supervisor: &Weak<Supervisor>,
     runtime: &tokio::runtime::Handle,
     kind: SinkHandoff,
@@ -86,28 +102,49 @@ pub fn spawn_supervisor_op<F, Fut>(
     }
 }
 
-/// Routes an open-time escrow reversal to the actor-owned budget tracker via the supervisor
-/// mailbox.
-///
-/// It spawns nothing: the caller awaits [`Self::refund`] in a task it already holds, which for a
-/// streaming open is a task on the open's spawner, so a refund fired after shutdown began still
-/// runs (ADR-049 Decision 16, item 2, second exception).
-pub struct ActorEscrowRefundSink {
-    /// The supervisor whose mailbox owns the target context's budget tracker.
-    supervisor: Weak<Supervisor>,
+scp_runtime_types::pub_under_testing! {
+    /// Routes an open-time escrow reversal to the actor-owned budget tracker via the supervisor
+    /// mailbox.
+    ///
+    /// It spawns nothing: the caller awaits [`Self::refund`] in a task it already holds, which for a
+    /// streaming open is a task on the open's spawner, so a refund fired after shutdown began still
+    /// runs (ADR-049 Decision 16, item 2, second exception).
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct ActorEscrowRefundSink {
+        /// The supervisor whose mailbox owns the target context's budget tracker.
+        supervisor: Weak<Supervisor>,
+    }
 }
 
 impl ActorEscrowRefundSink {
+    /// Test-only reach into [`Self::new`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn new_for_test(supervisor: Weak<Supervisor>) -> Self {
+        Self::new(supervisor)
+    }
+
     /// Wrap a `Weak` supervisor reference as the streaming escrow-refund sink.
     #[must_use]
-    pub const fn new(supervisor: Weak<Supervisor>) -> Self {
+    pub(crate) const fn new(supervisor: Weak<Supervisor>) -> Self {
         Self { supervisor }
+    }
+
+    /// Test-only reach into [`Self::refund`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn refund_for_test(&self, context_id: &str, member_did: &DID, amount: Amount) {
+        Self::refund(self, context_id, member_did, amount).await;
     }
 
     /// Reverses `amount` of `member_did`'s open-time hold in `context_id`.
     /// When the Supervisor has dropped, the refund does not run and logs at
     /// error; a reversal error logs at warn.
-    pub async fn refund(&self, context_id: &str, member_did: &DID, amount: Amount) {
+    pub(crate) async fn refund(&self, context_id: &str, member_did: &DID, amount: Amount) {
         let Some(supervisor) = self.supervisor.upgrade() else {
             tracing::error!(
                 context_id,
@@ -134,37 +171,50 @@ impl ActorEscrowRefundSink {
     }
 }
 
-/// Concrete [`StreamSettlementSink`] routing a stream's close-time economic
-/// settlement to the actor via the supervisor mailbox.
-///
-/// Held as `Arc<dyn StreamSettlementSink>` inside the streaming pump;
-/// constructed by the streaming open orchestrator with a `Weak` to the
-/// supervisor and the reservation's spawn-`generation` (captured in the
-/// adapter, NOT in the settlement payload — the confused-deputy guard compares
-/// it to the live actor's generation at settle time).
-pub struct ActorStreamSettlementSink {
-    /// The supervisor whose mailbox owns the target context's Class-S/economy
-    /// state (and the payment adapter for the no-actor fallback capture).
-    supervisor: Weak<Supervisor>,
-    /// Spawn-generation the reservation was made against. Threaded into the
-    /// [`SettleOutletStream`](crate::context::actor::commands::OutletsCommand::SettleOutletStream)
-    /// command so the handler drops the settlement on a generation mismatch
-    /// (despawn/respawn between reserve and settle).
-    generation: u64,
-    /// Runtime handle captured at construction (the pump fires `settle` on a
-    /// runtime task, but capturing at construction keeps the two sinks uniform
-    /// and robust to a future off-runtime caller).
-    runtime: tokio::runtime::Handle,
+scp_runtime_types::pub_under_testing! {
+    /// Concrete [`StreamSettlementSink`] routing a stream's close-time economic
+    /// settlement to the actor via the supervisor mailbox.
+    ///
+    /// Held as `Arc<dyn StreamSettlementSink>` inside the streaming pump;
+    /// constructed by the streaming open orchestrator with a `Weak` to the
+    /// supervisor and the reservation's spawn-`generation` (captured in the
+    /// adapter, NOT in the settlement payload — the confused-deputy guard compares
+    /// it to the live actor's generation at settle time).
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct ActorStreamSettlementSink {
+        /// The supervisor whose mailbox owns the target context's Class-S/economy
+        /// state (and the payment adapter for the no-actor fallback capture).
+        supervisor: Weak<Supervisor>,
+        /// Spawn-generation the reservation was made against. Threaded into the
+        /// [`SettleOutletStream`](crate::context::actor::commands::OutletsCommand::SettleOutletStream)
+        /// command so the handler drops the settlement on a generation mismatch
+        /// (despawn/respawn between reserve and settle).
+        generation: u64,
+        /// Runtime handle captured at construction (the pump fires `settle` on a
+        /// runtime task, but capturing at construction keeps the two sinks uniform
+        /// and robust to a future off-runtime caller).
+        runtime: tokio::runtime::Handle,
+    }
 }
 
 impl ActorStreamSettlementSink {
+    /// Test-only reach into [`Self::new`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_for_test(supervisor: Weak<Supervisor>, generation: u64) -> Self {
+        Self::new(supervisor, generation)
+    }
+
     /// Wrap a `Weak` supervisor reference + the reservation's spawn-`generation` as the
     /// streaming settlement sink, capturing the current runtime handle.
     ///
     /// The non-test constructor is the streaming open orchestrator
     /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
     #[must_use]
-    pub fn new(supervisor: Weak<Supervisor>, generation: u64) -> Self {
+    pub(crate) fn new(supervisor: Weak<Supervisor>, generation: u64) -> Self {
         Self {
             supervisor,
             generation,

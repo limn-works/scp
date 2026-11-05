@@ -131,17 +131,19 @@ pub async fn build_inner_wire<S: std::hash::BuildHasher + Sync>(
 /// The error of [`build_inner_wire`], or the seal's error.
 #[allow(clippy::too_many_arguments)]
 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
-// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
-// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal
-// after the deleted provider twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
+// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, and tests
+// outside core through `build_encrypted_envelope_actor_for_test`) can drive the
+// PRODUCTION actor app-data seal after the deleted provider twin
+// `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
 // visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
-// `pub(crate)` / `pub(crate)` cap would wrongly forbid the crypto/mls
-// caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
+// `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
+// caller (E0624). A domain crate seals through `ActorDeps::build_encrypted_envelope`
+// (ADR-070 §4). It is a purely internal crate seam with no FFI/SDK surface, so it
 // carries no cross-layer bridge-export requirement. `redundant_pub_crate` is a
 // false positive here for the same reason as `Supervisor::build_actor_deps`: the
 // enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
 #[allow(clippy::redundant_pub_crate)]
-pub async fn build_encrypted_envelope_actor<S: std::hash::BuildHasher + Sync>(
+pub(crate) async fn build_encrypted_envelope_actor<S: std::hash::BuildHasher + Sync>(
     clock: &Arc<dyn Clock>,
     crypto_state: &mut crate::context::actor::state::ContextCryptoState,
     local_did: &str,
@@ -169,6 +171,114 @@ pub async fn build_encrypted_envelope_actor<S: std::hash::BuildHasher + Sync>(
     // The serialized MLS message; the transport frames it once for each
     // per-member pseudonym address it fans out to (ADR-002, spec 23 §23.4.1).
     crypto_state.seal(&context_id_bytes, local_did, &inner, aad_sequence)
+}
+
+/// Test-only reach into [`build_encrypted_envelope_actor`] for tests outside
+/// this crate.
+///
+/// Those tests seal against a standalone crypto state with a clock and local
+/// DID of their choosing. Compiled only under `testing`, so no production or
+/// bridge build reaches it (ADR-070 §4).
+///
+/// # Errors
+///
+/// Every error [`build_encrypted_envelope_actor`] returns.
+#[cfg(any(test, feature = "testing"))]
+pub async fn build_encrypted_envelope_actor_for_test(
+    clock: &Arc<dyn Clock>,
+    crypto_state: &mut crate::context::actor::state::ContextCryptoState,
+    local_did: &str,
+    request: EncryptedEnvelopeRequest<'_>,
+) -> Result<Vec<u8>, ContextError> {
+    let EncryptedEnvelopeRequest {
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        aad_sequence,
+        source_provenance,
+        message_type,
+    } = request;
+    build_encrypted_envelope_actor(
+        clock,
+        crypto_state,
+        local_did,
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        aad_sequence,
+        source_provenance,
+        message_type,
+    )
+    .await
+}
+
+/// The per-send inputs of [`ActorDeps::build_encrypted_envelope`]; the clock
+/// and the local DID come from the `ActorDeps` itself.
+pub struct EncryptedEnvelopeRequest<'r> {
+    /// The context the message is sent in.
+    pub context_id: &'r str,
+    /// The DID the message is sent as.
+    pub sender_did: &'r DID,
+    /// The application payload.
+    pub payload: &'r [u8],
+    /// The key and stamped persona that sign the inner envelope.
+    pub signer: MessageSigner<'r>,
+    /// Each recipient's access key, by member DID.
+    pub recipients_data: &'r std::collections::HashMap<String, AccessKey>,
+    /// The sender-layer AAD sequence (`MembershipState::next_sequence_number`).
+    pub aad_sequence: u64,
+    /// The source context, when the payload crossed a context boundary.
+    pub source_provenance: Option<&'r SourceContextInfo>,
+    /// The message type the envelope carries.
+    pub message_type: MessageType,
+}
+
+impl ActorDeps {
+    /// Builds and seals an application-data send through `crypto_state`, with
+    /// this actor's clock and local DID (the sealed sender-layer AAD binds the
+    /// identity the actor runs as).
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method; core calls [`build_encrypted_envelope_actor`] directly
+    /// (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`build_encrypted_envelope_actor`] returns.
+    pub async fn build_encrypted_envelope(
+        &self,
+        crypto_state: &mut crate::context::actor::state::ContextCryptoState,
+        request: EncryptedEnvelopeRequest<'_>,
+    ) -> Result<Vec<u8>, ContextError> {
+        let EncryptedEnvelopeRequest {
+            context_id,
+            sender_did,
+            payload,
+            signer,
+            recipients_data,
+            aad_sequence,
+            source_provenance,
+            message_type,
+        } = request;
+        build_encrypted_envelope_actor(
+            &self.clock,
+            crypto_state,
+            self.crypto.local_did(),
+            context_id,
+            sender_did,
+            payload,
+            signer,
+            recipients_data,
+            aad_sequence,
+            source_provenance,
+            message_type,
+        )
+        .await
+    }
 }
 
 /// Discharges a deferred spending-nonce commit token and returns the error.

@@ -935,7 +935,7 @@ pub fn build_stream_post_input_hook(
 /// The pair returned by [`build_stream_post_input_hook`]: the synchronous
 /// §7.3.8 local-check hook and the durable counter reservation committed at the
 /// dispatch pump's final open-time gate.
-pub type StreamPostInputBuild = (
+pub(crate) type StreamPostInputBuild = (
     Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
     Option<crate::context::outlets::dispatch::StreamCounterReservation>,
 );

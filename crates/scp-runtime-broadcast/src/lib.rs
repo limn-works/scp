@@ -25,6 +25,16 @@ mod helpers;
 #[cfg(test)]
 mod test_support;
 
+/// The items the assembly crate's tests call directly (`testing` only).
+///
+/// Subscriber blocking runs only from a `BroadcastCommand` in production; the
+/// assembly's supervisor tests drive the two functions on a bare cell, so they
+/// are exported here and nowhere else. No production build compiles this module.
+#[cfg(feature = "testing")]
+pub mod testing_access {
+    pub use crate::helpers::{block_broadcast_subscriber, unblock_broadcast_subscriber};
+}
+
 /// The broadcast domain's [`BroadcastDomain`](scp_runtime_core::context::domains::BroadcastDomain)
 /// implementation, which the assembly's `domain_handlers()` installs.
 pub struct Broadcast;
@@ -38,42 +48,5 @@ impl scp_runtime_core::context::domains::BroadcastDomain for Broadcast {
         cmd: scp_runtime_core::context::actor::commands::BroadcastCommand,
     ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         handler::dispatch(cell, deps, cmd).await
-    }
-
-    async fn block_broadcast_subscriber(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        context_id: &str,
-        author_did: &scp_did::DID,
-        subscriber_did: &scp_did::DID,
-    ) -> Result<scp_protocol::context::broadcast::BlockResult, scp_protocol::context::ContextError>
-    {
-        crate::helpers::block_broadcast_subscriber(
-            cell,
-            deps,
-            context_id,
-            author_did,
-            subscriber_did,
-        )
-        .await
-    }
-
-    async fn unblock_broadcast_subscriber(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        context_id: &str,
-        author_did: &scp_did::DID,
-        subscriber_did: &scp_did::DID,
-    ) -> Result<(), scp_protocol::context::ContextError> {
-        crate::helpers::unblock_broadcast_subscriber(
-            cell,
-            deps,
-            context_id,
-            author_did,
-            subscriber_did,
-        )
-        .await
     }
 }

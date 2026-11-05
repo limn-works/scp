@@ -1527,61 +1527,6 @@ pub enum GovernanceCommand {
         /// Oneshot reply channel. Carries the cleared fault marker.
         reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
     },
-
-    /// Sweep: evaluate consequence rules for THIS actor's context, applying
-    /// any triggered consequences (suspend / revoke / etc.) to membership.
-    ///
-    /// Dispatched per-actor by the supervisor's iterating sweep entry
-    /// point
-    /// `governance_helpers::evaluate_periodic_consequences`.
-    /// The supervisor iterates `supervisor.actors` and sends one of these
-    /// commands per actor; aggregate completion is implicit (the
-    /// iterator waits for each reply in turn).
-    ///
-    /// Mirrors the legacy
-    /// `evaluate_periodic_consequences_legacy` body (which iterated the
-    /// supervisor's `contexts` DashMap and operated on a single
-    /// context's state per call). The actor-shape handler operates on
-    /// `&mut PerContextState` for the SINGLE actor — sweep iteration
-    /// happens at the supervisor level.
-    ///
-    /// Reply replies `Ok(())` regardless of whether any consequences
-    /// fired; the legacy method has no error path (per-rule enforcement
-    /// failures log via `tracing::warn!` inside `enforce_triggered_consequences`).
-    EvaluatePeriodicConsequences {
-        /// Oneshot reply channel. Always replies `Ok(())` (matches the
-        /// legacy method's no-error contract).
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
-    /// Sweep: process THIS actor's pending MLS commit retry queue (PR
-    /// #1606 C6).
-    ///
-    /// Dispatched per-actor by the supervisor's iterating sweep entry
-    /// point
-    /// `governance_helpers::process_pending_commits`.
-    /// The supervisor iterates `supervisor.actors` and sends one of
-    /// these commands per actor.
-    ///
-    /// Mirrors the legacy `process_pending_commits_legacy` body.
-    /// Iterates `state.pending_commits`, retries any commits whose
-    /// `next_attempt_at <= now`, and either dequeues on success, updates
-    /// retry count on transient failure, or marks the context fail-
-    /// closed once the retry budget is exhausted. All transport sends
-    /// happen with the actor's state lock RELEASED (the actor's
-    /// `dispatch_state` arm releases its `&mut state` borrow for the
-    /// transport call by snapshotting + reacquiring; see the handler
-    /// for the phase split).
-    ///
-    /// Reply replies `Ok(())` regardless of per-commit outcomes; the
-    /// legacy method has no error path (per-commit failures log via
-    /// `tracing::warn!` and emit `CommitBroadcast*` receive-buffer
-    /// events).
-    ProcessPendingCommits {
-        /// Oneshot reply channel. Always replies `Ok(())` (matches the
-        /// legacy method's no-error contract).
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
     // NOTE (ADR-049 Decision-1 / finding A3): the former `EvaluateTimeouts`
     // and `StartTimeoutTask` variants were retired. The governance-timeout
     // sweep is now ACTOR-OWNED — `ContextActor`'s `governance_timeout`

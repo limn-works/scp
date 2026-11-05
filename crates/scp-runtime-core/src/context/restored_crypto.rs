@@ -437,7 +437,7 @@ pub fn restore_crypto_state_with_floor_guard(
 ///
 /// Returns the `site`-prefixed rejection reason when the extension is absent
 /// or unreadable, or when any binding rule fails.
-pub fn verify_scp_context_binding(
+pub(in crate::context) fn verify_scp_context_binding(
     read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
     context_id: &str,
     creator_did: &str,

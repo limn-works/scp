@@ -781,8 +781,11 @@ fn gate_uses_single_entry_no_double_insert() {
     );
     // Both floors live under that single entry.
     let entry = s.floors_for_test().get(&CTX).expect("ctx entry");
-    assert_eq!(entry.sender_epochs.get(DID).copied(), Some(1));
-    assert_eq!(entry.recv_sequence.get(DID).copied(), Some(rf(1, 1)));
+    assert_eq!(entry.sender_epochs_for_test().get(DID).copied(), Some(1));
+    assert_eq!(
+        entry.recv_sequence_for_test().get(DID).copied(),
+        Some(rf(1, 1))
+    );
 }
 
 // -- Decision-14: gate work is O(1) — independent of sender count -----------
@@ -807,15 +810,24 @@ fn gate_is_o1_independent_of_sender_count() {
     s.check_and_advance_sender_epoch_for_test(&CTX, DID, 42, MAX_EPOCH_ADVANCE)
         .unwrap();
     let entry = s.floors_for_test().get(&CTX).expect("ctx entry");
-    assert_eq!(entry.sender_epochs.get(DID).copied(), Some(42));
+    assert_eq!(entry.sender_epochs_for_test().get(DID).copied(), Some(42));
     // Every pre-loaded sender is untouched (still 1) — the gate did not
     // rewrite or iterate them.
-    assert_eq!(entry.sender_epochs.get("did:dht:zBulk0").copied(), Some(1));
     assert_eq!(
-        entry.sender_epochs.get("did:dht:zBulk4999").copied(),
+        entry
+            .sender_epochs_for_test()
+            .get("did:dht:zBulk0")
+            .copied(),
         Some(1)
     );
-    assert_eq!(entry.sender_epochs.len(), 5_001);
+    assert_eq!(
+        entry
+            .sender_epochs_for_test()
+            .get("did:dht:zBulk4999")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(entry.sender_epochs_for_test().len(), 5_001);
 }
 
 // -- shuttle-style strict-monotonicity concurrency test ---------------------
@@ -878,7 +890,7 @@ fn concurrent_advances_are_strictly_monotone_no_lost_update() {
 #[test]
 fn handle_accessors_forward_to_registry() {
     let s = sup();
-    let h = SupervisorHandle::wrap(&s);
+    let h = SupervisorHandle::wrap_for_test(&s);
 
     h.seed_context_floors(&CTX).unwrap();
     assert!(
@@ -889,7 +901,7 @@ fn handle_accessors_forward_to_registry() {
         h.check_and_advance_recv_sequence(&CTX, DID, rf(3, 1), MAX_EPOCH_ADVANCE)
             .is_ok()
     );
-    h.validate_and_merge_all_floors(
+    h.validate_and_merge_all_floors_for_test(
         &CTX,
         vec![(DID.to_owned(), 8)],
         vec![(DID.to_owned(), rf(8, 2))],

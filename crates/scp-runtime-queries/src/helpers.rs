@@ -49,8 +49,8 @@
 //! - [`drain_events`] — drains the receive buffer.
 //! - [`scp_runtime_core::context::shared::queries::report_degraded_mode`] — emits a `DegradedMode` event.
 //! - [`scp_runtime_core::context::shared::queries::generate_context_access_key`], [`scp_runtime_core::context::shared::queries::revoke_context_access_key`],
-//!   [`scp_runtime_core::context::shared::queries::restore_context_access_key`], [`set_access_key`],
-//!   [`remove_access_key`] — access-key store mutations.
+//!   [`scp_runtime_core::context::shared::queries::restore_context_access_key`] — access-key
+//!   store mutations.
 //! - `inject_access_key`, `get_access_key`, `get_all_access_keys`,
 //!   `grant_budget_for_test`, `remaining_budget_for_test`,
 //!   `velocity_for_test` — `#[cfg(feature = "testing")]` accessors.
@@ -140,7 +140,7 @@ pub fn local_routing_ids(
     now_secs: u64,
 ) -> Result<scp_runtime_core::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
     let current = local_pseudonym(state)?;
-    let rotation = &state.class_s.pseudonym_rotation;
+    let rotation = &state.class_s().pseudonym_rotation;
     let policy = state.handle.params().pseudonym_rotation;
     Ok(
         scp_runtime_core::context::actor::pseudonym_rotation::LocalRoutingIds {
@@ -206,7 +206,7 @@ pub const fn local_mls_epoch(state: &PerContextState) -> Option<u64> {
     if state.broadcast_context.is_some() {
         None
     } else {
-        Some(state.epoch.mls_epoch)
+        Some(state.epoch().mls_epoch)
     }
 }
 
@@ -218,7 +218,7 @@ pub const fn local_mls_epoch(state: &PerContextState) -> Option<u64> {
 /// which contexts to drive through the six-phase protocol.
 #[must_use]
 pub const fn needs_reconnect(state: &PerContextState) -> bool {
-    state.epoch.needs_reconnect
+    state.epoch().needs_reconnect
 }
 
 /// Returns `true` if the given DID is a member of the context.
@@ -260,7 +260,7 @@ pub fn capability_requirements(
     state: &PerContextState,
 ) -> Result<scp_protocol::trust::CapabilityRequirements, scp_protocol::context::ContextError> {
     state
-        .governance
+        .governance()
         .class_s
         .capability_requirements
         .live(state.handle.context_id(), "capability requirements")
@@ -290,7 +290,7 @@ pub fn has_established_outlet_interface(
     target_context_hex: &str,
     outlet_registration_id: &str,
 ) -> bool {
-    state.governance.outlet_interfaces.iter().any(|i| {
+    state.governance().outlet_interfaces.iter().any(|i| {
         i.approved_by_source
             && i.approved_by_target
             && i.source_context == source_context_hex
@@ -357,30 +357,6 @@ pub fn event_log_entries(
 }
 
 // ===========================================================================
-// Access-key management (actor-shape, mutating)
-// ===========================================================================
-
-/// Stores an access key in the access key store. Best-effort — no
-/// validation on `member_did`.
-pub fn set_access_key(
-    state: &mut PerContextState,
-    context_id: &str,
-    member_did: &str,
-    key: scp_protocol::crypto::access_keys::AccessKey,
-) {
-    state
-        .access
-        .access_key_store
-        .set(context_id, member_did, key);
-}
-
-/// Removes a member's access key. Best-effort — silently no-op if the
-/// key is absent.
-pub fn remove_access_key(state: &mut PerContextState, context_id: &str, member_did: &str) {
-    state.access.access_key_store.remove(context_id, member_did);
-}
-
-// ===========================================================================
 // Test-only accessors
 // ===========================================================================
 
@@ -393,7 +369,7 @@ pub fn inject_access_key(
     key: scp_protocol::crypto::access_keys::AccessKey,
 ) {
     state
-        .access
+        .access_mut()
         .access_key_store
         .set(context_id, member_did, key);
 }
@@ -407,7 +383,7 @@ pub fn get_access_key(
     member_did: &str,
 ) -> Option<scp_protocol::crypto::access_keys::AccessKey> {
     state
-        .access
+        .access()
         .access_key_store
         .get(context_id, member_did)
         .cloned()
@@ -420,7 +396,7 @@ pub fn get_all_access_keys(
     state: &PerContextState,
     context_id: &str,
 ) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
-    state.access.access_key_store.get_all(context_id)
+    state.access().access_key_store.get_all(context_id)
 }
 
 /// Grants budget to a member. Test-only.
@@ -430,7 +406,10 @@ pub fn grant_budget_for_test(
     member_did: &DID,
     amount: scp_protocol::economy::types::Amount,
 ) {
-    state.governance.budget_tracker.grant(member_did, amount);
+    state
+        .governance_mut()
+        .budget_tracker
+        .grant(member_did, amount);
 }
 
 /// Returns the remaining budget for a member. Test-only.
@@ -440,7 +419,7 @@ pub fn remaining_budget_for_test(
     state: &PerContextState,
     member_did: &DID,
 ) -> scp_protocol::economy::types::Amount {
-    state.governance.budget_tracker.remaining(member_did)
+    state.governance().budget_tracker.remaining(member_did)
 }
 
 /// Returns the per-DID velocity for a member. Test-only.
@@ -448,7 +427,7 @@ pub fn remaining_budget_for_test(
 #[must_use]
 pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u64) -> u64 {
     state
-        .governance
+        .governance()
         .velocity_tracker
         .get_velocity(member_did, now_secs)
 }
@@ -762,7 +741,7 @@ fn emit_equivocation_alert(
         local_merkle_root: local_root,
         remote_merkle_root: remote.merkle_root,
     };
-    state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
+    deps.emit_event_into(receive_buffer, event, context_id);
 }
 
 // ===========================================================================

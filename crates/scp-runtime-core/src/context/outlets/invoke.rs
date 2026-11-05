@@ -1228,7 +1228,7 @@ async fn void_escrow_and_rollback<S: BuildHasher>(
 /// # Errors
 ///
 /// [`InvocationError::BudgetExceeded`] when the adapter refuses the escrow hold.
-pub async fn authorize_outlet_payment(
+pub(crate) async fn authorize_outlet_payment(
     adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
     policy: &scp_protocol::economy::types::EconomicPolicy,
     context_id: &str,
@@ -1278,7 +1278,7 @@ pub async fn authorize_outlet_payment(
 /// # Errors
 ///
 /// [`InvocationError::ExecutionFailed`] when the adapter cannot capture the payment.
-pub async fn complete_outlet_payment(
+pub(crate) async fn complete_outlet_payment(
     adapter: &dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn,
     policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
     prepared: &scp_runtime_types::economy::integration::PreparedAction,
@@ -4229,6 +4229,57 @@ pub(crate) fn ingest_stream_chunk(
     terminal.observe(&chunk.payload);
 }
 
+/// Test-only reach into [`build_streaming_outlet_event`], one named field per argument.
+///
+/// For tests outside this crate. Compiled only under `testing`, so no
+/// production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct StreamingOutletEventForTest<'a> {
+    /// See [`build_streaming_outlet_event`].
+    pub request_id: RequestId,
+    /// See [`build_streaming_outlet_event`].
+    pub outlet_id: &'a OutletId,
+    /// See [`build_streaming_outlet_event`].
+    pub invoker_did: &'a DID,
+    /// See [`build_streaming_outlet_event`].
+    pub input_hash: String,
+    /// See [`build_streaming_outlet_event`].
+    pub execution_time_ms: u64,
+    /// See [`build_streaming_outlet_event`].
+    pub stream_chunk_count: u32,
+    /// See [`build_streaming_outlet_event`].
+    pub chunks_billed: u32,
+    /// See [`build_streaming_outlet_event`].
+    pub stream_manifest_hash: [u8; 32],
+    /// See [`build_streaming_outlet_event`].
+    pub terminal: &'a StreamTerminalSummary,
+    /// See [`build_streaming_outlet_event`].
+    pub audit_anomaly: Option<scp_protocol::context::outlets::lifecycle::AuditAnomaly>,
+    /// See [`build_streaming_outlet_event`].
+    pub cancel_ack_seq: Option<u64>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl StreamingOutletEventForTest<'_> {
+    /// Calls [`build_streaming_outlet_event`] with these arguments.
+    #[must_use]
+    pub fn build(self) -> OutletInvokedEvent {
+        build_streaming_outlet_event(
+            self.request_id,
+            self.outlet_id,
+            self.invoker_did,
+            self.input_hash,
+            self.execution_time_ms,
+            self.stream_chunk_count,
+            self.chunks_billed,
+            self.stream_manifest_hash,
+            self.terminal,
+            self.audit_anomaly,
+            self.cancel_ack_seq,
+        )
+    }
+}
+
 /// Assembles the §5.4.5 `OutletInvokedEvent` from the precomputed stream aggregates (SCP-OUT-035).
 ///
 /// The `stream_manifest_hash`, `stream_chunk_count`, and `chunks_billed` are produced incrementally
@@ -4239,7 +4290,7 @@ pub(crate) fn ingest_stream_chunk(
 #[allow(clippy::too_many_arguments)]
 // Assembles one flat event record from independent scalar aggregates (ids, hashes, counts, terminal summary); a wrapper struct would just relocate the same fields.
 #[must_use]
-pub fn build_streaming_outlet_event(
+pub(crate) fn build_streaming_outlet_event(
     request_id: RequestId,
     outlet_id: &OutletId,
     invoker_did: &DID,
@@ -4606,46 +4657,88 @@ use scp_protocol::context::outlets::registration::OutletRegistration;
 use scp_protocol::context::outlets::stream::{compute_chunk_manifest_root, verify_chunk_signature};
 use scp_protocol::trust::caveats::InvocationCaveats;
 
-/// The verification descriptor the cross-context bridge PINS at stream-open
-/// and consults for every forwarded chunk (§5.4.5 "Verification source at the
-/// crossing").
-///
-/// Every field is sourced from the governed outlet-interface descriptor /
-/// stream-open — the operator's public key from the operating context's
-/// registered stream signer, the operating context id (B), the outlet id, and
-/// the `caveats_binding` pinned at open. It is **never** rebuilt from values a
-/// chunk (or a malicious bridge) supplies at delivery time: a bridge that could
-/// substitute the verification inputs could pass off chunks signed by a
-/// *different* operator, or for a *different* context it controls, as if they
-/// were B's — defeating the per-chunk equivocation binding.
-#[derive(Clone)]
-pub struct CrossContextVerificationDescriptor {
-    /// The operating context B's operator verifying key (from the pinned
-    /// stream signer at open).
-    pub operator_pk: VerifyingKey,
-    /// The OPERATING context id (B) — the context whose `context_id` the
-    /// operator committed into each chunk-signature preimage.
-    pub operating_context_id: String,
-    /// The outlet id committed into each chunk-signature preimage.
-    pub outlet_id: String,
-    /// The 32-byte `caveats_binding` pinned at stream-open, committed into
-    /// each chunk-signature preimage.
-    pub caveats_binding: [u8; 32],
-    /// The 16-byte `request_id` pinned at stream-open — the ONLY `request_id`
-    /// whose chunks this crossing forwards (§5.4.5 "Verification source at the
-    /// crossing"). The per-chunk preimage commits `request_id`, so the
-    /// verification MUST fix it from the governed open — NOT trust the
-    /// `request_id` a delivered chunk asserts. Although `caveats_binding`
-    /// already commits `request_id` (§5.4.5 binding preimage) and so a chunk
-    /// signed for a different stream would fail signature verification against
-    /// the pinned `caveats_binding` today, pinning `request_id` explicitly makes
-    /// the "never rebuilt from chunk-supplied values" invariant hold on its own
-    /// terms — defense-in-depth against any future decoupling of the two
-    /// bindings. §5.4.5:570 enumerates `operator_pk` / `context_id` /
-    /// `caveats_binding` as the pinned values; `request_id` is not in that list,
-    /// so this pin extends the rule's SPIRIT (never trust a delivery-time-
-    /// asserted value) to `request_id`, it does not implement the rule verbatim.
-    pub expected_request_id: RequestId,
+scp_runtime_types::pub_under_testing! {
+    /// The verification descriptor the cross-context bridge PINS at stream-open
+    /// and consults for every forwarded chunk (§5.4.5 "Verification source at the
+    /// crossing").
+    ///
+    /// Every field is sourced from the governed outlet-interface descriptor /
+    /// stream-open — the operator's public key from the operating context's
+    /// registered stream signer, the operating context id (B), the outlet id, and
+    /// the `caveats_binding` pinned at open. It is **never** rebuilt from values a
+    /// chunk (or a malicious bridge) supplies at delivery time: a bridge that could
+    /// substitute the verification inputs could pass off chunks signed by a
+    /// *different* operator, or for a *different* context it controls, as if they
+    /// were B's — defeating the per-chunk equivocation binding.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Clone)]
+    pub(crate) struct CrossContextVerificationDescriptor {
+        /// The operating context B's operator verifying key (from the pinned
+        /// stream signer at open).
+        pub(crate) operator_pk: VerifyingKey,
+        /// The OPERATING context id (B) — the context whose `context_id` the
+        /// operator committed into each chunk-signature preimage.
+        pub(crate) operating_context_id: String,
+        /// The outlet id committed into each chunk-signature preimage.
+        pub outlet_id: String,
+        /// The 32-byte `caveats_binding` pinned at stream-open, committed into
+        /// each chunk-signature preimage.
+        pub caveats_binding: [u8; 32],
+        /// The 16-byte `request_id` pinned at stream-open — the ONLY `request_id`
+        /// whose chunks this crossing forwards (§5.4.5 "Verification source at the
+        /// crossing"). The per-chunk preimage commits `request_id`, so the
+        /// verification MUST fix it from the governed open — NOT trust the
+        /// `request_id` a delivered chunk asserts. Although `caveats_binding`
+        /// already commits `request_id` (§5.4.5 binding preimage) and so a chunk
+        /// signed for a different stream would fail signature verification against
+        /// the pinned `caveats_binding` today, pinning `request_id` explicitly makes
+        /// the "never rebuilt from chunk-supplied values" invariant hold on its own
+        /// terms — defense-in-depth against any future decoupling of the two
+        /// bindings. §5.4.5:570 enumerates `operator_pk` / `context_id` /
+        /// `caveats_binding` as the pinned values; `request_id` is not in that list,
+        /// so this pin extends the rule's SPIRIT (never trust a delivery-time-
+        /// asserted value) to `request_id`, it does not implement the rule verbatim.
+        pub(crate) expected_request_id: RequestId,
+    }
+}
+
+/// Test-only construction of a pinned descriptor. Compiled only under
+/// `testing`: a descriptor names the operator key a crossing verifies chunks
+/// against, so no production or bridge build may pin one outside core
+/// (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl CrossContextVerificationDescriptor {
+    /// A descriptor pinning the given operator key, operating context, outlet,
+    /// caveats binding and request id.
+    #[must_use]
+    pub const fn new_for_test(
+        operator_pk: VerifyingKey,
+        operating_context_id: String,
+        outlet_id: String,
+        caveats_binding: [u8; 32],
+        expected_request_id: RequestId,
+    ) -> Self {
+        Self {
+            operator_pk,
+            operating_context_id,
+            outlet_id,
+            caveats_binding,
+            expected_request_id,
+        }
+    }
+}
+
+/// Test-only reach into [`verify_forwarded_chunk`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn verify_forwarded_chunk_for_test(
+    descriptor: &CrossContextVerificationDescriptor,
+    chunk: &OutletStreamChunk,
+) -> bool {
+    verify_forwarded_chunk(descriptor, chunk)
 }
 
 /// Verifies one forwarded chunk's operator signature against the PINNED descriptor (§5.4.5
@@ -4656,7 +4749,7 @@ pub struct CrossContextVerificationDescriptor {
 /// This is the receiver-side crossing analog of §6.2.4's caller-authentication
 /// rule: the channel-pinned identity governs, not envelope-asserted fields.
 #[must_use]
-pub fn verify_forwarded_chunk(
+pub(crate) fn verify_forwarded_chunk(
     descriptor: &CrossContextVerificationDescriptor,
     chunk: &OutletStreamChunk,
 ) -> bool {
@@ -4675,6 +4768,21 @@ pub fn verify_forwarded_chunk(
         &descriptor.outlet_id,
         &descriptor.caveats_binding,
     )
+}
+
+/// Test-only reach into [`cross_context_economy_gate`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+///
+/// # Errors
+///
+/// Every error [`cross_context_economy_gate`] returns.
+#[cfg(any(test, feature = "testing"))]
+pub fn cross_context_economy_gate_for_test(
+    registration: &OutletRegistration,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+) -> Result<(), InvocationError> {
+    cross_context_economy_gate(registration, cost_per_chunk)
 }
 
 /// §5.4.5 "Cross-context economy (best-effort is zero-escrow)" gate.
@@ -4714,7 +4822,7 @@ pub fn verify_forwarded_chunk(
 /// Returns [`InvocationError::CrossContextPaidActionUnsupported`] when the
 /// registered cost OR the billed `cost_per_chunk` is positive; `Ok(())`
 /// otherwise (both zero — the only shape the zero-escrow bridge serves).
-pub fn cross_context_economy_gate(
+pub(crate) fn cross_context_economy_gate(
     registration: &OutletRegistration,
     cost_per_chunk: scp_protocol::economy::types::Amount,
 ) -> Result<(), InvocationError> {
@@ -4749,12 +4857,16 @@ pub fn cross_context_economy_gate(
     Ok(())
 }
 
-/// Test/fault seam for the §5.4.5 mid-stream bridge-failure path (SCP-OUT-036 AC8).
-///
-/// Production passes `None`; a probe returning `Some(detail)` for a chunk forces the bridge to emit
-/// the transport-fault terminal in that chunk's place, modelling an internal decrypt / re-encrypt /
-/// forward / validation infrastructure failure that the best-effort bridge cannot recover.
-pub type BridgeFaultProbe = Box<dyn Fn(&OutletStreamChunk) -> Option<String> + Send>;
+scp_runtime_types::pub_under_testing! {
+    /// Test/fault seam for the §5.4.5 mid-stream bridge-failure path (SCP-OUT-036 AC8).
+    ///
+    /// Production passes `None`; a probe returning `Some(detail)` for a chunk forces the bridge to emit
+    /// the transport-fault terminal in that chunk's place, modelling an internal decrypt / re-encrypt /
+    /// forward / validation infrastructure failure that the best-effort bridge cannot recover.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) type BridgeFaultProbe = Box<dyn Fn(&OutletStreamChunk) -> Option<String> + Send>;
+}
 
 /// Forward a single chunk to A's outer channel, mirroring the same-context
 /// `invoke_outlet` handoff: the bridge never re-signs and introduces NO new
@@ -4914,6 +5026,17 @@ async fn record_cross_context_a_event(
     }
 }
 
+/// Test-only reach into [`build_onward_a_leg_open`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn build_onward_a_leg_open_for_test(
+    incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
+) -> scp_protocol::context::outlets::stream::OutletStreamOpen {
+    build_onward_a_leg_open(incoming_open)
+}
+
 /// Constructs the onward A-leg [`OutletStreamOpen`] the shared-member SDK seam
 /// uses to frame delivery of the re-encrypted stream to the RECEIVING context
 /// A's OTHER members (§5.4.5; §6.2.0).
@@ -4929,7 +5052,7 @@ async fn record_cross_context_a_event(
 ///
 /// [`OutletStreamOpen`]: scp_protocol::context::outlets::stream::OutletStreamOpen
 #[must_use]
-pub fn build_onward_a_leg_open(
+pub(crate) fn build_onward_a_leg_open(
     incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
 ) -> scp_protocol::context::outlets::stream::OutletStreamOpen {
     // Identity-carry: the load-bearing invariant is that `chain_depth` is
@@ -4938,25 +5061,92 @@ pub fn build_onward_a_leg_open(
     incoming_open.clone()
 }
 
-/// Absolute ceiling on the number of chunks the cross-context bridge RETAINS in
-/// its §6.2.5 write-through replay snapshot (`reassembled`) for a single stream.
+scp_runtime_types::pub_under_testing! {
+    /// Absolute ceiling on the number of chunks the cross-context bridge RETAINS in
+    /// its §6.2.5 write-through replay snapshot (`reassembled`) for a single stream.
+    ///
+    /// The snapshot must hold the full chunk sequence to re-derive A's manifest root
+    /// at close, so it grows with stream length. For a zero-cost / Query best-effort
+    /// stream (`cost_per_chunk == 0` ⇒ `max_billable == None`) there is NO economic
+    /// bound on the chunk count, and `Progress` chunks are NEVER billed — so a
+    /// hostile or buggy operating context B could otherwise flood the bridge task
+    /// with unbilled chunks and drive A's process to OOM (the outer `mpsc(1)`
+    /// bounds only the in-flight forward, not the retained snapshot). This absolute
+    /// ceiling bounds the retained snapshot regardless of chunk type; on breach the
+    /// bridge forwards a transport-fault terminal (`SCP-OUTLET-6160`) and stops.
+    ///
+    /// The value (`1 << 20` = 1,048,576) is chosen to sit far above any legitimate
+    /// best-effort stream while bounding the per-stream retained memory to a finite
+    /// envelope. It is a SAFE default the review did not pin numerically; a paid,
+    /// unbounded-length metered stream is the streaming saga's domain (SCP-OUT-046),
+    /// not this best-effort bridge.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const MAX_CROSS_CONTEXT_STREAM_CHUNKS: usize = 1 << 20;
+}
+
+/// Test-only reach into [`run_cross_context_bridge`], one named field per argument.
 ///
-/// The snapshot must hold the full chunk sequence to re-derive A's manifest root
-/// at close, so it grows with stream length. For a zero-cost / Query best-effort
-/// stream (`cost_per_chunk == 0` ⇒ `max_billable == None`) there is NO economic
-/// bound on the chunk count, and `Progress` chunks are NEVER billed — so a
-/// hostile or buggy operating context B could otherwise flood the bridge task
-/// with unbilled chunks and drive A's process to OOM (the outer `mpsc(1)`
-/// bounds only the in-flight forward, not the retained snapshot). This absolute
-/// ceiling bounds the retained snapshot regardless of chunk type; on breach the
-/// bridge forwards a transport-fault terminal (`SCP-OUTLET-6160`) and stops.
-///
-/// The value (`1 << 20` = 1,048,576) is chosen to sit far above any legitimate
-/// best-effort stream while bounding the per-stream retained memory to a finite
-/// envelope. It is a SAFE default the review did not pin numerically; a paid,
-/// unbounded-length metered stream is the streaming saga's domain (SCP-OUT-046),
-/// not this best-effort bridge.
-pub const MAX_CROSS_CONTEXT_STREAM_CHUNKS: usize = 1 << 20;
+/// For tests outside this crate. Compiled only under `testing`, so no
+/// production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct CrossContextBridgeForTest {
+    /// See [`run_cross_context_bridge`].
+    pub inner_rx: mpsc::Receiver<OutletStreamChunk>,
+    /// See [`run_cross_context_bridge`].
+    pub outer_tx: mpsc::Sender<OutletStreamChunk>,
+    /// See [`run_cross_context_bridge`].
+    pub descriptor: CrossContextVerificationDescriptor,
+    /// See [`run_cross_context_bridge`].
+    pub output_schema: serde_json::Value,
+    /// See [`run_cross_context_bridge`].
+    pub aggregate_schema: Option<serde_json::Value>,
+    /// See [`run_cross_context_bridge`].
+    pub a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    /// See [`run_cross_context_bridge`].
+    pub receiving_context_id: String,
+    /// See [`run_cross_context_bridge`].
+    pub invoker_did: DID,
+    /// See [`run_cross_context_bridge`].
+    pub request_id: RequestId,
+    /// See [`run_cross_context_bridge`].
+    pub outlet_id: OutletId,
+    /// See [`run_cross_context_bridge`].
+    pub input_hash: String,
+    /// See [`run_cross_context_bridge`].
+    pub governing_chain_depth: u8,
+    /// See [`run_cross_context_bridge`].
+    pub timestamp_secs: u64,
+    /// See [`run_cross_context_bridge`].
+    pub max_retained_chunks: usize,
+    /// See [`run_cross_context_bridge`].
+    pub fault_probe: Option<BridgeFaultProbe>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl CrossContextBridgeForTest {
+    /// Calls [`run_cross_context_bridge`] with these arguments.
+    pub async fn run(self) {
+        run_cross_context_bridge(
+            self.inner_rx,
+            self.outer_tx,
+            self.descriptor,
+            self.output_schema,
+            self.aggregate_schema,
+            self.a_event_log,
+            self.receiving_context_id,
+            self.invoker_did,
+            self.request_id,
+            self.outlet_id,
+            self.input_hash,
+            self.governing_chain_depth,
+            self.timestamp_secs,
+            self.max_retained_chunks,
+            self.fault_probe,
+        )
+        .await;
+    }
+}
 
 /// The off-mailbox bridge task body (SCP-OUT-036).
 ///
@@ -5004,7 +5194,7 @@ pub const MAX_CROSS_CONTEXT_STREAM_CHUNKS: usize = 1 << 20;
 // synthesis; splitting it would thread that mutable state and the break signal
 // through a helper, obscuring the §5.4.5 ordering.
 #[allow(clippy::too_many_lines)]
-pub async fn run_cross_context_bridge(
+pub(crate) async fn run_cross_context_bridge(
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     descriptor: CrossContextVerificationDescriptor,
@@ -5249,6 +5439,57 @@ pub async fn run_cross_context_bridge(
     .await;
 }
 
+/// Test-only reach into [`run_streaming_saga_seal_task`], one named field per argument.
+///
+/// For tests outside this crate. Compiled only under `testing`, so no
+/// production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct StreamingSagaSealTaskForTest {
+    /// See [`run_streaming_saga_seal_task`].
+    pub supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
+    /// See [`run_streaming_saga_seal_task`].
+    pub target_context_hex: String,
+    /// See [`run_streaming_saga_seal_task`].
+    pub saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
+    /// See [`run_streaming_saga_seal_task`].
+    pub target_signer: crate::context::actor::signer::CommandSigner,
+    /// See [`run_streaming_saga_seal_task`].
+    pub inner_rx: mpsc::Receiver<OutletStreamChunk>,
+    /// See [`run_streaming_saga_seal_task`].
+    pub outer_tx: mpsc::Sender<OutletStreamChunk>,
+    /// See [`run_streaming_saga_seal_task`].
+    pub escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
+    /// See [`run_streaming_saga_seal_task`].
+    pub descriptor: CrossContextVerificationDescriptor,
+    /// See [`run_streaming_saga_seal_task`].
+    pub output_schema: serde_json::Value,
+    /// See [`run_streaming_saga_seal_task`].
+    pub aggregate_schema: Option<serde_json::Value>,
+    /// See [`run_streaming_saga_seal_task`].
+    pub a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl StreamingSagaSealTaskForTest {
+    /// Calls [`run_streaming_saga_seal_task`] with these arguments.
+    pub async fn run(self) {
+        run_streaming_saga_seal_task(
+            self.supervisor,
+            self.target_context_hex,
+            self.saga_id,
+            self.target_signer,
+            self.inner_rx,
+            self.outer_tx,
+            self.escrow_ticket,
+            self.descriptor,
+            self.output_schema,
+            self.aggregate_schema,
+            self.a_event_log,
+        )
+        .await;
+    }
+}
+
 /// The transactional streaming-saga seal task (SCP-OUT-046 #134; the ADR-061 seal phase).
 ///
 /// The off-mailbox sibling of [`run_cross_context_bridge`]: it owns B's operator-signed chunk
@@ -5289,7 +5530,7 @@ pub async fn run_cross_context_bridge(
 /// upgrade takes the same path as a vanished target actor: the journal stays
 /// `Committing` for crash recovery.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn run_streaming_saga_seal_task(
+pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
     saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,
@@ -5773,6 +6014,67 @@ pub(crate) async fn record_streaming_saga_a_event(
     }
 }
 
+/// Test-only reach into [`invoke_outlet_cross_context`], one named field per argument.
+///
+/// For tests outside this crate. Compiled only under `testing`, so no
+/// production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+pub struct OutletCrossContextInvokeForTest<'a, E: ?Sized> {
+    /// See [`invoke_outlet_cross_context`].
+    pub supervisor: &'a std::sync::Arc<crate::context::supervisor::Supervisor>,
+    /// See [`invoke_outlet_cross_context`].
+    pub a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    /// See [`invoke_outlet_cross_context`].
+    pub receiving_context_id: &'a str,
+    /// See [`invoke_outlet_cross_context`].
+    pub operating_context_id: &'a str,
+    /// See [`invoke_outlet_cross_context`].
+    pub registry: &'a OutletRegistry,
+    /// See [`invoke_outlet_cross_context`].
+    pub outlet_id: &'a OutletId,
+    /// See [`invoke_outlet_cross_context`].
+    pub input: serde_json::Value,
+    /// See [`invoke_outlet_cross_context`].
+    pub invoker_did: &'a DID,
+    /// See [`invoke_outlet_cross_context`].
+    pub timeout_ms: Option<u32>,
+    /// See [`invoke_outlet_cross_context`].
+    pub executor: std::sync::Arc<E>,
+    /// See [`invoke_outlet_cross_context`].
+    pub incoming_open: &'a scp_protocol::context::outlets::stream::OutletStreamOpen,
+    /// See [`invoke_outlet_cross_context`].
+    pub caveat_binding: Option<InvocationCaveatBinding>,
+    /// See [`invoke_outlet_cross_context`].
+    pub params: crate::context::outlets::dispatch::OpenStreamParams,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<E: OutletExecutor + ?Sized + 'static> OutletCrossContextInvokeForTest<'_, E> {
+    /// Calls [`invoke_outlet_cross_context`] with these arguments.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`invoke_outlet_cross_context`] returns.
+    pub async fn run(self) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> {
+        invoke_outlet_cross_context(
+            self.supervisor,
+            self.a_event_log,
+            self.receiving_context_id,
+            self.operating_context_id,
+            self.registry,
+            self.outlet_id,
+            self.input,
+            self.invoker_did,
+            self.timeout_ms,
+            self.executor,
+            self.incoming_open,
+            self.caveat_binding,
+            self.params,
+        )
+        .await
+    }
+}
+
 /// Best-effort cross-context re-encrypting streaming bridge (SCP-OUT-036).
 ///
 /// Opens the outlet stream in the OPERATING context B (via the supervisor's
@@ -5838,7 +6140,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
 ///   exhausted.
 #[allow(clippy::too_many_arguments)]
-pub async fn invoke_outlet_cross_context<E>(
+pub(crate) async fn invoke_outlet_cross_context<E>(
     supervisor: &std::sync::Arc<crate::context::supervisor::Supervisor>,
     a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
     receiving_context_id: &str,

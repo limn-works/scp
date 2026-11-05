@@ -42,46 +42,50 @@ use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, MergePolicy};
 
 use super::supervisor::Supervisor;
 
-/// Per-context Class-M floor bundle held by the supervisor registry.
-///
-/// Bundled (rather than two separate maps) because the receive-side overshoot
-/// ceiling in `Supervisor::check_and_advance_recv_sequence` reads the sender
-/// epoch floor from the SAME entry — one `DashMap` entry guard covers both,
-/// keeping every gate a single acquire (ADR-049 Decision 13).
-///
-/// No `Zeroize`: these are non-secret monotonic counters (epoch high-water and
-/// `(epoch, sequence)` anti-replay marks), not key material.
-#[derive(Debug, Default)]
-pub struct ContextFloors {
-    /// `sender_did` → highest sender-key epoch observed for that sender. The
-    /// AUTHORITATIVE per-sender epoch high-water for this context (ADR-049 PR-6;
-    /// the provider's `SenderKeyStore.epochs` mirror is no longer read on the
-    /// node).
+scp_runtime_types::pub_under_testing! {
+    /// Per-context Class-M floor bundle held by the supervisor registry.
     ///
-    /// INVARIANT (black-hat F-3): this one map holds BOTH the REMOTE per-sender
-    /// distributed-epoch high-water (keyed by each remote sender DID) AND — via
-    /// the local-rotation mirror-forward — the LOCAL `sender_key_epoch` scalar
-    /// keyed by `local_did`. This coexistence is safe ONLY because `local_did`
-    /// never appears as a remote sender in its own recv path, so the receive-side
-    /// overshoot ceiling (which reads `sender_epochs[remote_did]`) never reads the
-    /// local scalar. This is LOAD-BEARING and enforced at the recv seam:
-    /// `decrypt_and_dispatch` rejects an application message whose MLS sender is
-    /// `local_did`. A
-    /// violation is fail-safe on the SECURITY axis: co-mingling the (typically
-    /// higher) local scalar into `sender_epochs[local_did]` would only RAISE the
-    /// receive-side epoch CEILING for the local DID — an over-PERMIT on the
-    /// ceiling axis, which is harmless because you cannot decrypt at an
-    /// un-installed epoch — and NEVER lowers the monotonic anti-replay floor, so
-    /// it can never admit a replay or a floor below the live one. The alternative
-    /// — splitting the two counters into separate maps — was rejected as
-    /// over-engineering (it ripples through merge/export/blob format).
-    pub sender_epochs: HashMap<String, u64>,
-    /// `sender_did` → highest [`ReceiveFloor`] (`epoch`, `sequence`) accepted
-    /// from that sender — the intra-epoch anti-replay floor (spec §23.17.3). The
-    /// AUTHORITATIVE receive-side floor (ADR-049 PR-6; the provider's
-    /// `recv_sequence_tracker` mirror is deleted). LEXICOGRAPHIC (epoch-major)
-    /// order.
-    pub recv_sequence: HashMap<String, ReceiveFloor>,
+    /// Bundled (rather than two separate maps) because the receive-side overshoot
+    /// ceiling in `Supervisor::check_and_advance_recv_sequence` reads the sender
+    /// epoch floor from the SAME entry — one `DashMap` entry guard covers both,
+    /// keeping every gate a single acquire (ADR-049 Decision 13).
+    ///
+    /// No `Zeroize`: these are non-secret monotonic counters (epoch high-water and
+    /// `(epoch, sequence)` anti-replay marks), not key material.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Default)]
+    pub(crate) struct ContextFloors {
+        /// `sender_did` → highest sender-key epoch observed for that sender. The
+        /// AUTHORITATIVE per-sender epoch high-water for this context (ADR-049 PR-6;
+        /// the provider's `SenderKeyStore.epochs` mirror is no longer read on the
+        /// node).
+        ///
+        /// INVARIANT (black-hat F-3): this one map holds BOTH the REMOTE per-sender
+        /// distributed-epoch high-water (keyed by each remote sender DID) AND — via
+        /// the local-rotation mirror-forward — the LOCAL `sender_key_epoch` scalar
+        /// keyed by `local_did`. This coexistence is safe ONLY because `local_did`
+        /// never appears as a remote sender in its own recv path, so the receive-side
+        /// overshoot ceiling (which reads `sender_epochs[remote_did]`) never reads the
+        /// local scalar. This is LOAD-BEARING and enforced at the recv seam:
+        /// `decrypt_and_dispatch` rejects an application message whose MLS sender is
+        /// `local_did`. A
+        /// violation is fail-safe on the SECURITY axis: co-mingling the (typically
+        /// higher) local scalar into `sender_epochs[local_did]` would only RAISE the
+        /// receive-side epoch CEILING for the local DID — an over-PERMIT on the
+        /// ceiling axis, which is harmless because you cannot decrypt at an
+        /// un-installed epoch — and NEVER lowers the monotonic anti-replay floor, so
+        /// it can never admit a replay or a floor below the live one. The alternative
+        /// — splitting the two counters into separate maps — was rejected as
+        /// over-engineering (it ripples through merge/export/blob format).
+        pub(in crate::context::supervisor) sender_epochs: HashMap<String, u64>,
+        /// `sender_did` → highest [`ReceiveFloor`] (`epoch`, `sequence`) accepted
+        /// from that sender — the intra-epoch anti-replay floor (spec §23.17.3). The
+        /// AUTHORITATIVE receive-side floor (ADR-049 PR-6; the provider's
+        /// `recv_sequence_tracker` mirror is deleted). LEXICOGRAPHIC (epoch-major)
+        /// order.
+        pub(in crate::context::supervisor) recv_sequence: HashMap<String, ReceiveFloor>,
+    }
 }
 
 /// Rejection reason from a floor-advance gate.
@@ -813,7 +817,7 @@ impl Supervisor {
     /// permanently gone
     /// or is being replaced by a fresh group. Idempotent: remove-on-absent is a
     /// no-op, so a bounded TTL-expiry retry re-entering here is harmless.
-    pub fn remove_context_floors(&self, ctx: &[u8; 32]) {
+    pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
         self.floors.remove(ctx);
     }
 
@@ -850,6 +854,23 @@ impl Supervisor {
             floors.sender_epochs.remove(did);
             floors.recv_sequence.remove(did);
         }
+    }
+}
+
+/// Test-only reach into fields that stay private to this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches them (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl ContextFloors {
+    /// The registry's per-sender epoch floors.
+    #[must_use]
+    pub const fn sender_epochs_for_test(&self) -> &HashMap<String, u64> {
+        &self.sender_epochs
+    }
+
+    /// The registry's per-sender receive floors.
+    #[must_use]
+    pub const fn recv_sequence_for_test(&self) -> &HashMap<String, ReceiveFloor> {
+        &self.recv_sequence
     }
 }
 

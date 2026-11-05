@@ -1445,9 +1445,18 @@ impl<'a> RoleStateClassCMut<'a> {
         }
     }
 
+    /// Test-only reach into [`Self::context_id`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn context_id_for_test(&self) -> &str {
+        Self::context_id(self)
+    }
+
     /// Read the context identifier (structural identity).
     #[must_use]
-    pub const fn context_id(&self) -> &str {
+    pub(crate) const fn context_id(&self) -> &str {
         self.context_id
     }
 
@@ -1457,22 +1466,47 @@ impl<'a> RoleStateClassCMut<'a> {
         self.creator_did
     }
 
+    /// Test-only reach into [`Self::ceiling`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn ceiling_for_test(&self) -> &CapabilityCeiling {
+        Self::ceiling(self)
+    }
+
     /// READ-ONLY access to the immutable capability ceiling. DOWNWARD-AUTH
     /// Class-S: ceiling modifications are fail-closed governance (§5.3.2), so
     /// there is deliberately no `&mut` counterpart on this view.
     #[must_use]
-    pub const fn ceiling(&self) -> &CapabilityCeiling {
+    pub(crate) const fn ceiling(&self) -> &CapabilityCeiling {
         self.ceiling
+    }
+
+    /// Test-only reach into [`Self::role_definitions_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn role_definitions_mut_for_test(&mut self) -> &mut HashMap<String, RoleDefinition> {
+        Self::role_definitions_mut(self)
     }
 
     /// `&mut` access to the role definitions map (Class-C / structural
     /// governance configuration).
-    pub const fn role_definitions_mut(&mut self) -> &mut HashMap<String, RoleDefinition> {
+    pub(crate) const fn role_definitions_mut(&mut self) -> &mut HashMap<String, RoleDefinition> {
         self.role_definitions
     }
 
+    /// Test-only reach into [`Self::assignments_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn assignments_mut_for_test(&mut self) -> &mut HashMap<String, RoleAssignment> {
+        Self::assignments_mut(self)
+    }
+
     /// `&mut` access to the current role assignments (Class-C / structural).
-    pub const fn assignments_mut(&mut self) -> &mut HashMap<String, RoleAssignment> {
+    pub(crate) const fn assignments_mut(&mut self) -> &mut HashMap<String, RoleAssignment> {
         self.assignments
     }
 
@@ -1481,6 +1515,15 @@ impl<'a> RoleStateClassCMut<'a> {
     /// add re-derives from the durable membership flow.
     pub const fn members_mut(&mut self) -> &mut HashSet<String> {
         self.members
+    }
+
+    /// Test-only reach into [`Self::member_capabilities`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn member_capabilities_for_test(&self) -> &HashMap<String, HashSet<Capability>> {
+        Self::member_capabilities(self)
     }
 
     /// READ-ONLY access to the per-member GRANTED capability sets (ADR-049 §9 /
@@ -1494,7 +1537,7 @@ impl<'a> RoleStateClassCMut<'a> {
     /// the consequence-only [`ConsequenceRoleStateMut`] (whose caller persists
     /// fail-closed) or another fail-closed combinator.
     #[must_use]
-    pub const fn member_capabilities(&self) -> &HashMap<String, HashSet<Capability>> {
+    pub(crate) const fn member_capabilities(&self) -> &HashMap<String, HashSet<Capability>> {
         self.member_capabilities
     }
 
@@ -1911,12 +1954,20 @@ impl<'a> MembershipClassCMut<'a> {
         self.membership.rollback_sequence_number(sender_did);
     }
 
+    /// Test-only reach into [`Self::get_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn get_mut_for_test(&mut self, did: &str) -> Option<&mut MemberInfo> {
+        Self::get_mut(self, did)
+    }
+
     /// `&mut` access to a specific member's metadata, if present (Class-C /
     /// structural per-member bookkeeping). Forwards
     /// [`MembershipState::get_mut`]. NOTE: this cannot remove a member (it
     /// returns `Option<&mut MemberInfo>`, not the roster), so it is not a
     /// downward-auth removal path.
-    pub fn get_mut(&mut self, did: &str) -> Option<&mut MemberInfo> {
+    pub(crate) fn get_mut(&mut self, did: &str) -> Option<&mut MemberInfo> {
         self.membership.get_mut(did)
     }
 
@@ -1933,10 +1984,19 @@ impl<'a> MembershipClassCMut<'a> {
         self.membership.contains(did)
     }
 
+    /// Test-only reach into [`Self::get`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn get_for_test(&self, did: &str) -> Option<&MemberInfo> {
+        Self::get(self, did)
+    }
+
     /// Read a specific member's metadata, if present. Forwards
     /// [`MembershipState::get`].
     #[must_use]
-    pub fn get(&self, did: &str) -> Option<&MemberInfo> {
+    pub(crate) fn get(&self, did: &str) -> Option<&MemberInfo> {
         self.membership.get(did)
     }
 
@@ -2131,10 +2191,26 @@ pub struct ConsequenceStateSplit<'a> {
     pub checkpoint_events_since: &'a mut u64,
 }
 
-#[allow(
-    dead_code,
-    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/outlet/sweep path."
-)]
+impl ConsequenceStateSplit<'_> {
+    /// Pushes `event` into this context's receive buffer and fans it out on
+    /// `event_tx`. A split comes only from core's combinators or from a
+    /// `&mut PerContextState` core lent, so only such code can call it
+    /// (ADR-070 §4).
+    pub fn emit_event(
+        &mut self,
+        event: scp_protocol::context::membership::ContextEvent,
+        context_id: &str,
+        event_tx: Option<
+            &tokio::sync::broadcast::Sender<(
+                String,
+                scp_protocol::context::membership::ContextEvent,
+            )>,
+        >,
+    ) {
+        crate::context::state::emit_event_into(self.receive_buffer, event, context_id, event_tx);
+    }
+}
+
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a [`ConsequenceStateSplit`] DIRECTLY from a `&mut PerContextState`,
     /// with NO owning [`ClassSCell`] / [`ClassCMut`] in scope (the cell-free
@@ -2159,6 +2235,28 @@ impl<'a> ConsequenceStateSplit<'a> {
             receive_buffer,
             checkpoint_events_since,
         }
+    }
+}
+
+/// Operations a domain crate runs on this view's own fields. A `ClassCMut` comes
+/// only from a `ClassSCell` combinator, so these are callable only by code that
+/// core lent a cell (ADR-070 §4).
+impl ClassCMut<'_> {
+    /// Runs the synchronous terminal phase of a TTL expiry on this context: the
+    /// `Expired` transition of its handle and the scope-driven destruction of
+    /// its actor-owned keys (spec §5.4.5). `prior_completed` is the
+    /// completed-step bitmask of an earlier attempt, so a retry re-runs only
+    /// the failed step.
+    #[must_use]
+    pub fn apply_ttl_terminal_transition(
+        &mut self,
+        prior_completed: u8,
+    ) -> crate::context::ttl::TtlExpiryResult {
+        crate::context::ttl::apply_ttl_terminal_transition(
+            self.handle,
+            self.mode.crypto_mut(),
+            prior_completed,
+        )
     }
 }
 
@@ -2261,6 +2359,14 @@ impl<'a> ClassCMut<'a> {
         }
     }
 
+    /// Test-only reach into [`Self::from_state`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn from_state_for_test(state: &'a mut PerContextState) -> Self {
+        Self::from_state(state)
+    }
+
     /// Build a [`ClassCMut`] DIRECTLY from a `&mut PerContextState`, with NO
     /// owning [`ClassSCell`] in scope.
     ///
@@ -2285,7 +2391,7 @@ impl<'a> ClassCMut<'a> {
     /// construction — exactly as through the cell path — so the absence of a
     /// fail-closed persist here is safe: every mutation it exposes is Class-C /
     /// structural (coalesce-window rollback acceptable).
-    pub const fn from_state(state: &'a mut PerContextState) -> Self {
+    pub(crate) const fn from_state(state: &'a mut PerContextState) -> Self {
         Self::new(state)
     }
 
@@ -2300,9 +2406,17 @@ impl<'a> ClassCMut<'a> {
         &mut self.governance
     }
 
+    /// Test-only reach into [`Self::members_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn members_mut_for_test(&mut self) -> &mut HashSet<DID> {
+        Self::members_mut(self)
+    }
+
     /// `&mut` access to the active-member DID set (Class-C / structural). Safe to
     /// hand out directly: `HashSet<DID>` contains no Class-S sub-struct.
-    pub const fn members_mut(&mut self) -> &mut HashSet<DID> {
+    pub(crate) const fn members_mut(&mut self) -> &mut HashSet<DID> {
         self.members
     }
 
@@ -2319,7 +2433,7 @@ impl<'a> ClassCMut<'a> {
     /// [`crate::context::state::emit_event_into`] (the same security invariants:
     /// `WelcomeGenerated` never broadcasts, message payloads are stripped before
     /// broadcast). The buffered event is best-effort / coalesce-window-rollback
-    /// acceptable.
+    /// acceptable. Domain crates call it on a view core lent them (ADR-070 §4).
     pub fn emit_event(
         &mut self,
         event: scp_protocol::context::membership::ContextEvent,
@@ -2517,9 +2631,17 @@ impl<'a> ClassCMut<'a> {
         self.checkpoint_last_time_secs
     }
 
+    /// Test-only reach into [`Self::checkpoints_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn checkpoints_mut_for_test(&mut self) -> &mut Vec<ConsistencyCheckpoint> {
+        Self::checkpoints_mut(self)
+    }
+
     /// `&mut` access to the locally generated consistency checkpoints (Class-C /
     /// §9.9.3). Best-effort rollback acceptable.
-    pub const fn checkpoints_mut(&mut self) -> &mut Vec<ConsistencyCheckpoint> {
+    pub(crate) const fn checkpoints_mut(&mut self) -> &mut Vec<ConsistencyCheckpoint> {
         self.checkpoints
     }
 
@@ -2674,44 +2796,59 @@ impl<'a> ClassCMut<'a> {
     }
 }
 
-/// Outcome of a [`ClassSCell::commit_class_s_then_append`] that did not complete
-/// cleanly (the post-persist `after` step failed, or a persist failed).
-///
-/// `durability_diverged` is a DURABILITY-DIVERGENCE flag, NOT an "in-memory
-/// changed relative to pre-`f`" flag. It answers the only question the caller
-/// needs: *could the durable (persisted) state disagree with the in-memory state
-/// this call returns?* See the field doc for the exact contract.
-#[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "ADR-049 §9: returned only by `commit_class_s_then_append`, which has no production caller until the handler-migration PR. Exercised by this module's unit tests."
-)]
-pub struct AppendOutcomeError {
-    /// Whether DURABLE state may diverge from the in-memory state this call
-    /// leaves behind — a hard fault the caller must surface.
+scp_runtime_types::pub_under_testing! {
+    /// Outcome of a [`ClassSCell::commit_class_s_then_append`] that did not complete
+    /// cleanly (the post-persist `after` step failed, or a persist failed).
     ///
-    /// `true` when the on-disk and in-memory views are NOT known to agree:
-    /// - initial-persist-fail — `f`'s mutation is in memory but did not durably
-    ///   land (no later persist made it durable); and
-    /// - re-persist-fail — `after` failed, the in-memory rollback ran, but the
-    ///   RE-PERSIST that would make that rollback durable itself failed, so disk
-    ///   still holds `f`'s mutation while memory holds the rollback.
+    /// `durability_diverged` is a DURABILITY-DIVERGENCE flag, NOT an "in-memory
+    /// changed relative to pre-`f`" flag. It answers the only question the caller
+    /// needs: *could the durable (persisted) state disagree with the in-memory state
+    /// this call returns?* See the field doc for the exact contract.
     ///
-    /// `false` when durable and in-memory are known to agree:
-    /// - `f` rejected before any persist (nothing changed durably or in memory);
-    ///   and
-    /// - `after` failed but the rollback's RE-PERSIST succeeded (disk and memory
-    ///   both hold the pre-`f` value).
-    ///
-    /// This is deliberately NOT framed as "in-memory mutated relative to the
-    /// pre-`f` snapshot": on the re-persist-fail arm the in-memory state HAS been
-    /// rolled back to pre-`f`, yet `durability_diverged` is `true` because
-    /// durability diverged. Durability-divergence is the meaning the caller acts
-    /// on.
-    pub durability_diverged: bool,
-    /// The error that terminated the operation (the `after` error, or the
-    /// re-persist error if the rollback could not be made durable).
-    pub err: ContextError,
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug)]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 §9: returned only by `commit_class_s_then_append`, which has no production caller until the handler-migration PR. Exercised by this module's unit tests."
+    )]
+    pub(crate) struct AppendOutcomeError {
+        /// Whether DURABLE state may diverge from the in-memory state this call
+        /// leaves behind — a hard fault the caller must surface.
+        ///
+        /// `true` when the on-disk and in-memory views are NOT known to agree:
+        /// - initial-persist-fail — `f`'s mutation is in memory but did not durably
+        ///   land (no later persist made it durable); and
+        /// - re-persist-fail — `after` failed, the in-memory rollback ran, but the
+        ///   RE-PERSIST that would make that rollback durable itself failed, so disk
+        ///   still holds `f`'s mutation while memory holds the rollback.
+        ///
+        /// `false` when durable and in-memory are known to agree:
+        /// - `f` rejected before any persist (nothing changed durably or in memory);
+        ///   and
+        /// - `after` failed but the rollback's RE-PERSIST succeeded (disk and memory
+        ///   both hold the pre-`f` value).
+        ///
+        /// This is deliberately NOT framed as "in-memory mutated relative to the
+        /// pre-`f` snapshot": on the re-persist-fail arm the in-memory state HAS been
+        /// rolled back to pre-`f`, yet `durability_diverged` is `true` because
+        /// durability diverged. Durability-divergence is the meaning the caller acts
+        /// on.
+        pub(crate) durability_diverged: bool,
+        /// The error that terminated the operation (the `after` error, or the
+        /// re-persist error if the rollback could not be made durable).
+        pub(crate) err: ContextError,
+    }
+}
+
+/// Test-only reach into an [`AppendOutcomeError`]'s fields. Compiled only
+/// under `testing`, so no production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl AppendOutcomeError {
+    /// `(durability_diverged, err)`.
+    #[must_use]
+    pub fn into_parts_for_test(self) -> (bool, ContextError) {
+        (self.durability_diverged, self.err)
+    }
 }
 
 /// Owns one [`PerContextState`] and gates every mutation behind a
@@ -2755,8 +2892,16 @@ impl Deref for ClassSCell {
 }
 
 impl ClassSCell {
+    /// Test-only reach into [`Self::new`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn new_for_test(state: PerContextState) -> Self {
+        Self::new(state)
+    }
+
     /// Wrap an owned [`PerContextState`].
-    pub const fn new(state: PerContextState) -> Self {
+    pub(crate) const fn new(state: PerContextState) -> Self {
         Self {
             state,
             mutation_epoch: 0,
@@ -2779,7 +2924,7 @@ impl ClassSCell {
     /// lifecycle hand-off tests); its first non-test caller is the shutdown/replace
     /// drain migration. Exercised by this module's unit tests today.
     #[allow(dead_code)]
-    pub fn into_inner(self) -> PerContextState {
+    pub(crate) fn into_inner(self) -> PerContextState {
         self.state
     }
 
@@ -3150,7 +3295,7 @@ impl ClassSCell {
     ///
     /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
     #[allow(dead_code)]
-    pub async fn commit_class_s_then_append<T, A>(
+    pub(crate) async fn commit_class_s_then_append<T, A>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -3550,6 +3695,14 @@ impl ClassSCommitToken {
         Self::new(context_id)
     }
 
+    /// Test-only reach into [`Self::note_downward_auth`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn note_downward_auth_for_test(sink: &mut Option<Self>, did_grow: bool, context_id: &str) {
+        Self::note_downward_auth(sink, did_grow, context_id);
+    }
+
     /// Populate a downward-auth sink with a fresh obligation if one is not already
     /// owed (ADR-049 §9, RED-CS3). Idempotent: a cascade that applies more than one
     /// downward-auth GROW still owes EXACTLY ONE fail-closed persist (the single
@@ -3557,7 +3710,7 @@ impl ClassSCommitToken {
     /// memory), so a second GROW reuses the token already in the sink rather than
     /// minting a duplicate. A no-op when `did_grow` is `false` (no downward-auth
     /// transition occurred — the caller's ordinary coalesced persist suffices).
-    pub fn note_downward_auth(sink: &mut Option<Self>, did_grow: bool, context_id: &str) {
+    pub(crate) fn note_downward_auth(sink: &mut Option<Self>, did_grow: bool, context_id: &str) {
         if did_grow && sink.is_none() {
             *sink = Some(Self::for_downward_auth(context_id));
         }
@@ -3775,13 +3928,13 @@ impl ClassSCommitToken {
     /// **Calling `subsume` WITHOUT a guaranteed sibling commit silently discards
     /// the owed fail-closed persist, re-opening the ≤50ms coalesce-window re-grant
     /// hazard.** The set of sanctioned callers is therefore bounded by the
-    /// `subsume_caller_allowlist_is_bounded` tripwire (this module's test): a NEW
+    /// `subsume_callers_equal_the_allowlist` tripwire (`crates/scp-testing/tests/subsume_caller_allowlist.rs`): a NEW
     /// `.subsume(` caller trips CI and must be reviewed for its sibling commit. The
     /// two sanctioned production sites and their siblings are:
     ///
-    /// - `messaging_helpers.rs` (paid-send reconcile) — sibling: the nonce
+    /// - `crates/scp-runtime-messaging/src/helpers.rs` (paid-send reconcile) — sibling: the nonce
     ///   `ClassSCommitToken` committed in `persist_finalized_send`.
-    /// - `governance_helpers.rs` (governance finalize) — sibling: the ambient
+    /// - `crates/scp-runtime-governance/src/helpers.rs` (governance finalize) — sibling: the ambient
     ///   `execute_governance_action` `discharge_with` token.
     ///
     /// The `context_id` is debug-asserted against the token's own, mirroring
@@ -4916,132 +5069,6 @@ mod tests {
              combinator / `ClassSCommitToken`, or — if it is genuinely safe — add \
              it to KNOWN_SAFE with a §9 safety argument on the method. \
              Found: {no_persist_methods:?}, expected: {expected:?}"
-        );
-    }
-
-    /// ADR-049 §9 — bound the set of production [`ClassSCommitToken::subsume`]
-    /// callers to a closed allowlist of the two sanctioned sites.
-    ///
-    /// `subsume` is a DISCARD primitive: it consumes a token and defuses its
-    /// `Drop` guard WITHOUT performing any persist, on the documented precondition
-    /// that a SIBLING token commits the identical whole-`cell.state` fail-closed
-    /// persist (one `persist_state_fail_closed` makes the WHOLE in-memory Class-S
-    /// state durable, so a second persist for the same state would be redundant).
-    /// A new caller that arms a downward-auth GROW and reaches for `subsume`
-    /// WITHOUT a guaranteed sibling commit would silently re-open the ≤50ms
-    /// coalesce-window re-grant hazard — a one-line flip. There is no live exploit
-    /// today; the only two production callers honor the precondition:
-    ///
-    /// - `crates/scp-runtime-messaging/src/helpers.rs` (paid-send reconcile) — the
-    ///   sibling is the nonce `ClassSCommitToken` committed in
-    ///   `persist_finalized_send`.
-    /// - `crates/scp-runtime-governance/src/helpers.rs` (governance finalize) — the
-    ///   sibling is the ambient `execute_governance_action` `discharge_with` token.
-    ///
-    /// # Approach (and why it is robust)
-    ///
-    /// The scan reads every `.rs` file under each `crates/scp-runtime*/src`
-    /// directory (ADR-070 split the runtime into 16 crates), each
-    /// comment/string-stripped through the shared `code_only` lexer so a
-    /// `.subsume(` mention in a comment or string does not count (both sanctioned
-    /// files DO carry such prose mentions). It skips `class_s.rs` itself, whose
-    /// test module legitimately calls `.subsume(` from
-    /// `subsume_discharges_without_panicking` /
-    /// `subsume_wrong_context_panics_in_debug`. The allowlist is a CLOSED POSITIVE
-    /// set keyed on `(file, count)`: each sanctioned file must contain EXACTLY its
-    /// expected number of calls, and NO un-listed file may contain one.
-    ///
-    /// # Honest scope
-    ///
-    /// Like the no-persist whitelist tripwire above, this is a convergent
-    /// honest-contributor SPEED-BUMP catching a NEW `subsume` caller — NOT an
-    /// adversarial gate. A determined evader who can add a caller can equally edit
-    /// this test or the allowlist. The real durability guarantee is the
-    /// obligation-coupling (the `Drop` guard + `#[must_use]` token) plus each
-    /// site's PROVEN sibling commit; this test merely forces a NEW caller to be
-    /// consciously reviewed for that sibling before it can ship.
-    #[test]
-    fn subsume_caller_allowlist_is_bounded() {
-        // The closed positive allowlist: each sanctioned production file and the
-        // EXACT number of `.subsume(` call sites it is permitted to contain. A new
-        // caller (a 2nd site in either file, or a call in any other file) trips the
-        // assert. Adding a deliberately-sanctioned site means bumping the count
-        // here WITH a §9 sibling-commit safety argument on the new call.
-        const KNOWN_SUBSUME_SITES: [(&str, usize); 2] = [
-            ("crates/scp-runtime-messaging/src/helpers.rs", 1),
-            ("crates/scp-runtime-governance/src/helpers.rs", 1),
-        ];
-        // The definition plus `#[cfg(test)]` test calls, neither a production caller.
-        const SELF: &str = "crates/scp-runtime-core/src/context/actor/class_s.rs";
-
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("read a runtime source directory") {
-                let path = entry.expect("read a directory entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
-        fn workspace_root() -> std::path::PathBuf {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .ancestors()
-                .nth(2)
-                .expect("the crate sits two levels below the repository root")
-                .to_path_buf()
-        }
-
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(workspace_root().join("crates")).expect("read crates/") {
-            let dir = entry.expect("read a crates/ entry").path();
-            let is_runtime = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("scp-runtime"));
-            if is_runtime && dir.join("src").is_dir() {
-                rust_files(&dir.join("src"), &mut files);
-            }
-        }
-        assert!(
-            files
-                .iter()
-                .any(|f| f.ends_with("scp-runtime-messaging/src/helpers.rs")),
-            "the scan must reach the domain crates' sources"
-        );
-
-        // Count `.subsume(` call sites per file over the COMMENT/STRING-stripped
-        // source, so a `.subsume(` inside a `//`/`/* */` comment or a string
-        // literal (both sanctioned files carry such prose) does not count.
-        let mut found: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for file in &files {
-            let rel = file
-                .strip_prefix(workspace_root())
-                .expect("a scanned file sits under the repository root")
-                .to_string_lossy()
-                .into_owned();
-            if rel == SELF {
-                continue;
-            }
-            let src = std::fs::read_to_string(file).expect("read a runtime source file");
-            let count = code_only(&src).matches(".subsume(").count();
-            if count > 0 {
-                found.insert(rel, count);
-            }
-        }
-
-        let expected: std::collections::BTreeMap<String, usize> = KNOWN_SUBSUME_SITES
-            .iter()
-            .map(|(f, n)| ((*f).to_owned(), *n))
-            .collect();
-        assert_eq!(
-            found, expected,
-            "ADR-049 §9: the `ClassSCommitToken::subsume()` call sites in the runtime \
-             crates differ from KNOWN_SUBSUME_SITES. subsume DISCARDS the owed \
-             fail-closed persist — prove a sibling token commits the same whole-state \
-             persist, then add the site to KNOWN_SUBSUME_SITES with a §9 safety argument."
         );
     }
 

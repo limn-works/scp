@@ -39,6 +39,8 @@
 //!   capability-reduced [`deps::ActorDeps`].
 
 pub mod class_s;
+#[cfg(any(test, feature = "testing"))]
+mod class_s_testing_access;
 pub mod commands;
 pub mod deps;
 pub mod handle;
@@ -81,11 +83,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::{Interval, MissedTickBehavior, Sleep};
 
-/// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
-/// burst of mutations that all complete within this window collapse to
-/// a single durable snapshot write. The actor's `run()` loop wakes on
-/// this interval iff `dirty == true` and writes the latest snapshot.
-pub const COALESCE_INTERVAL: Duration = Duration::from_millis(50);
+scp_runtime_types::pub_under_testing! {
+    /// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
+    /// burst of mutations that all complete within this window collapse to
+    /// a single durable snapshot write. The actor's `run()` loop wakes on
+    /// this interval iff `dirty == true` and writes the latest snapshot.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const COALESCE_INTERVAL: Duration = Duration::from_millis(50);
+}
 
 /// BASE backoff before retrying an INCOMPLETE TTL expiry (SEC-1 / ADR-049 §9
 /// amendment; M2). When [`ContextActor::on_ttl_tick`] leaves the context
@@ -116,11 +122,19 @@ const TTL_EXPIRY_RETRY_CAP: Duration = Duration::from_mins(5);
 /// an undurable terminal state.
 const TTL_EXPIRY_STUCK_THRESHOLD: u32 = 12;
 
+/// Test-only reach into [`ttl_expiry_retry_backoff`] for tests outside this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn ttl_expiry_retry_backoff_for_test(retries: u32) -> Duration {
+    ttl_expiry_retry_backoff(retries)
+}
+
 /// Bounded exponential backoff for the n-th (1-based) consecutive incomplete
 /// TTL-expiry attempt (M2): `TTL_EXPIRY_RETRY_BASE · 2^(n−1)`, saturating at
 /// `TTL_EXPIRY_RETRY_CAP`. `retries == 0` is treated as the first attempt.
 #[must_use]
-pub fn ttl_expiry_retry_backoff(retries: u32) -> Duration {
+fn ttl_expiry_retry_backoff(retries: u32) -> Duration {
     // Cap the shift well under 64 so `1u64 << shift` cannot overflow; the `.min`
     // against the cap below makes any shift past the cap-crossing point a no-op.
     let shift = retries.saturating_sub(1).min(32);

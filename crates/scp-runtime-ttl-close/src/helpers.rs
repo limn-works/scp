@@ -48,7 +48,7 @@ use scp_runtime_core::context::actor::class_s::ClassSCell;
 use scp_runtime_core::context::actor::deps::ActorDeps;
 use scp_runtime_core::context::actor::state::PerContextState;
 use scp_runtime_core::context::state::{context_id_to_bytes, strip_event_payload};
-use scp_runtime_core::context::ttl::{self, TtlExtension, TtlTimer};
+use scp_runtime_core::context::ttl::{TtlExtension, TtlTimer};
 
 // ---------------------------------------------------------------------------
 // 1. handle_ttl_expiry
@@ -160,11 +160,9 @@ pub async fn handle_ttl_expiry(
     // crypto via the field-granular Class-C view (the provider holds none). The
     // view borrow is scoped tightly so `cell` is free for the fail-closed persist
     // below.
-    let terminal_result = {
-        let mut view = cell.class_c_view();
-        let crypto_state = view.mode_mut().crypto_mut();
-        ttl::apply_ttl_terminal_transition(handle, crypto_state, prior_completed)
-    };
+    let terminal_result = cell
+        .class_c_view()
+        .apply_ttl_terminal_transition(prior_completed);
 
     // Prune the authoritative Class-M floor registry entry (ADR-049) on a
     // GENUINE terminal expiry. Gated on `state_transitioned()` so an aborted /
@@ -197,15 +195,18 @@ pub async fn handle_ttl_expiry(
             // Participation decay on TTL expiry (#1530): clear participation
             // cache + cooldown so stale data does not carry over on a later
             // restore.
-            state.governance.decay_participation();
+            state.governance_mut().decay_participation();
             // Clear the recorded convergent deadline durably in the terminal
             // snapshot so a stale absolute deadline cannot re-fire against the
             // expired context on a later restore (BUG-1 parity with
             // `close_context_with_key`).
-            state.ttl.timer.deadline_unix_secs = None;
+            state.ttl_mut().timer.deadline_unix_secs = None;
             // §9.10.4.1 "Leave, close and expiry": an expired
             // context drops its previous routing ID and pending rotation work.
-            state.class_s.pseudonym_rotation.discard_rotation_state();
+            state
+                .class_s_mut()
+                .pseudonym_rotation
+                .discard_rotation_state();
             Ok(())
         })
         .await;
@@ -260,13 +261,8 @@ pub async fn handle_ttl_expiry(
         ));
         unlogged
     } else if let (Ok(()), Ok(expiry_deadline_secs)) = (&persist_result, leaf_deadline) {
-        let io_fut = ttl::finish_ttl_expiry_io(
-            handle,
-            Some(deps.transport.as_ref()),
-            deps.event_log.as_ref(),
-            terminal_result.clone(),
-            expiry_deadline_secs,
-        );
+        let io_fut =
+            deps.finish_ttl_expiry_io(handle, terminal_result.clone(), expiry_deadline_secs);
         match tokio::time::timeout(scp_runtime_core::context::actor::HANDLER_TIMEOUT, io_fut).await
         {
             Ok(r) => r,
@@ -433,7 +429,7 @@ pub async fn reset_ttl_timer(
     // for the §5.10.1 step-5 leaf's `consenting_members`. Convergent (sorted)
     // across members. The tally clears below, only after the leaf is stored.
     let consenting_members = cell
-        .ttl
+        .ttl()
         .extension
         .as_ref()
         .map(TtlExtension::consented_dids)
@@ -836,7 +832,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        scp_runtime_core::context::actor::class_s::ClassSCell::new(state)
+        scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state)
     }
 
     /// The committed governance extension still extends when the log cannot
@@ -869,13 +865,13 @@ mod tests {
         .await
         .expect("a committed extension returns Ok over an unreadable log");
         assert_eq!(
-            governance.ttl.timer.deadline_unix_secs,
+            governance.ttl().timer.deadline_unix_secs,
             Some(CREATION + TTL + ADDITIONAL),
             "the committed extension moves the timer"
         );
 
         let mut reset = ttl_cell(ctx);
-        let before = reset.ttl.timer.deadline_unix_secs;
+        let before = reset.ttl().timer.deadline_unix_secs;
         let err = super::extend_ttl_deadline_and_record(
             &mut reset,
             &log,
@@ -896,7 +892,8 @@ mod tests {
             "the read error reaches the caller: {err:?}"
         );
         assert_eq!(
-            reset.ttl.timer.deadline_unix_secs, before,
+            reset.ttl().timer.deadline_unix_secs,
+            before,
             "the timer is unchanged"
         );
     }

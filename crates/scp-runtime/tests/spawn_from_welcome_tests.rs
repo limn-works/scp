@@ -312,7 +312,7 @@ fn alice_welcome_for_bob(
         );
     alice_state.seed_encrypted_crypto_from_owned(owned);
     alice_state
-        .add_member(BOB_DID, Some(kp_bytes), &scp_clock::SystemClock)
+        .add_member_for_test(BOB_DID, Some(kp_bytes), &scp_clock::SystemClock)
         .expect("alice adds bob's reserved key package on her owned group")
 }
 
@@ -711,7 +711,7 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
         "the joiner's actor is registered and serves its mailbox (send handle live)"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_some(),
+        j.sup.lookup_for_test(&j.ctx_id).is_some(),
         "a context actor handle is registered for the joiner"
     );
 
@@ -1058,7 +1058,7 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
         "the refusal must name the outlet-count bound (not some other precheck), got {message}"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after an over-cap outlet rejection"
     );
 
@@ -1146,7 +1146,7 @@ async fn welcome_rejects_invalid_policy_before_the_kp_consume() {
         "the refusal must name the sybil policy (not some other precheck), got {message}"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after an invalid sybil policy"
     );
     assert!(
@@ -1210,7 +1210,7 @@ async fn assert_welcome_refuses_before_the_kp_consume(
         "expected CreationFailed naming {field}, got {err:?}"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a refused {field}"
     );
     assert!(
@@ -1347,7 +1347,7 @@ async fn spawn_from_welcome_group_round_trips_both_directions() {
         "the joiner's actor is registered and serves its mailbox (send handle live)"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_some(),
+        j.sup.lookup_for_test(&j.ctx_id).is_some(),
         "a context actor handle is registered for the joiner"
     );
 
@@ -1440,7 +1440,7 @@ async fn persist_failure_leaves_no_half_keyed_actor() {
 
     // No live actor is registered — the context is unreachable, not half-keyed.
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "no actor handle may be registered after a fail-closed rejection"
     );
     assert_eq!(
@@ -1529,7 +1529,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
         "expected InvalidState for a consumed reservation, got {replay:?}"
     );
     assert!(
-        sup.lookup(&replay_ctx_id).is_none(),
+        sup.lookup_for_test(&replay_ctx_id).is_none(),
         "the replay to a fresh context id must not stand up an actor"
     );
 
@@ -1626,7 +1626,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
         "expected CreationFailed for a missing pseudonym, got {err:?}"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a pseudonym rejection"
     );
     assert!(
@@ -1691,7 +1691,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
     .await
     .expect("bob creates the colliding broadcast context");
     assert!(
-        sup.lookup(&collide_id).is_some(),
+        sup.lookup_for_test(&collide_id).is_some(),
         "the broadcast context registered an actor"
     );
     assert!(
@@ -1730,7 +1730,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 
     // The broadcast context SURVIVES intact — not clobbered.
     assert!(
-        sup.lookup(&collide_id).is_some(),
+        sup.lookup_for_test(&collide_id).is_some(),
         "the pre-existing broadcast context survives the rejected colliding join"
     );
     assert_eq!(
@@ -1790,7 +1790,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 /// (fail-open) fails the first two assertions.
 #[test]
 fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error() {
-    use scp_runtime_core::context::snapshot::welcome_snapshot_crypto_is_durable;
+    use scp_runtime_core::context::snapshot::welcome_snapshot_crypto_is_durable_for_test as welcome_snapshot_crypto_is_durable;
 
     // A populated crypto blob is durable — the spawn may proceed.
     assert!(
@@ -1880,7 +1880,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     // No actor registered — the keyless joiner never became reachable, and the
     // fail-closed branch ran BEFORE the persist (nothing durable to resurrect).
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a fail-closed non-durable export"
     );
     assert_eq!(
@@ -1994,7 +1994,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     //     durable Precheck D can catch the collision.
     let (target_sup, _target_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
     assert!(
-        target_sup.lookup(&ctx_id).is_none(),
+        target_sup.lookup_for_test(&ctx_id).is_none(),
         "the target supervisor has no live actor for the id (only durable state exists)"
     );
 
@@ -2047,7 +2047,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     );
     // No actor stood up and no group was installed on the target.
     assert!(
-        target_sup.lookup(&ctx_id).is_none(),
+        target_sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a durable-collision reject"
     );
     assert!(
@@ -2145,7 +2145,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
         }
     });
     sup.key_package_stores_for_test()
-        .insert(bob.clone(), KeyPackageStoreHandle::from_sender(tx));
+        .insert(bob.clone(), KeyPackageStoreHandle::from_sender_for_test(tx));
 
     // A well-formed request: the fake store ignores `reservation_id` /
     // `welcome_bytes`, so they need not name a real reserved KP. The reversible
@@ -2190,7 +2190,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
         "no MLS group may be installed after a timed-out join"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a timed-out join"
     );
     assert_eq!(
@@ -2215,7 +2215,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     .await
     .expect("a later bootstrap for a different id proceeds — the global lock was released");
     assert!(
-        sup.lookup(&other_id).is_some(),
+        sup.lookup_for_test(&other_id).is_some(),
         "the follow-up create stood up its own live actor (the global lock was not pinned)"
     );
     assert!(
@@ -2303,7 +2303,7 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
         "the reserve->spawn join stands up a registered, send-capable actor"
     );
     assert!(
-        sup.lookup(&ctx_id).is_some(),
+        sup.lookup_for_test(&ctx_id).is_some(),
         "a context actor handle is registered for the joiner"
     );
 
@@ -2370,7 +2370,7 @@ async fn spawn_under_a_different_did_is_rejected() {
         "expected InvalidState for an absent (cross-identity) reservation, got {err:?}"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may stand up under the wrong identity"
     );
 
@@ -2424,7 +2424,7 @@ async fn assert_binding_refused_no_side_effects(
     );
     // No actor registered / reachable.
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "no actor handle may be registered after a binding refusal"
     );
     assert_eq!(
@@ -2565,7 +2565,7 @@ async fn join_group_without_scp_context_extension_is_refused() {
         "no MLS group may be installed after a rule-1 refusal"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "no actor handle may be registered after a rule-1 refusal"
     );
     assert!(
@@ -2717,7 +2717,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
         "no group may be installed after a signature refusal"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a signature refusal"
     );
 
@@ -2789,7 +2789,7 @@ async fn tampered_ciphertext_fails_aead_open() {
         "no group may be installed after an open failure"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after an open failure"
     );
 }
@@ -2843,7 +2843,7 @@ async fn tampered_bundle_signature_is_rejected() {
         "no group may be installed after a signature refusal"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a signature refusal"
     );
 }
@@ -2921,7 +2921,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
         "no group may be installed after a structural refusal"
     );
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no actor may be registered after a structural refusal"
     );
 }
@@ -3050,7 +3050,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         "the invited joiner stands up a live, send-capable actor"
     );
     assert!(
-        bob_sup.lookup(&ctx_id).is_some(),
+        bob_sup.lookup_for_test(&ctx_id).is_some(),
         "a context actor handle is registered for the invited joiner"
     );
     assert_eq!(
@@ -3610,7 +3610,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // governance engine from `creator_did`), so NO context actor is registered
     // and Bob's crypto provider has NO installed group for this id.
     assert!(
-        sup.lookup(&ctx_id).is_none(),
+        sup.lookup_for_test(&ctx_id).is_none(),
         "no context actor may be registered for a creator-substituted join — \
          build_welcome_joiner_state (and SingleAdminEngine::new) never ran"
     );
@@ -3655,7 +3655,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
 
     // --- Pre-teardown: all three pieces of join state are present. ---
     assert!(
-        j.sup.lookup(&j.ctx_id).is_some(),
+        j.sup.lookup_for_test(&j.ctx_id).is_some(),
         "a live context actor is registered for the joiner"
     );
     assert!(
@@ -3696,7 +3696,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
 
     // 1. Actor handle gone — no orphaned live actor lingers.
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "the actor handle is removed"
     );
     assert_eq!(
@@ -3838,7 +3838,7 @@ impl ContextPersistence for GatedPersistence {
 /// Waits until the actor behind `held` has exited, so its last write has
 /// landed before a test reads the store.
 async fn await_exit(held: &scp_runtime_core::context::actor::handle::ContextActorHandle) {
-    held.stop_and_await_exit_unbounded().await;
+    held.stop_and_await_exit_unbounded_for_test().await;
 }
 
 /// A clone of the actor handle held outside the registry (a bridge's cached
@@ -3858,7 +3858,7 @@ async fn discard_joined_context_deletes_after_the_actors_last_write() {
     result.expect("the happy-path join succeeds");
     let held = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
     gated.arm();
 
@@ -3900,7 +3900,7 @@ async fn a_timed_out_discard_deletes_the_snapshot_after_the_stuck_last_write() {
     result.expect("the happy-path join succeeds");
     let held = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
     gated.arm();
     tokio::time::pause();
@@ -3949,7 +3949,7 @@ async fn a_discard_that_finds_a_full_mailbox_deletes_the_snapshot_after_the_last
     result.expect("the happy-path join succeeds");
     let held = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
     gated.arm();
     tokio::time::pause();
@@ -4043,7 +4043,7 @@ async fn a_crash_respawn_queued_before_a_discard_leaves_no_actor_and_no_snapshot
     result.expect("the happy-path join succeeds");
     let crashed = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
 
     let spawn_guard = j.sup.lock_bootstrap_spawn_for_test().await;
@@ -4065,7 +4065,7 @@ async fn a_crash_respawn_queued_before_a_discard_leaves_no_actor_and_no_snapshot
         "the discard tears down the actor the respawn registered, got {outcome:?}"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "no actor runs for the discarded context"
     );
     assert!(
@@ -4089,7 +4089,7 @@ async fn a_respawn_during_a_discard_reads_no_snapshot_and_registers_no_actor() {
     result.expect("the happy-path join succeeds");
     let held = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
     gated.arm();
 
@@ -4118,7 +4118,7 @@ async fn a_respawn_during_a_discard_reads_no_snapshot_and_registers_no_actor() {
         "the refused respawn reads no snapshot"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "the refused respawn registers no actor"
     );
 
@@ -4149,7 +4149,7 @@ async fn a_respawn_queued_behind_a_discard_of_an_empty_slot_restores_nothing() {
     result.expect("the happy-path join succeeds");
     let held = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
     assert!(
         j.sup.despawn_actor(&j.ctx_id).await,
@@ -4196,7 +4196,7 @@ async fn a_respawn_queued_behind_a_discard_of_an_empty_slot_restores_nothing() {
         "the respawn behind the discard finds no snapshot to restore, got {respawned:?}"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "no actor runs for the discarded context"
     );
     assert!(
@@ -4220,7 +4220,7 @@ async fn the_watchdog_does_not_respawn_a_crashed_actor_another_path_removed() {
     result.expect("the happy-path join succeeds");
     let crashed = j
         .sup
-        .lookup(&j.ctx_id)
+        .lookup_for_test(&j.ctx_id)
         .expect("a live context actor is registered for the joiner");
 
     let spawn_guard = j.sup.lock_bootstrap_spawn_for_test().await;
@@ -4243,7 +4243,7 @@ async fn the_watchdog_does_not_respawn_a_crashed_actor_another_path_removed() {
         "the watchdog reads no snapshot for an actor another path removed"
     );
     assert!(
-        j.sup.lookup(&j.ctx_id).is_none(),
+        j.sup.lookup_for_test(&j.ctx_id).is_none(),
         "the watchdog registers no actor for an actor another path removed"
     );
 }
@@ -5085,7 +5085,7 @@ async fn invite_member_rejects_a_key_package_attested_by_the_invitee_agent_key()
     use scp_runtime_types::crypto::mls::test_support::MintAttestedForTest as _;
     let mallory_wrap = mallory_wrapping_public_key().await;
     let agent_key =
-        scp_runtime_types::crypto::mls::test_support::test_agent_key(&bob_signing_key());
+        scp_runtime_types::crypto::mls::test_support::test_agent_key_for_test(&bob_signing_key());
     let key_package =
         scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
             scp_clock::SystemClock,
@@ -5491,7 +5491,10 @@ async fn assert_join_left_no_trace(
         reservation_is_live(sup, owner, reservation_id).await,
         "a join that failed before the consume leaves the reservation live"
     );
-    assert!(sup.lookup(ctx_id).is_none(), "no actor is registered");
+    assert!(
+        sup.lookup_for_test(ctx_id).is_none(),
+        "no actor is registered"
+    );
     assert!(
         sup.local_mls_epoch(ctx_id).await.is_none(),
         "no group is installed"
@@ -5547,7 +5550,7 @@ async fn invite_member_seals_to_the_invitee_key_package_wrapping_key() {
     };
 
     let dh = custody
-        .dh_agree(wrapping_key.handle(), enc.as_bytes())
+        .dh_agree(wrapping_key.handle_for_test(), enc.as_bytes())
         .await
         .expect("the wrapping handle agrees");
     let wire =
@@ -5603,14 +5606,14 @@ async fn sealed_invitation_opens_only_through_the_invitee_wrapping_handle() {
         .load_wrapping_key_for_test(&bob)
         .await
         .expect("bob's wrapping key");
-    let (genuine_handle, genuine_public) = (*genuine.handle(), *genuine.public());
+    let (genuine_handle, genuine_public) = (*genuine.handle_for_test(), *genuine.public());
     let point_record = |handle: scp_platform::traits::KeyHandle, public: [u8; 65]| {
         let storage = Arc::clone(&storage);
         let bob_sup = Arc::clone(&bob_sup);
         let bob = bob.clone();
         async move {
             bob_sup.wrapping_keys_for_test().remove(&bob);
-            scp_runtime_core::store::wrapping_key::store_wrapping_key_handle(
+            scp_runtime_core::store::wrapping_key::store_wrapping_key_handle_for_test(
                 storage.as_ref(),
                 &bob,
                 &handle,
@@ -5767,7 +5770,7 @@ async fn join_rejects_a_reserved_wrapping_key_that_differs_from_the_recorded_key
         .try_into()
         .expect("65 bytes");
     bob_sup.wrapping_keys_for_test().remove(&bob);
-    scp_runtime_core::store::wrapping_key::store_wrapping_key_handle(
+    scp_runtime_core::store::wrapping_key::store_wrapping_key_handle_for_test(
         bob_sup
             .mls_storage_ref_for_test()
             .expect("bob's MLS storage")
@@ -6002,7 +6005,7 @@ async fn invite_then_restart_joiner_then_join_opens_with_the_reloaded_custody_ha
         .expect("the reloaded key");
     assert_eq!(
         generated,
-        vec![*reloaded.handle()],
+        vec![*reloaded.handle_for_test()],
         "the join used the handle generated before the restart"
     );
     assert_eq!(after.member_count(&ctx_id).await, Some(2));
@@ -6040,7 +6043,10 @@ async fn join_after_restart_with_a_custody_that_lost_the_wrapping_key_fails_befo
         0,
         "the load generates no replacement key"
     );
-    assert!(after.lookup(&ctx_id).is_none(), "no actor is registered");
+    assert!(
+        after.lookup_for_test(&ctx_id).is_none(),
+        "no actor is registered"
+    );
     drop(after);
 
     // The reservation is durable: a supervisor over the same storage and the

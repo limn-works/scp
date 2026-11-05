@@ -3159,7 +3159,7 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
     let commit_tail = &helper[commit_at..];
     assert!(
         record_at < commit_at
-            && commit_tail.contains("state.class_s.pseudonym_rotation = rotation")
+            && commit_tail.contains("state.class_s_mut().pseudonym_rotation = rotation")
             && commit_tail.contains("set_local_pseudonym(old)"),
         "rotate_pseudonym must record the rotation, then persist the rotated state \
          (query-only list included) inside commit_class_s_compensating, whose \
@@ -8223,7 +8223,7 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // Bound the seal-task function body: from its `fn` to the next item
     // (`record_streaming_saga_a_event`, which immediately follows it).
     let fn_start = OUTLETS_INVOKE_SRC
-        .find("pub async fn run_streaming_saga_seal_task")
+        .find("pub(crate) async fn run_streaming_saga_seal_task")
         .expect("run_streaming_saga_seal_task must exist in invoke.rs");
     let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
     let fn_len = after_fn

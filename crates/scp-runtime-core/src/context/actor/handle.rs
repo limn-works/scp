@@ -136,19 +136,23 @@ pub async fn bounded_reply_await<T>(rx: oneshot::Receiver<T>) -> Result<T, Bound
 // Deliberate exit
 // ---------------------------------------------------------------------------
 
-/// Why an actor's `run()` loop ended on purpose. The actor records it before
-/// its inbox drops, so a caller whose command went unanswered can tell an
-/// actor that stopped on purpose from one that crashed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliberateExit {
-    /// The actor dispatched `LifecycleControlCommand::Shutdown`.
-    Shutdown,
-    /// The actor dispatched a `LifecycleControlCommand::PrepareForReplace`
-    /// that claimed its slot for an imported context.
-    Replaced,
-    /// The actor's TTL expiry landed the context in a terminal state, which
-    /// the expiry persisted before the actor despawned itself.
-    Expired,
+scp_runtime_types::pub_under_testing! {
+    /// Why an actor's `run()` loop ended on purpose. The actor records it before
+    /// its inbox drops, so a caller whose command went unanswered can tell an
+    /// actor that stopped on purpose from one that crashed.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DeliberateExit {
+        /// The actor dispatched `LifecycleControlCommand::Shutdown`.
+        Shutdown,
+        /// The actor dispatched a `LifecycleControlCommand::PrepareForReplace`
+        /// that claimed its slot for an imported context.
+        Replaced,
+        /// The actor's TTL expiry landed the context in a terminal state, which
+        /// the expiry persisted before the actor despawned itself.
+        Expired,
+    }
 }
 
 /// The cell an actor records its [`DeliberateExit`] in, shared with every
@@ -159,8 +163,16 @@ pub enum DeliberateExit {
 pub struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
 
 impl ExitRecord {
+    /// Test-only reach into [`Self::record`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn record_for_test(&self, exit: DeliberateExit) {
+        Self::record(self, exit);
+    }
+
     /// Records `exit`. The first record wins; an actor exits once.
-    pub fn record(&self, exit: DeliberateExit) {
+    pub(in crate::context) fn record(&self, exit: DeliberateExit) {
         if self.0.set(exit).is_err() {
             tracing::error!(?exit, "an actor recorded a second deliberate exit");
         }
@@ -196,6 +208,15 @@ pub struct ContextActorHandle {
 }
 
 impl ContextActorHandle {
+    /// Test-only reach into [`Self::from_sender`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn from_sender_for_test(inbox: mpsc::Sender<ContextCommand>) -> Self {
+        Self::from_sender(inbox)
+    }
+
     /// Wraps a raw mpsc sender. Visible only within the actor-supervisor
     /// module pair — the sender half is paired with an actor's `inbox:
     /// Receiver` by the `Supervisor::spawn_actor` constructor. External
@@ -207,25 +228,43 @@ impl ContextActorHandle {
     /// `#[cfg(test)]` until the lifecycle handler migrates in commit 9.
     #[must_use]
     #[allow(dead_code)]
-    pub fn from_sender(inbox: mpsc::Sender<ContextCommand>) -> Self {
+    pub(in crate::context) fn from_sender(inbox: mpsc::Sender<ContextCommand>) -> Self {
         Self {
             inbox,
             exit: ExitRecord::default(),
         }
     }
 
+    /// Test-only reach into [`Self::exit_record`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn exit_record_for_test(&self) -> ExitRecord {
+        Self::exit_record(self)
+    }
+
     /// The cell the actor behind this handle records its deliberate exit
     /// in. The spawn hands it to [`super::ContextActor::new`], so the
     /// handle reads what that actor records.
     #[must_use]
-    pub fn exit_record(&self) -> ExitRecord {
+    pub(in crate::context) fn exit_record(&self) -> ExitRecord {
         self.exit.clone()
+    }
+
+    /// Test-only reach into [`Self::exited_deliberately`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn exited_deliberately_for_test(&self) -> Option<DeliberateExit> {
+        Self::exited_deliberately(self)
     }
 
     /// The exit the actor recorded when its `run()` loop ended on purpose,
     /// or `None` while it runs and after any other exit, a panic included.
     #[must_use]
-    pub fn exited_deliberately(&self) -> Option<DeliberateExit> {
+    pub(in crate::context) fn exited_deliberately(&self) -> Option<DeliberateExit> {
         self.exit.get()
     }
 
@@ -496,6 +535,18 @@ impl ContextActorHandle {
         .await
     }
 
+    /// Test-only reach into [`Self::shutdown_and_await_exit`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::shutdown_and_await_exit`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn shutdown_and_await_exit_for_test(&self) -> Result<(), ContextError> {
+        Self::shutdown_and_await_exit(self).await
+    }
+
     /// Stops the actor and waits until its `run()` has returned, so no write
     /// the actor makes can land after this resolves.
     ///
@@ -510,7 +561,7 @@ impl ContextActorHandle {
     /// The `Shutdown` send's error, or [`ContextError::ActorBusy`] when the
     /// send succeeded, if the actor has not exited within [`REPLY_TIMEOUT`].
     /// The actor may still write after an error.
-    pub async fn shutdown_and_await_exit(&self) -> Result<(), ContextError> {
+    pub(in crate::context) async fn shutdown_and_await_exit(&self) -> Result<(), ContextError> {
         // A closed inbox (the actor already exited) fails the send and
         // resolves `closed` at once, so the exit wait alone decides success.
         let shutdown = self.send_shutdown().await;
@@ -538,6 +589,14 @@ impl ContextActorHandle {
         self.inbox.is_closed()
     }
 
+    /// Test-only reach into [`Self::stop_and_await_exit_unbounded`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn stop_and_await_exit_unbounded_for_test(&self) {
+        Self::stop_and_await_exit_unbounded(self).await;
+    }
+
     /// [`Self::shutdown_and_await_exit`] with no time bound, for a caller that
     /// must not proceed until the actor has exited however long it takes.
     ///
@@ -545,7 +604,7 @@ impl ContextActorHandle {
     /// so a full mailbox delays the stop rather than skipping it. A send that
     /// fails means the inbox receiver has dropped, which happens only when
     /// `run()` returns, so the actor has already exited.
-    pub async fn stop_and_await_exit_unbounded(&self) {
+    pub(in crate::context) async fn stop_and_await_exit_unbounded(&self) {
         let (reply, _ack) = oneshot::channel();
         let shutdown =
             ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply });
