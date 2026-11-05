@@ -411,6 +411,7 @@ fi
 # the layer is core's `context/` tree plus every domain crate's `src/` tree.
 HELPER_DIRS=(
     "crates/scp-runtime-core/src/context"
+    "crates/scp-runtime-types/src/context"
     "crates/scp-runtime-messaging/src"
     "crates/scp-runtime-lifecycle/src"
     "crates/scp-runtime-governance/src"

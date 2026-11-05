@@ -1020,10 +1020,41 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
+      # cargo-shear's source, checked against the checksum pinned-tool pins and built
+      # against the Cargo.lock it ships. The install runs before cargo-fetch, after
+      # which every cargo command in this job runs offline.
+      - name: Download the cargo-shear source
+        id: cargo-shear
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: cargo-shear
+      - name: Install cargo-shear
+        env:
+          CRATE: ${{ steps.cargo-shear.outputs.path }}
+        run: cargo install --locked --path "$CRATE"
       - uses: ./.github/actions/cargo-fetch
+      # check-protocol-deps.sh parses `cargo metadata` with `python3.12`, which
+      # the runner image does not ship.
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: "3.12"
       - run: bash scripts/check-protocol-deps.sh --self-test
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
+      # Each runtime crate (ADR-070) declares only the dependencies its code uses, and
+      # a dependency only its tests use sits under [dev-dependencies]. cargo-shear reads
+      # each crate's sources and exits non-zero on an unused, misplaced or
+      # feature-only dependency, or on an empty source file.
+      - name: Unused dependencies in the runtime crates
+        run: |
+          set -euo pipefail
+          packages=()
+          for manifest in crates/scp-runtime*/Cargo.toml; do
+            crate="${manifest#crates/}"
+            packages+=(-p "${crate%/Cargo.toml}")
+          done
+          cargo shear --frozen --deny-warnings "${packages[@]}"
       # A publishable crate with a normal or build dependency on a
       # `publish = false` crate, or a release.yml publish order that puts a
       # crate before its dependency, breaks `cargo publish` at release time.

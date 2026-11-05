@@ -228,6 +228,11 @@ CRATES: dict[str, Archive] = {
         17472,
         "9e55b5486943f5842313e04e3a22ee51c301784dec1101087a88cc5c145930eb",
     ),
+    "cargo-shear": Archive(
+        "https://static.crates.io/crates/cargo-shear/cargo-shear-1.14.0.crate",
+        81689,
+        "6a9bcb4b513e82026b1e0fedc0a7622654cd726d80559d194ca8c424596b21a8",
+    ),
 }
 
 
