@@ -350,7 +350,6 @@ pub struct OwnedAuthInputs {
 /// `receive_buffer` so a long-lived paid context cannot grow this buffer without
 /// limit (memory-growth `DoS`). Evicts the oldest before pushing the newest once
 /// the buffer is full.
-#[allow(dead_code)]
 pub fn record_payment_receipt(
     payment_receipts: &mut std::collections::VecDeque<PaymentReceipt>,
     receipt: &PaymentReceipt,
@@ -374,7 +373,6 @@ pub fn record_payment_receipt(
 // fn and a `&PerContextState` held across the void `.await` is not `Send`
 // (`PerContextState` is `!Sync`). Both callers (the join tail and the send path)
 // drop the now-removed argument — a mechanical, behaviour-neutral call-site edit.
-#[allow(dead_code)]
 pub async fn void_paid_action(_deps: &ActorDeps, auth: PaidActionAuthorization, context_id: &str) {
     if let Some(ref authorization) = auth.prepared.envelope.authorization
         && let Err(e) = auth.adapter.void_dyn(authorization).await
