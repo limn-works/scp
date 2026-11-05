@@ -899,8 +899,17 @@ pub struct ContextSnapshot {
     /// **Deprecated**: Retained for backward-compatible deserialization of
     /// snapshots that predate `velocity_tracker_state`. New snapshots populate
     /// `velocity_tracker_state` instead.
+    ///
+    /// Core-internal; `pub` under `testing` so the runtime crates' tests can
+    /// write a `ContextSnapshot` literal (ADR-070 §5).
+    #[cfg(any(test, feature = "testing"))]
     #[serde(default)]
     pub velocity_tracker: Option<u64>,
+    /// Core-internal; outside `testing` no crate but core names this field, so
+    /// none can write a `ContextSnapshot` literal.
+    #[cfg(not(any(test, feature = "testing")))]
+    #[serde(default)]
+    pub(crate) velocity_tracker: Option<u64>,
     /// Full velocity tracker state including per-sender timestamps (#1530).
     ///
     /// Supersedes `velocity_tracker` (config-only). Contains both the sliding
@@ -1689,8 +1698,9 @@ impl AccessControlState {
     /// Construct a fresh, empty `AccessControlState`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
     /// fixture (ADR-049 §15) to populate the corresponding field
-    /// without peeking at private fields. Deleted in ADR-049 §15 alongside
-    /// the rest of the legacy manager module.
+    /// without peeking at private fields. Compiled only under `testing`, like
+    /// that fixture (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub(crate) fn new_empty_for_actor() -> Self {
         Self {
@@ -1705,8 +1715,9 @@ impl EpochState {
     /// coordinator scoped to the given context, a fresh grace store, and
     /// `needs_reconnect = false`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
-    /// the rest of the legacy manager module.
+    /// fixture (ADR-049 §15). Compiled only under `testing`, like that
+    /// fixture (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub(crate) fn new_fresh_for_actor(context_id: &str) -> Self {
         Self {
@@ -1726,8 +1737,9 @@ impl TtlState {
     /// Construct a fresh `TtlState` with a clock-less `TtlTimer` and no
     /// active extension. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
-    /// the rest of the legacy manager module.
+    /// fixture (ADR-049 §15). Compiled only under `testing`, like that
+    /// fixture (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub(crate) fn new_fresh_for_actor() -> Self {
         Self {
@@ -1744,8 +1756,8 @@ impl GovernanceState {
     /// actor's [`crate::context::actor::state::PerContextState`]
     /// default-for-test helper (ADR-049 §15). Production paths
     /// continue to construct the struct inline from the lifecycle handler.
-    /// Deleted in ADR-049 §15 alongside the rest of the legacy manager
-    /// module.
+    /// Compiled only under `testing`, like that fixture (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub(crate) fn new_fresh_for_actor(
         context_id: &str,
@@ -1865,7 +1877,7 @@ pub(crate) use crate::context::actor::state::PerContextState;
 ///   on the broadcast channel (receive buffer only).
 /// - `MessageReceived` / `MessageSent` payloads are stripped (replaced
 ///   with empty `Vec`) before broadcast.
-pub fn emit_event_into(
+pub(crate) fn emit_event_into(
     receive_buffer: &mut ReceiveBuffer,
     event: ContextEvent,
     context_id: &str,

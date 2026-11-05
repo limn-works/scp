@@ -43,7 +43,7 @@ use scp_runtime_core::context::actor::commands::{
     UnsubscribeBroadcastReply,
 };
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 use scp_runtime_core::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 
 use scp_runtime_core::context::shared::economy::ContextRevocationChecker;
@@ -165,7 +165,7 @@ async fn handle_subscribe_broadcast(
     // creator / revocation set are all materialised as owned values first.
     let ceiling = cell.role_state.ceiling().to_ucan_string_set();
     let creator_did = cell.role_state.creator_did.clone();
-    let revoked = cell.governance.revoked_spending_ucan_cids.clone();
+    let revoked = cell.governance().revoked_spending_ucan_cids.clone();
     // Proof resolver: EMPTY, by design. Per spec §5.14.4 a gated `messages:read`
     // grant is issued DIRECTLY by the context admin/creator — a ROOT token
     // (`prf = []`) whose root issuer IS `context_creator_did`. Intra-context
@@ -588,27 +588,6 @@ impl scp_protocol::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
     }
 }
 
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
-        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
-        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
 /// Handle [`BroadcastCommand::SeedBroadcastAuthor`] (actor-shape, test-only).
 ///
 /// Test seam: registers an additional DID as a broadcast author on an existing
@@ -873,7 +852,7 @@ mod tests {
         authors: &[&str],
     ) -> (ClassSCell, String) {
         let (state, ctx_hex) = build_broadcast_state_with_authors(admission, authors);
-        (ClassSCell::new(state), ctx_hex)
+        (ClassSCell::new_for_test(state), ctx_hex)
     }
 
     /// The [`PerContextState`] behind [`build_broadcast_cell_with_authors`],
@@ -1227,7 +1206,7 @@ mod tests {
             .await
             .expect("self-leave");
         assert!(
-            !cell.access.read_exclusion_list.contains(&m),
+            !cell.access().read_exclusion_list.contains(&m),
             "self-leave must clear read_exclusion_list (the laundering vector)"
         );
         assert!(
@@ -1360,7 +1339,7 @@ mod tests {
             .read_exclusion_list
             .remove(&m);
         assert!(
-            !cell.access.read_exclusion_list.contains(&m),
+            !cell.access().read_exclusion_list.contains(&m),
             "the read_exclusion_list defense-in-depth is now cleared"
         );
         assert!(
@@ -1440,7 +1419,7 @@ mod tests {
         .await
         .expect("self-leave");
         assert!(
-            !cell.access.read_exclusion_list.contains(&lurker),
+            !cell.access().read_exclusion_list.contains(&lurker),
             "self-leave clears the membership-scoped read_exclusion_list"
         );
         assert!(
@@ -1683,7 +1662,7 @@ mod tests {
         .await
         .expect("self-leave");
         assert!(
-            !cell.access.read_exclusion_list.contains(&creator),
+            !cell.access().read_exclusion_list.contains(&creator),
             "self-leave clears read_exclusion_list (the laundering vector)"
         );
         assert!(
@@ -1884,7 +1863,7 @@ mod tests {
             )
             .expect("single-admin propose approves immediately");
         let proposal_id = proposal.proposal_id;
-        state.governance.engine = Box::new(engine);
+        state.governance_mut().engine = Box::new(engine);
         proposal_id
     }
 
@@ -1896,13 +1875,13 @@ mod tests {
         proposal_id: &scp_protocol::context::governance::ProposalId,
     ) {
         let tracked = state
-            .governance
+            .governance()
             .engine
             .get_proposal(proposal_id)
             .cloned()
             .expect("the seeded proposal is engine-tracked");
         state
-            .governance
+            .governance_mut()
             .approved_proposals
             .insert(*proposal_id, (tracked, 0, 1_700_000_000));
     }
@@ -2147,9 +2126,9 @@ mod tests {
             )
             .expect("single-admin propose approves immediately");
         let proposal_id = proposal.proposal_id;
-        state.governance.engine = Box::new(engine);
+        state.governance_mut().engine = Box::new(engine);
 
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2178,7 +2157,7 @@ mod tests {
              got {result:?}"
         );
         assert!(
-            cell.governance
+            cell.governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -2219,7 +2198,7 @@ mod tests {
             },
         );
         seed_conflict_tracking_entry(&mut state, &proposal_id);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2248,7 +2227,7 @@ mod tests {
             "the anchor-leaf append failure must reach the caller unchanged; got {first:?}"
         );
         assert!(
-            cell.governance
+            cell.governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -2256,7 +2235,7 @@ mod tests {
         );
         assert!(
             !cell
-                .governance
+                .governance()
                 .approved_proposals
                 .contains_key(&proposal_id),
             "a consumed proposal must leave `approved_proposals`: the kept marker \
@@ -2323,7 +2302,7 @@ mod tests {
             },
         );
         seed_conflict_tracking_entry(&mut state, &proposal_id);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2348,7 +2327,7 @@ mod tests {
             "the fixture's anchor-leaf failure must be post-effect; got {first:?}"
         );
         assert!(
-            cell.governance
+            cell.governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -2368,7 +2347,7 @@ mod tests {
             },
         );
         let later = scratch
-            .governance
+            .governance()
             .engine
             .get_proposal(&later_id)
             .cloned()
@@ -2381,7 +2360,7 @@ mod tests {
             "no conflict may be reported against a consumed proposal; got {events:?}"
         );
         assert!(
-            cell.governance.approved_proposals.contains_key(&later_id),
+            cell.governance().approved_proposals.contains_key(&later_id),
             "the later conflicting proposal must be tracked for execution"
         );
     }
@@ -2404,12 +2383,12 @@ mod tests {
         };
         let proposal_id = seed_approved_proposal(&mut state, &ctx_hex, action.clone());
         let proposal = state
-            .governance
+            .governance()
             .engine
             .get_proposal(&proposal_id)
             .cloned()
             .expect("the seeded proposal is engine-tracked");
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2501,7 +2480,7 @@ mod tests {
             },
         );
         let mut proposal = state
-            .governance
+            .governance()
             .engine
             .get_proposal(&proposal_id)
             .cloned()
@@ -2718,7 +2697,7 @@ mod tests {
             seed_conflict_tracking_entry(&mut state, &proposal_id);
         }
         let mut tampered = state
-            .governance
+            .governance()
             .engine
             .get_proposal(&proposal_id)
             .cloned()
@@ -2727,11 +2706,11 @@ mod tests {
             did: DID(SUBSCRIBER_DID.to_owned()),
             access: AccessScope::Write,
         };
-        state.governance.engine = Box::new(TamperingEngine {
-            inner: state.governance.engine.boxed_clone(),
+        state.governance_mut().engine = Box::new(TamperingEngine {
+            inner: state.governance().engine.boxed_clone(),
             tampered,
         });
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2784,7 +2763,7 @@ mod tests {
         );
         assert!(
             !cell
-                .governance
+                .governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -2809,7 +2788,7 @@ mod tests {
         );
         assert!(
             !cell
-                .governance
+                .governance()
                 .approved_proposals
                 .contains_key(&proposal_id),
             "a refused proposal leaves the conflict-tracking set"
@@ -2864,7 +2843,7 @@ mod tests {
             },
         );
         seed_conflict_tracking_entry(&mut state, &proposal_id);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
             .await
             .expect("open subscribe");
@@ -2899,7 +2878,7 @@ mod tests {
             "the dispatch's own leaves landed before finalize failed"
         );
         assert!(
-            cell.governance
+            cell.governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -2907,7 +2886,7 @@ mod tests {
         );
         assert!(
             !cell
-                .governance
+                .governance()
                 .approved_proposals
                 .contains_key(&proposal_id),
             "the consumed proposal must leave `approved_proposals` even though \
@@ -2935,7 +2914,7 @@ mod tests {
                 reason: "fixture".to_owned(),
             },
         );
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
 
         for attempt in 0..2 {
@@ -2956,7 +2935,7 @@ mod tests {
             );
             assert!(
                 !cell
-                    .governance
+                    .governance()
                     .class_s
                     .executed_proposals
                     .contains_key(&proposal_id),
@@ -3022,7 +3001,7 @@ mod tests {
         let (deps, _appends) = build_deps().await;
         let (state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let outcome = scp_runtime_governance::testing_access::propose_governance_action_inner(
             &mut cell,
             &deps,
@@ -3254,7 +3233,7 @@ mod tests {
         for (label, action) in actions {
             let (state, ctx_hex) =
                 build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-            let mut cell = ClassSCell::new(state);
+            let mut cell = ClassSCell::new_for_test(state);
 
             let refused = scp_runtime_governance::testing_access::propose_governance_action_inner(
                 &mut cell,
@@ -3324,7 +3303,7 @@ mod tests {
         let (deps, _appends) = build_deps().await;
         let (state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let proposer = DID(CREATOR_DID.to_owned());
         let migrate = |ceiling: Vec<Capability>| GovernanceAction::ProposeContextMigration {
             new_context_params: Box::new(scp_protocol::context::params::ContextParams {
@@ -3414,7 +3393,7 @@ mod tests {
         let (deps, _appends) = build_deps().await;
         let (state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let proposer = DID(CREATOR_DID.to_owned());
 
         // An approved, not-yet-executed ejection of the proposer.
@@ -3485,7 +3464,7 @@ mod tests {
             BroadcastAdmission::Open,
             &[CREATOR_DID, LURKER_DID],
         );
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let empty_migration = || GovernanceAction::ProposeContextMigration {
             new_context_params: Box::new(scp_protocol::context::params::ContextParams {
                 ceiling: Vec::new(),
@@ -3552,7 +3531,7 @@ mod tests {
         let (deps, appends) = build_deps().await;
         let (state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
         let epoch_before = cell.mutation_epoch();
         let buffered_before = cell.receive_buffer.len();
@@ -3612,7 +3591,7 @@ mod tests {
         let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
         let (state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
         let pid = [0x78; 32];
         let destination = {
@@ -3667,7 +3646,7 @@ mod tests {
         assert_eq!(cell.handle.state(), ContextState::Active);
         assert!(cell.migration_state.is_none());
         assert!(
-            supervisor.lookup(&destination).is_some(),
+            supervisor.lookup_for_test(&destination).is_some(),
             "the destination still runs"
         );
         assert_eq!(
@@ -3701,7 +3680,7 @@ mod tests {
         let claimed = |deps: &ActorDeps| {
             let free = deps.supervisor.claim_first_state(&destination).is_ok();
             if free {
-                deps.supervisor.release_first_state(&destination);
+                deps.supervisor.release_first_state_for_test(&destination);
             }
             !free
         };
@@ -3737,7 +3716,7 @@ mod tests {
             supervisor.bootstrap_spawn_lock_is_free_for_test(),
             "a refused claim releases the lock it took"
         );
-        deps.supervisor.release_first_state(&destination);
+        deps.supervisor.release_first_state_for_test(&destination);
     }
 
     /// A single-admin migration proposal made while another bootstrap holds
@@ -3752,7 +3731,7 @@ mod tests {
         let (mut state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
         let creator_vk = creator_key().verifying_key();
-        state.governance.engine =
+        state.governance_mut().engine =
             Box::new(scp_protocol::context::governance::SingleAdminEngine::new(
                 DID(CREATOR_DID.to_owned()),
                 Arc::new(move |did: &DID, kid: SigningKeyId| {
@@ -3760,7 +3739,7 @@ mod tests {
                         .then_some(creator_vk)
                 }),
             ));
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
         let creator = DID(CREATOR_DID.to_owned());
         let signer = scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key());
@@ -3796,7 +3775,7 @@ mod tests {
             "a busy migration proposal must record no proposal"
         );
         assert!(
-            cell.governance.proposal_timestamps.is_empty(),
+            cell.governance().proposal_timestamps.is_empty(),
             "a busy migration proposal must spend no rate-limit slot"
         );
         assert_eq!(appends.load(Ordering::SeqCst), 0, "no event was appended");
@@ -3845,7 +3824,7 @@ mod tests {
                 auto_invite: false,
             },
         );
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
 
         for attempt in 0..2 {
@@ -3871,7 +3850,7 @@ mod tests {
             );
             assert!(
                 !cell
-                    .governance
+                    .governance()
                     .class_s
                     .executed_proposals
                     .contains_key(&proposal_id),
@@ -3915,7 +3894,7 @@ mod tests {
             },
         );
         seed_conflict_tracking_entry(&mut state, &proposal_id);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         // A member the single-admin proposal carries no approval for, so the
         // unanimity check finds one consent missing.
         cell.class_c_view().membership_class_c_mut().add_member(
@@ -3956,7 +3935,7 @@ mod tests {
             "the rejection leaf is credited once and the executed leaf never lands"
         );
         assert!(
-            cell.governance
+            cell.governance()
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
@@ -3964,7 +3943,7 @@ mod tests {
         );
         assert!(
             !cell
-                .governance
+                .governance()
                 .approved_proposals
                 .contains_key(&proposal_id),
             "a rejected attempt consumes the proposal: it leaves `approved_proposals`"
@@ -4016,13 +3995,13 @@ mod tests {
             },
         );
         let approvals = state
-            .governance
+            .governance()
             .engine
             .get_proposal(&proposal_id)
             .expect("engine tracks the proposal")
             .approvals
             .clone();
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
         reset_leaf_counter(&mut cell);
 
@@ -4107,13 +4086,13 @@ mod tests {
         );
         // The creator's approval alone: the four added members never voted.
         let approvals = state
-            .governance
+            .governance()
             .engine
             .get_proposal(&proposal_id)
             .expect("engine tracks the proposal")
             .approvals
             .clone();
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let expected_sorted = add_unsorted_members(&mut cell);
         appends.store(0, Ordering::SeqCst);
         recorded.write().expect("recorded leaves lock").clear();
@@ -4174,7 +4153,7 @@ mod tests {
             .handle
             .transition_to(&ContextState::Active)
             .expect("activate");
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let mut expected_sorted = add_unsorted_members(&mut cell);
         expected_sorted.push(CREATOR_DID.to_owned());
         expected_sorted.sort_unstable();
@@ -4242,7 +4221,7 @@ mod tests {
             .handle
             .transition_to(&ContextState::Active)
             .expect("activate");
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         appends.store(0, Ordering::SeqCst);
         reset_leaf_counter(&mut cell);
 
@@ -4264,21 +4243,6 @@ mod tests {
             cell.checkpoint_events_since, 1,
             "the landed TtlExtended leaf must be credited by the combinator"
         );
-    }
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    mod outcome_sketch_tests {
-        use super::super::{ContextError, outcome_error_sketch};
-
-        #[test]
-        fn sketch_keeps_supervisor_shut_down_typed() {
-            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-            assert!(
-                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-                "got {sketch:?}"
-            );
-        }
     }
 
     // -- Publish in one actor turn (ADR-049 Decision 7a) -----------------------

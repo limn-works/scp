@@ -214,149 +214,189 @@ pub mod failing {
         ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
 
-    /// Fails `CeilingEmpty`.
-    #[must_use]
-    pub fn empty_ceiling(base: ContextParams) -> ContextParams {
-        ContextParams {
-            ceiling: Vec::new(),
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `CeilingEmpty`.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn empty_ceiling(base: ContextParams) -> ContextParams {
+            ContextParams {
+                ceiling: Vec::new(),
+                ..base
+            }
         }
     }
 
-    /// Fails `CeilingEntry`: a custom entry that spells the `messages:read`
-    /// built-in (§5.3.1.1 no privileged-built-in collision).
-    #[must_use]
-    pub fn malformed_ceiling_entry(base: ContextParams) -> ContextParams {
-        let mut ceiling = base.ceiling.clone();
-        ceiling.push(Capability::Custom("messages:read".to_owned()));
-        ContextParams { ceiling, ..base }
-    }
-
-    /// Fails `Version`: a protocol major this SDK does not speak.
-    #[must_use]
-    pub fn unsupported_version(base: ContextParams) -> ContextParams {
-        ContextParams {
-            min_protocol_version: Some((9, 0)),
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `CeilingEntry`: a custom entry that spells the `messages:read`
+        /// built-in (§5.3.1.1 no privileged-built-in collision).
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn malformed_ceiling_entry(base: ContextParams) -> ContextParams {
+            let mut ceiling = base.ceiling.clone();
+            ceiling.push(Capability::Custom("messages:read".to_owned()));
+            ContextParams { ceiling, ..base }
         }
     }
 
-    /// Fails `GovernanceModel`: majority governance with no eligible voter.
-    #[must_use]
-    pub fn voterless_governance(base: ContextParams) -> ContextParams {
-        ContextParams {
-            governance: GovernanceModel::Majority {
-                eligible_voters: Vec::new(),
-            },
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `Version`: a protocol major this SDK does not speak.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn unsupported_version(base: ContextParams) -> ContextParams {
+            ContextParams {
+                min_protocol_version: Some((9, 0)),
+                ..base
+            }
         }
     }
 
-    /// Fails `ConsequenceRule`: a capability suspension that names no
-    /// capability.
-    #[must_use]
-    pub fn empty_suspension_rule(base: ContextParams) -> ContextParams {
-        ContextParams {
-            consequence_rules: vec![ConsequenceRule {
-                trigger: ConsequenceTrigger::WarningCount,
-                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                    capabilities: Vec::new(),
-                }),
-                threshold: 1,
-                window: std::time::Duration::from_hours(1),
-            }],
-            ..base
-        }
-    }
-
-    /// Fails `EconomicPolicy`: a pricing formula over `StorageUsage`, which
-    /// the runtime does not populate.
-    #[must_use]
-    pub fn unavailable_pricing_metric(base: ContextParams) -> ContextParams {
-        ContextParams {
-            economic_policy: Some(EconomicPolicy {
-                locked: false,
-                cost_schedule: CostSchedule {
-                    currency: CurrencyCode::from("USD"),
-                    per_message: None,
-                    per_outlet_call: None,
-                    per_join: None,
-                    per_period: None,
-                    per_byte_stored: None,
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `GovernanceModel`: majority governance with no eligible voter.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn voterless_governance(base: ContextParams) -> ContextParams {
+            ContextParams {
+                governance: GovernanceModel::Majority {
+                    eligible_voters: Vec::new(),
                 },
-                payment_adapters: Vec::new(),
-                pricing_formula: Some(PricingFormula {
-                    base_cost: Amount(1),
-                    variables: vec![PricingVariable::Linear {
-                        metric: PricingMetric::StorageUsage,
-                        coefficient: Coefficient(1),
-                    }],
-                    cap: None,
-                    floor: None,
+                ..base
+            }
+        }
+    }
+
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `ConsequenceRule`: a capability suspension that names no
+        /// capability.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn empty_suspension_rule(base: ContextParams) -> ContextParams {
+            ContextParams {
+                consequence_rules: vec![ConsequenceRule {
+                    trigger: ConsequenceTrigger::WarningCount,
+                    action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                        capabilities: Vec::new(),
+                    }),
+                    threshold: 1,
+                    window: std::time::Duration::from_hours(1),
+                }],
+                ..base
+            }
+        }
+    }
+
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `EconomicPolicy`: a pricing formula over `StorageUsage`, which
+        /// the runtime does not populate.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn unavailable_pricing_metric(base: ContextParams) -> ContextParams {
+            ContextParams {
+                economic_policy: Some(EconomicPolicy {
+                    locked: false,
+                    cost_schedule: CostSchedule {
+                        currency: CurrencyCode::from("USD"),
+                        per_message: None,
+                        per_outlet_call: None,
+                        per_join: None,
+                        per_period: None,
+                        per_byte_stored: None,
+                    },
+                    payment_adapters: Vec::new(),
+                    pricing_formula: Some(PricingFormula {
+                        base_cost: Amount(1),
+                        variables: vec![PricingVariable::Linear {
+                            metric: PricingMetric::StorageUsage,
+                            coefficient: Coefficient(1),
+                        }],
+                        cap: None,
+                        floor: None,
+                    }),
+                    payee: DID::from("did:dht:z6MkPayee"),
                 }),
-                payee: DID::from("did:dht:z6MkPayee"),
-            }),
-            ..base
+                ..base
+            }
         }
     }
 
-    /// Fails `PseudonymRotation`: a policy that sets no trigger (§9.10.4.1).
-    #[must_use]
-    pub fn triggerless_rotation(base: ContextParams) -> ContextParams {
-        ContextParams {
-            pseudonym_rotation: Some(PseudonymRotationPolicy {
-                interval_secs: None,
-                on_membership_change: false,
-            }),
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `PseudonymRotation`: a policy that sets no trigger (§9.10.4.1).
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn triggerless_rotation(base: ContextParams) -> ContextParams {
+            ContextParams {
+                pseudonym_rotation: Some(PseudonymRotationPolicy {
+                    interval_secs: None,
+                    on_membership_change: false,
+                }),
+                ..base
+            }
         }
     }
 
-    /// Fails `GenesisOutlets`: an outlet whose schemas declare no property,
-    /// under the §6.2/§9.2.1 specificity floor.
-    #[must_use]
-    pub fn property_free_outlet(base: ContextParams) -> ContextParams {
-        ContextParams {
-            outlets: vec![OutletRegistration {
-                outlet_id: "weather".to_owned(),
-                kind: OutletKind::Action,
-                name: "weather".to_owned(),
-                description: "genesis outlet fixture".to_owned(),
-                schema: OutletSchema {
-                    input_schema: serde_json::Value::Object(serde_json::Map::default()),
-                    output_schema: serde_json::Value::Object(serde_json::Map::default()),
-                    aggregate_schema: None,
-                },
-                implementation_hash: [7u8; 32],
-                test_vectors: Vec::new(),
-                message_catalog: Vec::new(),
-                operator_did: "did:dht:z6MkOperator".into(),
-                cost: None,
-                registered_at: 0,
-                signature: Vec::new(),
-            }],
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `GenesisOutlets`: an outlet whose schemas declare no property,
+        /// under the §6.2/§9.2.1 specificity floor.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn property_free_outlet(base: ContextParams) -> ContextParams {
+            ContextParams {
+                outlets: vec![OutletRegistration {
+                    outlet_id: "weather".to_owned(),
+                    kind: OutletKind::Action,
+                    name: "weather".to_owned(),
+                    description: "genesis outlet fixture".to_owned(),
+                    schema: OutletSchema {
+                        input_schema: serde_json::Value::Object(serde_json::Map::default()),
+                        output_schema: serde_json::Value::Object(serde_json::Map::default()),
+                        aggregate_schema: None,
+                    },
+                    implementation_hash: [7u8; 32],
+                    test_vectors: Vec::new(),
+                    message_catalog: Vec::new(),
+                    operator_did: "did:dht:z6MkOperator".into(),
+                    cost: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
+                }],
+                ..base
+            }
         }
     }
 
-    /// Fails `MemoryScope`: a Broadcast context whose memory is not `Full`
-    /// (§5.11).
-    #[must_use]
-    pub fn ephemeral_broadcast(base: ContextParams) -> ContextParams {
-        ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: MemoryScope::Ephemeral,
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `MemoryScope`: a Broadcast context whose memory is not `Full`
+        /// (§5.11).
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn ephemeral_broadcast(base: ContextParams) -> ContextParams {
+            ContextParams {
+                mode: ContextMode::Broadcast,
+                memory_scope: MemoryScope::Ephemeral,
+                ..base
+            }
         }
     }
 
-    /// Fails `Template`: names `BilateralPersistent`, whose ceiling the base
-    /// params do not match.
-    #[must_use]
-    pub fn template_mismatch(base: ContextParams) -> ContextParams {
-        ContextParams {
-            template_id: Some(TemplateId::BilateralPersistent),
-            ..base
+    scp_runtime_types::pub_under_testing! {
+        /// Fails `Template`: names `BilateralPersistent`, whose ceiling the base
+        /// params do not match.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        #[must_use]
+        pub(crate) fn template_mismatch(base: ContextParams) -> ContextParams {
+            ContextParams {
+                template_id: Some(TemplateId::BilateralPersistent),
+                ..base
+            }
         }
     }
 }

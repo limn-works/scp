@@ -64,12 +64,21 @@ impl<B: MlsBackend + ?Sized> MintAttestedForTest for B {
     }
 }
 
+/// Test-only reach into [`test_agent_key`] for tests outside this crate.
+/// Compiled only under `testing`, so no production or bridge build
+/// reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn test_agent_key_for_test(active: &SigningKey) -> SigningKey {
+    test_agent_key(active)
+}
+
 /// The `#agent` key the test resolvers name for an identity whose `#active` key is `active`.
 ///
 /// It is a fixed key derived from `active` and distinct from it, so a test can
 /// sign with the `#agent` key of any fixture identity.
 #[must_use]
-pub fn test_agent_key(active: &SigningKey) -> SigningKey {
+pub(crate) fn test_agent_key(active: &SigningKey) -> SigningKey {
     let mut seed = active.to_bytes();
     for byte in &mut seed {
         *byte ^= 0x5A;

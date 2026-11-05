@@ -80,14 +80,4 @@ impl scp_runtime_core::context::domains::TtlCloseDomain for TtlClose {
     ) -> scp_runtime_core::context::shared::ttl_close::TtlExpiryOutcome {
         crate::helpers::handle_ttl_expiry(cell, deps, handle, prior_completed).await
     }
-
-    async fn reset_ttl_timer(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        context_id: &str,
-        new_duration: std::time::Duration,
-    ) -> Result<(), scp_protocol::context::ContextError> {
-        crate::helpers::reset_ttl_timer(cell, deps, context_id, new_duration).await
-    }
 }

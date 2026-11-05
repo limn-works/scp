@@ -49,7 +49,6 @@ use scp_protocol::crypto::sender_keys::MergePolicy;
 
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
-use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +80,15 @@ impl SupervisorHandle {
     // non-per-identity methods below (registry fan-out, saga dispatch,
     // lifecycle bootstrap) are unaffected by this rule.
 
+    /// Test-only reach into [`Self::wrap`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn wrap_for_test(supervisor: &Arc<Supervisor>) -> Self {
+        Self::wrap(supervisor)
+    }
+
     /// Wrap a `Weak` reference to the Supervisor (ADR-049 Decision 16).
     /// Visible only to supervisor-module code; the supervisor constructs one
     /// in
@@ -88,7 +96,7 @@ impl SupervisorHandle {
     /// at actor-spawn time, and handlers receive the handle via
     /// `ActorDeps` at dispatch time.
     #[must_use]
-    pub fn wrap(supervisor: &Arc<Supervisor>) -> Self {
+    pub(in crate::context::supervisor) fn wrap(supervisor: &Arc<Supervisor>) -> Self {
         Self {
             supervisor: Arc::downgrade(supervisor),
         }
@@ -108,6 +116,26 @@ impl SupervisorHandle {
         })
     }
 
+    /// Test-only reach into [`Self::spawn_tracked`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::spawn_tracked`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn spawn_tracked_for_test<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        Self::spawn_tracked(self, operation, future)
+    }
+
     /// Spawns `future` onto the Supervisor's task tracker (ADR-049 Decision
     /// 16). An actor uses this for any detached task that can write through
     /// the store, so `shutdown_all_contexts` waits for it. A future that holds
@@ -117,7 +145,7 @@ impl SupervisorHandle {
     ///
     /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
     /// or shutdown has begun; the future is dropped without running.
-    pub fn spawn_tracked<F>(
+    pub(in crate::context) fn spawn_tracked<F>(
         &self,
         operation: &str,
         future: F,
@@ -243,6 +271,25 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.export_recv_sequence_floors(ctx))
     }
 
+    /// Test-only reach into [`Self::validate_and_merge_all_floors`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::validate_and_merge_all_floors`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn validate_and_merge_all_floors_for_test(
+        &self,
+        ctx: &[u8; 32],
+        epochs: Vec<(String, u64)>,
+        recv: Vec<(String, ReceiveFloor)>,
+        max_advance: u64,
+        policy: MergePolicy,
+    ) -> Result<(), ContextError> {
+        Self::validate_and_merge_all_floors(self, ctx, epochs, recv, max_advance, policy)
+    }
+
     /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
     /// floors into the registry under one guard (the restore/import sink). See
     /// `Supervisor::validate_and_merge_all_floors`.
@@ -254,7 +301,7 @@ impl SupervisorHandle {
     /// on an Inv-3 regression ([`MergePolicy::RejectRegression`]) or an overshoot
     /// (RejectRegression only). [`ContextError::SupervisorShutDown`] when the
     /// Supervisor has dropped.
-    pub fn validate_and_merge_all_floors(
+    pub(in crate::context) fn validate_and_merge_all_floors(
         &self,
         ctx: &[u8; 32],
         epochs: Vec<(String, u64)>,
@@ -573,14 +620,7 @@ impl SupervisorHandle {
     ///
     /// [`ContextError::SupervisorShutDown`] when the supervisor has dropped.
     pub async fn register_standing_context(&self, peer_did: DID) -> Result<(), ContextError> {
-        let supervisor = self.upgrade()?;
-        let _guard = supervisor.write_lock.lock().await;
-        let snapshot = supervisor.standing_contexts.load_full();
-        let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
-        updated.insert(peer_did.to_string(), peer_did);
-        supervisor
-            .standing_contexts
-            .store(std::sync::Arc::new(updated));
+        self.upgrade()?.insert_standing_context(peer_did).await;
         Ok(())
     }
 
@@ -643,11 +683,16 @@ impl SupervisorHandle {
     /// `&OwnedIdentityDid` proves ownership, the token cannot be minted
     /// outside `supervisor/`, and the method shares the type's
     /// `pub(in crate::context)` visibility — so no `private_interfaces`
-    /// asymmetry exists to allow.
+    /// asymmetry exists to allow. Compiled only under `testing`: no
+    /// production path reads it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     pub(in crate::context) fn my_key_package_store(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Result<Option<KeyPackageStoreHandle>, ContextError> {
+    ) -> Result<
+        Option<crate::context::supervisor::key_package_actor::KeyPackageStoreHandle>,
+        ContextError,
+    > {
         let did = identity.as_did();
         Ok(self
             .upgrade()?
@@ -733,13 +778,27 @@ impl SupervisorHandle {
             .map(drop)
     }
 
+    /// Test-only reach into [`Self::relay_contact_store`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::relay_contact_store`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn relay_contact_store_for_test(
+        &self,
+    ) -> Result<Arc<dyn crate::store::sync::RelayContactStore>, ContextError> {
+        Self::relay_contact_store(self)
+    }
+
     /// The supervisor's store of each context's last successful relay
     /// contact. See [`Supervisor::relay_contact_store`].
     ///
     /// # Errors
     ///
     /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub fn relay_contact_store(
+    pub(crate) fn relay_contact_store(
         &self,
     ) -> Result<Arc<dyn crate::store::sync::RelayContactStore>, ContextError> {
         Ok(self.upgrade()?.relay_contact_store())
@@ -984,6 +1043,20 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.lookup(context_id))
     }
 
+    /// Test-only reach into [`Self::try_lock_bootstrap_spawn`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::try_lock_bootstrap_spawn`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn try_lock_bootstrap_spawn_for_test(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
+        Self::try_lock_bootstrap_spawn(self)
+    }
+
     /// Try-locks the Supervisor's `bootstrap_spawn_lock` for a bootstrap that
     /// runs in an actor turn, the migration create.
     ///
@@ -997,7 +1070,7 @@ impl SupervisorHandle {
     /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock;
     ///   the caller retries.
     /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub fn try_lock_bootstrap_spawn(
+    pub(in crate::context) fn try_lock_bootstrap_spawn(
         &self,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
         Arc::clone(&self.upgrade()?.bootstrap_spawn_lock)
@@ -1077,9 +1150,17 @@ impl SupervisorHandle {
         )))
     }
 
+    /// Test-only reach into [`Self::release_first_state`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn release_first_state_for_test(&self, context_id: &str) {
+        Self::release_first_state(self, context_id);
+    }
+
     /// Releases a claim [`Self::claim_first_state`] made. A dropped Supervisor
     /// holds no claim.
-    pub fn release_first_state(&self, context_id: &str) {
+    pub(in crate::context) fn release_first_state(&self, context_id: &str) {
         if let Some(supervisor) = self.supervisor.upgrade() {
             supervisor.pending_first_state.remove(context_id);
             supervisor.first_state_settled.notify_waiters();

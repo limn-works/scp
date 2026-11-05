@@ -1122,7 +1122,13 @@ async fn enabling_rotation_anchors_the_schedule_at_the_commit() {
         !quiet.iter().any(is_rotation_signal),
         "passed boundaries trigger nothing: {quiet:?}"
     );
-    assert_eq!(n.store.snapshot(ctx).pseudonym_rotation.boundary_index, 2);
+    assert_eq!(
+        n.store
+            .snapshot(ctx)
+            .pseudonym_rotation
+            .boundary_index_for_test(),
+        2
+    );
     assert_eq!(n.ids(ctx).await.next_pseudonym_epoch, Some(2));
 }
 

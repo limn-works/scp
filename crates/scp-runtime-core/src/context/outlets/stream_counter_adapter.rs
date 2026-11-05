@@ -41,28 +41,41 @@ use crate::context::supervisor::supervisor::Supervisor;
 use crate::store::StoreError;
 use crate::trust::caveat_counters::{CaveatCounterApi, CounterError, CounterExhausted};
 
-/// Concrete [`CaveatCounterApi`] implementation routing to the actor-owned
-/// Class-S `caveat_counters` slice via the supervisor mailbox.
-///
-/// Held as `Arc<dyn CaveatCounterApi>` inside the streaming pump's
-/// [`StreamCounterReservation`](crate::context::outlets::dispatch::StreamCounterReservation);
-/// constructed by the streaming open orchestrator with a `Weak` reference to
-/// the supervisor.
-pub struct ActorClassSCaveatCounterAdapter {
-    /// The supervisor whose mailbox owns the target context's Class-S state.
-    /// A `Weak` (ADR-049 Decision 16): the adapter lives inside the streaming
-    /// pump, a supervisor-spawned task, so it never keeps the Supervisor alive.
-    /// Each operation upgrades it; a failed upgrade returns a typed error.
-    supervisor: Weak<Supervisor>,
+scp_runtime_types::pub_under_testing! {
+    /// Concrete [`CaveatCounterApi`] implementation routing to the actor-owned
+    /// Class-S `caveat_counters` slice via the supervisor mailbox.
+    ///
+    /// Held as `Arc<dyn CaveatCounterApi>` inside the streaming pump's
+    /// [`StreamCounterReservation`](crate::context::outlets::dispatch::StreamCounterReservation);
+    /// constructed by the streaming open orchestrator with a `Weak` reference to
+    /// the supervisor.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct ActorClassSCaveatCounterAdapter {
+        /// The supervisor whose mailbox owns the target context's Class-S state.
+        /// A `Weak` (ADR-049 Decision 16): the adapter lives inside the streaming
+        /// pump, a supervisor-spawned task, so it never keeps the Supervisor alive.
+        /// Each operation upgrades it; a failed upgrade returns a typed error.
+        supervisor: Weak<Supervisor>,
+    }
 }
 
 impl ActorClassSCaveatCounterAdapter {
+    /// Test-only reach into [`Self::new`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn new_for_test(supervisor: Weak<Supervisor>) -> Self {
+        Self::new(supervisor)
+    }
+
     /// Wrap a supervisor `Arc` as the streaming counter store.
     ///
     /// The non-test constructor is the streaming open orchestrator
     /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
     #[must_use]
-    pub const fn new(supervisor: Weak<Supervisor>) -> Self {
+    pub(crate) const fn new(supervisor: Weak<Supervisor>) -> Self {
         Self { supervisor }
     }
 

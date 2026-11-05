@@ -92,14 +92,12 @@ use scp_runtime_core::context::ContextHandle;
 use scp_runtime_core::context::actor::deps::ActorDeps;
 use scp_runtime_core::context::actor::state::DistributionReport;
 use scp_runtime_core::context::actor::state::{
-    ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
-    RecvSequenceTracker,
+    ContextCryptoState, ContextModeState, ContextRouting, ContextStateParts, PerContextState,
 };
 use scp_runtime_core::context::state::{
-    self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
+    self, AccessControlState, CommitOperation, EpochState, GovernanceState,
 };
-use scp_runtime_core::context::ttl::{self, CloseResult, TtlTimer};
-use scp_runtime_types::context::actor::sequence::SendSequenceTracker;
+use scp_runtime_core::context::ttl::{self, CloseResult};
 use scp_runtime_types::context::governance::timeout::DeadlockDetectionState;
 
 // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
@@ -356,12 +354,7 @@ pub async fn leave_context(
             let left_event = ContextEvent::MemberLeft {
                 member_did: member_did.clone(),
             };
-            state::emit_event_into(
-                &mut state.receive_buffer,
-                left_event,
-                &context_id,
-                deps.event_tx.as_ref(),
-            );
+            deps.emit_event_into(&mut state.receive_buffer, left_event, &context_id);
 
             let should_close = state.membership.count() == 0;
 
@@ -748,7 +741,7 @@ pub async fn close_context_with_key(
 
     // Gate: multi-admin models must use governance path (SCP-270, ADR-031).
     if !matches!(
-        cell.governance.engine.model_config(),
+        cell.governance().engine.model_config(),
         GovernanceModelConfig::SingleAdmin { .. }
     ) {
         return Err(ContextError::PermissionDenied(
@@ -796,7 +789,7 @@ pub async fn close_context_with_key(
         None => None,
         Some(signer) => {
             let broadcast_context_is_none = cell.broadcast_context.is_none();
-            let mls_epoch = cell.epoch.mls_epoch;
+            let mls_epoch = cell.epoch().mls_epoch;
             final_close_checkpoint(
                 broadcast_context_is_none,
                 mls_epoch,
@@ -846,7 +839,7 @@ pub async fn close_context_with_key(
         // the fail-closed snapshot) so a stale absolute deadline cannot fire
         // against the closed context on a later restore and despawn it —
         // re-opening this very close window (BUG-1).
-        state.ttl.timer.deadline_unix_secs = None;
+        state.ttl_mut().timer.deadline_unix_secs = None;
         // Drop broadcast context state -- keys are zeroed by Zeroize.
         state.broadcast_context = None;
 
@@ -859,11 +852,14 @@ pub async fn close_context_with_key(
         state.routing = ContextRouting::Broadcast;
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_rotation_state();
+        state
+            .class_s_mut()
+            .pseudonym_rotation
+            .discard_rotation_state();
 
         // Participation decay: clear participation cache and cooldown state
         // on context close (#1530).
-        state.governance.decay_participation();
+        state.governance_mut().decay_participation();
 
         // Record the final checkpoint signed above (§9.9.3).
         if let Some(cp) = final_checkpoint {
@@ -884,12 +880,7 @@ pub async fn close_context_with_key(
         let close_event = ContextEvent::SystemClose {
             initiator_did: initiator_did.clone(),
         };
-        state::emit_event_into(
-            &mut state.receive_buffer,
-            close_event,
-            &context_id,
-            deps.event_tx.as_ref(),
-        );
+        deps.emit_event_into(&mut state.receive_buffer, close_event, &context_id);
 
         // The gauge refresh queries every registered actor, this one included,
         // which is still inside its close handler; it runs as a tracked task
@@ -995,7 +986,7 @@ pub async fn join_context(
             }
         }
         None => {
-            if !cfg!(any(test, feature = "testing")) {
+            if !scp_runtime_types::TESTING {
                 return Err(ContextError::InvalidKeyPackage(
                     "production MlsBackend requires MLS key package bytes".to_string(),
                 ));
@@ -1021,7 +1012,7 @@ pub async fn join_context(
     // reads), dropped before the Class-C mutations below.
     crate::logic::evaluate_sybil_resistance(
         cell.handle.params().sybil_policy.as_ref(),
-        &cell.governance,
+        cell.governance(),
         &member_did,
         deps.clock.now_secs(),
     )?;
@@ -1064,7 +1055,7 @@ pub async fn join_context(
         match cell.begin_class_s_conditional(&context_id, |mut view| {
             let state = view.rest_mut();
             let member_count = state.membership.count();
-            let governance = &mut state.governance;
+            let governance = state.governance_mut();
             let cost = crate::logic::enforce_join_economy(
                 governance,
                 member_count,
@@ -1097,13 +1088,12 @@ pub async fn join_context(
     // downstream error path (adapter, MLS, sender-key) is forced
     // to roll back velocity + hard_rate_limit + budget, not just
     // the budget.
-    let ticket = scp_runtime_core::context::shared::economy::EconomyTicket {
-        actor_did: member_did.clone(),
+    let ticket = scp_runtime_core::context::shared::economy::EconomyTicket::new(
+        member_did.clone(),
         deducted_cost,
         velocity_token,
-        needs_hard_rate_limit_refund: true,
-        consumed: false,
-    };
+        true,
+    );
 
     // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
     // If authorization fails, rollback the ticket — no MLS state touched.
@@ -1173,7 +1163,7 @@ pub async fn join_context(
     // The same commit records the §9.10.4.1 membership trigger for the local
     // member; the rollbacks below restore `rotation_before_add` with the MLS
     // removal, so an add that does not commit triggers no rotation.
-    let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
+    let rotation_before_add = cell.class_s().pseudonym_rotation.clone();
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
             add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)
@@ -1237,7 +1227,7 @@ pub async fn join_context(
                 let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 // §9.10.4.1: the add did not commit, so neither does its
                 // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
+                s.class_s_mut().pseudonym_rotation = rotation_before_add;
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1487,16 +1477,11 @@ pub fn join_context_membership(
         member_did: member_did.clone(),
         role_name: "member".into(),
     };
-    state::emit_event_into(
-        view.receive_buffer_mut(),
-        join_event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    deps.emit_event_into(view.receive_buffer_mut(), join_event, context_id);
 
     // Emit WelcomeGenerated event if the add produced a Welcome message.
     if !add_output.welcome_bytes.is_empty() {
-        state::emit_event_into(
+        deps.emit_event_into(
             view.receive_buffer_mut(),
             ContextEvent::WelcomeGenerated {
                 context_id: context_id.to_owned(),
@@ -1510,7 +1495,6 @@ pub fn join_context_membership(
                 ),
             },
             context_id,
-            deps.event_tx.as_ref(),
         );
     }
 
@@ -1614,7 +1598,7 @@ fn record_payment_capture_failure(
         error: error_msg.to_owned(),
         cost: cost.map(scp_protocol::economy::types::Amount::value),
     };
-    state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
+    deps.emit_event_into(receive_buffer, event, context_id);
 }
 
 /// Reverses a Phase-1 [`EconomyTicket`](scp_runtime_core::context::shared::economy::EconomyTicket)
@@ -1804,13 +1788,13 @@ pub async fn create_context(
     // pseudonym" unrepresentable in live state; broadcast contexts ignore the
     // pseudonym entirely. See `build_routing` for the `None`/sentinel rationale.
     let create_routing = build_routing(create_is_broadcast, local_pseudonym);
-    let mut per_context = PerContextState {
+    let mut per_context = PerContextState::from_parts(
+        deps,
+        ContextStateParts {
         context_id: context_id_bytes,
-        created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time — the same value stamped on
         // the ContextCreated leaf above. Base for the convergent TTL deadline.
         creation_timestamp_secs,
-        generation: 0, // assigned by SupervisorHandle::insert_context.
         handle: handle.clone(),
         membership,
         members: actor_members,
@@ -1827,8 +1811,6 @@ pub async fn create_context(
             scp_runtime_core::context::state::OutletRegistrySeed::GenesisDeclaration,
         ),
         role_state,
-        receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: VecDeque::new(),
         broadcast_context,
         migration_state: None,
         epoch: EpochState {
@@ -1844,12 +1826,6 @@ pub async fn create_context(
             read_exclusion_list: HashSet::new(),
             access_key_store: initial_access_key_store,
         },
-        ttl: TtlState {
-            timer: TtlTimer::with_clock(Arc::clone(&deps.clock)),
-            extension: None,
-        },
-        sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
-        reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         // PR #1606 C6: fresh contexts start with an empty commit retry
         // queue and no fail-close marker.
         pending_commits: VecDeque::new(),
@@ -1857,28 +1833,12 @@ pub async fn create_context(
         // Checkpoint tracking (§9.9.3): fresh counters for new contexts.
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: deps.clock.now_secs(),
-        checkpoints: Vec::new(),
-        last_seen_remote_checkpoint: std::collections::HashMap::new(),
         // §9.10.4: pseudonym routing axis. Encrypted contexts carry the
         // member's pseudonym + an empty peer registry; broadcast contexts
         // carry no pseudonym state.
         routing: create_routing,
         // §5.12.3.1: the creator's relays host the context (PUSH-025).
         relay_urls: normalize_relay_urls(relay_urls),
-        // ADR-049 commit 8: fresh actor-shape tracker at creation.
-        send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A
-        // finalization — type unification): the actor-owned state fields
-        // start in their fresh-instance shapes. `event_log` is `None`
-        // until the first event lands; the in-memory RFC-6962 Merkle
-        // tree above is the proof-generation surface and is populated
-        // lazily by the messaging handler.
-        recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated outlet interface is
-        // established. Not rehydrated from any snapshot — reconstructable
-        // interface state, never authorization secrecy.
-        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: scp_runtime_core::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
@@ -1903,11 +1863,9 @@ pub async fn create_context(
                     creation_timestamp_secs,
                 ),
         },
-        welcome_scratchpad: None,
-        lifecycle_state: ContextLifecycleState::Open,
-        event_log: None,
         mode,
-    };
+    },
+    );
 
     // #2148 (ADR-049 birth-into-actor) CREATE seam: `builder::create_context`
     // above BIRTHS the MLS group + local sender key as OWNED material (Encrypted
@@ -2517,9 +2475,10 @@ pub async fn import_context(
     // not-yet-announced non-FFI bootstrap path (e.g. a test fixture) and maps to
     // the reserved sentinel via `build_routing` (see its doc comment).
     let import_routing = build_routing(false, local_pseudonym);
-    let mut per_context = PerContextState {
+    let mut per_context = PerContextState::from_parts(
+        deps,
+        ContextStateParts {
         context_id: context_id_bytes,
-        created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time, consumed VERBATIM from the
         // creator-signed export snapshot (§7.3.1, §9.9.3). The signature and the
         // `exporter_did == creator_did` binding were verified in
@@ -2536,13 +2495,10 @@ pub async fn import_context(
         // this path anymore; the reject is the whole guard. The value is the
         // committed `T0` whenever the import carries a group (§5.13.3 rule 9).
         creation_timestamp_secs: ttl_base_secs,
-        generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
         membership: export.snapshot.membership,
         members: actor_members,
         role_state: export.snapshot.role_state,
-        receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: VecDeque::new(),
         broadcast_context: None,
         migration_state: None,
         governance: GovernanceState {
@@ -2623,12 +2579,6 @@ pub async fn import_context(
             read_exclusion_list: export.snapshot.read_exclusion_list,
             access_key_store: export.snapshot.access_key_store,
         },
-        ttl: TtlState {
-            timer: TtlTimer::with_clock(Arc::clone(&deps.clock)),
-            extension: None,
-        },
-        sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
-        reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         // PR #1606 C6: import path starts with an empty commit retry
         // queue and no fail-close marker.
         pending_commits: VecDeque::new(),
@@ -2637,8 +2587,6 @@ pub async fn import_context(
         // contexts.
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: deps.clock.now_secs(),
-        checkpoints: Vec::new(),
-        last_seen_remote_checkpoint: std::collections::HashMap::new(),
         // Fresh Merkle tree for imported contexts.
         // §9.10.4: the importer derives their OWN pseudonym — the exporter's
         // is local-instance state with no meaning here. The peer registry
@@ -2649,14 +2597,6 @@ pub async fn import_context(
         // §5.12.3.1: the creator-signed export names the relays that host the
         // context; the importer installs that set (PUSH-025).
         relay_urls: normalize_relay_urls(export.snapshot.relay_urls.clone()),
-        // ADR-049 commit 8: fresh actor-shape tracker on import.
-        send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone: import path is
-        // encrypted-only (`mode = ContextModeState::Encrypted(default)`).
-        // Receive tracker and Welcome scratchpad start empty; lifecycle is
-        // Open after the replaceability gate succeeded and the snapshot
-        // validated.
-        //
         // The saga slot starts EMPTY on import (NOT rehydrated from the
         // snapshot): unlike same-node restore, a cross-node import receives an
         // UNTRUSTED exporter's snapshot, and staged saga evidence is
@@ -2665,12 +2605,6 @@ pub async fn import_context(
         // peer actors do not exist here. `strip_snapshot_for_public` already
         // strips it to empty; a full import deliberately drops it too so a
         // foreign saga cannot drive local Commit/Abort.
-        recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated outlet interface is
-        // established. Not rehydrated from any snapshot — reconstructable
-        // interface state, never authorization secrecy.
-        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: scp_runtime_core::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
@@ -2698,11 +2632,9 @@ pub async fn import_context(
                     deps.clock.now_secs(),
                 ),
         },
-        welcome_scratchpad: None,
-        lifecycle_state: ContextLifecycleState::Open,
-        event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
-    };
+    },
+    );
 
     // 6b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 import seed: SEED the OWNED crypto
     //     material rebuilt + floor-gated + binding-verified above directly onto
@@ -2791,7 +2723,7 @@ pub async fn import_context(
     )
     .map_or(TtlArming::Unarmed, TtlArming::Deadline);
 
-    Ok(SpawnedContext { handle, ttl })
+    Ok(SpawnedContext::with_ttl(handle, ttl))
 }
 
 // ---------------------------------------------------------------------------
@@ -2985,7 +2917,7 @@ pub async fn restore_context(
         validate_context_params_for_import,
     };
     use scp_protocol::context::governance::mls_integration::EpochCoordinator;
-    use scp_protocol::context::membership::ReceiveBuffer;
+
     use scp_runtime_core::context::state::derive_message_pricing;
     use scp_runtime_core::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
@@ -3284,193 +3216,171 @@ pub async fn restore_context(
     // precisely why a destructure-and-rebuild is no longer possible here — and
     // why it is no longer needed.
     let restored_routing = ctx_snapshot.routing;
-    let mut per_context = PerContextState {
-        context_id: context_id_bytes,
-        created_at: deps.clock.now_secs(),
-        // Convergent creator-assigned creation time, restored VERBATIM from the
-        // persisted snapshot (same-node crash recovery). Carrying it forward —
-        // rather than re-deriving from local `now()` — keeps the re-armed TTL
-        // expiry deadline (`creation + ttl`) identical to what the context had
-        // before the restart, so the timer-fired `ContextExpired`/`ContextClosed`
-        // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
-        // re-armed below on the ABSOLUTE convergent deadline (the persisted
-        // `ttl_deadline_secs`, or the `creation + ttl` fallback).
-        // The committed `T0`, or the snapshot's value on a keyless restore
-        // (§5.13.3 rule 9).
-        creation_timestamp_secs: restore_ttl_base_secs,
-        // Placeholder — `spawn_actor_with_state` overwrites this
-        // unconditionally with a fresh monotonic `spawn_generation`
-        // (AtomicU64; first spawn = 1) before the state crosses into the
-        // actor task. The snapshot value is never the live generation.
-        generation: ctx_snapshot.generation,
-        handle: handle.clone(),
-        membership: ctx_snapshot.membership,
-        members: actor_members,
-        governance: GovernanceState {
-            engine: governance_engine,
-            next_proposal_seq: ctx_snapshot
-                .next_proposal_seq
-                .max(ctx_snapshot.approved_proposals.len() as u64),
-            approved_proposals: ctx_snapshot.approved_proposals,
-            freeze: ctx_snapshot.governance_freeze,
-            deadlock: DeadlockDetectionState::default(),
-            pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
-            pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
-            registered_outlets: ctx_snapshot.registered_outlets,
-            outlet_interfaces: ctx_snapshot.outlet_interfaces,
-            pruning_policy: ctx_snapshot.pruning_policy,
-            message_pricing: validated_message_pricing,
-            hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                hrl_config, hrl_state,
-            ),
-            economic_policy: ctx_snapshot.economic_policy,
-            budget_tracker: ctx_snapshot.budget_tracker,
-            last_known_members: last_members,
-            pending_epoch_resets: Vec::new(),
-            consequence_rules: ctx_snapshot.consequence_rules,
-            velocity_tracker: validated_velocity_tracker,
-            participation_cache: ctx_snapshot.participation_cache,
-            cooldown_until: ctx_snapshot.cooldown_until,
-            // ADR-049 §9 Class S: restore the revocation set FROM the snapshot.
-            // Resetting it to empty here (the prior behaviour) silently dropped
-            // every revocation on actor respawn / process restart — a
-            // downward-authorization rollback the crash-safety invariant
-            // forbids. The snapshot is authoritative.
-            revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
-            proposal_timestamps: ctx_snapshot.proposal_timestamps,
-            class_s: scp_runtime_core::context::state::GovernanceClassS {
-                executed_proposals: {
-                    let now = deps.clock.now_secs();
-                    ctx_snapshot
-                        .executed_proposals
-                        .into_iter()
-                        .map(|id| (id, now))
-                        .collect()
+    let mut per_context = PerContextState::from_parts(
+        deps,
+        ContextStateParts {
+            context_id: context_id_bytes,
+            // Convergent creator-assigned creation time, restored VERBATIM from the
+            // persisted snapshot (same-node crash recovery). Carrying it forward —
+            // rather than re-deriving from local `now()` — keeps the re-armed TTL
+            // expiry deadline (`creation + ttl`) identical to what the context had
+            // before the restart, so the timer-fired `ContextExpired`/`ContextClosed`
+            // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
+            // re-armed below on the ABSOLUTE convergent deadline (the persisted
+            // `ttl_deadline_secs`, or the `creation + ttl` fallback).
+            // The committed `T0`, or the snapshot's value on a keyless restore
+            // (§5.13.3 rule 9).
+            creation_timestamp_secs: restore_ttl_base_secs,
+            handle: handle.clone(),
+            membership: ctx_snapshot.membership,
+            members: actor_members,
+            governance: GovernanceState {
+                engine: governance_engine,
+                next_proposal_seq: ctx_snapshot
+                    .next_proposal_seq
+                    .max(ctx_snapshot.approved_proposals.len() as u64),
+                approved_proposals: ctx_snapshot.approved_proposals,
+                freeze: ctx_snapshot.governance_freeze,
+                deadlock: DeadlockDetectionState::default(),
+                pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+                pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
+                registered_outlets: ctx_snapshot.registered_outlets,
+                outlet_interfaces: ctx_snapshot.outlet_interfaces,
+                pruning_policy: ctx_snapshot.pruning_policy,
+                message_pricing: validated_message_pricing,
+                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                    hrl_config, hrl_state,
+                ),
+                economic_policy: ctx_snapshot.economic_policy,
+                budget_tracker: ctx_snapshot.budget_tracker,
+                last_known_members: last_members,
+                pending_epoch_resets: Vec::new(),
+                consequence_rules: ctx_snapshot.consequence_rules,
+                velocity_tracker: validated_velocity_tracker,
+                participation_cache: ctx_snapshot.participation_cache,
+                cooldown_until: ctx_snapshot.cooldown_until,
+                // ADR-049 §9 Class S: restore the revocation set FROM the snapshot.
+                // Resetting it to empty here (the prior behaviour) silently dropped
+                // every revocation on actor respawn / process restart — a
+                // downward-authorization rollback the crash-safety invariant
+                // forbids. The snapshot is authoritative.
+                revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
+                proposal_timestamps: ctx_snapshot.proposal_timestamps,
+                class_s: scp_runtime_core::context::state::GovernanceClassS {
+                    executed_proposals: {
+                        let now = deps.clock.now_secs();
+                        ctx_snapshot
+                            .executed_proposals
+                            .into_iter()
+                            .map(|id| (id, now))
+                            .collect()
+                    },
+                    threshold_signers: ctx_snapshot.threshold_signers,
+                    threshold_value: ctx_snapshot.threshold_value,
+                    capability_requirements: ctx_snapshot.capability_requirements,
+                    spending_nonce_tracker:
+                        scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                            context_id.to_owned(),
+                            Arc::clone(&deps.clock),
+                            ctx_snapshot.spending_nonce_tracker_state,
+                        ),
                 },
-                threshold_signers: ctx_snapshot.threshold_signers,
-                threshold_value: ctx_snapshot.threshold_value,
-                capability_requirements: ctx_snapshot.capability_requirements,
-                spending_nonce_tracker:
-                    scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
-                        context_id.to_owned(),
-                        Arc::clone(&deps.clock),
-                        ctx_snapshot.spending_nonce_tracker_state,
-                    ),
             },
-        },
-        role_state: ctx_snapshot.role_state,
-        receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: VecDeque::new(),
-        broadcast_context: broadcast_ctx,
-        migration_state: ctx_snapshot.migration_state,
-        epoch: EpochState {
-            mls_epoch: ctx_snapshot.mls_epoch,
-            coordinator: EpochCoordinator::from_records(
-                ctx_snapshot.epoch_coordination_records,
-                context_id,
-            ),
-            grace_store,
-            needs_reconnect,
-        },
-        access: AccessControlState {
-            read_exclusion_list: ctx_snapshot.read_exclusion_list,
-            access_key_store: ctx_snapshot.access_key_store,
-        },
-        ttl: TtlState {
-            timer: scp_runtime_core::context::ttl::TtlTimer::with_clock(Arc::clone(&deps.clock)),
-            extension: None,
-        },
-        sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
-        reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
-        pending_commits: ctx_snapshot.pending_commits,
-        commit_fault: ctx_snapshot.commit_fault,
-        checkpoint_events_since: ctx_snapshot.checkpoint_events_since,
-        checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
-        checkpoints: Vec::new(),
-        last_seen_remote_checkpoint: std::collections::HashMap::new(),
-        routing: restored_routing,
-        // Same-node restore carries the persisted relay set forward (PUSH-025).
-        relay_urls: normalize_relay_urls(ctx_snapshot.relay_urls),
-        send_tracker: SendSequenceTracker::new(),
-        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
-        // staged saga slot from the snapshot. This is the crash-recovery path
-        // the §9 invariant covers — a Prepare's staged-but-unpublished MLS
-        // handles and B-side reservation linkage MUST survive a crash so
-        // Commit can consume the right reservation. Each entry is reconstructed
-        // from its sanctioned `SagaPreparedStateSnapshot` mirror. The Welcome
-        // scratchpad is genuinely transient and restarts fresh.
-        recv_tracker: RecvSequenceTracker::new(),
-        // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
-        // it is reconstructable interface state, repopulated when the outlet
-        // interface is (re-)established.
-        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        class_s: scp_runtime_core::context::actor::state::ClassSState {
-            saga_pending: ctx_snapshot
-                .saga_pending
-                .into_iter()
-                .map(|(id, mirror)| (id, mirror.into_prepared()))
-                .collect(),
-            // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
-            // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
-            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextOutletInvoke`
-            // within the dedup TTL; reinitializing it empty on restore would let
-            // a crash inside the window re-open a charging-outlet replay (BLACK-624-01).
-            // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
-            // import drops it (the snapshot field is empty), so a foreign node starts
-            // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
-            // than the freshness skew tolerance) so the restored window matches the
-            // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
-            xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
-                ctx_snapshot.xctx_nonce_dedup,
-                scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
-            ),
+            role_state: ctx_snapshot.role_state,
+            broadcast_context: broadcast_ctx,
+            migration_state: ctx_snapshot.migration_state,
+            epoch: EpochState {
+                mls_epoch: ctx_snapshot.mls_epoch,
+                coordinator: EpochCoordinator::from_records(
+                    ctx_snapshot.epoch_coordination_records,
+                    context_id,
+                ),
+                grace_store,
+                needs_reconnect,
+            },
+            access: AccessControlState {
+                read_exclusion_list: ctx_snapshot.read_exclusion_list,
+                access_key_store: ctx_snapshot.access_key_store,
+            },
+            pending_commits: ctx_snapshot.pending_commits,
+            commit_fault: ctx_snapshot.commit_fault,
+            checkpoint_events_since: ctx_snapshot.checkpoint_events_since,
+            checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
+            routing: restored_routing,
+            // Same-node restore carries the persisted relay set forward (PUSH-025).
+            relay_urls: normalize_relay_urls(ctx_snapshot.relay_urls),
             // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
-            // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
-            // with durable output capture") so a Commit replayed after a crash
-            // re-emits the STORED output + the IDENTICAL receipt rather than
-            // re-invoking the outlet. The live `CommittedOutletInvocation` is public (no
-            // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
-            xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
-            xctx_committed_stream_outputs: ctx_snapshot.xctx_committed_stream_outputs,
-            xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
-            // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
-            // caller-side durable reservation reversal records so a crash-recovery
-            // abort can reverse the caller deduction + void the escrow from the
-            // record. Dropped on cross-node import (caller economy is local).
-            xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
-            // §7.3.8 Class S: same-node restore REHYDRATES the value-caveat
-            // counters so a consumed `max_calls` / `amount_max_cumulative` /
-            // `rate_window` cap survives a crash rather than un-consuming (which
-            // would re-open the spend/rate window). Pruning of the rate-window
-            // ring buffer runs lazily on the next consume against the restored
-            // wall clock, so a restart can only ever DROP stale timestamps —
-            // never widen a window. Cross-node public export strips this map.
-            caveat_counters: ctx_snapshot.caveat_counters,
-            // Fix-D Class S: same-node restore REHYDRATES the streaming
-            // reservation recovery records so the post-restore reconcile sweep
-            // can RELEASE the escrow hold + cumulative counter reserve of any
-            // stream whose off-mailbox pump survived the crash (its close-time
-            // settle lands on the respawned generation and is dropped). Cross-
-            // node public export strips this map (invoker economy is local).
-            stream_reservations: ctx_snapshot.stream_reservations,
-            // §9.10.4.1 Class S: same-node restore REHYDRATES the rotation state.
-            // A restore with `announce_pending` set re-publishes the announcement
-            // for the persisted epoch (the actor's rotation arm signals the
-            // driver until the publish succeeds). The query-only list is restored
-            // whole: an entry that expired while the node was down stays until the
-            // next rotation drops it, and `LocalRoutingIds` leaves it out. `T0` is the
-            // committed value (§5.13.3 rule
-            // 9), never the snapshot's copy; a keyless restore holds none and
-            // follows no interval schedule until reconnection.
-            pseudonym_rotation: ctx_snapshot
-                .pseudonym_rotation
-                .with_schedule_t0(restore_committed_t0),
+            // staged saga slot from the snapshot. This is the crash-recovery path
+            // the §9 invariant covers — a Prepare's staged-but-unpublished MLS
+            // handles and B-side reservation linkage MUST survive a crash so
+            // Commit can consume the right reservation. Each entry is reconstructed
+            // from its sanctioned `SagaPreparedStateSnapshot` mirror.
+            class_s: scp_runtime_core::context::actor::state::ClassSState {
+                saga_pending: ctx_snapshot
+                    .saga_pending
+                    .into_iter()
+                    .map(|(id, mirror)| (id, mirror.into_prepared()))
+                    .collect(),
+                // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
+                // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
+                // ONLY gate against a fresh-`SagaId` replay of a `CrossContextOutletInvoke`
+                // within the dedup TTL; reinitializing it empty on restore would let
+                // a crash inside the window re-open a charging-outlet replay (BLACK-624-01).
+                // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
+                // import drops it (the snapshot field is empty), so a foreign node starts
+                // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
+                // than the freshness skew tolerance) so the restored window matches the
+                // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
+                xctx_nonce_dedup:
+                    scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
+                        ctx_snapshot.xctx_nonce_dedup,
+                        scp_runtime_core::context::actor::state::SAGA_NONCE_DEDUP_TTL_SECS,
+                    ),
+                // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+                // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
+                // with durable output capture") so a Commit replayed after a crash
+                // re-emits the STORED output + the IDENTICAL receipt rather than
+                // re-invoking the outlet. The live `CommittedOutletInvocation` is public (no
+                // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
+                xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+                xctx_committed_stream_outputs: ctx_snapshot.xctx_committed_stream_outputs,
+                xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
+                // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
+                // caller-side durable reservation reversal records so a crash-recovery
+                // abort can reverse the caller deduction + void the escrow from the
+                // record. Dropped on cross-node import (caller economy is local).
+                xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+                // §7.3.8 Class S: same-node restore REHYDRATES the value-caveat
+                // counters so a consumed `max_calls` / `amount_max_cumulative` /
+                // `rate_window` cap survives a crash rather than un-consuming (which
+                // would re-open the spend/rate window). Pruning of the rate-window
+                // ring buffer runs lazily on the next consume against the restored
+                // wall clock, so a restart can only ever DROP stale timestamps —
+                // never widen a window. Cross-node public export strips this map.
+                caveat_counters: ctx_snapshot.caveat_counters,
+                // Fix-D Class S: same-node restore REHYDRATES the streaming
+                // reservation recovery records so the post-restore reconcile sweep
+                // can RELEASE the escrow hold + cumulative counter reserve of any
+                // stream whose off-mailbox pump survived the crash (its close-time
+                // settle lands on the respawned generation and is dropped). Cross-
+                // node public export strips this map (invoker economy is local).
+                stream_reservations: ctx_snapshot.stream_reservations,
+                // §9.10.4.1 Class S: same-node restore REHYDRATES the rotation state.
+                // A restore with `announce_pending` set re-publishes the announcement
+                // for the persisted epoch (the actor's rotation arm signals the
+                // driver until the publish succeeds). The query-only list is restored
+                // whole: an entry that expired while the node was down stays until the
+                // next rotation drops it, and `LocalRoutingIds` leaves it out. `T0` is the
+                // committed value (§5.13.3 rule
+                // 9), never the snapshot's copy; a keyless restore holds none and
+                // follows no interval schedule until reconnection.
+                pseudonym_rotation: ctx_snapshot
+                    .pseudonym_rotation
+                    .with_schedule_t0(restore_committed_t0),
+            },
+            mode,
         },
-        welcome_scratchpad: None,
-        lifecycle_state: ContextLifecycleState::Open,
-        event_log: None,
-        mode,
-    };
+    );
 
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2: SEED the rehydrated owned crypto onto
     // the actor state (the actor is the SOLE crypto authority). This installs the
@@ -3564,376 +3474,8 @@ pub async fn restore_context(
     Ok(())
 }
 
-// ===========================================================================
-// Supervisor-iterating sweep entry points (Phase 2A finalization)
-// ===========================================================================
-//
-// These replaced the now-deleted legacy lifecycle sweep helpers
-// (the `lifecycle_helpers_legacy` module is gone). Each iterates
-// [`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids)
-// (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
-// and dispatches one typed sweep command per actor via the per-actor
-// mailbox.
-//
-// `restore_all_contexts` is the exception — it iterates PERSISTENCE
-// (snapshots from the configured persistence provider) because no
-// actors exist before restore. The body builds each context's
-// payload from snapshot and calls `Supervisor::restore_context`,
-// which routes the bootstrap variant through
-// `dispatch_lifecycle_direct` (the only legitimate caller of the
-// bootstrap-shape helpers per ADR-049 §7 allowlist).
-//
-// Per-actor sweep bodies live in
-// [`crate::handler`] as `handle_*_actor`
-// functions, dispatched from the actor's `dispatch_actor_inner` arm
-// for the matching `LifecycleCommand` variant.
-
-/// Sweep entry point: restore every persisted context from the
-/// configured persistence provider.
-///
-/// Returns the list of restored context IDs. Contexts in `Closing` /
-/// `Closed` / `Expired` states are skipped (only `Active` contexts are
-/// resurrected after a restart).
-///
-/// Relocates the legacy `restore_all_contexts_legacy` off direct
-/// `Supervisor::contexts` `DashMap` insertion (the legacy body is now
-/// deleted). The body
-/// iterates persistence snapshots and dispatches one
-/// `Supervisor::restore_context` call per snapshot — that ergonomic
-/// method routes through the actor mailbox (after the bootstrap
-/// `dispatch_lifecycle_direct` arm spawns the actor) so the resulting
-/// actor registry is populated correctly.
-///
-/// # Errors
-///
-/// - [`ContextError::PersistenceFailed`] if the persistence provider
-///   is unconfigured or `list_persisted_contexts` fails.
-pub async fn restore_all_contexts(
-    supervisor: &Arc<scp_runtime_core::context::supervisor::Supervisor>,
-) -> Result<Vec<String>, ContextError> {
-    let Some(persistence) = supervisor.persistence_ref() else {
-        return Err(ContextError::PersistenceFailed(
-            "no persistence provider configured".into(),
-        ));
-    };
-    let context_ids = persistence.list_persisted_contexts().await.map_err(|e| {
-        ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
-    })?;
-
-    let mut restored = Vec::new();
-    for ctx_id in &context_ids {
-        let ctx_snapshot = match persistence.load_context(ctx_id).await {
-            Ok(Some(snap)) => snap,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %ctx_id,
-                    error = %e,
-                    "failed to load context snapshot during restore"
-                );
-                continue;
-            }
-        };
-
-        if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
-            continue;
-        }
-
-        let handle = scp_runtime_core::context::ContextHandle::new(
-            ctx_id.clone(),
-            ctx_snapshot.context_params.clone(),
-        );
-
-        match supervisor.restore_context(ctx_id, &handle).await {
-            Ok(()) => restored.push(ctx_id.clone()),
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %ctx_id,
-                    error = %e,
-                    "failed to restore context"
-                );
-            }
-        }
-    }
-    Ok(restored)
-}
-
-/// Sweep entry point: shut down every actor (best-effort, local
-/// cleanup only).
-///
-/// Shuts down every context and drains the supervisor's tracked tasks
-/// (ADR-049 Decision 16, supervisor task drain).
-///
-/// Steps, in order:
-/// 1. Set the closed flag.
-/// 2. Snapshot the actor registry under the write lock. A spawner that
-///    passed the closed-flag check registers under the same lock, so the
-///    snapshot holds every actor that can still be spawned.
-/// 3. Send each actor
-///    [`LifecycleCommand::ShutdownSelf`](scp_runtime_core::context::actor::commands::LifecycleCommand::ShutdownSelf),
-///    which destroys sender keys, the MLS group, and the event log in that
-///    order (zeroize secrets before tearing down structure), then despawn the
-///    actor whether or not the send succeeded and whether or not the actor
-///    replied within [`REPLY_TIMEOUT`](scp_runtime_core::context::actor::REPLY_TIMEOUT):
-///    the despawn drops the last
-///    mailbox sender, the actor's `run()` loop exits on the closed inbox, and
-///    its task releases its `PerContextState`.
-/// 4. Stop every key-package actor and clear `key_package_stores`.
-/// 5. Clear the standing-context index, the local-DID registry, and the
-///    per-identity wrapping keys.
-/// 6. Close the task tracker and await it.
-/// 7. Drop each swept context's floor-registry entry. A despawned actor whose
-///    `ShutdownSelf` was not delivered or not answered keeps running its
-///    mailbox backlog until step 6 has awaited it, and each persist it makes
-///    reads its floors from this registry.
-///
-/// Used by
-/// [`Supervisor::shutdown_all_contexts`](scp_runtime_core::context::supervisor::Supervisor::shutdown_all_contexts)
-/// for process exit and test teardown. Does NOT
-/// send leave messages or notify remote peers.
-pub async fn shutdown_all_contexts(supervisor: &scp_runtime_core::context::supervisor::Supervisor) {
-    let context_ids = shutdown_sweep(supervisor).await;
-    supervisor.await_tracked_tasks().await;
-    let removed_count = reap_swept_floors(supervisor, &context_ids);
-    tracing::info!(
-        removed_count,
-        "shutdown: removed all contexts, stopped key-package actors, and drained every \
-         supervisor task"
-    );
-}
-
-/// Steps 1 to 5 of [`shutdown_all_contexts`]; returns the ids of the context
-/// actors the sweep despawned.
-async fn shutdown_sweep(
-    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
-) -> Vec<String> {
-    use std::collections::{HashMap, HashSet};
-
-    use scp_runtime_core::context::actor::commands::{ContextCommand, LifecycleCommand};
-
-    supervisor.close_spawn_gate();
-    let context_ids = {
-        let _guard = supervisor.write_lock.lock().await;
-        supervisor.actor_ids()
-    };
-    for ctx_id in &context_ids {
-        if let Some(actor) = supervisor.lookup(ctx_id) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
-            match actor
-                .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
-                .await
-            {
-                Ok(()) => match scp_runtime_core::context::actor::bounded_reply_await(rx).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!(
-                        context_id = %ctx_id,
-                        error = %e,
-                        "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
-                    ),
-                    Err(scp_runtime_core::context::actor::BoundedReplyError::Dropped) => {
-                        tracing::warn!(
-                            context_id = %ctx_id,
-                            "shutdown: actor exited before replying to ShutdownSelf; despawning"
-                        );
-                    }
-                    Err(scp_runtime_core::context::actor::BoundedReplyError::Elapsed) => {
-                        tracing::warn!(
-                            context_id = %ctx_id,
-                            "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
-                             despawning"
-                        );
-                    }
-                },
-                Err(e) => tracing::warn!(
-                    context_id = %ctx_id,
-                    error = %e,
-                    "shutdown: ShutdownSelf not delivered; despawning, which closes the \
-                     actor's inbox and drops its state"
-                ),
-            }
-        }
-        // `ShutdownSelf` tears down the per-context resources (sender
-        // keys, MLS group, event log, timers) but does NOT break the
-        // actor's `run()` loop — only `LifecycleControlCommand::Shutdown`
-        // and a claimed `PrepareForReplace` do, and neither is sent here.
-        // Despawning removes the handle from `actors` under the write lock,
-        // dropping the last `mpsc::Sender`. That closes the inbox, so the
-        // actor's `run()` loop exits on its inbox-closed (`None`) arm and the
-        // spawned task releases its `PerContextState`. The despawn runs
-        // even when the send failed or the reply did not arrive within
-        // `REPLY_TIMEOUT`, so a full mailbox or a wedged actor cannot keep an
-        // actor registered past shutdown.
-        supervisor.despawn_actor(ctx_id).await;
-        // Clean shutdown: reap the (non-poison) crash-window entry so it does
-        // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
-        // — its dormant-poison signal survives a shutdown so a subsequent
-        // lookup still reports the poison until an operator clears it or the
-        // process restarts.
-        supervisor.reap_crash_window(ctx_id);
-        // The floor-registry entry is dropped in step 7, after the drain.
-        // Drop the per-context stream admission-tracker registry entry on the
-        // same teardown sweep (spec §5.4.5).
-        supervisor.reap_stream_admission(ctx_id);
-    }
-
-    supervisor.stop_key_package_actors().await;
-    supervisor.stop_challenger_ledger_actors().await;
-
-    // Supervisor-level state clear. Acquired under the write_lock once
-    // for the standing_contexts + local_dids stores so a concurrent
-    // reader observes a coherent shutdown rather than a partially-
-    // cleared registry. The wrapping keys clear under the same guard: a
-    // wrapping-key load in flight inserts only under it, after re-checking
-    // the gate closed above, so none re-inserts a secret after this clear.
-    {
-        let guard = supervisor.write_lock.lock().await;
-        supervisor
-            .standing_contexts_ref()
-            .store(std::sync::Arc::new(HashMap::new()));
-        supervisor
-            .local_dids_ref()
-            .store(std::sync::Arc::new(HashSet::new()));
-        supervisor.clear_wrapping_keys(&guard);
-    }
-
-    // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
-    // end with their actor's task. Every other supervisor-held task (actor
-    // watchdogs, the context-gauge refresh, the streaming saga seal task,
-    // the streaming settlement tasks) is on the tracker, which step 6 awaits.
-    context_ids
-}
-
-/// Step 7 of [`shutdown_all_contexts`]: drops the floor-registry entry of each
-/// swept context and returns how many contexts were swept. Runs only after the
-/// tracker drain has finished, so no actor task is left to persist a snapshot
-/// that would export the absent entry as empty floors.
-fn reap_swept_floors(
-    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
-    context_ids: &[String],
-) -> usize {
-    for ctx_id in context_ids {
-        supervisor.remove_context_floors(&scp_runtime_core::context::state::context_id_to_bytes(
-            ctx_id,
-        ));
-    }
-    context_ids.len()
-}
-
 #[cfg(test)]
 mod spawn_rollback_tests;
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod shutdown_sweep_tests {
-    //! ADR-049 Decision 16: the shutdown sweep despawns an actor that never
-    //! replies to `ShutdownSelf`.
-
-    use std::sync::Arc;
-
-    use super::shutdown_all_contexts;
-    use scp_runtime_core::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
-    use scp_runtime_core::context::supervisor::Supervisor;
-
-    fn supervisor() -> Arc<Supervisor> {
-        let crypto = Arc::new(
-            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
-                "did:dht:z6MkShutdownSweep".to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ),
-        );
-        crate::test_support::test_supervisor(
-            crypto,
-            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider),
-            Box::new(scp_runtime_core::context::providers::MerkleEventLogProvider::new()),
-            Arc::new(|_, _| None),
-        )
-    }
-
-    /// Two actors accept `ShutdownSelf` into a free mailbox slot and never
-    /// reply. The sweep waits `REPLY_TIMEOUT` for each, then despawns both, so
-    /// neither stays registered and the sweep reaches its end.
-    #[tokio::test(start_paused = true)]
-    async fn sweep_despawns_actors_that_never_reply_to_shutdown_self() {
-        let sup = supervisor();
-        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        sup.register_actor_handle_for_test("ctx-wedged-a", ContextActorHandle::from_sender(tx_a));
-        sup.register_actor_handle_for_test("ctx-wedged-b", ContextActorHandle::from_sender(tx_b));
-
-        let start = tokio::time::Instant::now();
-        shutdown_all_contexts(&sup).await;
-        assert!(
-            start.elapsed() >= REPLY_TIMEOUT * 2,
-            "the sweep waits REPLY_TIMEOUT for each unanswered ShutdownSelf"
-        );
-        assert!(
-            sup.actor_ids().is_empty(),
-            "an actor that never replies to ShutdownSelf is despawned, got {:?}",
-            sup.actor_ids()
-        );
-        // Each mailbox received the one ShutdownSelf, and the despawn dropped
-        // the last sender, so the inbox reads closed after it.
-        for rx in [&mut rx_a, &mut rx_b] {
-            assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
-            assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
-        }
-    }
-
-    /// An actor that never answers `ShutdownSelf` keeps running until the drain
-    /// awaits it. A persist it makes on its way out still reads the context's
-    /// floors from the registry, and only after the drain does the shutdown
-    /// drop the registry entry.
-    #[tokio::test(start_paused = true)]
-    async fn floors_outlive_an_unanswering_actor_until_the_drain_ends() {
-        use scp_runtime_core::context::actor::commands::LifecycleCommand;
-
-        let sup = supervisor();
-        let ctx_id = "ab".repeat(32);
-        let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(&ctx_id);
-        sup.check_and_advance_sender_epoch_for_test(&ctx_bytes, "floor-sender", 7, u64::MAX)
-            .unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
-        let actor_sup = Arc::clone(&sup);
-        let actor = sup
-            .spawn_tracked_for_test("unanswering actor", async move {
-                let mut held_replies = Vec::new();
-                while let Some(cmd) = rx.recv().await {
-                    if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd
-                    {
-                        held_replies.push(reply);
-                    }
-                }
-                // The inbox closed on the despawn: model the persist of a
-                // command the actor was still running.
-                (
-                    actor_sup.export_sender_key_epochs_for_test(&ctx_bytes),
-                    held_replies,
-                )
-            })
-            .expect("spawn before shutdown");
-
-        shutdown_all_contexts(&sup).await;
-
-        assert!(actor.is_finished(), "the drain awaited the actor task");
-        let (seen, held_replies) = actor.await.expect("the actor task does not panic");
-        assert_eq!(
-            held_replies.len(),
-            1,
-            "the actor held the one ShutdownSelf unanswered"
-        );
-        assert_eq!(
-            seen,
-            vec![("floor-sender".to_owned(), 7)],
-            "the actor's last persist read the advanced floor, not an empty export"
-        );
-        assert!(
-            sup.export_sender_key_epochs_for_test(&ctx_bytes).is_empty(),
-            "the shutdown dropped the floor entry after the drain"
-        );
-    }
-}
 
 #[cfg(all(test, feature = "testing"))]
 mod restore_reconcile_tests {
@@ -4357,16 +3899,15 @@ mod restore_reconcile_tests {
         let guard =
             scp_runtime_core::context::shared::lifecycle::FirstStateRollback::new(&deps, &ctx_id)
                 .expect("guard");
-        guard.inner.writes_idle.send_replace(false);
-        let writes = scp_runtime_core::context::shared::lifecycle::first_state_writes(
-            Arc::clone(&guard.inner),
+        guard.mark_writes_busy_for_test();
+        let writes = guard.first_state_writes_for_test(
             1_700_000_000,
             Box::new(snapshot),
             tokio_util::sync::CancellationToken::new(),
         );
         drop(writes);
         assert!(
-            *guard.inner.writes_idle.borrow(),
+            guard.writes_idle_for_test(),
             "an unpolled writes future marks the writes idle when dropped"
         );
     }
@@ -4897,7 +4438,7 @@ mod restore_reconcile_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         supervisor.register_actor_handle_for_test(
             ctx_id,
-            scp_runtime_core::context::actor::ContextActorHandle::from_sender(tx),
+            scp_runtime_core::context::actor::ContextActorHandle::from_sender_for_test(tx),
         );
 
         let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
@@ -4971,7 +4512,7 @@ mod restore_reconcile_tests {
             .expect("the created context has a log")
             .len();
 
-        helpers::shutdown_all_contexts(&supervisor).await;
+        supervisor.shutdown_all_contexts().await;
 
         assert!(
             matches!(
@@ -5390,20 +4931,21 @@ mod restore_reconcile_tests {
                 Capability::MessagesRead,
             ]))
             .expect("well-formed built-in ceiling");
-        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
-            locked: false,
-            cost_schedule: scp_protocol::economy::types::CostSchedule {
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                per_message: None,
-                per_outlet_call: None,
-                per_join: Some(scp_protocol::economy::types::Amount(10)),
-                per_period: None,
-                per_byte_stored: None,
-            },
-            payment_adapters: vec!["recording".to_owned()],
-            pricing_formula: None,
-            payee: admin.clone(),
-        });
+        state.governance_mut().economic_policy =
+            Some(scp_protocol::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: scp_protocol::economy::types::CostSchedule {
+                    currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_outlet_call: None,
+                    per_join: Some(scp_protocol::economy::types::Amount(10)),
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["recording".to_owned()],
+                pricing_formula: None,
+                payee: admin.clone(),
+            });
         state
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
@@ -5441,7 +4983,7 @@ mod restore_reconcile_tests {
         deps.persistence = Arc::new(FailingJoinPersistence);
 
         // `join_context` now takes the Class-S cell; wrap the owned state.
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
         let result = helpers::join_context(
             &mut cell,
             &deps,
@@ -5603,7 +5145,7 @@ mod restore_reconcile_tests {
         // skips the post-send checkpoint path. `finalize_send` is actor-shape
         // (ADR-049 §9): wrap the state in the owning `ClassSCell` for the call,
         // then reclaim it via `into_inner` for the post-send read below.
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
         let result = scp_runtime_messaging::testing_access::finalize_send(
             &mut cell,
             &deps,
@@ -5621,7 +5163,7 @@ mod restore_reconcile_tests {
             false, // is_broadcast
         )
         .await;
-        let mut state = cell.into_inner();
+        let mut state = cell.into_inner_for_test();
 
         assert!(
             result.is_ok(),
@@ -5763,20 +5305,21 @@ mod restore_reconcile_tests {
                 admin.clone(),
             );
         // A per-message cost so a paid action authorizes + captures.
-        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
-            locked: false,
-            cost_schedule: scp_protocol::economy::types::CostSchedule {
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                per_message: Some(scp_protocol::economy::types::Amount(10)),
-                per_outlet_call: None,
-                per_join: None,
-                per_period: None,
-                per_byte_stored: None,
-            },
-            payment_adapters: vec!["recording".to_owned()],
-            pricing_formula: None,
-            payee: admin.clone(),
-        });
+        state.governance_mut().economic_policy =
+            Some(scp_protocol::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: scp_protocol::economy::types::CostSchedule {
+                    currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                    per_message: Some(scp_protocol::economy::types::Amount(10)),
+                    per_outlet_call: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["recording".to_owned()],
+                pricing_formula: None,
+                payee: admin.clone(),
+            });
 
         // Sanity: no receipts and no durable leaves yet.
         assert!(state.payment_receipts.is_empty());
@@ -6007,7 +5550,7 @@ mod restore_reconcile_tests {
             .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
         // Self-removal (caller == member): always permitted, no MemberRemove cap.
         let result = helpers::leave_context(&mut cell, &deps, &handle, &leaver, &leaver).await;
 
@@ -6066,7 +5609,7 @@ mod restore_reconcile_tests {
             .transition_to(&scp_protocol::context::ContextState::Active)
             .unwrap();
 
-        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new(state);
+        let mut cell = scp_runtime_core::context::actor::class_s::ClassSCell::new_for_test(state);
         let result = helpers::close_context(&mut cell, &deps, &handle, &admin).await;
 
         assert!(
@@ -6232,9 +5775,11 @@ mod restore_reconcile_tests {
             .unwrap()
             .insert(ctx_id.to_owned(), snapshot);
         let restored = build_supervisor(Box::new(SharedCapture(store)));
-        let ids = helpers::restore_all_contexts(&restored)
+        let ids = restored
+            .restore_all_contexts_for_test()
             .await
-            .expect("restore_all_contexts");
+            .expect("restore_all_contexts")
+            .into_ids();
         assert_eq!(ids, vec![ctx_id.to_owned()], "the context restores");
         assert_eq!(
             restored
@@ -6481,19 +6026,20 @@ mod flush_sweep_tests {
     async fn an_actor_that_exited_on_purpose_before_it_flushed_is_skipped() {
         let sup = persisting_supervisor();
         let (tx_gone, rx_gone) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        let gone = ContextActorHandle::from_sender(tx_gone);
-        gone.exit_record().record(DeliberateExit::Shutdown);
+        let gone = ContextActorHandle::from_sender_for_test(tx_gone);
+        gone.exit_record_for_test()
+            .record_for_test(DeliberateExit::Shutdown);
         drop(rx_gone);
         sup.register_actor_handle_for_test("ctx-gone", gone);
         let (tx_exiting, mut rx_exiting) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        let exiting_handle = ContextActorHandle::from_sender(tx_exiting);
-        let exit = exiting_handle.exit_record();
+        let exiting_handle = ContextActorHandle::from_sender_for_test(tx_exiting);
+        let exit = exiting_handle.exit_record_for_test();
         sup.register_actor_handle_for_test("ctx-exiting", exiting_handle);
         let exiting = tokio::spawn(async move {
             let cmd = rx_exiting.recv().await;
             // The actor records its exit before its inbox and the unanswered
             // reply drop, as `ContextActor::run` does.
-            exit.record(DeliberateExit::Replaced);
+            exit.record_for_test(DeliberateExit::Replaced);
             drop(rx_exiting);
             drop(cmd);
         });
@@ -6515,7 +6061,10 @@ mod flush_sweep_tests {
     async fn an_actor_that_panicked_or_vanished_before_it_flushed_fails_the_sweep() {
         let sup = persisting_supervisor();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        sup.register_actor_handle_for_test("ctx-panicked", ContextActorHandle::from_sender(tx));
+        sup.register_actor_handle_for_test(
+            "ctx-panicked",
+            ContextActorHandle::from_sender_for_test(tx),
+        );
         let panicked = tokio::spawn(async move {
             let cmd = rx.recv().await;
             assert!(cmd.is_some(), "the sweep sent the flush");
@@ -6538,7 +6087,7 @@ mod flush_sweep_tests {
         drop(rx_closed);
         sup.register_actor_handle_for_test(
             "ctx-closed",
-            ContextActorHandle::from_sender(tx_closed),
+            ContextActorHandle::from_sender_for_test(tx_closed),
         );
         let result = flush_all_contexts(&sup).await;
         assert!(
@@ -6565,11 +6114,14 @@ mod flush_sweep_tests {
             .spawn_actor_with_state_for_test(state, deps, None)
             .await
             .unwrap();
-        assert_eq!(handle.exited_deliberately(), None);
+        assert_eq!(handle.exited_deliberately_for_test(), None);
 
-        handle.shutdown_and_await_exit().await.unwrap();
+        handle.shutdown_and_await_exit_for_test().await.unwrap();
 
-        assert_eq!(handle.exited_deliberately(), Some(DeliberateExit::Shutdown));
+        assert_eq!(
+            handle.exited_deliberately_for_test(),
+            Some(DeliberateExit::Shutdown)
+        );
     }
     /// An actor whose task still runs but whose mailbox stays full past the
     /// send timeout did not flush, and its state is still live, so the sweep
@@ -6583,7 +6135,10 @@ mod flush_sweep_tests {
             reply: filler_reply,
         }))
         .unwrap();
-        sup.register_actor_handle_for_test("ctx-full", ContextActorHandle::from_sender(tx));
+        sup.register_actor_handle_for_test(
+            "ctx-full",
+            ContextActorHandle::from_sender_for_test(tx),
+        );
 
         let result = flush_all_contexts(&sup).await;
 

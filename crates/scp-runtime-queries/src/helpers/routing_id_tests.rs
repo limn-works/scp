@@ -42,7 +42,7 @@ fn local_routing_ids_reports_a_query_only_routing_id_until_its_expiry() {
     let policy = interval_policy();
     let mut state = context_state(Some(policy));
     state
-        .class_s
+        .class_s_mut()
         .pseudonym_rotation
         .record_rotation(1, [9; 32], Some(&policy), T0 + I)
         .unwrap();

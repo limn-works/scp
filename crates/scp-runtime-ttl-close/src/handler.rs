@@ -46,7 +46,7 @@ use tokio::sync::oneshot;
 use scp_runtime_core::context::actor::class_s::ClassSCell;
 use scp_runtime_core::context::actor::commands::TtlCloseCommand;
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 
 use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
@@ -357,27 +357,6 @@ async fn handle_finalize_close(
     outcome
 }
 
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink. Mirrors the pattern used in
-/// `handlers::messaging`
-/// and
-/// `handlers::lifecycle`.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -480,7 +459,7 @@ mod tests {
             .await
             .expect("init event log");
 
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let _outcome = super::handle_finalize_close(&mut cell, &deps, context_id, reply_tx).await;
@@ -547,7 +526,7 @@ mod tests {
             .await
             .expect("init event log");
 
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let handle = cell.handle.clone();
 
         let attestation =
@@ -577,20 +556,5 @@ mod tests {
             !attestation.mls_group_destroyed,
             "no MLS group was present ⇒ mls_group_destroyed honestly false (not fabricated)"
         );
-    }
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    mod outcome_sketch_tests {
-        use super::super::{ContextError, outcome_error_sketch};
-
-        #[test]
-        fn sketch_keeps_supervisor_shut_down_typed() {
-            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-            assert!(
-                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-                "got {sketch:?}"
-            );
-        }
     }
 }

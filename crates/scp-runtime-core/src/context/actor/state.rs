@@ -65,7 +65,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use scp_clock::{Clock, SystemClock};
+use scp_clock::Clock;
+#[cfg(any(test, feature = "testing"))]
+use scp_clock::SystemClock;
 use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
@@ -388,20 +390,38 @@ impl DisposalOutcome {
         }
     }
 
+    /// Test-only reach into [`Self::mls_group_destroyed`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn mls_group_destroyed_for_test(self) -> bool {
+        Self::mls_group_destroyed(self)
+    }
+
     /// `true` iff an MLS group was observed present-and-destroyed by the
     /// disposal that produced this outcome. Sole read path for the attestation's
     /// `mls_group_destroyed` flag. Takes `self` by value — `DisposalOutcome` is a
     /// 2-byte `Copy` type, so a by-ref accessor is `trivially_copy_pass_by_ref`.
     #[must_use]
-    pub const fn mls_group_destroyed(self) -> bool {
+    pub(crate) const fn mls_group_destroyed(self) -> bool {
         self.mls_group_destroyed
+    }
+
+    /// Test-only reach into [`Self::sender_keys_destroyed`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn sender_keys_destroyed_for_test(self) -> bool {
+        Self::sender_keys_destroyed(self)
     }
 
     /// `true` iff sender-key material was observed present-and-destroyed by the
     /// disposal that produced this outcome. Sole read path for the attestation's
     /// `sender_keys_destroyed` flag. Takes `self` by value (2-byte `Copy` type).
     #[must_use]
-    pub const fn sender_keys_destroyed(self) -> bool {
+    pub(crate) const fn sender_keys_destroyed(self) -> bool {
         self.sender_keys_destroyed
     }
 }
@@ -949,18 +969,12 @@ impl ContextModeState {
         }
     }
 
-    /// Shared access to the encrypted-mode crypto sub-state, or `None` for a
-    /// broadcast context. Companion to [`Self::crypto_mut`].
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): immutable read twin of \
-                  crypto_mut. The send/receive seams reach the crypto through \
-                  the &mut crypto_mut accessor, so this shared-read companion \
-                  currently has no caller; retained for read-only call sites \
-                  and symmetry with crypto_mut."
-    )]
+    /// The encrypted-mode crypto state; `None` in broadcast mode.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn crypto(&self) -> Option<&ContextCryptoState> {
+    pub const fn crypto_for_test(&self) -> Option<&ContextCryptoState> {
         match self {
             Self::Encrypted(crypto) => Some(crypto),
             Self::Broadcast(_) => None,
@@ -1270,10 +1284,19 @@ pub struct ClassSStateSnapshot {
     reason = "ADR-049 §9 PR2a is a behaviour-neutral data split + mirror snapshot. The snapshot/restore mirror's first PRODUCTION consumer is the later privatization PR (restore wiring through the mutator-combinator boundary); for now it is exercised by the crate-internal lossless round-trip unit test. Mirrors the PR1 ClassSCell scaffolding precedent."
 )]
 impl ClassSState {
+    /// Test-only reach into [`Self::snapshot`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn snapshot_for_test(&self) -> ClassSStateSnapshot {
+        Self::snapshot(self)
+    }
+
     /// Project this Class-S subset onto its `Clone`-able mirror (ADR-049 §9).
     /// Lossless inverse of [`Self::restore`].
     #[must_use]
-    pub fn snapshot(&self) -> ClassSStateSnapshot {
+    pub(crate) fn snapshot(&self) -> ClassSStateSnapshot {
         use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
         ClassSStateSnapshot {
             saga_pending: self
@@ -1298,10 +1321,18 @@ impl ClassSState {
         }
     }
 
+    /// Test-only reach into [`Self::restore`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn restore_for_test(&mut self, snap: ClassSStateSnapshot) {
+        Self::restore(self, snap);
+    }
+
     /// Restore this Class-S subset from its mirror (ADR-049 §9), rehydrating
     /// `saga_pending` via `into_prepared` and `xctx_nonce_dedup` from its
     /// captured entries + TTL. Lossless inverse of [`Self::snapshot`].
-    pub fn restore(&mut self, snap: ClassSStateSnapshot) {
+    pub(crate) fn restore(&mut self, snap: ClassSStateSnapshot) {
         self.saga_pending = snap
             .saga_pending
             .into_iter()
@@ -1483,7 +1514,7 @@ pub struct PerContextState {
     /// (`pub(crate)`) because the `GovernanceState` struct itself cannot
     /// be named outside this crate. ADR-049 §15 deletes both it and the
     /// legacy manager module together.
-    pub governance: GovernanceState,
+    pub(crate) governance: GovernanceState,
 
     // -----------------------------------------------------------------
     // MLS + access control + TTL
@@ -1491,7 +1522,7 @@ pub struct PerContextState {
     /// MLS epoch + reconnection state (§5.9, §23.11). Mirrors legacy
     /// `state::PerContextState::epoch`. Type is elevated from private
     /// to `pub(crate)` by ADR-049 §15; field visibility matches.
-    pub epoch: EpochState,
+    pub(crate) epoch: EpochState,
 
     /// Access-control / CEK-wrapping exclusion list (ADR-038, §9.17).
     /// Mirrors legacy `state::PerContextState::access`. Type is
@@ -1501,12 +1532,12 @@ pub struct PerContextState {
     /// This is the sole authoritative storage site for the
     /// `access_key_store`: ADR-049 §15 removed the vestigial duplicate
     /// that briefly lived on [`ContextCryptoState`].
-    pub access: AccessControlState,
+    pub(crate) access: AccessControlState,
 
     /// TTL timer + extension state (SCP-021). Mirrors legacy
     /// `state::PerContextState::ttl`. Type is elevated from private
     /// to `pub(crate)` by ADR-049 §15; field visibility matches.
-    pub ttl: TtlState,
+    pub(crate) ttl: TtlState,
 
     // -----------------------------------------------------------------
     // Pseudonyms / routing (§9.10.4, §5.14)
@@ -1645,7 +1676,7 @@ pub struct PerContextState {
     /// never holds a whole `&mut PerContextState` outside a fail-closed view. The `&mut`
     /// in the snapshot/serialization paths (`build_snapshot_from_state`) reads it
     /// shared. ADR-049 §9.
-    pub class_s: ClassSState,
+    pub(in crate::context) class_s: ClassSState,
 
     /// Scratchpad held during multi-step MLS Welcome processing. `None`
     /// outside an active Welcome flow.
@@ -1667,11 +1698,207 @@ pub struct PerContextState {
 /// validation and auto-assigns the creator to the `admin` role. The
 /// skeleton test path does not touch role logic, so a hand-rolled
 /// empty shape is sufficient.
+#[cfg(any(test, feature = "testing"))]
 fn empty_role_state_for_test() -> ContextRoleState {
     // ADR-049 §9: `ContextRoleState`'s `ceiling` / `suspended_capabilities` fields
     // are private, so the skeleton is built via the crate's `empty_for_test`
     // constructor rather than a cross-crate struct literal.
     ContextRoleState::empty_for_test()
+}
+
+/// Read access to the five fields that stay restricted to core.
+///
+/// `governance`, `epoch`, `access`, `ttl` and `class_s` keep their core-only
+/// field visibility, so no code outside core can write a `PerContextState`
+/// struct literal (ADR-070 §4). A domain crate reads them through these
+/// accessors, on a `PerContextState` that only core hands out: through a
+/// [`ClassSCell`](crate::context::actor::class_s::ClassSCell) `Deref`, or
+/// through the views its commit combinators lend.
+impl PerContextState {
+    /// The governance bucket. Domain crates call it on a state core lent them.
+    #[must_use]
+    pub const fn governance(&self) -> &GovernanceState {
+        &self.governance
+    }
+
+    /// The MLS epoch and reconnection state. Domain crates call it on a state
+    /// core lent them.
+    #[must_use]
+    pub const fn epoch(&self) -> &EpochState {
+        &self.epoch
+    }
+
+    /// The access-control state. Domain crates call it on a state core lent
+    /// them.
+    #[must_use]
+    pub const fn access(&self) -> &AccessControlState {
+        &self.access
+    }
+
+    /// The TTL timer and extension state. Domain crates call it on a state core
+    /// lent them.
+    #[must_use]
+    pub const fn ttl(&self) -> &TtlState {
+        &self.ttl
+    }
+
+    /// The Class-S state, read-only. A Class-S write goes through a
+    /// `ClassSCell` commit combinator. Domain crates call it on a state core
+    /// lent them.
+    #[must_use]
+    pub const fn class_s(&self) -> &ClassSState {
+        &self.class_s
+    }
+
+    /// `&mut` to the governance bucket. A live `&mut PerContextState` reaches a
+    /// domain crate only inside a Class-S commit (`ClassSMut::rest_mut`), so a
+    /// write through it rides that commit's fail-closed persist (ADR-049 §9,
+    /// ADR-070 §4).
+    pub const fn governance_mut(&mut self) -> &mut GovernanceState {
+        &mut self.governance
+    }
+
+    /// `&mut` to the MLS epoch bucket. Same reach as [`Self::governance_mut`].
+    pub const fn epoch_mut(&mut self) -> &mut EpochState {
+        &mut self.epoch
+    }
+
+    /// `&mut` to the access-control bucket. Same reach as
+    /// [`Self::governance_mut`].
+    pub const fn access_mut(&mut self) -> &mut AccessControlState {
+        &mut self.access
+    }
+
+    /// `&mut` to the TTL bucket. Same reach as [`Self::governance_mut`].
+    pub const fn ttl_mut(&mut self) -> &mut TtlState {
+        &mut self.ttl
+    }
+
+    /// `&mut` to the Class-S durable bucket. Same reach as
+    /// [`Self::governance_mut`].
+    pub const fn class_s_mut(&mut self) -> &mut ClassSState {
+        &mut self.class_s
+    }
+}
+
+/// The values a lifecycle path (create, import or restore) supplies to build a
+/// context's actor state through [`PerContextState::from_parts`]. Core fills
+/// every field this struct leaves out (ADR-070 §4).
+pub struct ContextStateParts {
+    /// The canonical 32-byte context-id digest (ADR-056).
+    pub context_id: [u8; 32],
+    /// The convergent creator-assigned creation time, the TTL deadline base.
+    pub creation_timestamp_secs: u64,
+    /// The shared, immutable context handle.
+    pub handle: ContextHandle,
+    /// The membership roster.
+    pub membership: MembershipState,
+    /// The current member DIDs.
+    pub members: HashSet<DID>,
+    /// Role definitions and assignments.
+    pub role_state: ContextRoleState,
+    /// The broadcast roster, `Some` exactly for a broadcast context.
+    pub broadcast_context: Option<ProtocolBroadcastContext>,
+    /// An in-flight context migration, restored from a snapshot.
+    pub migration_state: Option<MigrationState>,
+    /// The governance bucket.
+    pub governance: GovernanceState,
+    /// The MLS epoch bucket.
+    pub epoch: EpochState,
+    /// The access-control bucket.
+    pub access: AccessControlState,
+    /// The commit retry queue.
+    pub pending_commits: VecDeque<PendingCommit>,
+    /// The commit fail-close marker.
+    pub commit_fault: Option<CommitFaultMarker>,
+    /// Events since the last consistency checkpoint (spec 09 §9.9.3).
+    pub checkpoint_events_since: u64,
+    /// The last consistency-checkpoint time.
+    pub checkpoint_last_time_secs: u64,
+    /// The routing axis (spec 09 §9.10.4).
+    pub routing: ContextRouting,
+    /// The relays hosting the context (spec 05 §5.12.3.1).
+    pub relay_urls: Vec<String>,
+    /// The Class-S durable state (ADR-049 §9).
+    pub class_s: ClassSState,
+    /// The mode-discriminated crypto state.
+    pub mode: ContextModeState,
+}
+
+impl PerContextState {
+    /// Builds a context's actor state from `parts`. The only way to build a
+    /// `PerContextState` outside core in a build without `testing`: the
+    /// `&ActorDeps` parameter, which only core constructs, restricts the
+    /// callers to the domain crates core lends a dependency bundle to
+    /// (ADR-070 §4). Core fills the TTL timer from `deps.clock`, stamps
+    /// `created_at` from it, and starts every per-instance buffer and tracker
+    /// fresh, with `generation` 0 until the spawn stamps it.
+    #[must_use]
+    pub fn from_parts(
+        deps: &crate::context::actor::deps::ActorDeps,
+        parts: ContextStateParts,
+    ) -> Self {
+        let ContextStateParts {
+            context_id,
+            creation_timestamp_secs,
+            handle,
+            membership,
+            members,
+            role_state,
+            broadcast_context,
+            migration_state,
+            governance,
+            epoch,
+            access,
+            pending_commits,
+            commit_fault,
+            checkpoint_events_since,
+            checkpoint_last_time_secs,
+            routing,
+            relay_urls,
+            class_s,
+            mode,
+        } = parts;
+        Self {
+            context_id,
+            created_at: deps.clock.now_secs(),
+            creation_timestamp_secs,
+            generation: 0,
+            handle,
+            membership,
+            members,
+            role_state,
+            event_log: None,
+            receive_buffer: ReceiveBuffer::new(),
+            payment_receipts: VecDeque::new(),
+            broadcast_context,
+            migration_state,
+            governance,
+            epoch,
+            access,
+            ttl: TtlState {
+                timer: crate::context::ttl::TtlTimer::with_clock(Arc::clone(&deps.clock)),
+                extension: None,
+            },
+            routing,
+            relay_urls,
+            sequence_tracker: SequenceTracker::new(),
+            reorder_buffer: ReorderBuffer::default(),
+            pending_commits,
+            commit_fault,
+            checkpoint_events_since,
+            checkpoint_last_time_secs,
+            checkpoints: Vec::new(),
+            last_seen_remote_checkpoint: HashMap::new(),
+            send_tracker: SendSequenceTracker::new(),
+            recv_tracker: RecvSequenceTracker::new(),
+            xctx_ucan_proofs: InMemoryProofResolver::new(),
+            class_s,
+            welcome_scratchpad: None,
+            lifecycle_state: ContextLifecycleState::Open,
+            mode,
+        }
+    }
 }
 
 impl PerContextState {
@@ -1716,7 +1943,12 @@ impl PerContextState {
     pub const fn saga_pending(&self) -> &HashMap<SagaId, SagaPreparedState> {
         &self.class_s.saga_pending
     }
+}
 
+/// Test-only constructors, compiled only under `testing`, so no production or
+/// bridge build can build a `PerContextState` outside core (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl PerContextState {
     /// Construct a fresh encrypted-mode actor state for test use. Populates
     /// every field with a sensible default (empty collections, zero
     /// counters, `None` optionals). The production construction path
@@ -1848,6 +2080,7 @@ impl PerContextState {
 /// Encode a 32-byte context ID as lowercase hex. Used by test fixtures
 /// to derive stable string identifiers for the fields that require a
 /// `String` context ID (`NonceTracker`, `EventLog`, `ContextHandle`).
+#[cfg(any(test, feature = "testing"))]
 fn hex_encode_context_id(id: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in id {
@@ -1911,6 +2144,26 @@ pub struct RotationPreimage {
 }
 
 impl ContextCryptoState {
+    /// Test-only reach into [`Self::enqueue_distribution`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn enqueue_distribution_for_test(
+        pending_distributions: &mut Vec<PendingDistribution>,
+        target_did: String,
+        recipient_key: Vec<u8>,
+        epoch: u64,
+        message: Vec<u8>,
+    ) {
+        Self::enqueue_distribution(
+            pending_distributions,
+            target_did,
+            recipient_key,
+            epoch,
+            message,
+        );
+    }
+
     /// Queues a pushed distribution of `epoch` to `target_did`, sealed to the
     /// target's wrapping key `recipient_key`, for publish (spec 09 §9.16.9
     /// "A distribution whose publish fails"). It replaces any distribution
@@ -1921,7 +2174,7 @@ impl ContextCryptoState {
     ///
     /// Takes the queue as a field of one [`ContextCryptoState`], so each call
     /// site names the queue it fills.
-    pub fn enqueue_distribution(
+    pub(crate) fn enqueue_distribution(
         pending_distributions: &mut Vec<PendingDistribution>,
         target_did: String,
         recipient_key: Vec<u8>,
@@ -2299,7 +2552,7 @@ impl ContextCryptoState {
     /// verification, freshness, nonce-replay, a mode/group mismatch, or a
     /// non-member requester (§9.16.6 Mitigation 1), or HPKE / serialization
     /// failure.
-    pub fn handle_sender_key_request(
+    pub fn handle_sender_key_request<S: std::hash::BuildHasher>(
         &mut self,
         context_id: &[u8; 32],
         local_did: &str,
@@ -2309,7 +2562,7 @@ impl ContextCryptoState {
         // width in the type so a mis-sized key is a compile error, not a runtime
         // signature failure. Every caller already passes `VerifyingKey::as_bytes()`.
         requester_public_key: &[u8; 32],
-        blocked_dids: &std::collections::HashSet<String>,
+        blocked_dids: &std::collections::HashSet<String, S>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
         let ctx_id_hex = hex::encode(context_id);
 
@@ -2531,6 +2784,20 @@ impl ContextCryptoState {
 // the `--no-default-features` lib build); the block-wide allow was narrowed
 // away (#2148 F9) so a genuinely-unwired future method is not masked.
 impl PerContextState {
+    /// Test-only reach into [`Self::encrypted_crypto_mut`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::encrypted_crypto_mut`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn encrypted_crypto_mut_for_test(
+        &mut self,
+    ) -> Result<&mut ContextCryptoState, ContextError> {
+        Self::encrypted_crypto_mut(self)
+    }
+
     /// `&mut` access to the encrypted-mode crypto state, or the provider's
     /// `"no MLS group for this context"` error when this actor is a broadcast
     /// context (a single actor's [`PerContextState`] is exactly one mode).
@@ -2539,7 +2806,7 @@ impl PerContextState {
     ///
     /// The provider's `"no MLS group for this context"` error when this actor is a broadcast
     /// context.
-    pub fn encrypted_crypto_mut(&mut self) -> Result<&mut ContextCryptoState, ContextError> {
+    fn encrypted_crypto_mut(&mut self) -> Result<&mut ContextCryptoState, ContextError> {
         match &mut self.mode {
             ContextModeState::Encrypted(crypto) => Ok(crypto.as_mut()),
             ContextModeState::Broadcast(_) => Err(ContextError::CryptoFailed(
@@ -2626,6 +2893,15 @@ impl PerContextState {
         }
     }
 
+    /// Test-only reach into [`Self::dispose_secrets`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn dispose_secrets_for_test(&mut self) -> DisposalOutcome {
+        Self::dispose_secrets(self)
+    }
+
     /// Disposes this actor's per-context MLS crypto secrets (Encrypted mode
     /// only; a no-op for Broadcast), delegating to
     /// [`ContextCryptoState::dispose_secrets`]. Called on failed-spawn /
@@ -2649,7 +2925,7 @@ impl PerContextState {
     /// invariant; a caller that discards it (a creation-rollback / shutdown path
     /// that builds no attestation) does so explicitly via `let _ = …`.
     #[must_use]
-    pub fn dispose_secrets(&mut self) -> DisposalOutcome {
+    pub(crate) fn dispose_secrets(&mut self) -> DisposalOutcome {
         match &mut self.mode {
             ContextModeState::Encrypted(crypto) => crypto.dispose_secrets(),
             ContextModeState::Broadcast(_) => DisposalOutcome::observed(false, false),
@@ -2766,6 +3042,23 @@ impl PerContextState {
         })
     }
 
+    /// Test-only reach into [`Self::add_member`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::add_member`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn add_member_for_test(
+        &mut self,
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+        clock: &dyn Clock,
+    ) -> Result<AddMemberOutput, ContextError> {
+        Self::add_member(self, member_did, key_package_bytes, clock)
+    }
+
     /// Adds a member to the MLS group by their optional TLS-serialized
     /// `KeyPackage` bytes, operating on THIS actor's OWNED `ScpMlsGroup`.
     ///
@@ -2789,7 +3082,7 @@ impl PerContextState {
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
     /// `KeyPackage`, no `KeyPackage` in production, or any MLS / serialization
     /// failure.
-    pub fn add_member(
+    pub(crate) fn add_member(
         &mut self,
         member_did: &str,
         key_package_bytes: Option<&[u8]>,
@@ -2806,7 +3099,7 @@ impl PerContextState {
         // exercise the non-crypto pipeline (role state sync, event logging,
         // governance side effects) — byte-for-byte with
         // `NodeMlsFactory::add_member`.
-        if cfg!(any(test, feature = "testing")) {
+        if scp_runtime_types::TESTING {
             let _ = member_did; // used only by the real path
             return Ok(AddMemberOutput::default());
         }
@@ -3054,6 +3347,23 @@ impl PerContextState {
         matches!(&self.mode, ContextModeState::Encrypted(crypto) if crypto.sender_key_rotation_pending)
     }
 
+    /// Test-only reach into [`Self::distribute_sender_key`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::distribute_sender_key`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn distribute_sender_key_for_test(
+        &mut self,
+        local_did: &str,
+        member_did: &str,
+        events: Option<&ContextEventTx>,
+    ) -> Result<(), ContextError> {
+        Self::distribute_sender_key(self, local_did, member_did, events)
+    }
+
     /// Distributes the local sender key to `member_did` (ADR-007), verbatim from
     /// the former provider `distribute_sender_key`. `local_did` enters as a
     /// parameter (node-resident).
@@ -3064,7 +3374,7 @@ impl PerContextState {
     /// serialization failure. A member with no wrapping key gets no
     /// distribution; that is reported on `events` as not built and is not an
     /// error (spec 09 §9.16.9).
-    pub fn distribute_sender_key(
+    pub(crate) fn distribute_sender_key(
         &mut self,
         local_did: &str,
         member_did: &str,
@@ -3282,16 +3592,31 @@ impl PerContextState {
         Ok(())
     }
 
+    /// Test-only reach into [`Self::drain_pending_sender_key_messages`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::drain_pending_sender_key_messages`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn drain_pending_sender_key_messages_for_test(
+        &mut self,
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        Self::drain_pending_sender_key_messages(self)
+    }
+
     /// Drains pending sender-key distribution messages, verbatim from the
     /// former provider `drain_pending_sender_key_messages`.
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch.
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures and,
+    // under `testing`, its `_for_test` twin above; targeted (not block-wide) so a
+    // genuinely-unwired future method still trips.
     #[allow(dead_code)]
-    pub fn drain_pending_sender_key_messages(
+    pub(crate) fn drain_pending_sender_key_messages(
         &mut self,
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
         let crypto = self.encrypted_crypto_mut()?;
@@ -3301,19 +3626,42 @@ impl PerContextState {
             .collect())
     }
 
+    /// Test-only reach into [`Self::set_sender_key_unchecked`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_sender_key_unchecked_for_test(&mut self, sender_did: &str, sender_key: SenderKey) {
+        Self::set_sender_key_unchecked(self, sender_did, sender_key);
+    }
+
     /// Installs an AUTHENTICATED sender key WITHOUT epoch gating, verbatim from
     /// the former provider `set_sender_key_unchecked`. A no-op when this actor
     /// is not encrypted-mode.
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures and,
+    // under `testing`, its `_for_test` twin above; targeted (not block-wide) so a
+    // genuinely-unwired future method still trips.
     #[allow(dead_code)]
-    pub fn set_sender_key_unchecked(&mut self, sender_did: &str, sender_key: SenderKey) {
+    pub(crate) fn set_sender_key_unchecked(&mut self, sender_did: &str, sender_key: SenderKey) {
         let ctx_id_hex = hex::encode(self.context_id);
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
             crypto
                 .sender_key_store
                 .set_unchecked(&ctx_id_hex, sender_did, sender_key);
         }
+    }
+
+    /// Test-only reach into [`Self::group_context_extension`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::group_context_extension`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn group_context_extension_for_test(
+        &self,
+    ) -> Result<Option<ScpContextExtension>, ContextError> {
+        Self::group_context_extension(self)
     }
 
     /// Reads the replicated `0xFF02` group-context extension off this actor's
@@ -3326,10 +3674,13 @@ impl PerContextState {
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or a malformed
     /// extension payload.
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures and,
+    // under `testing`, its `_for_test` twin above; targeted (not block-wide) so a
+    // genuinely-unwired future method still trips.
     #[allow(dead_code)]
-    pub fn group_context_extension(&self) -> Result<Option<ScpContextExtension>, ContextError> {
+    pub(crate) fn group_context_extension(
+        &self,
+    ) -> Result<Option<ScpContextExtension>, ContextError> {
         let ContextModeState::Encrypted(crypto) = &self.mode else {
             return Err(ContextError::CryptoFailed(
                 "no MLS group for this context".to_string(),
@@ -3455,6 +3806,18 @@ impl PerContextState {
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")))
     }
 
+    /// Test-only reach into [`Self::destroy_mls_group`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::destroy_mls_group`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn destroy_mls_group_for_test(&mut self) -> Result<(), ContextCreationError> {
+        Self::destroy_mls_group(self)
+    }
+
     /// Destroys the MLS group for this context (creation rollback).
     ///
     /// #2148 (birth-into-actor): the provider's `destroy_mls_group` is DELETED;
@@ -3485,10 +3848,11 @@ impl PerContextState {
         reason = "signature stability so callers can swap between the minimal \
                   group-null and whole-crypto `dispose_secrets` with no shape change"
     )]
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures and,
+    // under `testing`, its `_for_test` twin above; targeted (not block-wide) so a
+    // genuinely-unwired future method still trips.
     #[allow(dead_code)]
-    pub fn destroy_mls_group(&mut self) -> Result<(), ContextCreationError> {
+    pub(crate) fn destroy_mls_group(&mut self) -> Result<(), ContextCreationError> {
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
             if let Some(group) = crypto.mls_group.as_mut() {
                 let _ = scp_mls::group::destroy_group(group);
@@ -3496,6 +3860,18 @@ impl PerContextState {
             crypto.mls_group = None;
         }
         Ok(())
+    }
+
+    /// Test-only reach into [`Self::destroy_sender_key`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::destroy_sender_key`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn destroy_sender_key_for_test(&mut self) -> Result<(), ContextCreationError> {
+        Self::destroy_sender_key(self)
     }
 
     /// Destroys (rotates out) the local sender key and clears the per-context
@@ -3514,10 +3890,11 @@ impl PerContextState {
         clippy::unnecessary_wraps,
         reason = "signature stability with the sibling `destroy_mls_group` teardown op"
     )]
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures and,
+    // under `testing`, its `_for_test` twin above; targeted (not block-wide) so a
+    // genuinely-unwired future method still trips.
     #[allow(dead_code)]
-    pub fn destroy_sender_key(&mut self) -> Result<(), ContextCreationError> {
+    pub(crate) fn destroy_sender_key(&mut self) -> Result<(), ContextCreationError> {
         let ctx_id_hex = hex::encode(self.context_id);
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
             // Overwrite with a fresh key then clear stored member keys — ensures

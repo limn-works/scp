@@ -12,83 +12,38 @@ categories = ["cryptography", "network-programming"]
 [features]
 # Turns on the `testing`-gated command variants of `scp-runtime-core` together with
 # this crate's match arms for them (ADR-070 plan §4, unification hazard), and the
-# `testing_access` module sibling domain crates' tests call. Only test builds enable it.
+# `testing_access` module other runtime crates' tests call. Only test builds enable it.
 testing = ["scp-runtime-core/testing", "scp-runtime-types/testing"]
 
 [dependencies]
-scp-runtime-types = { path = "../scp-runtime-types", version = "=0.1.0-beta.2" }
-scp-runtime-core = { path = "../scp-runtime-core", version = "=0.1.0-beta.2" }
-openmls = { workspace = true }
-openmls_traits = { workspace = true }
-openmls_basic_credential = { workspace = true }
-openmls_rust_crypto = { workspace = true }
-openmls_memory_storage = { workspace = true }
+scp-runtime-types = { workspace = true }
+scp-runtime-core = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true, features = ["rt"] }
-serde = { workspace = true }
-thiserror = { workspace = true }
 rmp-serde = { workspace = true }
-rmpv = { workspace = true }
-scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
-scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
-scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
-# The push registrar maps relay `ERR` codes through `scp_relay_client::code`.
-scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
-scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
-scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
+scp-clock = { workspace = true }
+scp-crypto = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+scp-platform = { workspace = true }
+scp-event-log = { workspace = true }
 async-trait = { workspace = true }
-aes = { workspace = true }
-rand = { workspace = true }
 sha2 = { workspace = true }
-serde_bytes = { workspace = true }
 serde_json = { workspace = true }
-z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
-bs58 = { workspace = true }
-uuid = { workspace = true }
-lru = { workspace = true }
 tracing = { workspace = true }
-zeroize = { workspace = true, features = ["serde"] }
-subtle = { workspace = true }
-unicode-normalization = { workspace = true }
-metrics = { workspace = true }
-dashmap = { workspace = true }
-arc-swap = { workspace = true }
-futures = { workspace = true }
 
 [dev-dependencies]
-# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
-scp-crypto = { path = "../scp-crypto", features = ["testing"] }
-# The §25 vector tests read Vector 41's log through `validate_entry`, the
-# validated chain the node binding, node-list record and context operator
-# binding verifiers take (09-security-model.md §9.7.1 log-anchored class).
-scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
+scp-crypto = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-# The discovery test modules construct `InMemoryDhtClient` (now gated behind
-# `scp-dht/testing`); activate it for this crate's own test build (ADR-062
-# §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["testing"] }
-scp-mls = { path = "../scp-mls", features = ["testing"] }
-scp-protocol = { path = "../scp-protocol", features = ["testing"] }
-# `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
-# `ProtocolRepository::new`: `FilesystemStorage` is a plaintext backend that a
-# `compile_fail,E0277` assertion proves cannot reach a production constructor.
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing", "encrypting", "filesystem"] }
-scp-event-log = { path = "../scp-event-log", features = ["testing"] }
-openmls_basic_credential = { workspace = true, features = ["test-utils"] }
-proptest = "1"
-static_assertions = { workspace = true }
-metrics-util = "0.19"
-# The 12 sibling domains, so this crate's tests build a Supervisor with every domain
-# installed (`test_support::test_domain_handlers`) and call the items a sibling exposes in
-# its `testing_access` module. No `version`: `cargo publish` strips them, and no domain
-# crate has a non-dev dependency on a sibling (ADR-070 §3).
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-platform = { workspace = true, features = ["testing", "encrypting"] }
+scp-event-log = { workspace = true, features = ["testing"] }
+# The 12 sibling domains: `test_support::test_domain_handlers` installs every domain in
+# this crate's test Supervisor, and the tests call the `testing_access` items of
+# `scp-runtime-governance`, `scp-runtime-lifecycle` and `scp-runtime-ttl-close`. No `version`: `cargo publish` strips them, and no
+# domain crate has a non-dev dependency on a sibling (ADR-070 §3).
 scp-runtime-messaging = { path = "../scp-runtime-messaging", features = ["testing"] }
 scp-runtime-lifecycle = { path = "../scp-runtime-lifecycle", features = ["testing"] }
 scp-runtime-governance = { path = "../scp-runtime-governance", features = ["testing"] }

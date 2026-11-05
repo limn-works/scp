@@ -110,11 +110,11 @@ pub fn authorize_paid_action_prepare(
 ) -> Option<OwnedAuthInputs> {
     let adapter = deps.payment_adapter.as_ref().map(Arc::clone)?;
 
-    let policy = state.governance.economic_policy.clone();
+    let policy = state.governance().economic_policy.clone();
     let member_count = u64::try_from(state.membership.count()).unwrap_or(u64::MAX);
     let now_secs = deps.clock.now_secs();
     let velocity = state
-        .governance
+        .governance()
         .velocity_tracker
         .get_velocity(payer_did, now_secs);
 
@@ -122,7 +122,7 @@ pub fn authorize_paid_action_prepare(
         sender_velocity: velocity,
         member_count,
         context_message_rate: state
-            .governance
+            .governance()
             .velocity_tracker
             .aggregate_velocity(now_secs),
         relay_queue_depth: 0,
@@ -340,12 +340,7 @@ pub fn emit_payment_received_event(
         action: paid_action_label(&receipt.action_type).to_owned(),
         anchored: false,
     };
-    scp_runtime_core::context::state::emit_event_into(
-        receive_buffer,
-        event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    deps.emit_event_into(receive_buffer, event, context_id);
 }
 
 /// Maps a [`PaidActionType`] to the canonical action label carried in

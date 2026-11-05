@@ -677,7 +677,7 @@ async fn handle_reserve_stream_caveat_counter(
     // unchanged on exhaustion; consuming a clone means a rejection touches no
     // owned state and triggers no persist.
     let mut record = cell
-        .class_s
+        .class_s()
         .caveat_counters
         .get(ucan_cid)
         .cloned()
@@ -697,7 +697,7 @@ async fn handle_reserve_stream_caveat_counter(
     let ucan_cid_owned = ucan_cid.to_owned();
     let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
         view.rest_mut()
-            .class_s
+            .class_s_mut()
             .caveat_counters
             .insert(ucan_cid_owned, record);
         Ok(())
@@ -749,7 +749,7 @@ async fn handle_release_stream_caveat_counter(
     let ucan_cid_owned = ucan_cid.to_owned();
     let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
         view.rest_mut()
-            .class_s
+            .class_s_mut()
             .caveat_counters
             .entry(ucan_cid_owned)
             .or_default()
@@ -803,7 +803,7 @@ async fn handle_persist_stream_reservation(
     record.generation = cell.generation;
     let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
         view.rest_mut()
-            .class_s
+            .class_s_mut()
             .stream_reservations
             .insert(key, record);
         Ok(())
@@ -857,7 +857,7 @@ async fn handle_reconcile_stream_reservations(
     // Nothing to reconcile — reply without a spurious durable write. The common
     // case: a clean restart where every stream settled cleanly (its record was
     // cleared at close).
-    if cell.class_s.stream_reservations.is_empty() {
+    if cell.class_s().stream_reservations.is_empty() {
         let _ = reply.send(Ok(0));
         return Outcome::ok(());
     }

@@ -100,47 +100,6 @@ impl scp_runtime_core::context::domains::GovernanceDomain for Governance {
         )
     }
 
-    fn execute_propose_context_migration<'a>(
-        &'a self,
-        cell: &'a mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &'a scp_runtime_core::context::actor::deps::ActorDeps,
-        proposal: scp_runtime_core::context::domains::ProposeMigrationRequest<'a>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        scp_runtime_core::context::state::MigrationProposedResult,
-                        scp_protocol::context::ContextError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        crate::helpers::execute_propose_context_migration(
-            cell,
-            deps,
-            proposal.context_id,
-            proposal.new_context_params,
-            proposal.reason,
-            proposal.grace_period_secs,
-            proposal.auto_invite,
-            proposal.meta,
-            proposal.bootstrap,
-        )
-    }
-
-    async fn execute_revoke(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        context_id: &str,
-        did: &scp_did::DID,
-        access: scp_protocol::context::governance::AccessScope,
-        meta: scp_runtime_core::context::shared::governance::CommitMeta<'_>,
-    ) -> Result<usize, scp_protocol::context::ContextError> {
-        crate::helpers::execute_revoke(cell, deps, context_id, did, access, meta).await
-    }
-
     async fn keep_broadcast_failure(
         &self,
         cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,

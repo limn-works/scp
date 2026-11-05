@@ -4,7 +4,8 @@
 //! *live* scp-runtime message pipeline end to end — both halves of the wiring
 //! this story makes real:
 //!
-//! - **Send side (Part 2).** [`scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor`]
+//! - **Send side (Part 2).** `build_encrypted_envelope_actor`, reached here
+//!   through [`scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor_for_test`]
 //!   — the production actor app-data seal the live `Supervisor::send_message` →
 //!   `messaging_helpers::send_message` → `encrypt_and_send` chain bottoms out in
 //!   — stamps the caller's chosen [`SigningKeyId`] into
@@ -80,7 +81,9 @@ use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
 use crate::helpers::verify_and_unwrap;
 use scp_runtime_core::context::actor::state::PerContextState;
-use scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor;
+use scp_runtime_core::context::shared::messaging::{
+    EncryptedEnvelopeRequest, build_encrypted_envelope_actor_for_test,
+};
 use scp_runtime_core::context::supervisor::MessageSigner;
 
 const ALICE_DID: &str = "did:dht:z6MkAgentBindingPipelineAliceAliceAliceA";
@@ -231,21 +234,23 @@ async fn build_send_blob(
         .mode
         .crypto_mut()
         .expect("agent-binding pipeline test uses encrypted mode");
-    build_encrypted_envelope_actor(
+    build_encrypted_envelope_actor_for_test(
         &clock,
         crypto_state,
         ALICE_DID,
-        ctx_str,
-        &sender,
-        payload,
-        signer,
-        &recipients,
-        0,
-        None,
-        MessageType::Content,
+        EncryptedEnvelopeRequest {
+            context_id: ctx_str,
+            sender_did: &sender,
+            payload,
+            signer,
+            recipients_data: &recipients,
+            aad_sequence: 0,
+            source_provenance: None,
+            message_type: MessageType::Content,
+        },
     )
     .await
-    .expect("build_encrypted_envelope_actor")
+    .expect("build_encrypted_envelope_actor_for_test")
 }
 
 /// Receive half: MLS-open the captured blob on Bob's owned actor state, then
@@ -734,7 +739,7 @@ mod live_supervisor_send {
 &bob_wrapping, &bob_actor.context_id, &sender_did, &payload)
                         .await
                         .expect("bob processes Alice's sender key");
-                    bob_actor.set_sender_key_unchecked(&sender_did, key);
+                    bob_actor.set_sender_key_unchecked_for_test(&sender_did, key);
                 }
                 OpenResult::Commit { .. } | OpenResult::Control => {}
                 OpenResult::Application(_) => {

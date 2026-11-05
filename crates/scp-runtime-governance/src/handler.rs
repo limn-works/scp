@@ -51,7 +51,7 @@ use scp_runtime_core::context::actor::commands::{
     VoteOnProposalReply,
 };
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 use scp_runtime_core::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
 use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
@@ -203,39 +203,6 @@ async fn dispatch_state(
             ))
             .await
         }
-        GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(cell, deps, reply).await
-        }
-        GovernanceCommand::ProcessPendingCommits { reply } => {
-            Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
-        }
-    }
-}
-
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink given a borrowed error that cannot be
-/// cloned. Mirrors the pattern used in
-/// `handlers::messaging`
-/// and `handlers::lifecycle`.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
-        ContextError::ProposalIdMismatch { id, recomputed } => ContextError::ProposalIdMismatch {
-            id: id.clone(),
-            recomputed: recomputed.clone(),
-        },
-        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
 
@@ -795,7 +762,7 @@ async fn handle_evaluate_periodic_consequences_actor(
     // Reads of the Class-C consequence config / membership go through the
     // cell's `Deref` (`&PerContextState`); no whole-state `&mut` is taken until
     // the enforcement loop, which routes through the Class-C view.
-    let rules = cell.governance.consequence_rules.clone();
+    let rules = cell.governance().consequence_rules.clone();
     if rules.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
@@ -1220,15 +1187,15 @@ pub async fn evaluate_governance_timeouts(
 
     let current_members: HashSet<DID> = cell.membership.members().map(|m| m.did.clone()).collect();
     let departed: Vec<DID> = cell
-        .governance
+        .governance()
         .last_known_members
         .difference(&current_members)
         .cloned()
         .collect();
 
-    let mls_epoch = cell.epoch.mls_epoch;
-    let recovery_in_progress = cell.governance.deadlock.recovery_in_progress;
-    let active_voters = collect_active_voters(cell.governance.engine.as_ref());
+    let mls_epoch = cell.epoch().mls_epoch;
+    let recovery_in_progress = cell.governance().deadlock.recovery_in_progress;
+    let active_voters = collect_active_voters(cell.governance().engine.as_ref());
 
     // Class-C writes: refresh the last-known-member set, evict stale liveness
     // entries, drain the epoch-reset queue. Each is a short-lived view borrow.
@@ -1478,12 +1445,15 @@ mod consequence_fail_closed_tests {
         }
         // The consequence rule: a non-convergent MessageVelocity trigger whose
         // action is SuspendAccess (suspend every held capability).
-        state.governance.consequence_rules.push(ConsequenceRule {
-            trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-            threshold: 1,
-            window: Duration::from_hours(1),
-        });
+        state
+            .governance_mut()
+            .consequence_rules
+            .push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: Duration::from_hours(1),
+            });
         state
     }
 
@@ -1500,7 +1470,7 @@ mod consequence_fail_closed_tests {
             .await
             .expect("init log");
         deps.event_log.release_event_log(&[CTX_BYTE; 32]);
-        let mut cell = ClassSCell::new(seed_state());
+        let mut cell = ClassSCell::new_for_test(seed_state());
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ =
@@ -1523,7 +1493,7 @@ mod consequence_fail_closed_tests {
     #[tokio::test]
     async fn periodic_sweep_suspension_persists_fail_closed() {
         let deps = build_fail_closed_deps().await;
-        let mut cell = ClassSCell::new(seed_state());
+        let mut cell = ClassSCell::new_for_test(seed_state());
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let outcome =
@@ -1576,7 +1546,7 @@ mod consequence_fail_closed_tests {
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
         // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
         // under its DECODED digest. Resolve the explicit arg the same way the
@@ -1635,7 +1605,7 @@ mod consequence_fail_closed_tests {
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
         // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
         // under its DECODED digest. Resolve the explicit arg the same way the
@@ -1706,21 +1676,6 @@ mod consequence_fail_closed_tests {
             .suspended_for(SUBJECT)
             .expect("SUBJECT must have been suspended by the receive-path consequence");
         assert!(suspended.contains(&Capability::MessagesWrite));
-    }
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    mod outcome_sketch_tests {
-        use super::super::{ContextError, outcome_error_sketch};
-
-        #[test]
-        fn sketch_keeps_supervisor_shut_down_typed() {
-            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-            assert!(
-                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-                "got {sketch:?}"
-            );
-        }
     }
 
     mod commit_retry_framing_tests {

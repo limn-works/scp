@@ -34,7 +34,7 @@ mod test_support;
 /// nowhere else; no production build compiles this module.
 #[cfg(feature = "testing")]
 pub mod testing_access {
-    pub use crate::helpers::{drain_and_deliver_sender_keys, leave_context};
+    pub use crate::helpers::{close_context, drain_and_deliver_sender_keys, leave_context};
 }
 
 /// The lifecycle domain's [`LifecycleDomain`](scp_runtime_core::context::domains::LifecycleDomain)
@@ -50,17 +50,6 @@ impl scp_runtime_core::context::domains::LifecycleDomain for Lifecycle {
         cmd: scp_runtime_core::context::actor::commands::LifecycleCommand,
     ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         handler::dispatch(cell, deps, cmd).await
-    }
-
-    async fn close_context(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        handle: &scp_runtime_core::context::ContextHandle,
-        initiator_did: &scp_did::DID,
-    ) -> Result<scp_runtime_core::context::ttl::CloseResult, scp_protocol::context::ContextError>
-    {
-        crate::helpers::close_context(cell, deps, handle, initiator_did).await
     }
 
     async fn create_context(
@@ -114,13 +103,6 @@ impl scp_runtime_core::context::domains::LifecycleDomain for Lifecycle {
         .await
     }
 
-    async fn restore_all_contexts(
-        &self,
-        supervisor: &std::sync::Arc<scp_runtime_core::context::supervisor::Supervisor>,
-    ) -> Result<Vec<String>, scp_protocol::context::ContextError> {
-        crate::helpers::restore_all_contexts(supervisor).await
-    }
-
     async fn restore_context(
         &self,
         deps: &scp_runtime_core::context::actor::deps::ActorDeps,
@@ -153,12 +135,5 @@ impl scp_runtime_core::context::domains::LifecycleDomain for Lifecycle {
         context_id: &str,
     ) {
         crate::helpers::rotate_sender_key_and_distribute(cell, deps, context_id).await;
-    }
-
-    async fn shutdown_all_contexts(
-        &self,
-        supervisor: &scp_runtime_core::context::supervisor::Supervisor,
-    ) {
-        crate::helpers::shutdown_all_contexts(supervisor).await;
     }
 }

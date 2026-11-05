@@ -98,6 +98,19 @@ pub fn migration_destination_id(context_id: &str, proposal_id: &ProposalId) -> S
 /// (`scp_runtime_governance::helpers::execute_propose_context_migration` takes this as a required argument).
 pub struct MigrationBootstrap {
     /// The held `bootstrap_spawn_lock`.
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The first-state guard that holds the destination id's claim.
+    pub first_state: crate::context::shared::lifecycle::FirstStateRollback,
+    /// The destination context id the claim covers.
+    pub destination_context_id: String,
+}
+
+/// A [`MigrationBootstrap`] split by [`MigrationBootstrap::into_parts`].
+///
+/// Holding one proves nothing: only the unsplit `MigrationBootstrap` proves
+/// the lock is held, so no function takes this as an argument.
+pub struct MigrationBootstrapParts {
+    /// The held `bootstrap_spawn_lock`.
     pub guard: tokio::sync::OwnedMutexGuard<()>,
     /// The first-state guard that holds the destination id's claim.
     pub first_state: crate::context::shared::lifecycle::FirstStateRollback,
@@ -106,33 +119,52 @@ pub struct MigrationBootstrap {
 }
 
 impl MigrationBootstrap {
-    /// Try-locks `bootstrap_spawn_lock`, then claims the destination id of
-    /// `proposal_id`'s migration. The caller is an actor turn, and the
-    /// lock's holders wait on actor mailboxes, so it never waits for the
-    /// lock.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock,
-    ///   or another operation's first state of the destination is unsettled;
-    ///   both are retryable.
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub fn reserve(
-        deps: &ActorDeps,
-        context_id: &str,
-        proposal_id: &ProposalId,
-    ) -> Result<Self, ContextError> {
-        let destination_context_id = migration_destination_id(context_id, proposal_id);
-        let guard = deps.supervisor.try_lock_bootstrap_spawn()?;
-        let first_state = crate::context::shared::lifecycle::FirstStateRollback::new(
-            deps,
-            &destination_context_id,
-        )?;
-        Ok(Self {
-            guard,
-            first_state,
-            destination_context_id,
-        })
+    /// Splits the reservation into the held `bootstrap_spawn_lock` guard, the
+    /// destination's first-state claim, and the destination id. The guard field
+    /// stays private so only [`Self::reserve`], which takes `&ActorDeps`, can
+    /// build a `MigrationBootstrap`; a holder therefore proves the lock is held
+    /// (ADR-070 §4).
+    #[must_use]
+    pub fn into_parts(self) -> MigrationBootstrapParts {
+        MigrationBootstrapParts {
+            guard: self.guard,
+            first_state: self.first_state,
+            destination_context_id: self.destination_context_id,
+        }
+    }
+
+    scp_runtime_types::pub_under_testing! {
+        /// Try-locks `bootstrap_spawn_lock`, then claims the destination id of
+        /// `proposal_id`'s migration. The caller is an actor turn, and the
+        /// lock's holders wait on actor mailboxes, so it never waits for the
+        /// lock. It takes `&ActorDeps`, so only a domain crate running an actor
+        /// turn core lent it can call it (ADR-070 §4).
+        ///
+        /// # Errors
+        ///
+        /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock,
+        ///   or another operation's first state of the destination is unsettled;
+        ///   both are retryable.
+        /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+        ///
+        /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+        pub(crate) fn reserve(
+            deps: &ActorDeps,
+            context_id: &str,
+            proposal_id: &ProposalId,
+        ) -> Result<Self, ContextError> {
+            let destination_context_id = migration_destination_id(context_id, proposal_id);
+            let guard = deps.supervisor.try_lock_bootstrap_spawn()?;
+            let first_state = crate::context::shared::lifecycle::FirstStateRollback::new(
+                deps,
+                &destination_context_id,
+            )?;
+            Ok(Self {
+                guard,
+                first_state,
+                destination_context_id,
+            })
+        }
     }
 
     /// The bootstrap of `proposal`: `reserved` when the caller already

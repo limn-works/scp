@@ -60,7 +60,7 @@ fn test_handle() -> (Arc<Supervisor>, SupervisorHandle) {
         SupervisorConfig::default(),
         scp_runtime::domain_handlers(),
     ));
-    let handle = SupervisorHandle::wrap(&sup);
+    let handle = SupervisorHandle::wrap_for_test(&sup);
     (sup, handle)
 }
 
@@ -86,8 +86,8 @@ async fn handle_returns_supervisor_shut_down_after_owner_drops() {
     shut_down(handle.is_context_poisoned("ctx").map(drop));
     shut_down(handle.find_shared_context("a", "b").await.map(drop));
     shut_down(handle.update_context_gauges());
-    shut_down(handle.relay_contact_store().map(drop));
-    shut_down(handle.spawn_tracked("probe", async {}).map(drop));
+    shut_down(handle.relay_contact_store_for_test().map(drop));
+    shut_down(handle.spawn_tracked_for_test("probe", async {}).map(drop));
 }
 
 #[tokio::test]
@@ -105,9 +105,9 @@ async fn standing_peer_returns_none_when_unknown() {
 
 /// Minimal event log provider: accepts every call (these tests never
 /// touch the event log).
-struct NoopEventLog;
+struct NoOpEventLog;
 #[async_trait::async_trait]
-impl scp_runtime_core::context::builder::ContextEventLogProvider for NoopEventLog {
+impl scp_runtime_core::context::builder::ContextEventLogProvider for NoOpEventLog {
     fn event_log_entries(
         &self,
         _context_id: &[u8; 32],
@@ -165,7 +165,7 @@ async fn owner_deps(
     let sup = Supervisor::with_providers(
         crypto,
         Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider),
-        Box::new(NoopEventLog),
+        Box::new(NoOpEventLog),
         Arc::new(|_, _| None),
         Some(Box::new(TestPersistence)),
         None,
@@ -202,7 +202,7 @@ async fn my_wrapping_key_reports_shutdown_after_the_gate_closes() {
     let (sup, alice_deps) = owner_deps(&alice).await;
     let bob_deps = sup.build_actor_deps_loaded(&bob).await.expect("bob deps");
     sup.wrapping_keys_for_test().remove(&bob);
-    sup.close_spawn_gate();
+    sup.close_spawn_gate_for_test();
     assert!(matches!(
         bob_deps.my_wrapping_key(),
         Err(ContextError::SupervisorShutDown(_))
@@ -225,8 +225,8 @@ async fn my_wrapping_key_reads_the_owner_slot() {
         .insert(DID("did:example:bob".to_owned()), Arc::clone(&other));
     let got = deps.my_wrapping_key().unwrap();
     assert_eq!(got.public(), installed.public());
-    assert_eq!(got.handle(), installed.handle());
-    assert_ne!(got.handle(), other.handle());
+    assert_eq!(got.handle_for_test(), installed.handle_for_test());
+    assert_ne!(got.handle_for_test(), other.handle_for_test());
 }
 
 /// With the owner's slot empty the reader returns `None`, even while
@@ -239,7 +239,12 @@ async fn my_key_package_store_returns_none_when_unset() {
     let _bob_deps = sup.build_actor_deps_loaded(&bob).await.expect("bob deps");
     sup.key_package_stores_for_test().remove(&alice);
     assert!(sup.key_package_stores_for_test().contains_key(&bob));
-    assert!(alice_deps.my_key_package_store().unwrap().is_none());
+    assert!(
+        alice_deps
+            .my_key_package_store_for_test()
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -272,11 +277,11 @@ async fn my_key_package_store_returns_registered_handle() {
             .unwrap(),
     };
     sup.key_package_stores_for_test().remove(&did);
-    assert!(owner.my_key_package_store().unwrap().is_none());
+    assert!(owner.my_key_package_store_for_test().unwrap().is_none());
     let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
     sup.key_package_stores_for_test()
         .insert(did.clone(), kp_handle);
-    let got = owner.my_key_package_store().unwrap();
+    let got = owner.my_key_package_store_for_test().unwrap();
     assert!(got.is_some());
     if let Some(h) = got {
         h.send_shutdown().await.unwrap();

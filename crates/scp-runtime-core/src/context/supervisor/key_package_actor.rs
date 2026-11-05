@@ -771,11 +771,20 @@ pub struct KeyPackageStoreHandle {
 }
 
 impl KeyPackageStoreHandle {
+    /// Test-only reach into [`Self::from_sender`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn from_sender_for_test(inbox: mpsc::Sender<KeyPackageCommand>) -> Self {
+        Self::from_sender(inbox)
+    }
+
     /// Wraps a raw sender. `pub(in crate::context)` matches
     /// `ContextActorHandle::from_sender` — only the supervisor
     /// constructs handles.
     #[must_use]
-    pub const fn from_sender(inbox: mpsc::Sender<KeyPackageCommand>) -> Self {
+    pub(in crate::context) const fn from_sender(inbox: mpsc::Sender<KeyPackageCommand>) -> Self {
         Self { inbox }
     }
 
@@ -874,24 +883,28 @@ impl KeyPackageStoreHandle {
 // Actor dependencies
 // ---------------------------------------------------------------------------
 
-/// The owned collaborators a [`KeyPackageStoreActor`] needs. Assembled by the
-/// supervisor's `key_package_store_for` from its own provider slots and moved
-/// into the actor task at spawn time.
-pub struct KeyPackageStoreDeps {
-    /// MLS primitives backend — the replenish source AND the fused-join
-    /// executor (its `join_from_welcome` enforces the crypto-layer
-    /// consumed-init-key backstop).
-    pub mls: Arc<dyn MlsBackend>,
-    /// Durable KV for the Class-S reservation journal + KP records.
-    pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
-    /// Transport for the publish fan-out.
-    pub transport: Arc<dyn ContextTransportProvider>,
-    /// Wall-clock source for reservation timestamps.
-    pub clock: Arc<dyn Clock>,
-    /// The owning identity's wrapping key (spec 09 §9.16.1), shared with
-    /// the supervisor. Every KeyPackage publishes its public point in
-    /// `0xFF01`.
-    pub wrapping_key: Arc<IdentityWrappingKey>,
+scp_runtime_types::pub_under_testing! {
+    /// The owned collaborators a [`KeyPackageStoreActor`] needs. Assembled by the
+    /// supervisor's `key_package_store_for` from its own provider slots and moved
+    /// into the actor task at spawn time.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) struct KeyPackageStoreDeps {
+        /// MLS primitives backend — the replenish source AND the fused-join
+        /// executor (its `join_from_welcome` enforces the crypto-layer
+        /// consumed-init-key backstop).
+        pub mls: Arc<dyn MlsBackend>,
+        /// Durable KV for the Class-S reservation journal + KP records.
+        pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+        /// Transport for the publish fan-out.
+        pub transport: Arc<dyn ContextTransportProvider>,
+        /// Wall-clock source for reservation timestamps.
+        pub clock: Arc<dyn Clock>,
+        /// The owning identity's wrapping key (spec 09 §9.16.1), shared with
+        /// the supervisor. Every KeyPackage publishes its public point in
+        /// `0xFF01`.
+        pub wrapping_key: Arc<IdentityWrappingKey>,
+    }
 }
 
 // ---------------------------------------------------------------------------

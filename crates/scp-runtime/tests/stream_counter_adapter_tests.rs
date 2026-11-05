@@ -78,7 +78,7 @@ async fn supervisor_with_registered_context() -> Arc<Supervisor> {
         .await
         .expect("spawn_actor_with_state registers the live actor");
     assert!(
-        supervisor.lookup(&ctx_key()).is_some(),
+        supervisor.lookup_for_test(&ctx_key()).is_some(),
         "actor must be registered under the context key the adapter targets"
     );
     supervisor
@@ -94,7 +94,7 @@ async fn supervisor_with_registered_context() -> Arc<Supervisor> {
 #[tokio::test]
 async fn check_and_increment_admits_then_exhausts_and_mutates_owned_state() {
     let supervisor = supervisor_with_registered_context().await;
-    let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
+    let adapter = ActorClassSCaveatCounterAdapter::new_for_test(Arc::downgrade(&supervisor));
     let cid = "cid-mc";
 
     adapter
@@ -126,7 +126,7 @@ async fn check_and_increment_admits_then_exhausts_and_mutates_owned_state() {
 #[tokio::test]
 async fn release_returns_capacity_and_saturates_at_zero() {
     let supervisor = supervisor_with_registered_context().await;
-    let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
+    let adapter = ActorClassSCaveatCounterAdapter::new_for_test(Arc::downgrade(&supervisor));
     let cid = "cid-rel";
 
     // Consume the single slot; a second consume must now reject.
@@ -162,7 +162,7 @@ async fn release_returns_capacity_and_saturates_at_zero() {
 #[tokio::test]
 async fn per_ucan_cid_isolation() {
     let supervisor = supervisor_with_registered_context().await;
-    let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
+    let adapter = ActorClassSCaveatCounterAdapter::new_for_test(Arc::downgrade(&supervisor));
 
     // Exhaust cid-a's max_calls=1.
     adapter
@@ -191,7 +191,7 @@ async fn per_ucan_cid_isolation() {
 #[tokio::test]
 async fn amount_cumulative_exhausts_structurally() {
     let supervisor = supervisor_with_registered_context().await;
-    let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
+    let adapter = ActorClassSCaveatCounterAdapter::new_for_test(Arc::downgrade(&supervisor));
     let cid = "cid-amt";
 
     adapter
@@ -218,7 +218,7 @@ async fn amount_cumulative_exhausts_structurally() {
 #[tokio::test]
 async fn missing_actor_fails_closed_as_store_error() {
     let supervisor = supervisor_with_registered_context().await;
-    let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
+    let adapter = ActorClassSCaveatCounterAdapter::new_for_test(Arc::downgrade(&supervisor));
     let unregistered = hex::encode([0xEE_u8; 32]);
 
     let err = adapter

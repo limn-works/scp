@@ -83,7 +83,7 @@ struct Store(
 
 /// The local sender-key epoch a snapshot carries, if it carries crypto.
 fn snapshot_sender_epoch(ctx: &str, s: &ContextSnapshot) -> Option<u64> {
-    NodeMlsFactory::build_restored_owned(
+    NodeMlsFactory::build_restored_owned_for_test(
         &scp_protocol::context::context_id_bytes(ctx),
         &s.mls_crypto_state.0,
     )
@@ -125,7 +125,7 @@ impl Store {
             .get(ctx)
             .map(|s| s.value().clone())
             .expect("a persisted snapshot of the context");
-        NodeMlsFactory::build_restored_owned(
+        NodeMlsFactory::build_restored_owned_for_test(
             &scp_protocol::context::context_id_bytes(ctx),
             &snapshot.mls_crypto_state.0,
         )
@@ -142,7 +142,7 @@ impl Store {
             .get(ctx)
             .map(|s| s.value().clone())
             .expect("the refusal fired");
-        NodeMlsFactory::build_restored_owned(
+        NodeMlsFactory::build_restored_owned_for_test(
             &scp_protocol::context::context_id_bytes(ctx),
             &snapshot.mls_crypto_state.0,
         )
@@ -168,7 +168,7 @@ impl Store {
             .get(ctx)
             .map(|s| s.value().clone())
             .expect("a persisted snapshot of the context");
-        let (owned, _floors) = NodeMlsFactory::build_restored_owned(
+        let (owned, _floors) = NodeMlsFactory::build_restored_owned_for_test(
             &scp_protocol::context::context_id_bytes(ctx),
             &snapshot.mls_crypto_state.0,
         )
@@ -312,7 +312,7 @@ async fn alice_deps(
         crypto,
         Box::new(RelayTransport(Arc::clone(relay))),
         Box::new(OkEventLog),
-        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(ALICE, BOB),
         Some(Box::new(SharedStore(Arc::clone(store)))),
         None,
         Some(event_tx),
@@ -370,11 +370,11 @@ async fn alice_with_queued_distribution(ctx: &str) -> Alice {
     let (deps, sup, events) = alice_deps(alice_provider, &relay, &store, &clock).await;
     activate(&mut alice_state);
     alice_state
-        .distribute_sender_key(ALICE, BOB, None)
+        .distribute_sender_key_for_test(ALICE, BOB, None)
         .expect("Alice builds a distribution for Bob");
     assert_eq!(queue(&alice_state).len(), 1, "one distribution queued");
     Alice {
-        cell: ClassSCell::new(alice_state),
+        cell: ClassSCell::new_for_test(alice_state),
         deps,
         _sup: sup,
         relay,
@@ -387,7 +387,7 @@ async fn alice_with_queued_distribution(ctx: &str) -> Alice {
 fn queue(state: &PerContextState) -> Vec<PendingDistribution> {
     state
         .mode
-        .crypto()
+        .crypto_for_test()
         .expect("encrypted mode")
         .pending_distributions
         .clone()
@@ -404,7 +404,7 @@ fn enqueue(
 ) {
     let mut view = cell.class_c_view();
     let crypto = view.mode_mut().crypto_mut().expect("encrypted");
-    scp_runtime_core::context::actor::state::ContextCryptoState::enqueue_distribution(
+    scp_runtime_core::context::actor::state::ContextCryptoState::enqueue_distribution_for_test(
         &mut crypto.pending_distributions,
         target.to_owned(),
         recipient_key.to_vec(),
@@ -503,7 +503,7 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     .expect("snapshot");
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx);
     let (owned, _floors) =
-        NodeMlsFactory::build_restored_owned(&ctx_bytes, &snapshot.mls_crypto_state.0)
+        NodeMlsFactory::build_restored_owned_for_test(&ctx_bytes, &snapshot.mls_crypto_state.0)
             .expect("restore the crypto blob");
     let restored_queue = owned.pending_distributions.clone();
     assert_eq!(
@@ -522,7 +522,7 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     let mut state = PerContextState::new_for_test_encrypted(ctx_bytes, 0, DID::from(ALICE));
     state.seed_encrypted_crypto_from_owned(owned);
     activate(&mut state);
-    alice.cell = ClassSCell::new(state);
+    alice.cell = ClassSCell::new_for_test(state);
 
     alice.relay.down.store(false, Ordering::SeqCst);
     alice.clock.advance(1);
@@ -802,9 +802,9 @@ async fn a_member_with_no_wrapping_key_is_reported_not_built() {
     let mut alice = alice_with_queued_distribution(ctx).await;
     let carol = "did:dht:z6MkCarolSenderKeyRequeueCarolSenderKeyRe1";
     let tx = alice.deps.event_tx.clone();
-    let mut state = alice.cell.into_inner();
+    let mut state = alice.cell.into_inner_for_test();
     state
-        .distribute_sender_key(ALICE, carol, tx.as_ref())
+        .distribute_sender_key_for_test(ALICE, carol, tx.as_ref())
         .expect("no wrapping key is not an error");
     assert_eq!(queue(&state).len(), 1, "nothing queued for Carol");
     let events = channel_events(&mut alice.events);
@@ -838,9 +838,10 @@ fn bob_key_request(nonce: [u8; 16]) -> Vec<u8> {
         },
     )
     .expect("hash the request");
-    let signature = scp_runtime_core::crypto::mls::two_party_test_support::bob_signing_key()
-        .sign(&hash)
-        .to_bytes();
+    let signature =
+        scp_runtime_core::crypto::mls::two_party_test_support::bob_signing_key_for_test()
+            .sign(&hash)
+            .to_bytes();
     SenderKeyDistributionMessage::KeyRequest(SenderKeyRequest {
         requester_did: BOB.to_owned(),
         sender_did: ALICE.to_owned(),
@@ -877,10 +878,10 @@ async fn a_read_revoked_requester_gets_no_answer() {
     let (deps, _sup, _events) = alice_deps(alice_provider, &relay, &store, &clock).await;
     activate(&mut alice_state);
     alice_state
-        .access
+        .access_mut()
         .read_exclusion_list
         .insert(DID::from(BOB));
-    let mut cell = ClassSCell::new(alice_state);
+    let mut cell = ClassSCell::new_for_test(alice_state);
     let bob_cs = bob_state.mode.crypto_mut().expect("encrypted");
     let denied = bob_cs
         .mls_encrypt_management(&bob_key_request([1; 16]))
@@ -951,7 +952,7 @@ async fn a_request_flood_keeps_one_answer_per_target_and_epoch() {
     let clock = Arc::new(TestClock::new(T0));
     let (deps, _sup, _events) = alice_deps(alice_provider, &relay, &store, &clock).await;
     activate(&mut alice_state);
-    let mut cell = ClassSCell::new(alice_state);
+    let mut cell = ClassSCell::new_for_test(alice_state);
     let bob_cs = bob_state.mode.crypto_mut().expect("encrypted");
     for i in 0..100_u8 {
         let request = bob_cs
@@ -989,7 +990,7 @@ fn a_push_supersedes_the_targets_answer_of_an_earlier_epoch() {
     let mut q = Vec::new();
     ContextCryptoState::enqueue_answer(&mut q, BOB.to_owned(), vec![1], 1, vec![0]);
     ContextCryptoState::enqueue_answer(&mut q, "did:dht:zCarol".to_owned(), vec![2], 1, vec![0]);
-    ContextCryptoState::enqueue_distribution(&mut q, BOB.to_owned(), vec![3], 2, vec![0]);
+    ContextCryptoState::enqueue_distribution_for_test(&mut q, BOB.to_owned(), vec![3], 2, vec![0]);
     let to_bob: Vec<_> = q.iter().filter(|p| p.target_did == BOB).collect();
     assert_eq!(to_bob.len(), 1, "{q:?}");
     assert_eq!(to_bob[0].kind, DistributionKind::Push);

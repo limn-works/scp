@@ -151,6 +151,35 @@ license = "Apache-2.0"
 homepage = "https://github.com/limn/scp"
 
 [workspace.dependencies]
+# Internal crates the runtime crates inherit, so no runtime manifest hard-codes
+# a version (ADR-070). Publishing needs the exact-version pin each carries.
+scp-clock = { path = "crates/scp-clock", version = "=0.1.0-beta.2" }
+scp-crypto = { path = "crates/scp-crypto", version = "=0.1.0-beta.2" }
+scp-dht = { path = "crates/scp-dht", version = "=0.1.0-beta.2" }
+scp-did = { path = "crates/scp-did", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "crates/scp-event-log", version = "=0.1.0-beta.2" }
+scp-identity = { path = "crates/scp-identity", version = "=0.1.0-beta.2" }
+scp-kel = { path = "crates/scp-kel", version = "=0.1.0-beta.2" }
+scp-mls = { path = "crates/scp-mls", version = "=0.1.0-beta.2" }
+scp-platform = { path = "crates/scp-platform", version = "=0.1.0-beta.2" }
+scp-protocol = { path = "crates/scp-protocol", version = "=0.1.0-beta.2" }
+scp-relay-client = { path = "crates/scp-relay-client", version = "=0.1.0-beta.2" }
+scp-runtime-broadcast = { path = "crates/scp-runtime-broadcast", version = "=0.1.0-beta.2" }
+scp-runtime-core = { path = "crates/scp-runtime-core", version = "=0.1.0-beta.2" }
+scp-runtime-economy = { path = "crates/scp-runtime-economy", version = "=0.1.0-beta.2" }
+scp-runtime-governance = { path = "crates/scp-runtime-governance", version = "=0.1.0-beta.2" }
+scp-runtime-lifecycle = { path = "crates/scp-runtime-lifecycle", version = "=0.1.0-beta.2" }
+scp-runtime-lifecycle-control = { path = "crates/scp-runtime-lifecycle-control", version = "=0.1.0-beta.2" }
+scp-runtime-messaging = { path = "crates/scp-runtime-messaging", version = "=0.1.0-beta.2" }
+scp-runtime-outlets = { path = "crates/scp-runtime-outlets", version = "=0.1.0-beta.2" }
+scp-runtime-push = { path = "crates/scp-runtime-push", version = "=0.1.0-beta.2" }
+scp-runtime-queries = { path = "crates/scp-runtime-queries", version = "=0.1.0-beta.2" }
+scp-runtime-saga = { path = "crates/scp-runtime-saga", version = "=0.1.0-beta.2" }
+scp-runtime-standing = { path = "crates/scp-runtime-standing", version = "=0.1.0-beta.2" }
+scp-runtime-trust-recovery = { path = "crates/scp-runtime-trust-recovery", version = "=0.1.0-beta.2" }
+scp-runtime-ttl-close = { path = "crates/scp-runtime-ttl-close", version = "=0.1.0-beta.2" }
+scp-runtime-types = { path = "crates/scp-runtime-types", version = "=0.1.0-beta.2" }
+
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

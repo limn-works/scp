@@ -33,7 +33,9 @@ mod test_support;
 /// nowhere else; no production build compiles this module.
 #[cfg(feature = "testing")]
 pub mod testing_access {
-    pub use crate::helpers::{deliver_message_and_drain_buffered, finalize_send};
+    pub use crate::helpers::{
+        decrypt_and_dispatch, deliver_message_and_drain_buffered, finalize_send,
+    };
 }
 
 // The agent-binding live-pipeline tests (the whole file is `#![cfg(test)]`).
@@ -67,49 +69,5 @@ impl scp_runtime_core::context::domains::MessagingDomain for Messaging {
         cmd: scp_runtime_core::context::actor::commands::MessagingCommand,
     ) -> scp_runtime_core::context::actor::outcome::Outcome<()> {
         handler::dispatch(cell, deps, cmd).await
-    }
-
-    async fn decrypt_and_dispatch(
-        &self,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        crypto_state: Option<&mut scp_runtime_core::context::actor::state::ContextCryptoState>,
-        context_id: &str,
-        context_id_bytes: &[u8; 32],
-        encrypted_blob: &[u8],
-        denied: &std::collections::HashSet<String>,
-    ) -> Result<
-        scp_runtime_core::context::shared::messaging::Dispatched,
-        scp_protocol::context::ContextError,
-    > {
-        crate::helpers::decrypt_and_dispatch(
-            deps,
-            crypto_state,
-            context_id,
-            context_id_bytes,
-            encrypted_blob,
-            denied,
-        )
-        .await
-    }
-
-    async fn finalize_send(
-        &self,
-        cell: &mut scp_runtime_core::context::actor::class_s::ClassSCell,
-        deps: &scp_runtime_core::context::actor::deps::ActorDeps,
-        send: scp_runtime_core::context::domains::FinalizeSendRequest<'_>,
-    ) -> Result<(), scp_protocol::context::ContextError> {
-        crate::helpers::finalize_send(
-            cell,
-            deps,
-            send.context_id,
-            send.context_id_bytes,
-            send.sender_did,
-            send.sequence,
-            send.payload,
-            send.signer,
-            send.token,
-            send.is_broadcast,
-        )
-        .await
     }
 }

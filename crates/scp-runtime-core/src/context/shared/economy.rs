@@ -232,7 +232,28 @@ pub struct EconomyTicket {
     /// the caller honored the contract. Visible to the `messaging` /
     /// `lifecycle` modules that construct the ticket; mutated only via
     /// the `commit`/`rollback` helpers below.
-    pub consumed: bool,
+    pub(crate) consumed: bool,
+}
+
+impl EconomyTicket {
+    /// An unconsumed ticket for the Phase-1 deductions just made. A domain
+    /// crate builds it on its send or join path; only [`commit_economy_ticket`]
+    /// and [`rollback_economy_ticket_inline_view`] consume it, so a caller
+    /// cannot mint an already-consumed ticket that silences the `Drop` guard.
+    pub const fn new(
+        actor_did: DID,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+        velocity_token: scp_protocol::economy::antispam::VelocityRollbackToken,
+        needs_hard_rate_limit_refund: bool,
+    ) -> Self {
+        Self {
+            actor_did,
+            deducted_cost,
+            velocity_token,
+            needs_hard_rate_limit_refund,
+            consumed: false,
+        }
+    }
 }
 
 impl Drop for EconomyTicket {
@@ -307,7 +328,6 @@ pub fn rollback_economy_ticket_inline_view(
 ///
 /// All fields are owned / `Send`, so the async `scp_runtime_economy::helpers::authorize_paid_action_hold`
 /// future holds NO `&PerContextState` borrow (which would not be `Send`).
-#[allow(dead_code)]
 pub struct OwnedAuthInputs {
     /// The payment adapter that places the hold.
     pub adapter: Arc<dyn scp_runtime_types::economy::adapter::PaymentAdapterDyn>,

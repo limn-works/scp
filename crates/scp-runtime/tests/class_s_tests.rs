@@ -279,7 +279,7 @@ async fn begin_class_s_defers_persist_until_commit() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x61));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x61));
     let ctx = ctx_hex(0x61);
 
     let (value, token) = cell
@@ -295,7 +295,7 @@ async fn begin_class_s_defers_persist_until_commit() {
         "begin_class_s must NOT persist"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x6Au8; 16]),
@@ -323,7 +323,7 @@ async fn begin_class_s_issues_no_token_on_f_error() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x62));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x62));
     let ctx = ctx_hex(0x62);
 
     let result: Result<((), ClassSCommitToken), ContextError> = cell.begin_class_s(&ctx, |_view| {
@@ -344,7 +344,7 @@ async fn begin_class_s_issues_no_token_on_f_error() {
 #[tokio::test]
 async fn commit_keeps_mutation_and_surfaces_error_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x63));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x63));
     let ctx = ctx_hex(0x63);
 
     let (_v, token) = cell
@@ -359,7 +359,7 @@ async fn commit_keeps_mutation_and_surfaces_error_on_persist_failure() {
         .expect_err("FailPersistence ⇒ commit Err");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x6Bu8; 16]),
@@ -372,7 +372,7 @@ async fn commit_keeps_mutation_and_surfaces_error_on_persist_failure() {
 #[tokio::test]
 async fn conditional_issues_token_only_when_mutation_happened() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x64));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x64));
     let ctx = ctx_hex(0x64);
 
     // Mutation happened ⇒ Some(token).
@@ -424,20 +424,20 @@ async fn note_downward_auth_is_idempotent_and_noops_without_grow() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let cell = ClassSCell::new(fresh_state(0x69));
+    let cell = ClassSCell::new_for_test(fresh_state(0x69));
     let ctx = ctx_hex(0x69);
 
     // No GROW (did_grow == false) against an empty sink: stays empty, arms
     // nothing — the coalesced persist suffices, no fail-closed obligation owed.
     let mut sink: Option<ClassSCommitToken> = None;
-    ClassSCommitToken::note_downward_auth(&mut sink, false, &ctx);
+    ClassSCommitToken::note_downward_auth_for_test(&mut sink, false, &ctx);
     assert!(
         sink.is_none(),
         "no GROW must arm no obligation (hot path stays coalesced)"
     );
 
     // First GROW arms the single obligation.
-    ClassSCommitToken::note_downward_auth(&mut sink, true, &ctx);
+    ClassSCommitToken::note_downward_auth_for_test(&mut sink, true, &ctx);
     assert!(
         sink.is_some(),
         "the first downward-auth GROW arms the fail-closed obligation sink"
@@ -445,14 +445,14 @@ async fn note_downward_auth_is_idempotent_and_noops_without_grow() {
 
     // Second GROW in the SAME cascade is a no-op (`sink.is_some()`): one cascade
     // owes one persist, so the existing token is reused, not duplicated.
-    ClassSCommitToken::note_downward_auth(&mut sink, true, &ctx);
+    ClassSCommitToken::note_downward_auth_for_test(&mut sink, true, &ctx);
     assert!(
         sink.is_some(),
         "a second GROW in the same cascade reuses the armed token (idempotent)"
     );
 
     // A later `false` call must not clear or replace the armed obligation either.
-    ClassSCommitToken::note_downward_auth(&mut sink, false, &ctx);
+    ClassSCommitToken::note_downward_auth_for_test(&mut sink, false, &ctx);
 
     // EXACTLY ONE owed persist: discharge the single token and confirm the spy
     // saw exactly one fail-closed persist. (A stacked second obligation would
@@ -490,7 +490,7 @@ async fn discharge_with_consumes_token_on_f_error_keep_direction() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x66));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x66));
     let ctx = ctx_hex(0x66);
 
     let (_v, token) = cell
@@ -515,7 +515,7 @@ async fn discharge_with_consumes_token_on_f_error_keep_direction() {
         "keep-direction: the deferred persist runs even on the f-abort path"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x6Eu8; 16]),
@@ -549,7 +549,7 @@ async fn consequence_suspension_persists_fail_closed_and_keeps_suspension() {
     use scp_runtime_core::context::shared::governance::EnforceConsequencesCtx;
 
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x71));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x71));
     let ctx = ctx_hex(0x71);
     let subject = DID("did:example:suspend-subject".to_owned());
 
@@ -720,7 +720,7 @@ async fn paid_send_with_suspension_owes_single_fail_closed_persist() {
     // FailPersistence ⇒ the single nonce-token commit must surface the §9
     // durability error (not a silent coalesced ack).
     let deps = build_deps_with_event_log(Box::new(FailPersistence), Box::new(event_log)).await;
-    let mut cell = ClassSCell::new(fresh_state(ctx_byte));
+    let mut cell = ClassSCell::new_for_test(fresh_state(ctx_byte));
 
     // The send path requires an ACTIVE context (else `finalize_send` takes the
     // TTL-inactive early return and never runs consequence enforcement).
@@ -754,27 +754,23 @@ async fn paid_send_with_suspension_owes_single_fail_closed_persist() {
     // spending-nonce obligation (the exact stand-in the production send-path
     // fail-closed tests use). The send signs any due checkpoint through a
     // local test signer; the consequence path runs regardless.
-    let paid = scp_runtime::domain_handlers()
-        .messaging
-        .finalize_send(
-            &mut cell,
-            &deps,
-            scp_runtime_core::context::domains::FinalizeSendRequest {
-                context_id: &ctx,
-                context_id_bytes: &ctx_id_bytes,
-                sender_did: &sender,
-                sequence: 0,
-                payload: b"paid-with-suspension",
-                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(
-                    &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
-                        ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
-                    ),
-                ),
-                token: Some(ClassSCommitToken::new_for_test(&ctx)),
-                is_broadcast: false,
-            },
-        )
-        .await;
+    let paid = scp_runtime_messaging::testing_access::finalize_send(
+        &mut cell,
+        &deps,
+        &ctx,
+        &ctx_id_bytes,
+        &sender,
+        0,
+        b"paid-with-suspension",
+        scp_runtime_core::context::supervisor::MessageSigner::Active(
+            &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            ),
+        ),
+        Some(ClassSCommitToken::new_for_test(&ctx)),
+        false,
+    )
+    .await;
 
     // The single nonce-token commit covers BOTH the burned nonce and the armed
     // suspension; under FailPersistence it surfaces the §9 durability error
@@ -831,7 +827,7 @@ async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
     let deps = build_deps(Box::new(FailPersistence)).await;
     // Ceiling holds the HIGH/LOW role caps: mint-time enforcement (§7.2.1 step 8).
     let caps = [Capability::MessagesRead, Capability::MessagesWrite];
-    let mut cell = ClassSCell::new(fresh_state_with_ceiling(0x72, caps));
+    let mut cell = ClassSCell::new_for_test(fresh_state_with_ceiling(0x72, caps));
     let ctx = ctx_hex(0x72);
     let subject = DID("did:example:demote-subject".to_owned());
 
@@ -845,14 +841,14 @@ async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
         view.membership_class_c_mut()
             .add_member(subject.clone(), "high".to_owned(), Vec::new());
         let mut role_state = view.role_state_class_c_mut();
-        role_state.role_definitions_mut().insert(
+        role_state.role_definitions_mut_for_test().insert(
             "high".to_owned(),
             RoleDefinition {
                 name: "high".to_owned(),
                 capabilities: HashSet::from([Capability::MessagesRead, Capability::MessagesWrite]),
             },
         );
-        role_state.role_definitions_mut().insert(
+        role_state.role_definitions_mut_for_test().insert(
             "low".to_owned(),
             RoleDefinition {
                 name: "low".to_owned(),
@@ -960,7 +956,7 @@ async fn keep_persists_and_returns_ok_on_success() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x11));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x11));
     let ctx = ctx_hex(0x11);
 
     let returned = cell
@@ -973,7 +969,7 @@ async fn keep_persists_and_returns_ok_on_success() {
 
     assert_eq!(returned, "kept");
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -991,7 +987,7 @@ async fn keep_persists_and_returns_ok_on_success() {
 #[tokio::test]
 async fn keep_retains_mutation_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x12));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x12));
     let ctx = ctx_hex(0x12);
 
     let result = cell
@@ -1006,7 +1002,7 @@ async fn keep_retains_mutation_on_persist_failure() {
         "persist failure surfaces; got {result:?}"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -1022,7 +1018,7 @@ async fn keep_returns_f_error_without_persisting() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x13));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x13));
     let ctx = ctx_hex(0x13);
 
     let result: Result<(), ContextError> = cell
@@ -1051,7 +1047,7 @@ async fn keep_returns_f_error_without_persisting() {
 #[tokio::test]
 async fn restore_persists_and_returns_ok_on_success() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x21));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x21));
     let ctx = ctx_hex(0x21);
     let saga_a = saga("saga-restore-ok");
 
@@ -1067,7 +1063,7 @@ async fn restore_persists_and_returns_ok_on_success() {
 
     assert_eq!(value, 99);
     assert!(
-        cell.class_s.saga_pending.contains_key(&saga_a),
+        cell.class_s().saga_pending.contains_key(&saga_a),
         "mutation retained on persist success"
     );
 }
@@ -1078,7 +1074,7 @@ async fn restore_persists_and_returns_ok_on_success() {
 #[tokio::test]
 async fn restore_rolls_back_class_s_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x22));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x22));
     let ctx = ctx_hex(0x22);
     let saga_a = saga("saga-restore-rollback");
 
@@ -1100,19 +1096,20 @@ async fn restore_rolls_back_class_s_on_persist_failure() {
         "persist failure surfaces; got {result:?}"
     );
     assert!(
-        cell.class_s.saga_pending.is_empty(),
+        cell.class_s().saga_pending.is_empty(),
         "saga_pending rolled back via the mirror"
     );
     assert!(
         !cell
-            .class_s
+            .class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
         "recorded nonce rolled back via the mirror"
     );
     assert_eq!(
-        cell.governance.class_s.threshold_value, 0,
+        cell.governance().class_s.threshold_value,
+        0,
         "governance threshold rolled back via the mirror"
     );
 }
@@ -1125,7 +1122,7 @@ async fn restore_returns_f_error_without_persisting() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x23));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x23));
     let ctx = ctx_hex(0x23);
 
     let result: Result<(), ContextError> = cell
@@ -1147,7 +1144,7 @@ async fn restore_returns_f_error_without_persisting() {
 #[tokio::test]
 async fn compensating_does_not_compensate_on_persist_success() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x31));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x31));
     let ctx = ctx_hex(0x31);
     let compensated = Arc::new(AtomicUsize::new(0));
     let comp_for_closure = Arc::clone(&compensated);
@@ -1174,7 +1171,7 @@ async fn compensating_does_not_compensate_on_persist_success() {
         "compensation does not run on persist success"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -1187,7 +1184,7 @@ async fn compensating_does_not_compensate_on_persist_success() {
 #[tokio::test]
 async fn compensating_restores_then_compensates_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x32));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x32));
     let ctx = ctx_hex(0x32);
     let saga_a = saga("saga-compensate");
     // Compensation observes the post-restore Class-S state: it records
@@ -1222,7 +1219,7 @@ async fn compensating_restores_then_compensates_on_persist_failure() {
         "compensation runs AFTER the in-state restore (saga_pending already empty)"
     );
     assert!(
-        cell.class_s.saga_pending.is_empty(),
+        cell.class_s().saga_pending.is_empty(),
         "Class-S restored on persist failure"
     );
 }
@@ -1237,7 +1234,7 @@ async fn compensating_restores_then_compensates_on_persist_failure() {
 #[tokio::test]
 async fn keep_compensating_does_not_compensate_on_persist_success() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x36));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x36));
     let ctx = ctx_hex(0x36);
     let compensated = Arc::new(AtomicUsize::new(0));
     let comp_for_closure = Arc::clone(&compensated);
@@ -1269,7 +1266,7 @@ async fn keep_compensating_does_not_compensate_on_persist_success() {
         "no compensation on persist success"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -1288,7 +1285,7 @@ async fn keep_compensating_does_not_compensate_on_persist_success() {
 #[tokio::test]
 async fn keep_compensating_keeps_class_s_and_compensates_class_c_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x37));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x37));
     let ctx = ctx_hex(0x37);
     let member = DID("did:example:keep-comp-failure".to_owned());
     let member_for_f = member.clone();
@@ -1322,7 +1319,7 @@ async fn keep_compensating_keeps_class_s_and_compensates_class_c_on_persist_fail
                 );
                 // Undo the Class-C reservation the failed persist did not make
                 // durable.
-                classc.members_mut().remove(&external);
+                classc.members_mut_for_test().remove(&external);
             },
         )
         .await;
@@ -1336,7 +1333,7 @@ async fn keep_compensating_keeps_class_s_and_compensates_class_c_on_persist_fail
         "Class-S nonce is KEPT (not restored) when on_persist_failure runs"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -1357,7 +1354,7 @@ async fn keep_compensating_returns_f_error_without_persisting() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x38));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x38));
     let ctx = ctx_hex(0x38);
     let compensated = Arc::new(AtomicUsize::new(0));
     let comp_for_closure = Arc::clone(&compensated);
@@ -1398,12 +1395,12 @@ async fn keep_compensating_returns_f_error_without_persisting() {
 #[tokio::test]
 async fn then_append_ok_when_persist_and_after_succeed() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x41));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x41));
     let ctx = ctx_hex(0x41);
     let saga_a = saga("saga-append-ok");
 
     let value = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |mut view| {
@@ -1421,7 +1418,7 @@ async fn then_append_ok_when_persist_and_after_succeed() {
         .expect("persist + after succeed ⇒ Ok");
 
     assert_eq!(value, 11);
-    assert!(cell.class_s.saga_pending.contains_key(&saga_a));
+    assert!(cell.class_s().saga_pending.contains_key(&saga_a));
 }
 
 /// (new contract — FIX 1) `*_then_append`'s `after` receives a READ-ONLY
@@ -1442,7 +1439,7 @@ async fn then_append_after_reads_just_persisted_state_and_does_not_repersist() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x46));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x46));
     let ctx = ctx_hex(0x46);
     let saga_a = saga("saga-append-reads-state");
     // `after` records whether the read-only state it was handed already
@@ -1453,7 +1450,7 @@ async fn then_append_after_reads_just_persisted_state_and_does_not_repersist() {
     let saga_for_after = saga_a.clone();
 
     let value = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |mut view| {
@@ -1469,7 +1466,7 @@ async fn then_append_after_reads_just_persisted_state_and_does_not_repersist() {
             async move |input: &&str, state: &PerContextState, _deps: &ActorDeps| {
                 assert_eq!(*input, "append-input");
                 saw_flag.store(
-                    state.class_s.saga_pending.contains_key(&saga_for_after),
+                    state.class_s().saga_pending.contains_key(&saga_for_after),
                     Ordering::SeqCst,
                 );
                 Ok(())
@@ -1483,7 +1480,7 @@ async fn then_append_after_reads_just_persisted_state_and_does_not_repersist() {
         saw_mutation.load(Ordering::SeqCst),
         "after reads the JUST-PERSISTED state (f's mutation is visible)"
     );
-    assert!(cell.class_s.saga_pending.contains_key(&saga_a));
+    assert!(cell.class_s().saga_pending.contains_key(&saga_a));
     assert_eq!(
         persist_calls.load(Ordering::SeqCst),
         1,
@@ -1502,12 +1499,12 @@ async fn then_append_restores_and_repersists_on_after_failure() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x42));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x42));
     let ctx = ctx_hex(0x42);
     let saga_a = saga("saga-append-fail");
 
     let result = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |mut view| {
@@ -1523,10 +1520,8 @@ async fn then_append_restores_and_repersists_on_after_failure() {
         .await;
 
     match result {
-        Err(AppendOutcomeError {
-            durability_diverged,
-            err,
-        }) => {
+        Err(outcome) => {
+            let (durability_diverged, err) = outcome.into_parts_for_test();
             assert!(
                 !durability_diverged,
                 "rollback re-persisted ⇒ durability_diverged is false"
@@ -1539,7 +1534,7 @@ async fn then_append_restores_and_repersists_on_after_failure() {
         Ok(()) => panic!("expected AppendOutcomeError"),
     }
     assert!(
-        cell.class_s.saga_pending.is_empty(),
+        cell.class_s().saga_pending.is_empty(),
         "saga_pending rolled back after the after-failure"
     );
     // Two persists: the post-f fail-closed persist + the rollback re-persist.
@@ -1551,14 +1546,14 @@ async fn then_append_restores_and_repersists_on_after_failure() {
 #[tokio::test]
 async fn then_append_reports_diverged_on_initial_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x43));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x43));
     let ctx = ctx_hex(0x43);
     let saga_a = saga("saga-append-persistfail");
     let after_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let after_flag = Arc::clone(&after_ran);
 
     let result = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |mut view| {
@@ -1575,10 +1570,8 @@ async fn then_append_reports_diverged_on_initial_persist_failure() {
         .await;
 
     match result {
-        Err(AppendOutcomeError {
-            durability_diverged,
-            err,
-        }) => {
+        Err(outcome) => {
+            let (durability_diverged, err) = outcome.into_parts_for_test();
             assert!(
                 durability_diverged,
                 "initial persist failed ⇒ durability_diverged is true"
@@ -1605,12 +1598,12 @@ async fn then_append_reports_diverged_when_repersist_fails() {
         calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x44));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x44));
     let ctx = ctx_hex(0x44);
     let saga_a = saga("saga-append-repersistfail");
 
     let result = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |mut view| {
@@ -1626,10 +1619,8 @@ async fn then_append_reports_diverged_when_repersist_fails() {
         .await;
 
     match result {
-        Err(AppendOutcomeError {
-            durability_diverged,
-            err,
-        }) => {
+        Err(outcome) => {
+            let (durability_diverged, err) = outcome.into_parts_for_test();
             assert!(
                 durability_diverged,
                 "re-persist failed ⇒ durability_diverged is true"
@@ -1653,11 +1644,11 @@ async fn then_append_reports_not_diverged_when_f_rejects() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x45));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x45));
     let ctx = ctx_hex(0x45);
 
     let result: Result<(), AppendOutcomeError> = cell
-        .commit_class_s_then_append(
+        .commit_class_s_then_append_for_test(
             &deps,
             &ctx,
             |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
@@ -1666,10 +1657,8 @@ async fn then_append_reports_not_diverged_when_f_rejects() {
         .await;
 
     match result {
-        Err(AppendOutcomeError {
-            durability_diverged,
-            err,
-        }) => {
+        Err(outcome) => {
+            let (durability_diverged, err) = outcome.into_parts_for_test();
             assert!(!durability_diverged);
             assert!(matches!(err, ContextError::PermissionDenied(_)));
         }
@@ -1691,13 +1680,13 @@ async fn best_effort_runs_mutation_and_persists() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x51));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x51));
     let ctx = ctx_hex(0x51);
     let member = DID("did:example:best-effort-member".to_owned());
     let member_for_closure = member.clone();
 
     cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
-        view.members_mut().insert(member_for_closure);
+        view.members_mut_for_test().insert(member_for_closure);
     })
     .await;
 
@@ -1721,7 +1710,7 @@ async fn best_effort_split_yields_disjoint_class_c_borrows() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x52));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x52));
     let ctx = ctx_hex(0x52);
 
     cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
@@ -1748,7 +1737,7 @@ async fn best_effort_split_yields_disjoint_class_c_borrows() {
         "the disjoint &mut checkpoint counter was mutated through the split"
     );
     assert_eq!(
-        cell.governance.cooldown_until.get(&7usize),
+        cell.governance().cooldown_until.get(&7usize),
         Some(&1_700_000_999),
         "the GovernanceClassCMut Class-C accessor mutated cooldown_until through the split"
     );
@@ -1765,7 +1754,7 @@ async fn best_effort_governance_class_c_mut_mutates_class_c_field() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x53));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x53));
     let ctx = ctx_hex(0x53);
 
     cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
@@ -1782,7 +1771,7 @@ async fn best_effort_governance_class_c_mut_mutates_class_c_field() {
     .await;
 
     assert_eq!(
-        cell.governance.cooldown_until.get(&3usize),
+        cell.governance().cooldown_until.get(&3usize),
         Some(&1_700_000_500),
         "Class-C governance field mutated through governance_class_c_mut"
     );
@@ -1799,7 +1788,7 @@ async fn best_effort_governance_class_c_mut_mutates_class_c_field() {
 #[tokio::test]
 async fn best_effort_velocity_tracker_mut_records_through_view() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x54));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x54));
     let ctx = ctx_hex(0x54);
     let sender = DID("did:example:velocity-sender".to_owned());
     let sender_for_closure = sender.clone();
@@ -1812,7 +1801,7 @@ async fn best_effort_velocity_tracker_mut_records_through_view() {
     .await;
 
     assert_eq!(
-        cell.governance
+        cell.governance()
             .velocity_tracker
             .get_velocity(&sender, 1_700_000_000),
         1,
@@ -1828,7 +1817,7 @@ async fn best_effort_budget_tracker_mut_grants_through_view() {
     use scp_protocol::economy::types::Amount;
 
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x55));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x55));
     let ctx = ctx_hex(0x55);
     let member = DID("did:example:budget-member".to_owned());
     let member_for_closure = member.clone();
@@ -1841,7 +1830,7 @@ async fn best_effort_budget_tracker_mut_grants_through_view() {
     .await;
 
     assert_eq!(
-        cell.governance.budget_tracker.remaining(&member),
+        cell.governance().budget_tracker.remaining(&member),
         Amount(500),
         "budget grant landed through budget_tracker_mut"
     );
@@ -1855,7 +1844,7 @@ async fn best_effort_economic_policy_mut_sets_through_view() {
     use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
 
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x56));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x56));
     let ctx = ctx_hex(0x56);
 
     let policy = EconomicPolicy {
@@ -1880,7 +1869,7 @@ async fn best_effort_economic_policy_mut_sets_through_view() {
     .await;
 
     assert_eq!(
-        cell.governance.economic_policy,
+        cell.governance().economic_policy,
         Some(expected),
         "economic policy set through economic_policy_mut"
     );
@@ -1893,7 +1882,7 @@ async fn best_effort_receive_buffer_mut_pushes_through_view() {
     use scp_protocol::context::membership::ContextEvent;
 
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x57));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x57));
     let ctx = ctx_hex(0x57);
 
     let before = cell.receive_buffer.len();
@@ -1918,7 +1907,7 @@ async fn best_effort_receive_buffer_mut_pushes_through_view() {
 #[tokio::test]
 async fn best_effort_role_state_class_c_mut_mutates_members_through_view() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x58));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x58));
     let ctx = ctx_hex(0x58);
     let member_did = "did:example:role-member".to_owned();
     let member_for_assert = member_did.clone();
@@ -1950,7 +1939,7 @@ async fn class_c_view_mutates_without_persisting() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x71));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x71));
     // `deps` is unused by `class_c_view` itself (no persist); kept to mirror
     // the other tests' setup and to prove no persist runs.
     let _ = &deps;
@@ -1958,7 +1947,7 @@ async fn class_c_view_mutates_without_persisting() {
 
     {
         let mut view = cell.class_c_view();
-        view.members_mut().insert(member.clone());
+        view.members_mut_for_test().insert(member.clone());
     }
 
     assert!(
@@ -1984,7 +1973,7 @@ async fn class_c_view_mutates_without_persisting() {
 #[tokio::test]
 async fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x72));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x72));
     let ctx = ctx_hex(0x72);
     let member = "did:example:rs-classc-member".to_owned();
     let member_for_f = member.clone();
@@ -1994,16 +1983,16 @@ async fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
         // Structural &mut: add a member to the role-state member set.
         rs.members_mut().insert(member_for_f);
         // Read-only downward-auth accessors are reachable and return refs.
-        let _ceiling: &CapabilityCeiling = rs.ceiling();
+        let _ceiling: &CapabilityCeiling = rs.ceiling_for_test();
         let _suspended = rs.suspended_capabilities();
-        let _ = rs.context_id();
+        let _ = rs.context_id_for_test();
         let _ = rs.creator_did();
         // Other structural &mut accessors compile/reach their fields.
-        let _ = rs.role_definitions_mut().len();
-        let _ = rs.assignments_mut().len();
+        let _ = rs.role_definitions_mut_for_test().len();
+        let _ = rs.assignments_mut_for_test().len();
         // `member_capabilities` is READ-ONLY on this best-effort view (the F2
         // whole-`&mut` shrink accessor is deleted).
-        let _ = rs.member_capabilities().len();
+        let _ = rs.member_capabilities_for_test().len();
     })
     .await;
 
@@ -2023,7 +2012,7 @@ async fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
 #[tokio::test]
 async fn membership_class_c_mut_adds_and_bumps_sequence() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x73));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x73));
     let ctx = ctx_hex(0x73);
     let member = DID("did:example:membership-classc".to_owned());
     let member_for_f = member.clone();
@@ -2040,8 +2029,8 @@ async fn membership_class_c_mut_adds_and_bumps_sequence() {
         assert_eq!(first, Some(1));
         m.rollback_sequence_number(member_for_f.0.as_str());
         // `get_mut` reaches per-member metadata (not a removal path).
-        assert!(m.get_mut(member_for_f.0.as_str()).is_some());
-        let _ = m.get(member_for_f.0.as_str());
+        assert!(m.get_mut_for_test(member_for_f.0.as_str()).is_some());
+        let _ = m.get_for_test(member_for_f.0.as_str());
         let _ = m.count();
     })
     .await;
@@ -2072,7 +2061,7 @@ async fn keep_restore_split_persists_and_keeps_both_on_success() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x74));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x74));
     let ctx = ctx_hex(0x74);
     let saga_a = saga("saga-split-ok");
     let saga_for_f = saga_a.clone();
@@ -2099,11 +2088,11 @@ async fn keep_restore_split_persists_and_keeps_both_on_success() {
 
     assert_eq!(value, 42);
     assert!(
-        cell.class_s.saga_pending.contains_key(&saga_a),
+        cell.class_s().saga_pending.contains_key(&saga_a),
         "restore field kept on persist success"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -2122,7 +2111,7 @@ async fn keep_restore_split_persists_and_keeps_both_on_success() {
 #[tokio::test]
 async fn keep_restore_split_restores_one_keeps_other_on_persist_failure() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x75));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x75));
     let ctx = ctx_hex(0x75);
     let saga_for_f = saga("saga-split-fail");
 
@@ -2148,11 +2137,11 @@ async fn keep_restore_split_restores_one_keeps_other_on_persist_failure() {
         "persist failure surfaces; got {result:?}"
     );
     assert!(
-        cell.class_s.saga_pending.is_empty(),
+        cell.class_s().saga_pending.is_empty(),
         "RESTORE field rolled back on persist failure"
     );
     assert!(
-        cell.class_s
+        cell.class_s()
             .xctx_nonce_dedup
             .entries()
             .contains_key(&[0x3Cu8; 16]),
@@ -2168,7 +2157,7 @@ async fn keep_restore_split_f_reject_no_persist_no_restore() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x76));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x76));
     let ctx = ctx_hex(0x76);
     let restore_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let restore_flag = Arc::clone(&restore_ran);
@@ -2209,7 +2198,7 @@ async fn keep_restore_split_f_reject_no_persist_no_restore() {
 #[tokio::test]
 async fn into_inner_returns_wrapped_state() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x61));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x61));
     let ctx = ctx_hex(0x61);
     let saga_a = saga("saga-unwrap");
 
@@ -2224,7 +2213,7 @@ async fn into_inner_returns_wrapped_state() {
     // Read through Deref before unwrap.
     assert!(cell.saga_pending().contains_key(&saga_a));
 
-    let state = cell.into_inner();
+    let state = cell.into_inner_for_test();
     assert!(
         state.saga_pending().contains_key(&saga_a),
         "into_inner preserves the committed mutation"
@@ -2244,7 +2233,7 @@ async fn economy_pre_check_borrows_debits_while_reading() {
     use scp_protocol::economy::types::Amount;
 
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x90));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x90));
     let ctx = ctx_hex(0x90);
     let member = DID("did:example:precheck-member".to_owned());
     let member_for_closure = member.clone();
@@ -2270,7 +2259,7 @@ async fn economy_pre_check_borrows_debits_while_reading() {
     .await;
 
     assert_eq!(
-        cell.governance.budget_tracker.remaining(&member),
+        cell.governance().budget_tracker.remaining(&member),
         Amount(700),
         "budget debit landed through economy_pre_check_borrows.budget_tracker"
     );
@@ -2292,7 +2281,7 @@ async fn clear_committed_reservation_idempotent_removes_then_noops() {
         persist_calls: Arc::clone(&persist_calls),
     }))
     .await;
-    let mut cell = ClassSCell::new(fresh_state(0x91));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x91));
     let ctx = ctx_hex(0x91);
     let saga_a = saga("saga-straggler");
 
@@ -2317,7 +2306,10 @@ async fn clear_committed_reservation_idempotent_removes_then_noops() {
         "first clear removes the present reservation"
     );
     assert!(
-        !cell.class_s.xctx_caller_reservations.contains_key(&saga_a),
+        !cell
+            .class_s()
+            .xctx_caller_reservations
+            .contains_key(&saga_a),
         "reservation gone after clear"
     );
 
@@ -2346,7 +2338,7 @@ async fn clear_committed_reservation_idempotent_removes_then_noops() {
 #[tokio::test]
 async fn remove_subscriber_removes_from_roster() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x92));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x92));
     let ctx = ctx_hex(0x92);
     let sub = DID("did:example:broadcast-subscriber".to_owned());
     let sub_for_f = sub.clone();
@@ -2388,7 +2380,7 @@ async fn remove_subscriber_removes_from_roster() {
 #[tokio::test]
 async fn mutation_epoch_advances_on_keep_even_when_persist_fails() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x92));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x92));
     let ctx = ctx_hex(0x92);
 
     let result = cell
@@ -2403,7 +2395,8 @@ async fn mutation_epoch_advances_on_keep_even_when_persist_fails() {
         "persist failure surfaces; got {result:?}"
     );
     assert_eq!(
-        cell.governance.class_s.threshold_value, 7,
+        cell.governance().class_s.threshold_value,
+        7,
         "keep-direction retains the mutation"
     );
     assert_eq!(
@@ -2419,7 +2412,7 @@ async fn mutation_epoch_advances_on_keep_even_when_persist_fails() {
 #[tokio::test]
 async fn mutation_epoch_holds_when_the_closure_rejects() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x93));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x93));
     let ctx = ctx_hex(0x93);
 
     let result = cell
@@ -2445,7 +2438,7 @@ async fn mutation_epoch_holds_when_the_closure_rejects() {
 #[tokio::test]
 async fn mutation_epoch_follows_the_restore_combinators_outcome() {
     let failing = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x94));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x94));
     let ctx = ctx_hex(0x94);
 
     let result = cell
@@ -2459,7 +2452,8 @@ async fn mutation_epoch_follows_the_restore_combinators_outcome() {
         "persist failure surfaces; got {result:?}"
     );
     assert_eq!(
-        cell.governance.class_s.threshold_value, 0,
+        cell.governance().class_s.threshold_value,
+        0,
         "restore-direction rolled the mutation back"
     );
     assert_eq!(
@@ -2487,11 +2481,11 @@ async fn mutation_epoch_follows_the_restore_combinators_outcome() {
 #[tokio::test]
 async fn mutation_epoch_advances_on_commit_class_c_best_effort() {
     let deps = build_deps(Box::new(FailPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x95));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x95));
     let ctx = ctx_hex(0x95);
 
     cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
-        view.members_mut()
+        view.members_mut_for_test()
             .insert(DID("did:example:best-effort-member".to_owned()));
     })
     .await;
@@ -2510,7 +2504,7 @@ async fn mutation_epoch_advances_on_commit_class_c_best_effort() {
 #[tokio::test]
 async fn mutation_epoch_advances_at_begin_and_at_discharge() {
     let deps = build_deps(Box::new(OkPersistence)).await;
-    let mut cell = ClassSCell::new(fresh_state(0x96));
+    let mut cell = ClassSCell::new_for_test(fresh_state(0x96));
     let ctx = ctx_hex(0x96);
 
     let ((), token) = cell

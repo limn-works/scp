@@ -224,10 +224,10 @@ async fn open_outlet_stream_reserve_pump_settle_end_to_end() {
         .membership
         .add_member(invoker(), "owner".to_owned(), Vec::new());
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await
@@ -385,7 +385,7 @@ async fn open_outlet_stream_reserve_pump_settle_end_to_end() {
     // shutdown token closes the pump with `ContextClosedMidStream` before
     // the cancel-ack timer fires, and the pump runs on the tracker, so its
     // close-time settlement below is admitted through the closed gate.
-    supervisor.close_spawn_gate();
+    supervisor.close_spawn_gate_for_test();
 
     // Drain to the terminal chunk.
     let terminal_code = tokio::time::timeout(Duration::from_secs(5), async {
@@ -496,10 +496,10 @@ async fn open_outlet_stream_persists_one_invoked_event_035() {
         .membership
         .add_member(invoker(), "owner".to_owned(), Vec::new());
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await
@@ -761,10 +761,10 @@ async fn open_outlet_stream_post_reserve_failure_refunds_escrow() {
     // refunded its debit.
     let one_reservation = COST_PER_CHUNK * u64::from(DECLARED_ESTIMATE);
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(one_reservation));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await
@@ -949,10 +949,10 @@ async fn open_outlet_stream_per_invoker_cap_sourced_from_context_params() {
     // with headroom — the second open still reaches (and debits at) the
     // reserve before the admission gate rejects it.
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await
@@ -1305,10 +1305,10 @@ async fn open_outlet_stream_cross_context_returns_plaintext_receiver() {
         .membership
         .add_member(invoker(), "owner".to_owned(), Vec::new());
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await
@@ -1433,10 +1433,10 @@ async fn open_outlet_stream_cross_context_enforces_durable_counter() {
         .membership
         .add_member(invoker(), "owner".to_owned(), Vec::new());
     state
-        .governance
+        .governance_mut()
         .budget_tracker
         .grant(&invoker(), Amount::new(1_000_000));
-    state.governance.economic_policy = Some(policy());
+    state.governance_mut().economic_policy = Some(policy());
     let deps = supervisor
         .build_actor_deps_loaded(&invoker())
         .await

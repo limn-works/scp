@@ -72,12 +72,12 @@ pub struct PseudonymRotationState {
     /// moment the member starts following a policy (creation, join, or a
     /// policy change), so boundaries before that moment trigger nothing.
     #[serde(default)]
-    pub boundary_index: u64,
+    pub(crate) boundary_index: u64,
     /// Set when a committed AddMember or RemoveMember of another member
     /// obliges a rotation under `on_membership_change`; cleared by the next
     /// rotation. One rotation covers every change committed before it.
     #[serde(default)]
-    pub membership_change_pending: bool,
+    pub(crate) membership_change_pending: bool,
     /// Set when the member joined a context whose policy is set while holding
     /// a v1 routing ID: spec 09 §9.10.4.1 "First v2 derivation" puts a joiner
     /// on v2 at the schedule index `k`, and the join entry point receives the
@@ -521,6 +521,23 @@ pub struct LocalRoutingIds {
     pub next_pseudonym_epoch: Option<u64>,
     /// Whether a persisted rotation still waits for its announcement.
     pub announce_pending: bool,
+}
+
+/// Test-only reach into fields that stay private to this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches them (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl PseudonymRotationState {
+    /// The boundary index of the current pseudonym epoch.
+    #[must_use]
+    pub const fn boundary_index_for_test(&self) -> u64 {
+        self.boundary_index
+    }
+
+    /// Whether a membership change awaits a rotation.
+    #[must_use]
+    pub const fn membership_change_pending_for_test(&self) -> bool {
+        self.membership_change_pending
+    }
 }
 
 #[cfg(test)]

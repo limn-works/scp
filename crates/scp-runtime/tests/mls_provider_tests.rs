@@ -340,23 +340,28 @@ async fn app_data_seal_returns_the_mls_message_and_it_opens() {
     let sender = scp_did::DID(alice_did.clone());
     let recipients = app_data_recipients(ctx_str, &alice_did);
 
-    let wire = scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor(
-        &clock,
-        actor_crypto_mut(&mut alice_actor),
-        &alice_did,
-        ctx_str,
-        &sender,
-        b"roundtrip payload",
-        scp_runtime_core::context::supervisor::MessageSigner::Active(
-            &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(signing_key),
-        ),
-        &recipients,
-        0,
-        None,
-        scp_protocol::envelope::inner::MessageType::Content,
-    )
-    .await
-    .unwrap();
+    let wire =
+        scp_runtime_core::context::shared::messaging::build_encrypted_envelope_actor_for_test(
+            &clock,
+            actor_crypto_mut(&mut alice_actor),
+            &alice_did,
+            scp_runtime_core::context::shared::messaging::EncryptedEnvelopeRequest {
+                context_id: ctx_str,
+                sender_did: &sender,
+                payload: b"roundtrip payload",
+                signer: scp_runtime_core::context::supervisor::MessageSigner::Active(
+                    &scp_runtime_core::context::actor::signer::CommandSigner::local_ed25519(
+                        signing_key,
+                    ),
+                ),
+                recipients_data: &recipients,
+                aad_sequence: 0,
+                source_provenance: None,
+                message_type: scp_protocol::envelope::inner::MessageType::Content,
+            },
+        )
+        .await
+        .unwrap();
 
     assert!(
         scp_mls::wire::parse_mls_message_in(&wire).is_ok(),

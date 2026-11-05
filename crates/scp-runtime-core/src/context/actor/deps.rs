@@ -288,18 +288,134 @@ impl ActorDeps {
 
     /// The owning identity's `KeyPackageStoreActor` handle, read through this
     /// actor's capability token; `None` when no KeyPackage actor runs for it.
+    /// Compiled only under `testing`: no production path reads it, so no
+    /// production or bridge build reaches it (ADR-070 §4).
     ///
     /// # Errors
     ///
     /// [`ContextError::SupervisorShutDown`](scp_protocol::context::ContextError::SupervisorShutDown)
     /// when the supervisor has dropped.
-    pub fn my_key_package_store(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn my_key_package_store_for_test(
         &self,
     ) -> Result<
         Option<crate::context::supervisor::key_package_actor::KeyPackageStoreHandle>,
         scp_protocol::context::ContextError,
     > {
         self.supervisor.my_key_package_store(&self.owned_identity)
+    }
+
+    /// Pushes `event` into `receive_buffer` and fans it out on this context's
+    /// event channel.
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method; core calls [`crate::context::state::emit_event_into`] directly
+    /// (ADR-070 §4).
+    pub fn emit_event_into(
+        &self,
+        receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
+        event: ContextEvent,
+        context_id: &str,
+    ) {
+        crate::context::state::emit_event_into(
+            receive_buffer,
+            event,
+            context_id,
+            self.event_tx.as_ref(),
+        );
+    }
+
+    /// Runs the bounded I/O phase of a TTL expiry over this context's transport
+    /// and event log: the relay deletion and the idempotent `ContextExpired`
+    /// append (spec §5.4.5).
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method; core calls [`crate::context::ttl::finish_ttl_expiry_io`] directly
+    /// (ADR-070 §4).
+    pub async fn finish_ttl_expiry_io(
+        &self,
+        handle: &crate::context::ContextHandle,
+        result: crate::context::ttl::TtlExpiryResult,
+        expiry_deadline_secs: u64,
+    ) -> crate::context::ttl::TtlExpiryResult {
+        crate::context::ttl::finish_ttl_expiry_io(
+            handle,
+            Some(self.transport.as_ref()),
+            self.event_log.as_ref(),
+            result,
+            expiry_deadline_secs,
+        )
+        .await
+    }
+
+    /// Places the escrow hold for an outlet call against this context's payment
+    /// adapter. `Ok(None)` means the policy prices the call at zero, so no hold
+    /// is placed.
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// [`InvocationError::ExecutionFailed`](crate::context::outlets::invoke::InvocationError::ExecutionFailed)
+    /// when this context has no payment adapter, and
+    /// [`InvocationError::BudgetExceeded`](crate::context::outlets::invoke::InvocationError::BudgetExceeded)
+    /// when the adapter refuses the hold.
+    pub async fn authorize_outlet_payment(
+        &self,
+        policy: &scp_protocol::economy::types::EconomicPolicy,
+        context_id: &str,
+        invoker_did: &DID,
+        metrics: &scp_protocol::economy::policy::ObservableMetrics,
+    ) -> Result<
+        Option<scp_runtime_types::economy::integration::PreparedAction>,
+        crate::context::outlets::invoke::InvocationError,
+    > {
+        let adapter = self.require_payment_adapter()?;
+        crate::context::outlets::invoke::authorize_outlet_payment(
+            adapter,
+            policy,
+            context_id,
+            invoker_did,
+            metrics,
+        )
+        .await
+    }
+
+    /// Captures an outlet call's escrow hold against this context's payment
+    /// adapter and returns the receipt.
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// [`InvocationError::ExecutionFailed`](crate::context::outlets::invoke::InvocationError::ExecutionFailed)
+    /// when this context has no payment adapter or the adapter cannot capture.
+    pub async fn complete_outlet_payment(
+        &self,
+        policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+        prepared: &scp_runtime_types::economy::integration::PreparedAction,
+        metrics: &scp_protocol::economy::policy::ObservableMetrics,
+    ) -> Result<
+        Option<scp_runtime_types::economy::adapter::PaymentReceipt>,
+        crate::context::outlets::invoke::InvocationError,
+    > {
+        let adapter = self.require_payment_adapter()?;
+        crate::context::outlets::invoke::complete_outlet_payment(adapter, policy, prepared, metrics)
+            .await
+    }
+
+    /// This context's payment adapter, or the typed error an outlet payment
+    /// returns without one.
+    fn require_payment_adapter(
+        &self,
+    ) -> Result<&dyn PaymentAdapterDyn, crate::context::outlets::invoke::InvocationError> {
+        self.payment_adapter.as_deref().ok_or_else(|| {
+            crate::context::outlets::invoke::InvocationError::ExecutionFailed {
+                message: "this context has no payment adapter for an outlet payment".to_owned(),
+            }
+        })
     }
 }
 

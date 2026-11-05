@@ -286,7 +286,7 @@ async fn direct_legitimate_announcement_records_and_returns_consumed() {
         scp_runtime_core::context::actor::class_s::ClassSCommitToken,
     > = None;
     let consumed = crate::helpers::deliver_message_and_drain_buffered(
-        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state(&mut state),
+        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state_for_test(&mut state),
         &deps,
         &ctx,
         &ctx_bytes,
@@ -320,7 +320,7 @@ async fn direct_forged_did_announcement_errors_permission_denied() {
         scp_runtime_core::context::actor::class_s::ClassSCommitToken,
     > = None;
     let result = crate::helpers::deliver_message_and_drain_buffered(
-        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state(&mut state),
+        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state_for_test(&mut state),
         &deps,
         &ctx,
         &ctx_bytes,
@@ -357,7 +357,7 @@ async fn direct_reserved_value_announcement_errors_permission_denied() {
         scp_runtime_core::context::actor::class_s::ClassSCommitToken,
     > = None;
     let result = crate::helpers::deliver_message_and_drain_buffered(
-        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state(&mut state),
+        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state_for_test(&mut state),
         &deps,
         &ctx,
         &ctx_bytes,
@@ -387,7 +387,9 @@ async fn direct_same_did_reannounce_succeeds_and_updates_registry() {
             scp_runtime_core::context::actor::class_s::ClassSCommitToken,
         > = None;
         let consumed = crate::helpers::deliver_message_and_drain_buffered(
-            &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state(&mut state),
+            &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state_for_test(
+                &mut state,
+            ),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -452,7 +454,7 @@ async fn ingest_v2_announcement(
         scp_runtime_core::context::actor::class_s::ClassSCommitToken,
     > = None;
     crate::helpers::deliver_message_and_drain_buffered(
-        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state(state),
+        &mut scp_runtime_core::context::actor::class_s::ClassCMut::from_state_for_test(state),
         deps,
         &ctx,
         &[ctx_byte; 32],

@@ -17,7 +17,7 @@ use scp_protocol::context::roles::Capability;
 
 /// Maximum number of checkpoints retained per context. Older checkpoints
 /// are drained when this limit is exceeded to prevent unbounded growth.
-pub const MAX_RETAINED_CHECKPOINTS: usize = 100;
+pub(crate) const MAX_RETAINED_CHECKPOINTS: usize = 100;
 
 /// Clears the context's `EpochState.needs_reconnect` flag (spec §23.11).
 ///
@@ -410,16 +410,7 @@ pub async fn build_checkpoint(
 /// supervisor's write lock. No per-context actor-shape twin exists
 /// because the actor model serializes per-context, not supervisor-wide.
 pub async fn register_local_did(supervisor: &crate::context::supervisor::Supervisor, did: DID) {
-    // ArcSwap+write_lock pattern (ADR-049 §Decision 12). Reads are
-    // lock-free; writes serialize on the supervisor write_lock to
-    // avoid lost updates against the cloned snapshot.
-    let _guard = supervisor.write_lock.lock().await;
-    let snapshot = supervisor.local_dids_ref().load_full();
-    let mut updated: std::collections::HashSet<DID> = (*snapshot).clone();
-    updated.insert(did);
-    supervisor
-        .local_dids_ref()
-        .store(std::sync::Arc::new(updated));
+    supervisor.insert_local_did(did).await;
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.

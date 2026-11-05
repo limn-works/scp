@@ -692,7 +692,7 @@ pub async fn try_ttl_expiry_cleanup(
 /// already-`Expired` context is recognized as transitioned); key destruction is
 /// bitmask-guarded.
 #[must_use]
-pub fn apply_ttl_terminal_transition(
+pub(crate) fn apply_ttl_terminal_transition(
     handle: &ContextHandle,
     // #2148 (ADR-049 birth-into-actor): key destruction runs on the ACTOR-owned
     // crypto (the provider holds none). `Some` for an Encrypted context, `None`
@@ -844,7 +844,7 @@ pub fn apply_ttl_terminal_transition(
 /// `STEP_EVENT_LOGGED` bit is set WITHOUT re-appending — no duplicate leaf, a
 /// stable Merkle root across respawn. A log that cannot be read leaves the
 /// step undone and records the error, so the expiry retries it.
-pub async fn finish_ttl_expiry_io(
+pub(crate) async fn finish_ttl_expiry_io(
     handle: &ContextHandle,
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,

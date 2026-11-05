@@ -29,15 +29,15 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
-scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
-scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
-scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
-scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
-scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
+scp-clock = { workspace = true }
+scp-crypto = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+scp-mls = { workspace = true }
+scp-platform = { workspace = true }
+scp-identity = { workspace = true }
+scp-dht = { workspace = true }
+scp-event-log = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
@@ -55,14 +55,13 @@ subtle = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
-scp-crypto = { path = "../scp-crypto", features = ["testing"] }
-scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
+scp-crypto = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["testing"] }
-scp-mls = { path = "../scp-mls", features = ["testing"] }
-scp-protocol = { path = "../scp-protocol", features = ["testing"] }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing", "encrypting", "filesystem"] }
-scp-event-log = { path = "../scp-event-log", features = ["testing"] }
+scp-dht = { workspace = true, features = ["testing"] }
+scp-mls = { workspace = true, features = ["testing"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-platform = { workspace = true, features = ["testing", "encrypting"] }
+scp-event-log = { workspace = true, features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 metrics-util = "0.19"
 

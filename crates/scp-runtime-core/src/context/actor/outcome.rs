@@ -101,9 +101,10 @@ impl<T> Outcome<T> {
 /// canonical sketch never silently coarsens an error a caller's
 /// `Outcome`-inspecting code might switch on; any other variant collapses to a
 /// `CryptoFailed` carrying the `Display` text (lossless for logging). Hoisted to
-/// one definition so the saga and outlets handlers cannot diverge on which
-/// variants survive (a `ContextError`-not-`Clone` workaround that had drifted
-/// into two divergent copies).
+/// one definition so no handler, in core or in any domain crate, can diverge on
+/// which variants survive (a `ContextError`-not-`Clone` workaround that had
+/// drifted into divergent copies, one of which lost `PersistenceFailed`).
+/// Every domain handler imports this function; none keeps a copy (ADR-070 §4).
 #[must_use]
 pub fn outcome_error_sketch(err: &ContextError) -> ContextError {
     match err {
@@ -116,6 +117,13 @@ pub fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
+        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
+        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
+        ContextError::ProposalIdMismatch { id, recomputed } => ContextError::ProposalIdMismatch {
+            id: id.clone(),
+            recomputed: recomputed.clone(),
+        },
+        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         ContextError::RateLimited {
             resource,
@@ -220,6 +228,55 @@ mod outcome_sketch_tests {
         assert!(
             matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
             "got {sketch:?}"
+        );
+    }
+
+    /// Every variant a domain handler's former copy preserved survives the one
+    /// canonical sketch, and a variant with no arm still becomes `CryptoFailed`.
+    #[test]
+    fn sketch_keeps_every_variant_a_handler_distinguishes() {
+        for (err, same) in [
+            (
+                ContextError::PersistenceFailed("p".to_owned()),
+                "PersistenceFailed",
+            ),
+            (
+                ContextError::EventLogFailed("e".to_owned()),
+                "EventLogFailed",
+            ),
+            (
+                ContextError::GovernanceFailed("g".to_owned()),
+                "GovernanceFailed",
+            ),
+            (ContextError::InvalidState("i".to_owned()), "InvalidState"),
+            (
+                ContextError::MembershipFailed("m".to_owned()),
+                "MembershipFailed",
+            ),
+            (
+                ContextError::NotImplemented("n".to_owned()),
+                "NotImplemented",
+            ),
+        ] {
+            let sketch = outcome_error_sketch(&err);
+            assert_eq!(
+                format!("{sketch:?}"),
+                format!("{err:?}"),
+                "{same} must survive"
+            );
+        }
+        let mismatch = ContextError::ProposalIdMismatch {
+            id: "a".to_owned(),
+            recomputed: "b".to_owned(),
+        };
+        assert_eq!(
+            format!("{:?}", outcome_error_sketch(&mismatch)),
+            format!("{mismatch:?}")
+        );
+        let unmapped = outcome_error_sketch(&ContextError::ActorBusy("busy".to_owned()));
+        assert!(
+            matches!(unmapped, ContextError::CryptoFailed(_)),
+            "got {unmapped:?}"
         );
     }
 }

@@ -113,13 +113,17 @@
 // vector at the compiler instead of via a source-text scanner.
 #![deny(non_local_definitions)]
 
-// ADR-049 (read-authority switch): the supervisor-owned Class-M floor registry.
-// Private to `supervisor` — the `ContextFloors` type and `FloorAdvanceError`
-// are reachable only through the `Supervisor` gate primitives + `SupervisorHandle`
-// accessors, keeping the registry internal (nothing outside the supervisor
-// module names it directly).
 pub mod challenger_ledger_actor;
-pub mod floors;
+scp_runtime_types::pub_under_testing! {
+    /// The supervisor-owned Class-M floor registry (ADR-049 read-authority
+    /// switch).
+    ///
+    /// Core-internal: production code reaches `ContextFloors` and
+    /// `FloorAdvanceError` only through the `Supervisor` gate primitives and
+    /// the `SupervisorHandle` accessors. `pub` under `testing` for the runtime
+    /// crates' tests (ADR-070 §5).
+    pub(crate) mod floors;
+}
 pub mod handle;
 pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;

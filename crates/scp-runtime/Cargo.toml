@@ -11,10 +11,10 @@ keywords = ["protocol", "context", "governance", "encryption"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-# Turns on `testing` in every runtime crate and in the scp dependencies the
-# tests use. Only test builds enable it; see `scp-runtime-core`'s manifest for
-# why no shipped artifact resolves it.
-testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-runtime-core/testing", "scp-runtime-messaging/testing", "scp-runtime-lifecycle/testing", "scp-runtime-governance/testing", "scp-runtime-broadcast/testing", "scp-runtime-economy/testing", "scp-runtime-trust-recovery/testing", "scp-runtime-standing/testing", "scp-runtime-ttl-close/testing", "scp-runtime-outlets/testing", "scp-runtime-push/testing", "scp-runtime-queries/testing", "scp-runtime-saga/testing", "scp-runtime-lifecycle-control/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
+# Turns on `testing` in every runtime crate; `scp-runtime-core/testing` turns it on in
+# the scp dependencies the tests use. Only test builds enable it; see
+# `scp-runtime-core`'s manifest for why no shipped artifact resolves it.
+testing = ["allow_unencrypted_storage", "scp-runtime-core/testing", "scp-runtime-messaging/testing", "scp-runtime-lifecycle/testing", "scp-runtime-governance/testing", "scp-runtime-broadcast/testing", "scp-runtime-economy/testing", "scp-runtime-trust-recovery/testing", "scp-runtime-standing/testing", "scp-runtime-ttl-close/testing", "scp-runtime-outlets/testing", "scp-runtime-push/testing", "scp-runtime-queries/testing", "scp-runtime-saga/testing", "scp-runtime-lifecycle-control/testing", "scp-protocol/testing"]
 # Forwards to `scp-runtime-core/allow_unencrypted_storage`, which gates
 # `ProtocolRepository::new_for_testing()`.
 allow_unencrypted_storage = ["scp-runtime-core/allow_unencrypted_storage"]
@@ -29,88 +29,63 @@ saga-witness-test-mint = ["scp-runtime-core/saga-witness-test-mint"]
 outlet-capability-test-grant = ["scp-runtime-core/outlet-capability-test-grant", "scp-runtime-messaging/outlet-capability-test-grant"]
 
 [dependencies]
-scp-runtime-types = { path = "../scp-runtime-types", version = "=0.1.0-beta.2" }
-scp-runtime-core = { path = "../scp-runtime-core", version = "=0.1.0-beta.2" }
-scp-runtime-messaging = { path = "../scp-runtime-messaging", version = "=0.1.0-beta.2" }
-scp-runtime-lifecycle = { path = "../scp-runtime-lifecycle", version = "=0.1.0-beta.2" }
-scp-runtime-governance = { path = "../scp-runtime-governance", version = "=0.1.0-beta.2" }
-scp-runtime-broadcast = { path = "../scp-runtime-broadcast", version = "=0.1.0-beta.2" }
-scp-runtime-economy = { path = "../scp-runtime-economy", version = "=0.1.0-beta.2" }
-scp-runtime-trust-recovery = { path = "../scp-runtime-trust-recovery", version = "=0.1.0-beta.2" }
-scp-runtime-standing = { path = "../scp-runtime-standing", version = "=0.1.0-beta.2" }
-scp-runtime-ttl-close = { path = "../scp-runtime-ttl-close", version = "=0.1.0-beta.2" }
-scp-runtime-outlets = { path = "../scp-runtime-outlets", version = "=0.1.0-beta.2" }
-scp-runtime-push = { path = "../scp-runtime-push", version = "=0.1.0-beta.2" }
-scp-runtime-queries = { path = "../scp-runtime-queries", version = "=0.1.0-beta.2" }
-scp-runtime-saga = { path = "../scp-runtime-saga", version = "=0.1.0-beta.2" }
-scp-runtime-lifecycle-control = { path = "../scp-runtime-lifecycle-control", version = "=0.1.0-beta.2" }
-openmls = { workspace = true }
-openmls_traits = { workspace = true }
-openmls_basic_credential = { workspace = true }
-openmls_rust_crypto = { workspace = true }
-openmls_memory_storage = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true, features = ["rt"] }
-serde = { workspace = true }
-thiserror = { workspace = true }
-rmp-serde = { workspace = true }
-rmpv = { workspace = true }
-scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
-scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
-scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
-# The push registrar maps relay `ERR` codes through `scp_relay_client::code`.
-scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
-scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
-scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
-async-trait = { workspace = true }
-aes = { workspace = true }
-rand = { workspace = true }
-sha2 = { workspace = true }
-serde_bytes = { workspace = true }
-serde_json = { workspace = true }
-z-base-32 = { workspace = true }
-ed25519-dalek = { workspace = true }
-hex = { workspace = true }
-base64 = { workspace = true }
-bs58 = { workspace = true }
-uuid = { workspace = true }
-lru = { workspace = true }
-tracing = { workspace = true }
-zeroize = { workspace = true, features = ["serde"] }
-subtle = { workspace = true }
-unicode-normalization = { workspace = true }
-metrics = { workspace = true }
-dashmap = { workspace = true }
-arc-swap = { workspace = true }
-futures = { workspace = true }
+scp-runtime-core = { workspace = true }
+scp-runtime-messaging = { workspace = true }
+scp-runtime-lifecycle = { workspace = true }
+scp-runtime-governance = { workspace = true }
+scp-runtime-broadcast = { workspace = true }
+scp-runtime-economy = { workspace = true }
+scp-runtime-trust-recovery = { workspace = true }
+scp-runtime-standing = { workspace = true }
+scp-runtime-ttl-close = { workspace = true }
+scp-runtime-outlets = { workspace = true }
+scp-runtime-push = { workspace = true }
+scp-runtime-queries = { workspace = true }
+scp-runtime-saga = { workspace = true }
+scp-runtime-lifecycle-control = { workspace = true }
+scp-protocol = { workspace = true }
 
 [dev-dependencies]
 # The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
-scp-crypto = { path = "../scp-crypto", features = ["testing"] }
-# The §25 vector tests read Vector 41's log through `validate_entry`, the
-# validated chain the node binding, node-list record and context operator
-# binding verifiers take (09-security-model.md §9.7.1 log-anchored class).
-scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
+scp-crypto = { workspace = true, features = ["testing"] }
+# The test vectors drive the KEL resolution verdict through `scp_kel::classify`.
+scp-kel = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-# The discovery test modules construct `InMemoryDhtClient` (now gated behind
-# `scp-dht/testing`); activate it for this crate's own test build (ADR-062
-# §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
-scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["testing"] }
-scp-mls = { path = "../scp-mls", features = ["testing"] }
-scp-protocol = { path = "../scp-protocol", features = ["testing"] }
-# `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
-# `ProtocolRepository::new`: `FilesystemStorage` is a plaintext backend that a
-# `compile_fail,E0277` assertion proves cannot reach a production constructor.
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing", "encrypting", "filesystem"] }
-scp-event-log = { path = "../scp-event-log", features = ["testing"] }
+# The `identity` example constructs `InMemoryDhtClient`, gated behind `scp-dht/testing`
+# (ADR-062 §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
+scp-dht = { workspace = true, features = ["testing"] }
+scp-mls = { workspace = true, features = ["testing"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-platform = { workspace = true, features = ["testing", "encrypting"] }
+scp-event-log = { workspace = true, features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
-proptest = "1"
-static_assertions = { workspace = true }
 metrics-util = "0.19"
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+dashmap = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+metrics = { workspace = true }
+openmls = { workspace = true }
+rand = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+scp-clock = { workspace = true }
+scp-did = { workspace = true }
+scp-identity = { workspace = true }
+# The push tests match relay `ERR` codes through `scp_relay_client::code`.
+scp-relay-client = { workspace = true }
+scp-runtime-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+z-base-32 = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 [[test]]
 name = "economy_integration"
@@ -245,9 +220,9 @@ required-features = ["testing"]
 # the `scp-dht` and `scp-platform` dev-dependencies, and they store through the
 # production `ProtocolRepository::new` over an `EncryptingAdapter`. So
 # `cargo run -p scp-runtime --example identity` and `scripts/check-examples-compile.sh`
-# build them with no features. Those two dev-dependencies carry a `version` key because
-# cargo drops a dev-dependency without one from a published manifest, which would leave
-# the examples' imports unresolved there.
+# build them with no features. Those two dev-dependencies carry a `version` key, through
+# `[workspace.dependencies]`, because cargo drops a dev-dependency without one from a
+# published manifest, which would leave the examples' imports unresolved there.
 [[example]]
 name = "identity"
 

@@ -161,7 +161,7 @@ mod tests {
         activate(&state);
         assert!(
             state
-                .class_s
+                .class_s_mut()
                 .pseudonym_rotation
                 .record_rotation(1, [0x66; 32], None, 1_000)
                 .is_some(),
@@ -174,7 +174,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .class_s
+                .class_s()
                 .pseudonym_rotation
                 .live_query_only(1_000)
                 .iter()

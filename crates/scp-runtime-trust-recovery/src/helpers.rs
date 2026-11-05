@@ -98,7 +98,7 @@ pub fn add_checkpoint_cosignature(
     let checkpoint_hash: [u8; 32] = hasher.finalize().into();
 
     let status = cell
-        .governance
+        .governance()
         .engine
         .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
         .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
@@ -306,7 +306,7 @@ pub async fn recovery_send_notification(
 
     // Look up the current MLS epoch from owned state. Receivers validate
     // the message against their local epoch state.
-    let current_epoch = cell.epoch.mls_epoch;
+    let current_epoch = cell.epoch().mls_epoch;
 
     // Construct a minimal inner envelope for the recovery notification.
     // Recovery notifications bypass the full send_message pipeline but

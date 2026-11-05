@@ -112,7 +112,7 @@ fn add_member_rejects_key_package_with_off_curve_wrapping_key() {
     let mut off_curve = [0u8; 65];
     off_curve[0] = 0x04;
     let err = alice_a
-        .add_member(CAROL, Some(&kp_bytes(&off_curve)), &SystemClock)
+        .add_member_for_test(CAROL, Some(&kp_bytes(&off_curve)), &SystemClock)
         .expect_err("an off-curve 0xFF01 point is refused");
     match err {
         ContextError::CryptoFailed(msg) => {
@@ -128,7 +128,7 @@ fn add_member_rejects_key_package_with_off_curve_wrapping_key() {
 
     let (valid, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     alice_a
-        .add_member(CAROL, Some(&kp_bytes(valid.as_bytes())), &SystemClock)
+        .add_member_for_test(CAROL, Some(&kp_bytes(valid.as_bytes())), &SystemClock)
         .expect("a valid 0xFF01 point is admitted");
     assert_eq!(epoch_of(&alice_a), epoch_before + 1, "the MLS add ran");
     assert_eq!(recorded(&alice_a), Some(valid));
@@ -167,7 +167,7 @@ fn add_of_existing_member_with_a_different_wrapping_key_is_refused() {
 
     let (other_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     let err = alice_a
-        .add_member(
+        .add_member_for_test(
             BOB,
             Some(&key_package_bytes(BOB, other_key.as_bytes())),
             &SystemClock,
@@ -190,7 +190,7 @@ fn add_of_existing_member_with_a_different_wrapping_key_is_refused() {
     );
 
     alice_a
-        .add_member(
+        .add_member_for_test(
             BOB,
             Some(&key_package_bytes(BOB, bob_key.as_bytes())),
             &SystemClock,
@@ -212,7 +212,7 @@ fn add_whose_key_package_names_another_did_is_refused() {
     let (carol_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
 
     let err = alice_a
-        .add_member(
+        .add_member_for_test(
             DAVE,
             Some(&key_package_bytes(CAROL, carol_key.as_bytes())),
             &SystemClock,
@@ -237,7 +237,7 @@ fn open_of_an_update_commit_applies_the_new_wrapping_key() {
     let (alice_p, mut alice_a, _bob_p, mut bob_a, _) = setup();
     // A Welcome joiner's cache starts empty; Bob learned Alice's key.
     bob_a
-        .encrypted_crypto_mut()
+        .encrypted_crypto_mut_for_test()
         .unwrap()
         .member_wrapping_keys
         .insert(
@@ -276,7 +276,7 @@ fn peer_removed_member_re_added_with_a_new_key_succeeds() {
     let (k2, _s2) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
 
     let add = alice_a
-        .add_member(
+        .add_member_for_test(
             CAROL,
             Some(&key_package_bytes(CAROL, k1.as_bytes())),
             &SystemClock,
@@ -291,7 +291,7 @@ fn peer_removed_member_re_added_with_a_new_key_succeeds() {
     assert_eq!(actor_mls_epoch(&alice_a), actor_mls_epoch(&bob_a));
 
     let re_add = alice_a
-        .add_member(
+        .add_member_for_test(
             CAROL,
             Some(&key_package_bytes(CAROL, k2.as_bytes())),
             &SystemClock,
@@ -318,19 +318,22 @@ fn dispose_secrets_seeded_encrypted_reports_observed_true() {
         }
         ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
     }
-    let outcome = alice_a.dispose_secrets();
+    let outcome = alice_a.dispose_secrets_for_test();
     assert_eq!(
         (
-            outcome.mls_group_destroyed(),
-            outcome.sender_keys_destroyed()
+            outcome.mls_group_destroyed_for_test(),
+            outcome.sender_keys_destroyed_for_test()
         ),
         (true, true),
         "present group + present sender key ⇒ both destroyed-flags observed true"
     );
     // The material is now gone: a repeat disposal reports honest false.
-    let repeat = alice_a.dispose_secrets();
+    let repeat = alice_a.dispose_secrets_for_test();
     assert_eq!(
-        (repeat.mls_group_destroyed(), repeat.sender_keys_destroyed()),
+        (
+            repeat.mls_group_destroyed_for_test(),
+            repeat.sender_keys_destroyed_for_test()
+        ),
         (false, false),
         "after disposal the state is emptied ⇒ a repeat reports honest false"
     );
@@ -452,7 +455,9 @@ async fn golden_seal_open_after_rotate_nonzero_epoch() {
         "rotate must advance the sender-key epoch past 0"
     );
     // Deliver the rotated key to Bob (the rotate queued a distribution).
-    let msgs_a = alice_a.drain_pending_sender_key_messages().unwrap();
+    let msgs_a = alice_a
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs_a.len(), 1);
     let (key_a, recv_epoch_a) =
         scp_runtime_core::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
@@ -464,7 +469,7 @@ async fn golden_seal_open_after_rotate_nonzero_epoch() {
         .await
         .unwrap();
     assert_eq!(recv_epoch_a, epoch_a);
-    bob_recv_a.set_sender_key_unchecked(ALICE, key_a);
+    bob_recv_a.set_sender_key_unchecked_for_test(ALICE, key_a);
     let blob_actor = alice_a.seal(ALICE, &inner).unwrap();
     let opened_a = match bob_recv_a.open(CTX_STR, &blob_actor).unwrap() {
         OpenResult::Application(e) => e,
@@ -510,7 +515,9 @@ async fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
     assert!(epoch >= 1, "rotate advances the sender-key epoch past 0");
 
     // Deliver the rotated key to Bob (the rotate queued a distribution).
-    let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
+    let msgs = alice_a
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1);
     let (rotated_key, recv_epoch) =
         scp_runtime_core::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
@@ -522,7 +529,7 @@ async fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
         .await
         .unwrap();
     assert_eq!(recv_epoch, epoch);
-    bob_a.set_sender_key_unchecked(ALICE, rotated_key);
+    bob_a.set_sender_key_unchecked_for_test(ALICE, rotated_key);
 
     let inner = build_inner(ALICE, 0);
 
@@ -631,7 +638,7 @@ fn golden_mls_encrypt_management_cross_roundtrip() {
 #[test]
 fn golden_group_context_extension_byte_identical() {
     let (_alice_p, alice_a, _bob_p, _bob_a, _ctx) = setup();
-    let from_actor = alice_a.group_context_extension().unwrap();
+    let from_actor = alice_a.group_context_extension_for_test().unwrap();
     let ext = from_actor.expect("an SCP context group carries the 0xFF02 extension");
     assert_eq!(
         ext.context_id, CTX_STR,
@@ -659,13 +666,17 @@ async fn golden_distribute_and_process_recover_identical_key() {
     let (_alice_p, mut alice_a, bob_p, mut bob_a, _) = setup();
 
     // Actor distributes Alice's CURRENT (unrotated) sender key.
-    alice_a.distribute_sender_key(ALICE, BOB, None).unwrap();
-    let actor_msgs = alice_a.drain_pending_sender_key_messages().unwrap();
+    alice_a
+        .distribute_sender_key_for_test(ALICE, BOB, None)
+        .unwrap();
+    let actor_msgs = alice_a
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(actor_msgs.len(), 1, "one queued distribution");
     // Drain again — the queue is now empty (verbatim `std::mem::take`).
     assert!(
         alice_a
-            .drain_pending_sender_key_messages()
+            .drain_pending_sender_key_messages_for_test()
             .unwrap()
             .is_empty()
     );
@@ -694,7 +705,7 @@ async fn golden_distribute_and_process_recover_identical_key() {
 
     // `set_sender_key_unchecked` install half: after installing the recovered
     // key on the Bob actor, Alice's application seal opens under it.
-    bob_a.set_sender_key_unchecked(ALICE, recovered_key);
+    bob_a.set_sender_key_unchecked_for_test(ALICE, recovered_key);
     let inner = build_inner(ALICE, 0);
     let sealed = alice_a.seal(ALICE, &inner).unwrap();
     match bob_a.open(CTX_STR, &sealed).unwrap() {
@@ -726,7 +737,9 @@ async fn golden_rotate_sender_key_parity() {
 
     // The queued distribution from the actor rotate is processable by Bob and
     // carries the new epoch.
-    let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
+    let msgs = alice_a
+        .drain_pending_sender_key_messages_for_test()
+        .unwrap();
     assert_eq!(msgs.len(), 1, "one member (Bob) receives the rotated key");
     let (_key, epoch) =
         scp_runtime_core::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
@@ -813,7 +826,7 @@ fn golden_export_restore_equivalent() {
 
     // Capture the ORIGINAL group-context extension + local epoch off the live
     // actor (export is non-destructive) as the golden restore target.
-    let orig_ext = alice_a.group_context_extension().unwrap();
+    let orig_ext = alice_a.group_context_extension_for_test().unwrap();
     let orig_epoch = alice_a.local_sender_key_epoch();
 
     let blob_a = alice_a.export_crypto_state(Vec::new(), Vec::new()).unwrap();
@@ -824,11 +837,11 @@ fn golden_export_restore_equivalent() {
     // insert-path `restore_crypto_state` twin is gone), reseed an actor, and
     // confirm it agrees with the ORIGINAL on the group-context extension and
     // local sender-key epoch.
-    let (owned, _floors) = NodeMlsFactory::build_restored_owned(&ctx, &blob_a).unwrap();
+    let (owned, _floors) = NodeMlsFactory::build_restored_owned_for_test(&ctx, &blob_a).unwrap();
     let mut restored = PerContextState::new_for_test_encrypted(ctx, 0, DID::from(ALICE.to_owned()));
     restored.seed_encrypted_crypto_from_owned(owned);
     assert_eq!(
-        restored.group_context_extension().unwrap(),
+        restored.group_context_extension_for_test().unwrap(),
         orig_ext,
         "restored group-context extension must match the original"
     );
@@ -873,7 +886,7 @@ fn crypto_snapshot_encodes_like_plain_fields() {
     let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
     // A queued distribution, so `pending_distributions` is not empty.
     if let ContextModeState::Encrypted(cs) = &mut alice_a.mode {
-        ContextCryptoState::enqueue_distribution(
+        ContextCryptoState::enqueue_distribution_for_test(
             &mut cs.pending_distributions,
             BOB.to_owned(),
             vec![0x02; 33],
@@ -882,7 +895,7 @@ fn crypto_snapshot_encodes_like_plain_fields() {
         );
     }
     // A peer's sender key, so `sender_key_entries` is not empty.
-    alice_a.set_sender_key_unchecked(
+    alice_a.set_sender_key_unchecked_for_test(
         BOB,
         scp_protocol::crypto::sender_keys::generate_sender_key(),
     );
@@ -899,14 +912,17 @@ fn crypto_snapshot_encodes_like_plain_fields() {
     assert_eq!(*blob, plain_bytes);
 
     let wiping: MlsCryptoSnapshot = rmp_serde::from_slice(&plain_bytes).unwrap();
-    assert_eq!(*wiping.signer_bytes, plain.signer_bytes);
-    assert_eq!(*wiping.mls_storage_entries, plain.mls_storage_entries);
+    assert_eq!(**wiping.signer_bytes_for_test(), plain.signer_bytes);
     assert_eq!(
-        wiping.local_sender_key.as_bytes(),
+        **wiping.mls_storage_entries_for_test(),
+        plain.mls_storage_entries
+    );
+    assert_eq!(
+        wiping.local_sender_key_for_test().as_bytes(),
         plain.local_sender_key.as_bytes()
     );
     assert_eq!(
-        wiping.sender_key_entries.len(),
+        wiping.sender_key_entries_for_test().len(),
         plain.sender_key_entries.len()
     );
     assert_eq!(
@@ -925,7 +941,7 @@ fn golden_destroy_mls_group_empties_export() {
             .unwrap()
             .is_empty()
     );
-    alice_a.destroy_mls_group().unwrap();
+    alice_a.destroy_mls_group_for_test().unwrap();
     assert!(
         alice_a
             .export_crypto_state(Vec::new(), Vec::new())
@@ -941,7 +957,7 @@ fn golden_destroy_sender_key_rotates_and_clears() {
     let (_alice_p, mut alice_a, _bob_p, _bob_a, ctx) = setup();
 
     let key_before = actor_sender_key(&alice_a);
-    alice_a.destroy_sender_key().unwrap();
+    alice_a.destroy_sender_key_for_test().unwrap();
     let key_after = actor_sender_key(&alice_a);
     assert_ne!(
         key_before.as_bytes(),

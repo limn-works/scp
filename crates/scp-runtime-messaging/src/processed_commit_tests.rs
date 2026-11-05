@@ -230,7 +230,7 @@ async fn member_deps(
         crypto,
         Box::new(RecordingTransport(Arc::clone(&sent))),
         Box::new(OkEventLog),
-        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        scp_runtime_core::crypto::mls::two_party_test_support::pair_resolver_for_test(ALICE, BOB),
         Some(Box::new(SharedStore(Arc::clone(&store)))),
         None,
         None,
@@ -301,7 +301,7 @@ fn key_package(did: &str) -> Vec<u8> {
 fn epoch(state: &PerContextState) -> u64 {
     state
         .mode
-        .crypto()
+        .crypto_for_test()
         .and_then(|c| c.mls_group.as_ref())
         .expect("an encrypted group")
         .epoch()
@@ -312,7 +312,7 @@ fn epoch(state: &PerContextState) -> u64 {
 fn holds_leaf(state: &PerContextState, did: &str) -> bool {
     state
         .mode
-        .crypto()
+        .crypto_for_test()
         .and_then(|c| c.mls_group.as_ref())
         .expect("an encrypted group")
         .members()
@@ -382,7 +382,7 @@ async fn trio(ctx: &str) -> (Member, Member) {
     let (bob_deps, bob_sup, bob_store, bob_sent) = member_deps(BOB, bob_provider).await;
 
     let add = alice_state
-        .add_member(CAROL, Some(&key_package(CAROL)), &SystemClock)
+        .add_member_for_test(CAROL, Some(&key_package(CAROL)), &SystemClock)
         .expect("Alice adds Carol")
         .commit_bytes;
     let dispatched = crate::helpers::decrypt_and_dispatch(
@@ -405,14 +405,14 @@ async fn trio(ctx: &str) -> (Member, Member) {
     assert!(holds_leaf(&alice_state, CAROL) && holds_leaf(&bob_state, CAROL));
     (
         Member {
-            cell: ClassSCell::new(alice_state),
+            cell: ClassSCell::new_for_test(alice_state),
             deps: alice_deps,
             sup: alice_sup,
             store: alice_store,
             sent: alice_sent,
         },
         Member {
-            cell: ClassSCell::new(bob_state),
+            cell: ClassSCell::new_for_test(bob_state),
             deps: bob_deps,
             sup: bob_sup,
             store: bob_store,
@@ -459,8 +459,10 @@ async fn seed_bob_for_carol(bob: &mut Member, ctx: &str, sender_key_ctx: &str) {
                     tokens: Vec::new(),
                 },
             );
-            s.access.access_key_store.set(ctx, CAROL, carol_key.clone());
-            s.access.read_exclusion_list.insert(DID::from(CAROL));
+            s.access_mut()
+                .access_key_store
+                .set(ctx, CAROL, carol_key.clone());
+            s.access_mut().read_exclusion_list.insert(DID::from(CAROL));
             s.routing
                 .peer_registry_mut()
                 .expect("encrypted ⇒ registry")
@@ -511,7 +513,11 @@ async fn a_received_remove_commit_changes_only_the_trigger_and_the_registry_reco
 
     seed_bob_for_carol(&mut bob, ctx, &sender_key_ctx).await;
     let seeded = bob.store.snapshot(ctx).expect("the seed persisted");
-    assert!(!seeded.pseudonym_rotation.membership_change_pending);
+    assert!(
+        !seeded
+            .pseudonym_rotation
+            .membership_change_pending_for_test()
+    );
 
     let remove = alice
         .cell
@@ -530,7 +536,9 @@ async fn a_received_remove_commit_changes_only_the_trigger_and_the_registry_reco
 
     let after = bob.store.snapshot(ctx).expect("the Commit persisted");
     assert!(
-        after.pseudonym_rotation.membership_change_pending,
+        after
+            .pseudonym_rotation
+            .membership_change_pending_for_test(),
         "the processed Commit records the rotation trigger"
     );
     assert!(
@@ -569,7 +577,7 @@ async fn a_received_remove_commit_changes_only_the_trigger_and_the_registry_reco
 
     // The sender key, sequence tracker and floors are not in the snapshot's
     // plain fields; they are read where they live.
-    let crypto = bob.cell.mode.crypto().expect("encrypted");
+    let crypto = bob.cell.mode.crypto_for_test().expect("encrypted");
     assert_eq!(
         crypto
             .sender_key_store
@@ -707,8 +715,8 @@ async fn a_reset_without_the_targets_key_package_changes_nothing() {
 async fn a_non_committer_records_no_rotation_for_a_reset() {
     let ctx = "reset-records-no-rotation";
     let (mut alice, mut bob) = trio(ctx).await;
-    let rotation_before: PseudonymRotationState = bob.cell.class_s.pseudonym_rotation.clone();
-    assert!(!rotation_before.membership_change_pending);
+    let rotation_before: PseudonymRotationState = bob.cell.class_s().pseudonym_rotation.clone();
+    assert!(!rotation_before.membership_change_pending_for_test());
 
     let output = reset_carol(&mut alice, ctx, Some(&key_package(CAROL)))
         .await
@@ -745,7 +753,7 @@ async fn the_removed_member_discards_its_rotation_state_and_records_no_rotation(
     bob.cell
         .commit_class_s_keep(&bob.deps, ctx, |mut v| {
             v.rest_mut()
-                .class_s
+                .class_s_mut()
                 .pseudonym_rotation
                 .record_rotation(0, [0xB9; 32], Some(&membership_policy()), 1_700_000_000)
                 .expect("record Bob's rotation");
@@ -779,7 +787,9 @@ async fn the_removed_member_discards_its_rotation_state_and_records_no_rotation(
         "the pending announcement is discarded"
     );
     assert!(
-        !persisted.pseudonym_rotation.membership_change_pending,
+        !persisted
+            .pseudonym_rotation
+            .membership_change_pending_for_test(),
         "a member's own removal records no rotation"
     );
 }

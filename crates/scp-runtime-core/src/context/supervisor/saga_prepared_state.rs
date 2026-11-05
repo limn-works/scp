@@ -229,6 +229,18 @@ pub(in crate::context) struct CrossContextOutletInvocationPreparedWire {
 
 #[allow(dead_code)] // evidence path consumed by the saga dispatch wiring PR
 impl CrossContextOutletInvocationPrepared {
+    /// Test-only reach into [`Self::to_evidence_bytes`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::to_evidence_bytes`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn to_evidence_bytes_for_test(&self) -> Result<Vec<u8>, String> {
+        Self::to_evidence_bytes(self)
+    }
+
     /// Encode the public prepared state to its journal `evidence` bytes —
     /// `MessagePack` of the `CrossContextOutletInvocationPreparedWire`
     /// mirror (§6.2.4 "Public-metadata journaling"). Classified **public**;
@@ -238,7 +250,7 @@ impl CrossContextOutletInvocationPrepared {
     /// # Errors
     ///
     /// Returns the `rmp_serde` encode error string if serialization fails.
-    pub fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
+    pub(in crate::context) fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
         let wire = CrossContextOutletInvocationPreparedWire {
             caller_context_id: self.caller_context_id,
             target_context_id: self.target_context_id,

@@ -7,6 +7,102 @@
 //! MAINTENANCE: When adding a public module to scp-protocol or scp-runtime,
 //! add the corresponding re-export here. The CI check and structural test
 //! in `tests/facade_completeness.rs` will catch omissions.
+//!
+//! # Runtime seal (ADR-070 §4)
+//!
+//! A runtime-core item that mutates context or Supervisor state, exposes an
+//! actor handle, reads or writes key material, or bypasses a dispatch-time
+//! check is callable only inside `scp-runtime-core` and the 13 domain crates
+//! core lends a capability to. A crate that depends on `scp-core`, as every FFI
+//! bridge does, reaches none of them. Each case below compiled when those items
+//! were `pub`; each now fails with a privacy error.
+//!
+//! The Supervisor's actor lookup:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::supervisor::Supervisor;
+//! fn lookup(sup: &Supervisor) {
+//!     let _ = sup.lookup("context");
+//! }
+//! ```
+//!
+//! Minting the capability handle a domain crate receives:
+//!
+//! ```compile_fail,E0624
+//! use std::sync::Arc;
+//! use scp_core::context::supervisor::{Supervisor, SupervisorHandle};
+//! fn mint(sup: &Arc<Supervisor>) -> SupervisorHandle {
+//!     SupervisorHandle::wrap(sup)
+//! }
+//! ```
+//!
+//! The Supervisor's write lock:
+//!
+//! ```compile_fail,E0616
+//! use scp_core::context::supervisor::Supervisor;
+//! fn hold(sup: &Supervisor) {
+//!     let _ = &sup.write_lock;
+//! }
+//! ```
+//!
+//! Wrapping per-context state in the cell whose combinators order persistence:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::actor::class_s::ClassSCell;
+//! use scp_core::context::actor::state::PerContextState;
+//! fn cell(state: PerContextState) -> ClassSCell {
+//!     ClassSCell::new(state)
+//! }
+//! ```
+//!
+//! Building per-context state field by field:
+//!
+//! ```compile_fail,E0451
+//! use scp_core::context::actor::state::PerContextState;
+//! fn forge() -> PerContextState {
+//!     PerContextState { context_id: [0; 32], ..todo!() }
+//! }
+//! ```
+//!
+//! Writing an identity's wrapping-key handle:
+//!
+//! ```compile_fail,E0603
+//! use scp_core::store::wrapping_key::store_wrapping_key_handle;
+//! ```
+//!
+//! Running a cross-context outlet invocation outside its saga:
+//!
+//! ```compile_fail,E0603
+//! use scp_core::context::outlets::invoke::invoke_outlet_cross_context;
+//! ```
+//!
+//! Authorizing an outlet payment outside the invocation path:
+//!
+//! ```compile_fail,E0603
+//! use scp_core::context::outlets::invoke::authorize_outlet_payment;
+//! ```
+//!
+//! The control: the same paths resolve, and the public items beside the
+//! sealed ones compile. It also runs as `tests/runtime_seal.rs`, because
+//! `cargo nextest` runs no doctest.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use scp_core::context::actor::class_s::ClassSCell;
+//! use scp_core::context::actor::state::PerContextState;
+//! use scp_core::context::outlets::invoke::InvocationError;
+//! use scp_core::context::supervisor::{Supervisor, SupervisorHandle};
+//! fn reach(
+//!     _sup: &Arc<Supervisor>,
+//!     state: &PerContextState,
+//!     _cell: Option<&ClassSCell>,
+//!     _handle: Option<&SupervisorHandle>,
+//!     _err: Option<&InvocationError>,
+//! ) -> [u8; 32] {
+//!     state.context_id
+//! }
+//! let _ = reach;
+//! ```
 
 // --- Modules that exist ONLY in scp-protocol (no conflict) ---
 pub use scp_protocol::jcs;

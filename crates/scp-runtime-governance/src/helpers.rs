@@ -13,13 +13,9 @@
 //!
 //! Phase 2A.8 lands as a multi-commit ladder. Each commit migrates a
 //! group of related helpers, wiring the actor-shape
-//! `handlers::governance::dispatch` arms incrementally. The
-//! supervisor-scoped sweep helpers (`evaluate_periodic_consequences`,
-//! `process_pending_commits`, `compute_commit_retry_outcomes`,
-//! `apply_commit_retry_outcomes`) iterate the actor registry and drive
-//! each context's per-actor sweep body through its mailbox. (Governance
-//! timeouts are an ACTOR-OWNED interval arm — ADR-049 finding A3 — not a
-//! supervisor-spawned task.)
+//! `handlers::governance::dispatch` arms incrementally. The consequence
+//! evaluation and commit-retry bodies run per actor from its governance
+//! timer arm (ADR-049 finding A3); no supervisor-scoped sweep drives them.
 
 use scp_clock::Clock;
 use scp_did::DID;
@@ -40,7 +36,8 @@ use scp_protocol::economy::types::EconomicPolicy;
 use scp_runtime_core::context::actor::class_s::CommitBroadcastBorrows;
 use scp_runtime_core::context::shared::governance::conflicting_approved;
 use scp_runtime_core::context::shared::governance::{
-    BroadcastFailure, CommitMeta, MigrationBootstrap, check_commit_fault, migration_destination_id,
+    BroadcastFailure, CommitMeta, MigrationBootstrap, MigrationBootstrapParts, check_commit_fault,
+    migration_destination_id,
 };
 use tracing::instrument;
 
@@ -60,8 +57,8 @@ use scp_runtime_core::context::state::{
     MAX_OUTLET_INTERFACES, MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS,
     MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
     PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
-    SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, emit_event_into,
-    require_active, require_migrating_out, strip_event_payload,
+    SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, require_active,
+    require_migrating_out, strip_event_payload,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,12 +73,7 @@ use scp_runtime_core::context::state::{
 /// channel. Mirrors the legacy `PerContextState::emit_event` body but
 /// works on actor-owned state.
 fn emit(state: &mut PerContextState, event: ContextEvent, context_id: &str, deps: &ActorDeps) {
-    emit_event_into(
-        &mut state.receive_buffer,
-        event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    deps.emit_event_into(&mut state.receive_buffer, event, context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +100,7 @@ pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> G
         context_id: state.handle.context_id().to_owned(),
         members,
         admin_dids,
-        current_epoch: Some(state.epoch.mls_epoch),
+        current_epoch: Some(state.epoch().mls_epoch),
         now: clock.now_secs(),
     }
 }
@@ -163,7 +155,7 @@ pub fn get_proposal(
     proposal_id: &ProposalId,
 ) -> Result<GovernanceProposal, ContextError> {
     state
-        .governance
+        .governance()
         .engine
         .get_proposal(proposal_id)
         .cloned()
@@ -178,7 +170,7 @@ pub fn get_proposal(
 /// Enumerate every governance proposal tracked by the context's engine.
 #[must_use]
 pub fn list_proposals(state: &PerContextState) -> Vec<GovernanceProposal> {
-    state.governance.engine.list_proposals()
+    state.governance().engine.list_proposals()
 }
 
 /// Snapshot the current migration metadata for the context, if any.
@@ -265,7 +257,10 @@ pub async fn tombstone_migrated_context(
         emit(state, tombstone_event, context_id, deps);
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_rotation_state();
+        state
+            .class_s_mut()
+            .pseudonym_rotation
+            .discard_rotation_state();
 
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
         // the tombstone leaves the context non-Active so `reconcile_timers`
@@ -274,11 +269,11 @@ pub async fn tombstone_migrated_context(
         // stale absolute deadline cannot fire against the tombstoned context on
         // a later restore and despawn it — which would defeat tombstone finality
         // by making the id re-creatable (BUG-1).
-        state.ttl.timer.deadline_unix_secs = None;
+        state.ttl_mut().timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.migration_state = None;
         // M7: Participation decay on tombstone (#1530).
-        state.governance.decay_participation();
+        state.governance_mut().decay_participation();
         Ok(())
     })
     .await?;
@@ -420,7 +415,7 @@ pub async fn apply_pending_ceiling_modification(
 ) -> Result<bool, ContextError> {
     require_active(&cell.handle)?;
 
-    let pending = match &cell.governance.pending_ceiling_modification {
+    let pending = match &cell.governance().pending_ceiling_modification {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
@@ -454,7 +449,7 @@ pub async fn apply_pending_ceiling_modification(
                     "pending ceiling modification has a malformed entry: {e}"
                 ))
             })?;
-        state.governance.pending_ceiling_modification = None;
+        state.governance_mut().pending_ceiling_modification = None;
         Ok(())
     })
     .await?;
@@ -503,7 +498,7 @@ pub async fn apply_pending_economic_policy_change(
     // exactly. The not-yet-effective early return runs before any mutation.
     require_active(&cell.handle)?;
 
-    let pending = match &cell.governance.pending_economic_policy_change {
+    let pending = match &cell.governance().pending_economic_policy_change {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
@@ -658,9 +653,11 @@ fn freeze_has_expired(
     cell: &scp_runtime_core::context::actor::class_s::ClassSCell,
     now: u64,
 ) -> bool {
-    cell.governance.freeze.is_some_and(|(_, _, freeze_start)| {
-        now.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
-    })
+    cell.governance()
+        .freeze
+        .is_some_and(|(_, _, freeze_start)| {
+            now.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
+        })
 }
 
 /// Checks for and resolves the governance freeze expired at `now` (ADR-031
@@ -670,7 +667,7 @@ pub fn check_and_resolve_expired_freezes(
     now: u64,
 ) -> Vec<GovernanceEvent> {
     if freeze_has_expired(cell, now)
-        && let Some((proposal_a, proposal_b, _)) = cell.governance.freeze
+        && let Some((proposal_a, proposal_b, _)) = cell.governance().freeze
     {
         let mut view = cell.class_c_view();
         let gov = view.governance_class_c_mut();
@@ -891,7 +888,7 @@ pub async fn execute_revoke(
                     .role_state
                     .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
 
-                state.access.read_exclusion_list.insert(did.clone());
+                state.access_mut().read_exclusion_list.insert(did.clone());
 
                 if let Some(ref mut bc) = state.broadcast_context {
                     // `governance_ban_subscriber` ALWAYS records the durable ban
@@ -909,7 +906,7 @@ pub async fn execute_revoke(
                     }
                 } else {
                     state
-                        .access
+                        .access_mut()
                         .access_key_store
                         .remove(context_id, did.as_ref());
                     // No sender key is pushed to a read-revoked member: its
@@ -1112,7 +1109,7 @@ pub async fn execute_restore_access(
         let suspended_set = state.role_state.suspended_for(did.as_ref());
         let nothing_suspended_for_request =
             suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
-        let read_excluded = state.access.read_exclusion_list.contains(did);
+        let read_excluded = state.access().read_exclusion_list.contains(did);
         let read_requested = capabilities.contains(&Capability::MessagesRead);
         // #2088 Finding 2: a durable broadcast ban is a restorable condition too.
         // BOTH `suspended_capabilities` and `read_exclusion_list` are wiped by the
@@ -1139,7 +1136,7 @@ pub async fn execute_restore_access(
 
         let has_read = capabilities.contains(&Capability::MessagesRead);
         if has_read {
-            state.access.read_exclusion_list.remove(did);
+            state.access_mut().read_exclusion_list.remove(did);
 
             if let Some(bc) = state.broadcast_context.as_mut() {
                 bc.governance_unban_subscriber(&did.0);
@@ -1151,7 +1148,7 @@ pub async fn execute_restore_access(
                     did.as_ref(),
                 );
                 state
-                    .access
+                    .access_mut()
                     .access_key_store
                     .set(context_id, did.as_ref(), restored_key);
             }
@@ -1264,7 +1261,7 @@ pub async fn execute_add_member(
             }
         }
         None => {
-            if !cfg!(any(test, feature = "testing")) {
+            if !scp_runtime_types::TESTING {
                 return Err(ContextError::MembershipFailed(
                     "production add_member requires MLS key package bytes".to_string(),
                 ));
@@ -1734,7 +1731,7 @@ pub async fn execute_register_outlet(
         ));
     }
 
-    if cell.governance.registered_outlets.len() >= MAX_REGISTERED_OUTLETS {
+    if cell.governance().registered_outlets.len() >= MAX_REGISTERED_OUTLETS {
         return Err(ContextError::LimitExceeded(format!(
             "registered outlet limit of {MAX_REGISTERED_OUTLETS} exceeded"
         )));
@@ -1762,7 +1759,7 @@ pub async fn execute_register_outlet(
     // answering invocations the context revoked. `registry::register_outlet`
     // rejects a duplicate against its map; reject it against the vec here.
     if cell
-        .governance
+        .governance()
         .registered_outlets
         .iter()
         .any(|existing| existing.outlet_id == registration.outlet_id)
@@ -1845,7 +1842,7 @@ pub async fn execute_remove_outlet(
         require_active(&view.handle)?;
 
         view.rest_mut()
-            .governance
+            .governance_mut()
             .registered_outlets
             .retain(|t| t.outlet_id != outlet_id);
         Ok(())
@@ -1936,7 +1933,7 @@ pub async fn execute_modify_ceiling(
             ));
         }
 
-        if state.governance.pending_ceiling_modification.is_some() {
+        if state.governance().pending_ceiling_modification.is_some() {
             return Err(ContextError::PermissionDenied(
                 "a ceiling modification is already pending notification period".to_owned(),
             ));
@@ -1962,7 +1959,7 @@ pub async fn execute_modify_ceiling(
         let notified_at = timestamp_secs;
         let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
         let observed_at = deps.clock.now_secs();
-        state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
+        state.governance_mut().pending_ceiling_modification = Some(PendingCeilingModification {
             new_capabilities: new_ceiling.to_vec(),
             notified_at,
             effective_at,
@@ -2046,12 +2043,15 @@ pub async fn execute_close_context(
         // stale absolute deadline cannot fire against the closed context on a
         // later restore and despawn it (BUG-1) — mirroring
         // `execute_promote_context`.
-        state.ttl.timer.deadline_unix_secs = None;
+        state.ttl_mut().timer.deadline_unix_secs = None;
         state.broadcast_context = None;
-        state.governance.decay_participation();
+        state.governance_mut().decay_participation();
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_rotation_state();
+        state
+            .class_s_mut()
+            .pseudonym_rotation
+            .discard_rotation_state();
         Ok(())
     })
     .await?;
@@ -2425,12 +2425,12 @@ pub async fn execute_add_signer(
         if !view.membership.contains(did) {
             return Err(ContextError::MemberNotFound(did.to_string()));
         }
-        if view.governance.class_s.threshold_signers.contains(did) {
+        if view.governance().class_s.threshold_signers.contains(did) {
             return Err(ContextError::PermissionDenied(format!(
                 "DID is already a signer: {did}"
             )));
         }
-        if view.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+        if view.governance().class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
             return Err(ContextError::LimitExceeded(format!(
                 "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
             )));
@@ -2511,18 +2511,18 @@ pub async fn execute_remove_signer(
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
-        let before = view.governance.class_s.threshold_signers.len();
+        let before = view.governance().class_s.threshold_signers.len();
         view.governance_class_s_mut()
             .threshold_signers
             .retain(|s| s != did);
-        if view.governance.class_s.threshold_signers.len() == before {
+        if view.governance().class_s.threshold_signers.len() == before {
             return Err(ContextError::MemberNotFound(did.to_string()));
         }
-        if view.governance.class_s.threshold_value > 0 {
-            let remaining =
-                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-            if view.governance.class_s.threshold_value > remaining {
-                let threshold_value = view.governance.class_s.threshold_value;
+        if view.governance().class_s.threshold_value > 0 {
+            let remaining = u32::try_from(view.governance().class_s.threshold_signers.len())
+                .unwrap_or(u32::MAX);
+            if view.governance().class_s.threshold_value > remaining {
+                let threshold_value = view.governance().class_s.threshold_value;
                 view.governance_class_s_mut()
                     .threshold_signers
                     .push(did.clone());
@@ -2591,7 +2591,7 @@ pub async fn execute_modify_threshold(
         require_active(&view.handle)?;
 
         let signer_count =
-            u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            u32::try_from(view.governance().class_s.threshold_signers.len()).unwrap_or(u32::MAX);
         if new_threshold == 0 || new_threshold > signer_count {
             return Err(ContextError::PermissionDenied(format!(
                 "threshold must be 1..={signer_count}, got {new_threshold}"
@@ -2648,7 +2648,7 @@ pub async fn execute_establish_outlet_interface(
         ));
     }
 
-    if cell.governance.outlet_interfaces.len() >= MAX_OUTLET_INTERFACES {
+    if cell.governance().outlet_interfaces.len() >= MAX_OUTLET_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
             "outlet interface limit of {MAX_OUTLET_INTERFACES} exceeded"
         )));
@@ -2871,7 +2871,7 @@ pub async fn execute_resolve_conflict(
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
-        let (freeze_a, freeze_b, _) = view.governance.freeze.ok_or_else(|| {
+        let (freeze_a, freeze_b, _) = view.governance().freeze.ok_or_else(|| {
             ContextError::PermissionDenied(
                 "context is not in governance freeze state — no conflict to resolve".into(),
             )
@@ -2885,12 +2885,12 @@ pub async fn execute_resolve_conflict(
         }
 
         let action_a = view
-            .governance
+            .governance()
             .approved_proposals
             .get(proposal_a)
             .map(|(p, _, _)| &p.action);
         let action_b = view
-            .governance
+            .governance()
             .approved_proposals
             .get(proposal_b)
             .map(|(p, _, _)| &p.action);
@@ -2903,10 +2903,10 @@ pub async fn execute_resolve_conflict(
             ));
         };
 
-        let proposer_a = &view.governance.approved_proposals[proposal_a]
+        let proposer_a = &view.governance().approved_proposals[proposal_a]
             .0
             .proposer_did;
-        let proposer_b = &view.governance.approved_proposals[proposal_b]
+        let proposer_b = &view.governance().approved_proposals[proposal_b]
             .0
             .proposer_did;
         if !scp_protocol::sync::conflict_resolution::actions_conflict(
@@ -2946,7 +2946,7 @@ pub async fn execute_resolve_conflict(
             }
         }
 
-        view.rest_mut().governance.freeze = None;
+        view.rest_mut().governance_mut().freeze = None;
         Ok(())
     })
     .await?;
@@ -3033,7 +3033,7 @@ pub async fn execute_promote_context(
         let state = view.rest_mut();
         // Clear the recorded deadline so the actor-owned TTL arm disarms on the
         // next `reconcile_timers` (ADR-049 finding A3; no task to cancel).
-        state.ttl.timer.deadline_unix_secs = None;
+        state.ttl_mut().timer.deadline_unix_secs = None;
         // §5.10 params mutation: memory scope → Full AND `params.ttl` → None (the
         // prune-immune promotion authority the deadline reader consults).
         state.handle.promote_params();
@@ -3121,7 +3121,7 @@ pub async fn execute_rotate_content_keys(
                     .map(|d| d.0.clone())
                     .collect();
                 let current_epoch = state
-                    .access
+                    .access()
                     .access_key_store
                     .get_all(context_id)
                     .values()
@@ -3138,7 +3138,10 @@ pub async fn execute_rotate_content_keys(
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
                 for new_key in rotation.new_keys {
                     let did = new_key.member_did().to_owned();
-                    state.access.access_key_store.set(context_id, &did, new_key);
+                    state
+                        .access_mut()
+                        .access_key_store
+                        .set(context_id, &did, new_key);
                 }
                 // Non-broadcast: no broadcast-key epoch advances.
                 (Some(epoch_out), vec![])
@@ -3339,7 +3342,7 @@ pub async fn execute_reconfigure_governance(
                     new_threshold,
                 } => {
                     let signer_count =
-                        u32::try_from(view.governance.class_s.threshold_signers.len())
+                        u32::try_from(view.governance().class_s.threshold_signers.len())
                             .unwrap_or(u32::MAX);
                     if *new_threshold == 0 || *new_threshold > signer_count {
                         return Err(ContextError::PermissionDenied(format!(
@@ -3351,13 +3354,13 @@ pub async fn execute_reconfigure_governance(
             }
         }
 
-        if view.governance.class_s.threshold_value > 0 {
-            let remaining =
-                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-            if view.governance.class_s.threshold_value > remaining {
+        if view.governance().class_s.threshold_value > 0 {
+            let remaining = u32::try_from(view.governance().class_s.threshold_signers.len())
+                .unwrap_or(u32::MAX);
+            if view.governance().class_s.threshold_value > remaining {
                 return Err(ContextError::PermissionDenied(format!(
                     "reconfiguration left {remaining} signers < threshold {}",
-                    view.governance.class_s.threshold_value,
+                    view.governance().class_s.threshold_value,
                 )));
             }
         }
@@ -3448,7 +3451,7 @@ pub async fn execute_set_economic_policy(
     // helper, which the airtight Class-C view cannot be handed whole-state to).
     require_active(&cell.handle)?;
 
-    if let Some(existing) = &cell.governance.economic_policy
+    if let Some(existing) = &cell.governance().economic_policy
         && existing.locked
     {
         return Err(ContextError::PermissionDenied(
@@ -3456,7 +3459,7 @@ pub async fn execute_set_economic_policy(
         ));
     }
 
-    if cell.governance.pending_economic_policy_change.is_some() {
+    if cell.governance().pending_economic_policy_change.is_some() {
         return Err(ContextError::PermissionDenied(
             "an economic policy change is already pending notification period".to_owned(),
         ));
@@ -3495,7 +3498,7 @@ pub async fn execute_set_economic_policy(
             proposal_id,
         });
 
-        emit_event_into(
+        deps.emit_event_into(
             view.receive_buffer_mut(),
             ContextEvent::EconomicPolicyChangeNotification {
                 notified_at,
@@ -3503,7 +3506,6 @@ pub async fn execute_set_economic_policy(
                 proposal_id,
             },
             context_id,
-            deps.event_tx.as_ref(),
         );
     })
     .await;
@@ -3610,7 +3612,7 @@ pub async fn execute_lock_economic_policy(
     // triggers no persist, matching the prior reject-before-persist behaviour.
     require_active(&cell.handle)?;
 
-    match &cell.governance.economic_policy {
+    match &cell.governance().economic_policy {
         None => {
             return Err(ContextError::PermissionDenied(
                 "cannot lock economic policy: no policy is set".to_owned(),
@@ -3676,7 +3678,7 @@ pub async fn execute_modify_hard_rate_limit(
     // reject-before-persist behaviour.
     require_active(&cell.handle)?;
 
-    let mut preserved_state = cell.governance.hard_rate_limit.snapshot_entries();
+    let mut preserved_state = cell.governance().hard_rate_limit.snapshot_entries();
     scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
         &mut preserved_state,
         new_config,
@@ -3754,7 +3756,7 @@ pub async fn execute_modify_capability_requirements(
     };
     // A joiner awaiting the live list has no old list to tighten, so its
     // first replacement commits restore-direction.
-    let tightens = match &cell.governance.class_s.capability_requirements {
+    let tightens = match &cell.governance().class_s.capability_requirements {
         scp_runtime_core::context::state::Replicated::Live(old) => {
             requirements.is_tightening_of(old)
         }
@@ -3819,7 +3821,7 @@ pub async fn execute_modify_pseudonym_rotation_policy(
         let state = view.rest_mut();
         state.handle.set_pseudonym_rotation(new_policy);
         state
-            .class_s
+            .class_s_mut()
             .pseudonym_rotation
             .anchor_schedule(new_policy.as_ref(), now_secs);
         Ok(())
@@ -3883,11 +3885,11 @@ pub fn execute_propose_context_migration<'a>(
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let destination_context_id = migration_destination_id(context_id, &proposal_id);
-        let MigrationBootstrap {
+        let MigrationBootstrapParts {
             guard: bootstrap_guard,
             first_state,
             destination_context_id: reserved,
-        } = bootstrap;
+        } = bootstrap.into_parts();
         if reserved != destination_context_id {
             return Err(ContextError::InvalidState(format!(
                 "the migration of proposal {} was handed the bootstrap of destination \
@@ -4252,7 +4254,7 @@ pub async fn propose_governance_action_inner(
     // not refuse the proposal.
     let freeze_now = deps.clock.now_secs();
     let freeze_expires = freeze_has_expired(cell, freeze_now);
-    if cell.governance.freeze.is_some()
+    if cell.governance().freeze.is_some()
         && !freeze_expires
         && !matches!(action, GovernanceAction::ResolveConflict { .. })
     {
@@ -4288,7 +4290,7 @@ pub async fn propose_governance_action_inner(
             scp_runtime_core::context::params_validation::ParamsOrigin::Creation,
         )
     }) {
-        cell.governance
+        cell.governance()
             .engine
             .check_proposer(proposer_did)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
@@ -4301,7 +4303,7 @@ pub async fn propose_governance_action_inner(
     // context is never rebuilt after the sign await.
     let gov_ctx = build_governance_context(&*cell, &*deps.clock);
     let intent = cell
-        .governance
+        .governance()
         .engine
         .precheck_propose(proposer_did, &action, &gov_ctx)
         .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
@@ -4327,7 +4329,7 @@ pub async fn propose_governance_action_inner(
     // behind. No await separates the reservation from the records.
     let bootstrap = if matches!(action, GovernanceAction::ProposeContextMigration { .. }) {
         let (previewed, _) = cell
-            .governance
+            .governance()
             .engine
             .boxed_clone()
             .propose_signed(
@@ -4347,7 +4349,7 @@ pub async fn propose_governance_action_inner(
     // GovernanceFreezeExpired leaf carries that convergent deadline rather than
     // a per-member local `now()` (§7.3.1, §9.9.3).
     let freeze_expiry_deadline = cell
-        .governance
+        .governance()
         .freeze
         .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
     let freeze_events = check_and_resolve_expired_freezes(cell, freeze_now);
@@ -4398,7 +4400,7 @@ pub async fn propose_governance_action_inner(
         matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
     });
 
-    let in_freeze = cell.governance.freeze.is_some();
+    let in_freeze = cell.governance().freeze.is_some();
 
     // Emit conflict events to the event log.
     if !conflict_events.is_empty() {
@@ -4486,7 +4488,7 @@ fn actor_check_proposer_eligibility(
     use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
 
     // Pending-removal defense-in-depth (read via the cell's `Deref`).
-    for (proposal, _seq, _ts) in cell.governance.approved_proposals.values() {
+    for (proposal, _seq, _ts) in cell.governance().approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
             && did == proposer_did
         {
@@ -4507,7 +4509,7 @@ fn actor_check_proposer_eligibility(
     // Participation refresh + cache + threshold.
     let context_id = cell.handle.context_id().to_owned();
     if !cell
-        .governance
+        .governance()
         .participation_cache
         .contains_key(proposer_did.as_ref())
     {
@@ -4559,7 +4561,7 @@ fn actor_check_proposer_eligibility(
     }
 
     if let Some(record) = cell
-        .governance
+        .governance()
         .participation_cache
         .get(proposer_did.as_ref())
         && !meets_threshold(record)
@@ -4574,7 +4576,7 @@ fn actor_check_proposer_eligibility(
     if let Some(sybil_policy) = cell.handle.params().sybil_policy.as_ref() {
         let assessment = scp_runtime_core::context::shared::lifecycle::build_identity_assessment(
             proposer_did,
-            &cell.governance,
+            cell.governance(),
             now,
         );
         let (_level, capacity) =
@@ -4728,11 +4730,11 @@ pub async fn vote_on_proposal_inner(
     // vote shows whether it crosses quorum. No await separates a
     // reservation from the record it precedes.
     let mut preview = cell
-        .governance
+        .governance()
         .engine
         .get_proposal(proposal_id)
         .is_some_and(|p| matches!(p.action, GovernanceAction::ProposeContextMigration { .. }))
-        .then(|| cell.governance.engine.boxed_clone());
+        .then(|| cell.governance().engine.boxed_clone());
     let resolved_bootstrap = match preview.as_mut() {
         Some(engine) => match engine.precheck_vote(proposal_id, voter_did, &vote_type, &gov_ctx) {
             Ok(VoteIntent::Resolved(..) | VoteIntent::NoOp(..)) => {
@@ -4793,7 +4795,7 @@ pub async fn vote_on_proposal_inner(
     };
 
     let proposal_for_execution = if status == ProposalStatus::Approved {
-        cell.governance.engine.get_proposal(proposal_id).cloned()
+        cell.governance().engine.get_proposal(proposal_id).cloned()
     } else {
         None
     };
@@ -4852,7 +4854,7 @@ pub async fn vote_on_proposal_inner(
 
     // A freeze, standing or set by the conflict detection above, holds the
     // execution back.
-    let in_freeze = cell.governance.freeze.is_some();
+    let in_freeze = cell.governance().freeze.is_some();
     if let Some(proposal) =
         proposal_for_execution.filter(|_| !in_freeze && !invalidated_by_conflict)
     {
@@ -5861,22 +5863,23 @@ async fn finalize_governance_action(
         let mls_op = generate_mls_operations(proposal)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
-        let old_epoch = state.epoch.mls_epoch;
-        state.epoch.mls_epoch = old_epoch.saturating_add(1);
-        let _expired = state.epoch.grace_store.add_epoch(old_epoch);
+        let old_epoch = state.epoch().mls_epoch;
+        let new_epoch = old_epoch.saturating_add(1);
+        state.epoch_mut().mls_epoch = new_epoch;
+        let _expired = state.epoch_mut().grace_store.add_epoch(old_epoch);
 
         if let Some(operation) = mls_op {
             let timestamp = deps.clock.now_secs();
-            let _ = state.epoch.coordinator.record_coordination(
+            let _ = state.epoch_mut().coordinator.record_coordination(
                 proposal.proposal_id,
                 old_epoch,
-                state.epoch.mls_epoch,
+                new_epoch,
                 operation,
                 timestamp,
             );
         }
 
-        Some(state.epoch.mls_epoch)
+        Some(state.epoch().mls_epoch)
     } else {
         None
     };
@@ -5925,7 +5928,7 @@ async fn finalize_governance_action(
     // 2. Trigger checkpoint cosignature collection for multi-admin
     //    contexts (ADR-031 §9).
     let (required_signers, minimum_count) = state
-        .governance
+        .governance()
         .engine
         .checkpoint_cosignature_requirements();
     if minimum_count > 0 {
@@ -5935,7 +5938,7 @@ async fn finalize_governance_action(
                 proposal_id: proposal.proposal_id,
                 required_signers,
                 minimum_count,
-                at_epoch: state.epoch.mls_epoch,
+                at_epoch: state.epoch().mls_epoch,
             },
             context_id,
             deps,
@@ -5953,7 +5956,7 @@ async fn finalize_governance_action(
     // states feed the same enforcement pipeline.
     {
         let now = deps.clock.now_secs();
-        let rules = state.governance.consequence_rules.clone();
+        let rules = state.governance().consequence_rules.clone();
         if !rules.is_empty() {
             // Proposer and target share one merged event set and one convergent
             // window anchor so both evaluations are convergent across members.
@@ -6073,7 +6076,7 @@ async fn finalize_governance_action(
             && record.participation_count > 0
         {
             state
-                .governance
+                .governance_mut()
                 .participation_cache
                 .insert(proposal.proposer_did.to_string(), record);
         }
@@ -6163,7 +6166,7 @@ pub async fn execute_governance_action(
     // something the quorum-validated engine never retained — reject rather than
     // trust caller-supplied data.
     let proposal = cell
-        .governance
+        .governance()
         .engine
         .get_proposal(proposal_id)
         .cloned()
@@ -6213,7 +6216,7 @@ pub async fn execute_governance_action(
     // commit-fault gate already ran above). Actor-owned state — single linear
     // sequence.
     if cell
-        .governance
+        .governance()
         .class_s
         .executed_proposals
         .contains_key(&proposal.proposal_id)
@@ -6372,7 +6375,7 @@ async fn refuse_unexecutable_proposal(
          approved set and is neither executed nor recorded"
     );
     if !cell
-        .governance
+        .governance()
         .approved_proposals
         .contains_key(&proposal.proposal_id)
     {
@@ -6381,7 +6384,7 @@ async fn refuse_unexecutable_proposal(
     match cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             view.rest_mut()
-                .governance
+                .governance_mut()
                 .approved_proposals
                 .remove(&proposal.proposal_id);
             Ok(())
@@ -6444,7 +6447,7 @@ async fn discharge_and_order_governance_action(
     discharge
         .view()
         .rest_mut()
-        .governance
+        .governance_mut()
         .approved_proposals
         .remove(&proposal.proposal_id);
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
@@ -6617,7 +6620,7 @@ pub fn apply_broadcast_failure(
             retry_count: 1,
             failed_at: pending.first_attempt_at,
         });
-        emit_event_into(
+        deps.emit_event_into(
             receive_buffer,
             ContextEvent::CommitBroadcastFailed {
                 operation: label,
@@ -6625,13 +6628,12 @@ pub fn apply_broadcast_failure(
                 attempts: 1,
             },
             context_id,
-            deps.event_tx.as_ref(),
         );
         return;
     }
     pending_commits.push_back(pending);
     let label_for_event = label.clone();
-    emit_event_into(
+    deps.emit_event_into(
         receive_buffer,
         ContextEvent::CommitBroadcastPending {
             operation: label_for_event,
@@ -6639,7 +6641,6 @@ pub fn apply_broadcast_failure(
             attempt: 1,
         },
         context_id,
-        deps.event_tx.as_ref(),
     );
     tracing::warn!(
         context_id = %context_id,
@@ -6690,121 +6691,6 @@ pub async fn keep_broadcast_failure(
         Ok(())
     })
     .await
-}
-
-// ===========================================================================
-// Supervisor-iterating sweep entry points (Phase 2A finalization)
-// ===========================================================================
-//
-// These are the non-legacy replacements for the `_legacy` sweep helpers
-// in `governance_helpers_legacy.rs`. Each iterates
-// [`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids)
-// (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
-// and dispatches one typed sweep command per actor via the per-actor
-// mailbox.
-//
-// Per-actor sweep bodies live in
-// [`crate::handler`] as
-// `handle_*_actor` functions, dispatched from the actor's
-// `dispatch_state` arm for the matching `GovernanceCommand` variant.
-//
-// Sweep commands carry no `context_id` field — the routing target is
-// decided at the iteration site (one command per known actor). They
-// are NOT routable via `Supervisor::dispatch_governance_command`
-// because `governance_command_context_id` returns `None`; callers MUST
-// go through these entry points.
-
-/// Sweep entry point: evaluate consequence rules for every registered
-/// actor.
-///
-/// Relocates the legacy `evaluate_periodic_consequences_legacy` off
-/// the `Supervisor::contexts` `DashMap` (now deleted). Iterates the
-/// actor registry and dispatches one
-/// [`GovernanceCommand::EvaluatePeriodicConsequences`](scp_runtime_core::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences)
-/// per actor.
-///
-/// Best-effort: if an actor's mailbox is closed mid-sweep (actor has
-/// shut down) the iteration silently skips it. Per-actor replies are
-/// awaited in turn — the sweep returns when every actor has either
-/// replied or its mailbox is gone.
-///
-/// First bulk-iterator caller lands in Phase 2B per ADR-049 — the
-/// per-actor `EvaluatePeriodicConsequences` body is also invoked
-/// directly (Phase 4) by the ACTOR-OWNED governance-timeout sweep
-/// ([`handlers::governance::evaluate_governance_timeouts`](crate::handler),
-/// ADR-049 finding A3), so this supervisor-scope bulk sweep is only
-/// needed for FFI bridge "evaluate now" operations or test fixtures that
-/// drive deterministic ticks.
-#[allow(
-    dead_code,
-    reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
-              the per-actor variant is wired through the timer task today"
-)]
-pub async fn evaluate_periodic_consequences(
-    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
-) {
-    use scp_runtime_core::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    for ctx_id in supervisor.actor_ids() {
-        let Some(actor) = supervisor.lookup(&ctx_id) else {
-            continue;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = ContextCommand::Governance(GovernanceCommand::EvaluatePeriodicConsequences {
-            reply: tx,
-        });
-        if actor
-            .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
-            .await
-            .is_err()
-        {
-            // Mailbox closed — actor shut down between snapshot and
-            // dispatch. Skip silently (legacy did the same on
-            // DashMap::get returning None mid-iteration).
-            continue;
-        }
-        let _ = rx.await;
-    }
-}
-
-/// Sweep entry point: process the MLS commit retry queue for every
-/// registered actor (PR #1606 C6).
-///
-/// Relocates the legacy `process_pending_commits_legacy` off the
-/// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
-/// registry and dispatches one
-/// [`GovernanceCommand::ProcessPendingCommits`](scp_runtime_core::context::actor::commands::GovernanceCommand::ProcessPendingCommits)
-/// per actor.
-///
-/// First bulk-iterator caller lands in Phase 2B per ADR-049 — see
-/// [`evaluate_periodic_consequences`] for the rationale (the
-/// per-actor variant is already wired through the timer task).
-#[allow(
-    dead_code,
-    reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
-              the per-actor variant is wired through the timer task today"
-)]
-pub async fn process_pending_commits(
-    supervisor: &scp_runtime_core::context::supervisor::Supervisor,
-) {
-    use scp_runtime_core::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    for ctx_id in supervisor.actor_ids() {
-        let Some(actor) = supervisor.lookup(&ctx_id) else {
-            continue;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd =
-            ContextCommand::Governance(GovernanceCommand::ProcessPendingCommits { reply: tx });
-        if actor
-            .send_with_timeout(cmd, scp_runtime_core::context::actor::SEND_TIMEOUT)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        let _ = rx.await;
-    }
 }
 
 /// Translates governance timeout events into [`ContextEvent`]s for the
@@ -7200,7 +7086,7 @@ mod commit_broadcast_retry_tests {
         state
             .membership
             .add_member(DID(TARGET.to_owned()), "member".to_owned(), vec![]);
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         *cell.class_c_view().checkpoint_events_since_mut() = 0;
 
         super::execute_approve_spend(
@@ -7251,13 +7137,13 @@ mod commit_broadcast_retry_tests {
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("activate");
-        state.governance.class_s.threshold_signers = vec![
+        state.governance_mut().class_s.threshold_signers = vec![
             DID(ADMIN.to_owned()),
             DID(TARGET.to_owned()),
             DID("did:dht:z6MkThirdSigner".to_owned()),
         ];
-        state.governance.class_s.threshold_value = 2;
-        let mut cell = ClassSCell::new(state);
+        state.governance_mut().class_s.threshold_value = 2;
+        let mut cell = ClassSCell::new_for_test(state);
         *cell.class_c_view().checkpoint_events_since_mut() = 0;
 
         super::execute_reconfigure_governance(
@@ -7640,7 +7526,7 @@ mod commit_broadcast_retry_tests {
         )
         .await;
         let failure = make_failure(&deps, &remove_op()).await;
-        let mut cell = ClassSCell::new(fresh_state());
+        let mut cell = ClassSCell::new_for_test(fresh_state());
 
         let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
 
@@ -7690,7 +7576,7 @@ mod commit_broadcast_retry_tests {
         )
         .await;
         let failure = make_failure(&deps, &remove_op()).await;
-        let mut cell = ClassSCell::new(fresh_state());
+        let mut cell = ClassSCell::new_for_test(fresh_state());
 
         let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
 
@@ -7810,8 +7696,8 @@ mod commit_broadcast_retry_tests {
             .handle
             .transition_to(&ContextState::Active)
             .expect("Creating → Active is a valid transition");
-        state.ttl.timer.deadline_unix_secs = Some(1_700_000_500);
-        let mut cell = ClassSCell::new(state);
+        state.ttl_mut().timer.deadline_unix_secs = Some(1_700_000_500);
+        let mut cell = ClassSCell::new_for_test(state);
 
         let meta = scp_runtime_core::context::shared::governance::CommitMeta {
             pid: [0u8; 32],
@@ -7838,7 +7724,8 @@ mod commit_broadcast_retry_tests {
             "promotion kept: memory_scope → Full"
         );
         assert_eq!(
-            cell.ttl.timer.deadline_unix_secs, None,
+            cell.ttl().timer.deadline_unix_secs,
+            None,
             "promotion kept: the armed absolute deadline is disarmed in memory"
         );
     }
@@ -8017,8 +7904,8 @@ mod commit_broadcast_retry_tests {
                     .membership
                     .add_member(did(member), "member".to_owned(), vec![]);
             }
-            state.governance.engine = engine;
-            ClassSCell::new(state)
+            state.governance_mut().engine = engine;
+            ClassSCell::new_for_test(state)
         }
 
         fn change_role() -> GovernanceAction {
@@ -8338,7 +8225,7 @@ mod commit_broadcast_retry_tests {
 
             let held = deps
                 .supervisor
-                .try_lock_bootstrap_spawn()
+                .try_lock_bootstrap_spawn_for_test()
                 .expect("the bootstrap lock is free");
             let busy = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -8347,7 +8234,11 @@ mod commit_broadcast_retry_tests {
             .await
             .expect("the vote turn must not wait for the bootstrap lock");
             assert_busy(&busy);
-            let tracked = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            let tracked = cell
+                .governance()
+                .engine
+                .get_proposal(&pid)
+                .expect("proposal");
             assert_eq!(
                 tracked.status,
                 ProposalStatus::Pending,
@@ -8382,7 +8273,7 @@ mod commit_broadcast_retry_tests {
 
             let held = deps
                 .supervisor
-                .try_lock_bootstrap_spawn()
+                .try_lock_bootstrap_spawn_for_test()
                 .expect("the bootstrap lock is free");
             let busy = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -8392,7 +8283,7 @@ mod commit_broadcast_retry_tests {
             .expect("the vote turn must not wait for the bootstrap lock");
             assert_busy(&busy);
             assert_eq!(
-                cell.governance
+                cell.governance()
                     .engine
                     .get_proposal(&pid)
                     .expect("proposal")
@@ -8417,7 +8308,7 @@ mod commit_broadcast_retry_tests {
             let pid = propose_migration(&mut cell, &deps).await;
             let held = deps
                 .supervisor
-                .try_lock_bootstrap_spawn()
+                .try_lock_bootstrap_spawn_for_test()
                 .expect("the bootstrap lock is free");
 
             let (status, _) = tokio::time::timeout(
@@ -8430,7 +8321,7 @@ mod commit_broadcast_retry_tests {
 
             assert_eq!(status, ProposalStatus::Pending);
             assert!(
-                cell.governance
+                cell.governance()
                     .engine
                     .get_proposal(&pid)
                     .expect("proposal")
@@ -8468,7 +8359,11 @@ mod commit_broadcast_retry_tests {
                 .expect("B's vote applies although the clock moved during the sign");
             assert_eq!(status, ProposalStatus::Pending);
             assert_eq!(b_signs.load(Ordering::SeqCst), 1);
-            let proposal = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            let proposal = cell
+                .governance()
+                .engine
+                .get_proposal(&pid)
+                .expect("proposal");
             let b_vote = proposal
                 .approvals
                 .iter()

@@ -82,25 +82,29 @@ const MAX_SECOND_WAITS: u32 = 3;
 /// for its reply, so a caller holds at most one slot.
 const COMMAND_CAPACITY: usize = 4;
 
-/// How many seconds of elapsed time, on the device's monotonic clock, a run
-/// of `4062` answers to one request may span before the registrar stops
-/// retrying it.
-///
-/// Let `R1` be the relay's clock at the first `4062` and `F` the floor the
-/// relay holds (the last `timestamp` it accepted). The relay accepted `F` at
-/// a relay second at or below `R1`, and only if `F` was at most
-/// [`PUSH_TIMESTAMP_SKEW_SECS`] ahead of it, so `F <= R1 + 300`. After `e`
-/// seconds of elapsed time the relay's clock reads `R1 + e` and the device's
-/// wall clock reads `R1 + e - d`, where `d` is the relay's clock minus the
-/// device's at that moment; `d` absorbs every step of the device's wall
-/// clock in between. The next `timestamp` is that wall-clock second, which
-/// is above `F` once `e > d + 300`. While the relay accepts the device clock
-/// at all, `d <= 300`, so `e > 600` suffices (§10.7.1 **Freshness**).
-///
-/// The bound assumes the relay's clock does not step during the run and the
-/// device's monotonic clock runs no faster than real time. A monotonic clock
-/// that stops while the device sleeps only lengthens the run.
-pub const STALE_RUN_BOUND_SECS: u64 = 2 * PUSH_TIMESTAMP_SKEW_SECS;
+scp_runtime_types::pub_under_testing! {
+    /// How many seconds of elapsed time, on the device's monotonic clock, a run
+    /// of `4062` answers to one request may span before the registrar stops
+    /// retrying it.
+    ///
+    /// Let `R1` be the relay's clock at the first `4062` and `F` the floor the
+    /// relay holds (the last `timestamp` it accepted). The relay accepted `F` at
+    /// a relay second at or below `R1`, and only if `F` was at most
+    /// [`PUSH_TIMESTAMP_SKEW_SECS`] ahead of it, so `F <= R1 + 300`. After `e`
+    /// seconds of elapsed time the relay's clock reads `R1 + e` and the device's
+    /// wall clock reads `R1 + e - d`, where `d` is the relay's clock minus the
+    /// device's at that moment; `d` absorbs every step of the device's wall
+    /// clock in between. The next `timestamp` is that wall-clock second, which
+    /// is above `F` once `e > d + 300`. While the relay accepts the device clock
+    /// at all, `d <= 300`, so `e > 600` suffices (§10.7.1 **Freshness**).
+    ///
+    /// The bound assumes the relay's clock does not step during the run and the
+    /// device's monotonic clock runs no faster than real time. A monotonic clock
+    /// that stops while the device sleeps only lengthens the run.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) const STALE_RUN_BOUND_SECS: u64 = 2 * PUSH_TIMESTAMP_SKEW_SECS;
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -553,66 +557,98 @@ pub struct PushRegistrarConfig<C: KeyCustody, S: Storage> {
 
 /// SHA-256 of a token: the token's identity in in-memory keys, so no map key
 /// holds the token bytes.
-pub type TokenHash = [u8; 32];
+pub(crate) type TokenHash = [u8; 32];
+
+/// Test-only reach into [`token_hash`] for tests outside this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn token_hash_for_test(token: &PushToken) -> TokenHash {
+    token_hash(token)
+}
 
 /// The [`TokenHash`] of `token`.
 #[must_use]
-pub fn token_hash(token: &PushToken) -> TokenHash {
+fn token_hash(token: &PushToken) -> TokenHash {
     Sha256::digest(token.as_bytes()).into()
 }
 
-/// One relay key of the registrar's per-relay maps: the canonical relay URL
-/// and the token hash.
-pub type RelayKey = (String, TokenHash);
-
-/// A request the registrar sends one relay for one token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Request {
-    /// A registration of this routing-ID set.
-    Registration(BTreeSet<[u8; 32]>),
-    /// A deregistration.
-    Deregistration,
+scp_runtime_types::pub_under_testing! {
+    /// One relay key of the registrar's per-relay maps: the canonical relay URL
+    /// and the token hash.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) type RelayKey = (String, TokenHash);
 }
 
-/// Why a relay's refusal is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefusalCause {
-    /// A `4xxx` code other than `4062`, or a publisher with no push path.
-    Code,
-    /// A run of `4062` answers longer than the skew window. A
-    /// [`PushRegistrarTask::register`] command also clears this one, because
-    /// the device clock may have been corrected since.
-    StaleBeyondSkew,
+scp_runtime_types::pub_under_testing! {
+    /// A request the registrar sends one relay for one token.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Request {
+        /// A registration of this routing-ID set.
+        Registration(BTreeSet<[u8; 32]>),
+        /// A deregistration.
+        Deregistration,
+    }
 }
 
-/// A request a relay refused for good (ADR-004), which the registrar does not
-/// send again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal {
-    /// The refused request.
-    pub request: Request,
-    /// Why the refusal is kept.
-    pub cause: RefusalCause,
+scp_runtime_types::pub_under_testing! {
+    /// Why a relay's refusal is kept.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RefusalCause {
+        /// A `4xxx` code other than `4062`, or a publisher with no push path.
+        Code,
+        /// A run of `4062` answers longer than the skew window. A
+        /// [`PushRegistrarTask::register`] command also clears this one, because
+        /// the device clock may have been corrected since.
+        StaleBeyondSkew,
+    }
 }
 
-/// A run of consecutive `4062` answers from one relay to one request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleRun {
-    request: Request,
-    /// The monotonic clock's reading, in milliseconds, at the first `4062`
-    /// of the run.
-    pub first_millis: u64,
+scp_runtime_types::pub_under_testing! {
+    /// A request a relay refused for good (ADR-004), which the registrar does not
+    /// send again.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Refusal {
+        /// The refused request.
+        request: Request,
+        /// Why the refusal is kept.
+        cause: RefusalCause,
+    }
 }
 
-/// Whether `PushRegistrar::forget_stale_refusals` also drops the refusals
-/// recorded as [`RefusalCause::StaleBeyondSkew`] and every `4062` run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaleBound {
-    /// Keep them while their request is still the one the registrar sends.
-    Keep,
-    /// Drop them: a [`PushRegistrarTask::register`] or
-    /// [`PushRegistrarTask::deregister_all`] command.
-    Clear,
+scp_runtime_types::pub_under_testing! {
+    /// A run of consecutive `4062` answers from one relay to one request.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct StaleRun {
+        request: Request,
+        /// The monotonic clock's reading, in milliseconds, at the first `4062`
+        /// of the run.
+        first_millis: u64,
+    }
+}
+
+scp_runtime_types::pub_under_testing! {
+    /// Whether `PushRegistrar::forget_stale_refusals` also drops the refusals
+    /// recorded as [`RefusalCause::StaleBeyondSkew`] and every `4062` run.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum StaleBound {
+        /// Keep them while their request is still the one the registrar sends.
+        Keep,
+        /// Drop them: a [`PushRegistrarTask::register`] or
+        /// [`PushRegistrarTask::deregister_all`] command.
+        Clear,
+    }
 }
 
 /// A signed message ready to publish.
@@ -1382,8 +1418,16 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     }
 }
 
+/// Test-only reach into [`log_outcome`] for tests outside this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn log_outcome_for_test(operation: &str, outcome: &Result<RelayOutcomes, PushError>) -> bool {
+    log_outcome(operation, outcome)
+}
+
 /// Logs every failure in `outcome`. Returns whether one is retryable.
-pub fn log_outcome(operation: &str, outcome: &Result<RelayOutcomes, PushError>) -> bool {
+fn log_outcome(operation: &str, outcome: &Result<RelayOutcomes, PushError>) -> bool {
     match outcome {
         Err(err) => {
             tracing::warn!(operation, error = %err, retryable = err.retryable(), "push registrar: operation failed");
@@ -1480,32 +1524,36 @@ impl Triggers {
     }
 }
 
-/// A command to the registrar task.
-pub enum RegistrarCommand {
-    /// Replace the device token ([`PushRegistrarTask::refresh_token`]).
-    RefreshToken {
-        /// The new device token.
-        token: PushToken,
-        /// Receives each relay's outcome.
-        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
-    },
-    /// Deregister at every relay and stop registering
-    /// ([`PushRegistrarTask::deregister_all`]).
-    DeregisterAll {
-        /// Receives each relay's outcome.
-        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
-    },
-    /// Resume registering and reconcile ([`PushRegistrarTask::register`]).
-    Register {
-        /// Receives each relay's outcome.
-        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
-    },
+scp_runtime_types::pub_under_testing! {
+    /// A command to the registrar task.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    pub(crate) enum RegistrarCommand {
+        /// Replace the device token ([`PushRegistrarTask::refresh_token`]).
+        RefreshToken {
+            /// The new device token.
+            token: PushToken,
+            /// Receives each relay's outcome.
+            reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
+        },
+        /// Deregister at every relay and stop registering
+        /// ([`PushRegistrarTask::deregister_all`]).
+        DeregisterAll {
+            /// Receives each relay's outcome.
+            reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
+        },
+        /// Resume registering and reconcile ([`PushRegistrarTask::register`]).
+        Register {
+            /// Receives each relay's outcome.
+            reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
+        },
+    }
 }
 
 /// The running trigger task of a [`PushRegistrar`].
 pub struct PushRegistrarTask {
     /// The registrar's command mailbox.
-    pub commands: mpsc::Sender<RegistrarCommand>,
+    commands: mpsc::Sender<RegistrarCommand>,
     join: JoinHandle<()>,
 }
 
@@ -1572,9 +1620,17 @@ impl PushRegistrarTask {
     }
 }
 
+/// Test-only reach into [`backoff_delay`] for tests outside this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches it (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn backoff_delay_for_test(failures: usize) -> Duration {
+    backoff_delay(failures)
+}
+
 /// The ADR-004 delay before retry number `failures + 1`.
 #[must_use]
-pub fn backoff_delay(failures: usize) -> Duration {
+fn backoff_delay(failures: usize) -> Duration {
     let index = failures.min(BACKOFF_SECS.len() - 1);
     Duration::from_secs(BACKOFF_SECS[index])
 }
@@ -1598,4 +1654,41 @@ fn refuse_duplicates<'a>(relays: impl Iterator<Item = &'a PushRelay>) -> Result<
         }
     }
     Ok(())
+}
+
+/// Test-only reach into fields that stay private to this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches them (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl Refusal {
+    /// The refused request.
+    #[must_use]
+    pub const fn request_for_test(&self) -> &Request {
+        &self.request
+    }
+
+    /// Why the request was refused.
+    #[must_use]
+    pub const fn cause_for_test(&self) -> &RefusalCause {
+        &self.cause
+    }
+}
+
+/// Test-only reach into a stale run's first timestamp (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl StaleRun {
+    /// The first stale timestamp of the run, in Unix milliseconds.
+    #[must_use]
+    pub const fn first_millis_for_test(&self) -> u64 {
+        self.first_millis
+    }
+}
+
+/// Test-only reach into the registrar task's command sender (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl PushRegistrarTask {
+    /// The sender of the registrar's command channel.
+    #[must_use]
+    pub const fn commands_for_test(&self) -> &mpsc::Sender<RegistrarCommand> {
+        &self.commands
+    }
 }

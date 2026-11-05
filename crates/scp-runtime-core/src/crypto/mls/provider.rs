@@ -58,128 +58,132 @@ use scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend;
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
 // ---------------------------------------------------------------------------
 
-/// Serializable snapshot of per-context MLS cryptographic state.
-///
-/// Captures all state needed to resume MLS encryption/decryption after a
-/// process restart: the `OpenMLS` `MemoryStorage` contents (MLS group tree,
-/// epoch secrets, key schedule, etc.), the local sender key, the sender
-/// key store entries, the sender key epoch counter, and per-member
-/// DHKEM(P-256) wrapping public keys.
-///
-/// The MLS group state is serialized as the raw key-value pairs from the
-/// `OpenMLS` `MemoryStorage` backing the group. On restore, these are
-/// re-injected into a fresh `MemoryStorage` and the `MlsGroup` is
-/// reconstructed via `MlsGroup::load`.
-///
-/// # Security — Sensitive Key Material
-///
-/// **This struct contains raw private key material:**
-///
-/// - `signer_bytes` — P-256 private signing scalar (MLS credential signer, cs2)
-/// - `local_sender_key` — AES-256 sender key (per-context message encryption)
-/// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
-///   epoch secrets, HPKE private keys, and the key schedule
-///
-/// **Why self-encryption is not feasible:** Encrypting the snapshot before
-/// returning from `export_crypto_state` creates a circular dependency — the
-/// encryption key would need to be stored outside the snapshot or derived
-/// from material inside it (defeating the purpose). This is the same trust
-/// model used by `OpenMLS` itself, which stores MLS `KeyPackage` private
-/// keys in its `StorageProvider` backend in plaintext.
-///
-/// **Storage layer requirements:** The `Storage` backend that persists this
-/// blob MUST provide encryption at rest (§17.5). Platform implementations
-/// (Keychain on iOS/macOS, Android Keystore, OS-level encrypted storage)
-/// satisfy this. In-memory storage used in tests is acceptable because no
-/// persistence occurs.
-///
-/// **Defense in depth:** every field that holds private key material has a
-/// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
-/// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
-/// export or restore path, early returns included. Buffers that serde
-/// allocates and frees while decoding the blob are wiped as they are freed by
-/// the wiping global allocator every shipped artifact installs (security model
-/// spec §9.15, freed heap memory). `Zeroizing`'s
-/// serde impls delegate to the inner value, so the encoding is that of the
-/// plain fields.
-// ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
-// `pub(crate)` (fields included) so the additive
-// [`crate::context::actor::PerContextState::export_crypto_state`] inherent method
-// can build the BYTE-IDENTICAL snapshot by moving this provider method's body
-// verbatim (Decision 6 / Decision 15(a)). This mirrors the earlier
-// `EpochState` / `TtlState` / `AccessControlState` / `GovernanceState` elevations
-// ("elevated from private to pub(crate) so the actor can carry it"). The struct
-// stays defined here; the provider retains its own `export_crypto_state` until
-// the atomic core (SCP-CRYPTOMOVE-001) deletes it.
-#[derive(Serialize, Deserialize)]
-pub struct MlsCryptoSnapshot {
-    /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
-    /// Each pair is `(key_bytes, value_bytes)`.
-    pub mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
-    /// The local member's AES-256 sender key (32 bytes).
-    pub local_sender_key: SenderKey,
-    /// All sender keys for this context: `(sender_did, key)` pairs. The
-    /// `Zeroizing` vector wipes its whole buffer on drop, including the slots
-    /// restore drains keys out of.
-    pub sender_key_entries: Zeroizing<Vec<(String, SenderKey)>>,
-    /// Per-sender epoch high-water marks for this context:
-    /// `(sender_did, epoch)` pairs.
+scp_runtime_types::pub_under_testing! {
+    /// Serializable snapshot of per-context MLS cryptographic state.
     ///
-    /// Persisted so the `#1608` rollback-protection invariant
-    /// (`SenderKeyStore::set_checked` rejects epoch regressions) survives
-    /// a restart. Without this, an attacker who captured an old-epoch
-    /// sender-key distribution pre-restart could replay it after restore
-    /// because the fresh in-memory map would have no record of the
-    /// higher epoch.
+    /// Captures all state needed to resume MLS encryption/decryption after a
+    /// process restart: the `OpenMLS` `MemoryStorage` contents (MLS group tree,
+    /// epoch secrets, key schedule, etc.), the local sender key, the sender
+    /// key store entries, the sender key epoch counter, and per-member
+    /// DHKEM(P-256) wrapping public keys.
     ///
-    /// MIGRATION: `#[serde(default)]` — legacy snapshots (pre-C1)
-    /// deserialize with an empty vec. `SenderKey` material does not
-    /// carry the epoch it was bound to, so per-sender floors cannot
-    /// be recovered exactly from legacy data. The restore path
-    /// compensates by seeding every sender with a conservative lower
-    /// bound derived from the persisted global `sender_key_epoch`
-    /// counter. This closes the one-shot rollback window for the
-    /// common case. See `had_epoch_map` / `legacy_floor` logic in
-    /// `restore_crypto_state` for details and the documented
-    /// residual window for peers whose true floor exceeded the local
-    /// counter at snapshot time (bounded by `MAX_EPOCH_ADVANCE` in
-    /// the receive path).
-    #[serde(default)]
-    pub(crate) sender_key_epochs: Vec<(String, u64)>,
-    /// The sender key epoch counter.
-    pub(crate) sender_key_epoch: u64,
-    /// The send-side message sequence counter.
-    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize as 0, which is
-    /// the correct initial state. GCM nonces are random (`OsRng`), not counter-derived,
-    /// so a sequence reset does not create nonce reuse.
-    #[serde(default)]
-    pub(crate) send_sequence: u64,
-    /// Remote members' DHKEM(P-256) wrapping public keys: `(did, pubkey)`
-    /// pairs, each a validated uncompressed point (§9.5, checked on decode).
-    pub(crate) member_wrapping_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
-    /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
-    /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
-    /// feature, so we serialize it separately and store the blob here.
-    pub signer_bytes: Zeroizing<Vec<u8>>,
-    /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
-    pub(crate) group_id: Vec<u8>,
-    /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
-    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with an empty
-    /// tracker, so the first message from each sender is accepted unconditionally.
-    /// MLS-level replay protection remains the primary defense; this tracker is
-    /// defense-in-depth at the sender-key layer.
-    #[serde(default)]
-    pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
-    /// Sender-key distributions queued for publish, with their attempt
-    /// records. Persisted in the durable step of the rotation or Add that
-    /// queued them (spec 05 §5.15.3), so a publish that fails, or a crash
-    /// before the publish, leaves them to be published again (spec 09
-    /// §9.16.9 "A distribution whose publish fails").
-    pub pending_distributions: Vec<PendingDistribution>,
-    /// A sender-key rotation owed and not landed, set in the durable step of
-    /// the change that owes it and cleared in the rotation's (spec 09
-    /// §9.16.9 "A rotation that fails").
-    pub(crate) sender_key_rotation_pending: bool,
+    /// The MLS group state is serialized as the raw key-value pairs from the
+    /// `OpenMLS` `MemoryStorage` backing the group. On restore, these are
+    /// re-injected into a fresh `MemoryStorage` and the `MlsGroup` is
+    /// reconstructed via `MlsGroup::load`.
+    ///
+    /// # Security — Sensitive Key Material
+    ///
+    /// **This struct contains raw private key material:**
+    ///
+    /// - `signer_bytes` — P-256 private signing scalar (MLS credential signer, cs2)
+    /// - `local_sender_key` — AES-256 sender key (per-context message encryption)
+    /// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
+    ///   epoch secrets, HPKE private keys, and the key schedule
+    ///
+    /// **Why self-encryption is not feasible:** Encrypting the snapshot before
+    /// returning from `export_crypto_state` creates a circular dependency — the
+    /// encryption key would need to be stored outside the snapshot or derived
+    /// from material inside it (defeating the purpose). This is the same trust
+    /// model used by `OpenMLS` itself, which stores MLS `KeyPackage` private
+    /// keys in its `StorageProvider` backend in plaintext.
+    ///
+    /// **Storage layer requirements:** The `Storage` backend that persists this
+    /// blob MUST provide encryption at rest (§17.5). Platform implementations
+    /// (Keychain on iOS/macOS, Android Keystore, OS-level encrypted storage)
+    /// satisfy this. In-memory storage used in tests is acceptable because no
+    /// persistence occurs.
+    ///
+    /// **Defense in depth:** every field that holds private key material has a
+    /// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
+    /// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
+    /// export or restore path, early returns included. Buffers that serde
+    /// allocates and frees while decoding the blob are wiped as they are freed by
+    /// the wiping global allocator every shipped artifact installs (security model
+    /// spec §9.15, freed heap memory). `Zeroizing`'s
+    /// serde impls delegate to the inner value, so the encoding is that of the
+    /// plain fields.
+    ///
+    /// Core-internal; `pub` under `testing` for the runtime crates' tests (ADR-070 §5).
+    // ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
+    // `pub(crate)` (fields included) so the additive
+    // [`crate::context::actor::PerContextState::export_crypto_state`] inherent method
+    // can build the BYTE-IDENTICAL snapshot by moving this provider method's body
+    // verbatim (Decision 6 / Decision 15(a)). This mirrors the earlier
+    // `EpochState` / `TtlState` / `AccessControlState` / `GovernanceState` elevations
+    // ("elevated from private to pub(crate) so the actor can carry it"). The struct
+    // stays defined here; the provider retains its own `export_crypto_state` until
+    // the atomic core (SCP-CRYPTOMOVE-001) deletes it.
+    #[derive(Serialize, Deserialize)]
+    pub(crate) struct MlsCryptoSnapshot {
+        /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
+        /// Each pair is `(key_bytes, value_bytes)`.
+        pub(crate) mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
+        /// The local member's AES-256 sender key (32 bytes).
+        pub(crate) local_sender_key: SenderKey,
+        /// All sender keys for this context: `(sender_did, key)` pairs. The
+        /// `Zeroizing` vector wipes its whole buffer on drop, including the slots
+        /// restore drains keys out of.
+        pub(crate) sender_key_entries: Zeroizing<Vec<(String, SenderKey)>>,
+        /// Per-sender epoch high-water marks for this context:
+        /// `(sender_did, epoch)` pairs.
+        ///
+        /// Persisted so the `#1608` rollback-protection invariant
+        /// (`SenderKeyStore::set_checked` rejects epoch regressions) survives
+        /// a restart. Without this, an attacker who captured an old-epoch
+        /// sender-key distribution pre-restart could replay it after restore
+        /// because the fresh in-memory map would have no record of the
+        /// higher epoch.
+        ///
+        /// MIGRATION: `#[serde(default)]` — legacy snapshots (pre-C1)
+        /// deserialize with an empty vec. `SenderKey` material does not
+        /// carry the epoch it was bound to, so per-sender floors cannot
+        /// be recovered exactly from legacy data. The restore path
+        /// compensates by seeding every sender with a conservative lower
+        /// bound derived from the persisted global `sender_key_epoch`
+        /// counter. This closes the one-shot rollback window for the
+        /// common case. See `had_epoch_map` / `legacy_floor` logic in
+        /// `restore_crypto_state` for details and the documented
+        /// residual window for peers whose true floor exceeded the local
+        /// counter at snapshot time (bounded by `MAX_EPOCH_ADVANCE` in
+        /// the receive path).
+        #[serde(default)]
+        pub(crate) sender_key_epochs: Vec<(String, u64)>,
+        /// The sender key epoch counter.
+        pub(crate) sender_key_epoch: u64,
+        /// The send-side message sequence counter.
+        /// MIGRATION: `#[serde(default)]` — old snapshots deserialize as 0, which is
+        /// the correct initial state. GCM nonces are random (`OsRng`), not counter-derived,
+        /// so a sequence reset does not create nonce reuse.
+        #[serde(default)]
+        pub(crate) send_sequence: u64,
+        /// Remote members' DHKEM(P-256) wrapping public keys: `(did, pubkey)`
+        /// pairs, each a validated uncompressed point (§9.5, checked on decode).
+        pub(crate) member_wrapping_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
+        /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
+        /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
+        /// feature, so we serialize it separately and store the blob here.
+        pub(crate) signer_bytes: Zeroizing<Vec<u8>>,
+        /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
+        pub(crate) group_id: Vec<u8>,
+        /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
+        /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with an empty
+        /// tracker, so the first message from each sender is accepted unconditionally.
+        /// MLS-level replay protection remains the primary defense; this tracker is
+        /// defense-in-depth at the sender-key layer.
+        #[serde(default)]
+        pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
+        /// Sender-key distributions queued for publish, with their attempt
+        /// records. Persisted in the durable step of the rotation or Add that
+        /// queued them (spec 05 §5.15.3), so a publish that fails, or a crash
+        /// before the publish, leaves them to be published again (spec 09
+        /// §9.16.9 "A distribution whose publish fails").
+        pub pending_distributions: Vec<PendingDistribution>,
+        /// A sender-key rotation owed and not landed, set in the durable step of
+        /// the change that owes it and cleared in the rotation's (spec 09
+        /// §9.16.9 "A rotation that fails").
+        pub(crate) sender_key_rotation_pending: bool,
+    }
 }
 
 impl Drop for MlsCryptoSnapshot {
@@ -662,7 +666,7 @@ impl NodeMlsFactory {
         // the inherent `NodeMlsFactory` API. Production builds (no
         // `testing` feature) still require `did:dht:z*`.
         let accepted = self.local_did.starts_with("did:dht:z")
-            || (cfg!(any(test, feature = "testing"))
+            || (scp_runtime_types::TESTING
                 && (self.local_did.starts_with("did:test:")
                     || self.local_did.starts_with("did:key:")));
         if !accepted {
@@ -844,7 +848,7 @@ impl NodeMlsFactory {
         // key package — matches the old `MockCrypto::validate_key_package`
         // behaviour deleted in ADR-049 §15.
         let Some(bytes) = key_package_bytes else {
-            if cfg!(any(test, feature = "testing")) {
+            if scp_runtime_types::TESTING {
                 let _ = owner_did;
                 return Ok(());
             }
@@ -1015,6 +1019,21 @@ impl NodeMlsFactory {
     // seams live on the actor-owned `ContextCryptoState` (`context/actor/state.rs`);
     // tests drive them there.
 
+    /// Test-only reach into [`Self::build_restored_owned`] for tests outside this crate.
+    /// Compiled only under `testing`, so no production or bridge build
+    /// reaches it (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::build_restored_owned`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn build_restored_owned_for_test(
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(OwnedMlsCryptoState, RestoredFloors), ContextError> {
+        Self::build_restored_owned(context_id, data)
+    }
+
     /// Reconstructs the per-context MLS crypto MATERIAL from a persisted
     /// snapshot and RETURNS it as an owned [`OwnedMlsCryptoState`] plus the
     /// Class-M [`RestoredFloors`].
@@ -1035,7 +1054,7 @@ impl NodeMlsFactory {
     /// `restore_crypto_state`), if deserialization
     /// fails, if the data is corrupt, or if a provider storage entry carries
     /// openmls's signature-key-pair label (persistence spec §17.9.1).
-    pub fn build_restored_owned(
+    pub(crate) fn build_restored_owned(
         context_id: &[u8; 32],
         data: &[u8],
     ) -> Result<(OwnedMlsCryptoState, RestoredFloors), ContextError> {
@@ -1230,6 +1249,35 @@ impl NodeMlsFactory {
     // whose `validate_and_merge_*` sinks (`context/supervisor/floors.rs`) enforce the same
     // §23.17.2 Inv-2/Inv-3/Inv-4 + epoch-poisoning-overshoot merge; the restore/import guard
     // routes the snapshot floors there via the returned `RestoredFloors`.
+}
+
+/// Test-only reach into fields that stay private to this crate. Compiled only
+/// under `testing`, so no production or bridge build reaches them (ADR-070 §4).
+#[cfg(any(test, feature = "testing"))]
+impl MlsCryptoSnapshot {
+    /// The serialized MLS signer.
+    #[must_use]
+    pub const fn signer_bytes_for_test(&self) -> &Zeroizing<Vec<u8>> {
+        &self.signer_bytes
+    }
+
+    /// The `OpenMLS` provider storage entries.
+    #[must_use]
+    pub const fn mls_storage_entries_for_test(&self) -> &scp_mls::snapshot::ProviderStorageEntries {
+        &self.mls_storage_entries
+    }
+
+    /// The local sender key.
+    #[must_use]
+    pub const fn local_sender_key_for_test(&self) -> &SenderKey {
+        &self.local_sender_key
+    }
+
+    /// The remote sender keys.
+    #[must_use]
+    pub const fn sender_key_entries_for_test(&self) -> &Zeroizing<Vec<(String, SenderKey)>> {
+        &self.sender_key_entries
+    }
 }
 
 #[cfg(test)]

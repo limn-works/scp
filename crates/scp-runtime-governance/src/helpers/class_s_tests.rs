@@ -145,7 +145,7 @@ fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
         .handle
         .transition_to(&scp_protocol::context::ContextState::Active)
         .expect("transition to Active");
-    ClassSCell::new(state)
+    ClassSCell::new_for_test(state)
 }
 
 fn ceiling_commit_meta() -> scp_runtime_core::context::shared::governance::CommitMeta<'static> {
@@ -205,9 +205,9 @@ async fn governance_modify_capability_requirements_failure_direction() {
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
-        state.governance.class_s.capability_requirements =
+        state.governance_mut().class_s.capability_requirements =
             scp_runtime_core::context::state::Replicated::Live(old.clone());
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
 
         let result = crate::helpers::execute_modify_capability_requirements(
             &mut cell,
@@ -224,7 +224,7 @@ async fn governance_modify_capability_requirements_failure_direction() {
         );
         let expected = if tightening { &new } else { &old };
         assert_eq!(
-            &cell.governance.class_s.capability_requirements,
+            &cell.governance().class_s.capability_requirements,
             &scp_runtime_core::context::state::Replicated::Live(expected.clone()),
             "tightening {tightening}: the live list after a failed persist"
         );
@@ -263,10 +263,10 @@ async fn awaiting_joiner_takes_the_list_governance_sets() {
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
             .expect("transition to Active");
-        state.governance.class_s.capability_requirements =
+        state.governance_mut().class_s.capability_requirements =
             scp_runtime_core::context::state::Replicated::AwaitingReplication;
         assert!(scp_runtime_queries::testing_access::capability_requirements(&state).is_err());
-        let mut cell = ClassSCell::new(state);
+        let mut cell = ClassSCell::new_for_test(state);
         let _ = crate::helpers::execute_modify_capability_requirements(
             &mut cell,
             &deps,
@@ -275,7 +275,7 @@ async fn awaiting_joiner_takes_the_list_governance_sets() {
             ceiling_commit_meta(),
         )
         .await;
-        assert_eq!(cell.governance.class_s.capability_requirements, expected);
+        assert_eq!(cell.governance().class_s.capability_requirements, expected);
     }
 }
 
@@ -309,7 +309,7 @@ async fn execute_modify_ceiling_rejects_malformed_proposal_at_propose_time() {
         );
         // Fail-closed: nothing was staged.
         assert!(
-            cell.governance.pending_ceiling_modification.is_none(),
+            cell.governance().pending_ceiling_modification.is_none(),
             "a rejected malformed ceiling proposal must NOT stage a pending \
                  modification (entry {malformed:?})"
         );
@@ -342,7 +342,7 @@ async fn execute_modify_ceiling_stages_wellformed_proposal() {
         "well-formed ceiling proposal must stage: {res:?}"
     );
     let pending = cell
-        .governance
+        .governance()
         .pending_ceiling_modification
         .as_ref()
         .expect("well-formed proposal stages a pending modification");

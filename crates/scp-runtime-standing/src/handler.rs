@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 
 use scp_runtime_core::context::actor::commands::StandingCommand;
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 
 use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
 
@@ -185,28 +185,6 @@ async fn handle_reconnect_all_standing(
     outcome
 }
 
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink. Mirrors the pattern used in the other
-/// migrated handler modules (messaging, lifecycle, governance).
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
-        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
-        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -253,20 +231,5 @@ mod tests {
             "the Outcome must record the failed query"
         );
         assert_shut_down(&rx.await.unwrap());
-    }
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    mod outcome_sketch_tests {
-        use super::super::{ContextError, outcome_error_sketch};
-
-        #[test]
-        fn sketch_keeps_supervisor_shut_down_typed() {
-            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-            assert!(
-                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-                "got {sketch:?}"
-            );
-        }
     }
 }

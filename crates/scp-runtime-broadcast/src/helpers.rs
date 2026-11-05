@@ -107,7 +107,7 @@ where
             scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
         ));
     }
-    if cell.access.read_exclusion_list.contains(subscriber_did) {
+    if cell.access().read_exclusion_list.contains(subscriber_did) {
         return Err(ContextError::PermissionDenied(
             scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
         ));

@@ -46,7 +46,7 @@ use scp_runtime_core::context::actor::commands::{
     CloseContextReply, ExportContextReply, LifecycleCommand,
 };
 use scp_runtime_core::context::actor::deps::ActorDeps;
-use scp_runtime_core::context::actor::outcome::Outcome;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
 use scp_runtime_core::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 use scp_runtime_core::context::actor::state::PerContextState;
 
@@ -504,27 +504,6 @@ fn handle_restore_context_access_key_actor(
 // Shared utilities
 // ---------------------------------------------------------------------------
 
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink given a borrowed error that cannot be
-/// cloned. Mirrors the pattern used in
-/// `handlers::messaging`.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
-        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
-        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sweep handlers (Phase 2A finalization — sweep helper relocation)
 // ---------------------------------------------------------------------------
@@ -828,7 +807,7 @@ async fn handle_issue_mls_update_actor(
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
             let out = s.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
-            s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
+            s.epoch_mut().mls_epoch = s.epoch_mut().mls_epoch.saturating_add(1);
             Ok(out.commit_bytes)
         })
         .await
@@ -926,20 +905,5 @@ mod tests {
             0,
             "a flush without a floor export must persist nothing"
         );
-    }
-
-    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
-    /// recording it as a crypto failure.
-    mod outcome_sketch_tests {
-        use super::super::{ContextError, outcome_error_sketch};
-
-        #[test]
-        fn sketch_keeps_supervisor_shut_down_typed() {
-            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
-            assert!(
-                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
-                "got {sketch:?}"
-            );
-        }
     }
 }

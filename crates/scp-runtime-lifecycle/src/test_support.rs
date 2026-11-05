@@ -1,5 +1,5 @@
 //! Test support (ADR-070 plan §1.2): the 13 domain handlers with this crate's own
-//! domain, and a test Supervisor that installs them.
+//! domain.
 
 use std::sync::Arc;
 
@@ -22,21 +22,4 @@ pub fn test_domain_handlers() -> DomainHandlers {
         saga: Arc::new(scp_runtime_saga::Saga),
         lifecycle_control: Arc::new(scp_runtime_lifecycle_control::LifecycleControl),
     }
-}
-
-/// [`scp_runtime_core::context::supervisor::test_support::test_supervisor_with_domains`] with
-/// [`test_domain_handlers`].
-pub fn test_supervisor(
-    crypto: Arc<scp_runtime_core::crypto::mls::provider::NodeMlsFactory>,
-    transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider>,
-    event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider>,
-    key_resolver: scp_protocol::context::governance::KeyResolver,
-) -> Arc<scp_runtime_core::context::supervisor::Supervisor> {
-    scp_runtime_core::context::supervisor::test_support::test_supervisor_with_domains(
-        crypto,
-        transport,
-        event_log,
-        key_resolver,
-        test_domain_handlers(),
-    )
 }
