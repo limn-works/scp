@@ -87,6 +87,10 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           config-file: .github/codeql/codeql-config.yml
+          # init saves dependency caches on any ref when this input, or the
+          # CODEQL_ACTION_DEPENDENCY_CACHING variable it falls back to, turns them on;
+          # the literal false turns them off, so the step saves nothing.
+          dependency-caching: false
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2

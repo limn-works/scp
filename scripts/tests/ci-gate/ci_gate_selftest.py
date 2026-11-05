@@ -5059,7 +5059,8 @@ def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
 # the script whose digest of each workspace's root Cargo.toml it puts into the cache key.
 # See the `cache-key` entry in this file's docstring.
 RUST_CACHE_ACTION = "./.github/actions/rust-cache"
-RUST_CACHE_UPSTREAM = "Swatinem/rust-cache@"
+# The upstream action, as action_name reads any spelling of it.
+RUST_CACHE_UPSTREAM = "swatinem/rust-cache"
 RUST_CACHE_ACTION_FILE = REPO / ".github/actions/rust-cache/action.yml"
 MANIFEST_DIGEST_SCRIPT = REPO / ".github/actions/rust-cache/manifest-digest.sh"
 # A variable that changes what cargo compiles. rust-cache hashes the CARGO*/RUST*
@@ -5080,20 +5081,36 @@ ARTIFACT_ENV_WRITE = re.compile(
 ARTIFACT_ARG = re.compile(r"(?<![\w-])(--config(?=[\s=])|-Z\s*[\w-]+)")
 
 
-def direct_rust_cache_gaps(documents: list[tuple[Path, dict]]) -> list[str]:
-    """Return each workflow step that calls Swatinem/rust-cache without the wrapper.
+def direct_rust_cache_gaps(
+    documents: list[tuple[Path, dict]], actions: dict[str, dict] | None = None
+) -> list[str]:
+    """Return each step that calls Swatinem/rust-cache without the wrapper.
 
-    CRITERION: no step in any workflow `uses:` a ref starting with RUST_CACHE_UPSTREAM;
-    RUST_CACHE_ACTION is the only caller.
+    CRITERION: no step in any workflow or local composite action other than
+    RUST_CACHE_ACTION `uses:` an action whose action_name (any spelling) is
+    RUST_CACHE_UPSTREAM; RUST_CACHE_ACTION is the only caller.
     """
+    actions = local_actions() if actions is None else actions
     gaps = []
     for path, doc in documents:
         for job_id, job in sorted((doc.get("jobs") or {}).items()):
             for index, step in enumerate(job.get("steps") or []):
-                if str(step.get("uses") or "").startswith(RUST_CACHE_UPSTREAM):
+                if remote_name(step) == RUST_CACHE_UPSTREAM:
                     label = step.get("name") or f"step {index}"
                     gaps.append(f"{path.name} job {job_id}, {label}: uses {step['uses']}")
+    for uses, action in sorted(actions.items()):
+        if uses == RUST_CACHE_ACTION:
+            continue
+        for index, step in enumerate((action.get("runs") or {}).get("steps") or []):
+            if remote_name(step) == RUST_CACHE_UPSTREAM:
+                gaps.append(f"{uses} step {index}: uses {step['uses']}")
     return gaps
+
+
+def remote_name(step: object) -> str | None:
+    """A step's remote action, as action_name reads it; None for a local or no `uses:`."""
+    uses = step_uses(step) if isinstance(step, dict) else ""
+    return action_name(uses) if uses and not uses.startswith(("./", "docker://")) else None
 
 
 def wrapper_key_gaps(action: dict) -> list[str]:
@@ -5121,7 +5138,7 @@ def wrapper_key_gaps(action: dict) -> list[str]:
     caches = [
         (index, step)
         for index, step in enumerate(steps)
-        if str(step.get("uses") or "").startswith(RUST_CACHE_UPSTREAM)
+        if remote_name(step) == RUST_CACHE_UPSTREAM
     ]
     if len(caches) != 1:
         gaps.append(f"{len(caches)} {RUST_CACHE_UPSTREAM} steps, expected 1")
@@ -5354,11 +5371,19 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
         for step in job.get("steps") or []
         if str(step.get("uses") or "") == RUST_CACHE_ACTION
     )
-    step["uses"] = "Swatinem/rust-cache@v2"
+    for spelling in ("Swatinem/rust-cache@v2", "swatinem/rust-cache@v2"):
+        step["uses"] = spelling
+        check(
+            f"a direct {spelling} step in {path.name} is reported",
+            any(gap.startswith(f"{path.name} job ") for gap in direct_rust_cache_gaps(planted)),
+            f"{direct_rust_cache_gaps(planted)}",
+        )
+    actions = copy.deepcopy(local_actions())
+    actions[CARGO_FETCH_ACTION]["runs"]["steps"].append({"uses": "SWATINEM/Rust-Cache@v2"})
     check(
-        f"a direct Swatinem/rust-cache@v2 step in {path.name} is reported",
-        any(gap.startswith(f"{path.name} job ") for gap in direct_rust_cache_gaps(planted)),
-        f"{direct_rust_cache_gaps(planted)}",
+        f"a direct rust-cache step inside {CARGO_FETCH_ACTION} is reported",
+        any(gap.startswith(f"{CARGO_FETCH_ACTION} step ") for gap in direct_rust_cache_gaps(documents, actions)),
+        f"{direct_rust_cache_gaps(documents, actions)}",
     )
 
     action = yaml.safe_load(RUST_CACHE_ACTION_FILE.read_text())
@@ -5438,7 +5463,11 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
     )
     # Controls: a step that always hashes the file rekeys every group on each warm
     # edit, and one that never hashes it leaves a warm group's stale entry an exact
-    # match that skips the save.
+    # match that skips the save. Every group the workflows hold today is one
+    # cache-warm.yml writes, so the first control reads a planted group name that no
+    # workflow writes; without it, hashing the file into every group matches the
+    # live set exactly and nothing is reported.
+    planted_groups = groups | {"planted-group-cache-warm-does-not-write"}
     test = 'if grep -Eq "^[[:space:]]+shared-key:'
     for label, replacement, reported in (
         (
@@ -5454,7 +5483,7 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
     ):
         planted = manifest_step["run"].replace(test, replacement)
         check(f"the planting for a wrapper {label} replaced its test", planted != manifest_step["run"])
-        planted_gaps = wrapper_warm_key_gaps(planted, groups, warm_text)
+        planted_gaps = wrapper_warm_key_gaps(planted, planted_groups, warm_text)
         check(
             f"a wrapper {label} is reported",
             any(reported in gap for gap in planted_gaps),
@@ -7698,10 +7727,12 @@ def cache_write(step: dict) -> str | None:
     """Name the cache one step writes, or None when it writes none.
 
     A step writes a cache when a later run of any ref can restore what it saves:
-    a `Swatinem/rust-cache` step whose `save-if` is not the literal false, an
+    a `Swatinem/rust-cache` step (direct or through the wrapper, its name read in any
+    case as action_name reads it) whose `save-if` is not the literal false, an
     `actions/cache` or `actions/cache/save` step, a `gradle/actions/setup-gradle`
     step that neither disables its cache nor sets `cache-read-only` to the literal
-    true (it writes on the default branch by default), a step exporting a layer
+    true without a `cache-write-only` that overrides it (it writes on the default
+    branch by default), a step exporting a layer
     cache through `cache-to`, an `oven-sh/setup-bun` step that does not set
     `no-cache` to the literal true (it caches the bun executable by default), and
     a setup action given a `cache:` input. An input
@@ -7709,20 +7740,24 @@ def cache_write(step: dict) -> str | None:
     holding the job on push rather than toward skipping a writer.
     """
     uses = str(step.get("uses") or "")
-    action = uses.split("@", 1)[0]
-    inputs = step.get("with") or {}
+    action = uses.rstrip("/") if uses.startswith("./") else action_name(uses)
+    inputs = step_inputs(step)
 
     def literal(name: str) -> str:
         return str(inputs.get(name, "")).strip().lower()
 
-    if action == RUST_CACHE_ACTION:
+    if action in (RUST_CACHE_ACTION, RUST_CACHE_UPSTREAM):
         if literal("save-if") == "false":
             return None
         return f"rust-cache `{inputs.get('shared-key')}`"
     if action in ("actions/cache", "actions/cache/save"):
         return f"{action} `{inputs.get('key')}`"
     if action == "gradle/actions/setup-gradle":
-        if literal("cache-disabled") == "true" or literal("cache-read-only") == "true":
+        # `cache-write-only` overrides `cache-read-only` (setup-gradle action.yml).
+        write_only = literal("cache-write-only") not in ("", "false")
+        if literal("cache-disabled") == "true" or (
+            literal("cache-read-only") == "true" and not write_only
+        ):
             return None
         return "the Gradle user-home cache"
     if action == "oven-sh/setup-bun":
@@ -11160,6 +11195,476 @@ def check_script_reads(doc: dict, paths: list[str]) -> None:
     )
 
 
+COMPILE_STEPS_SCRIPT = REPO / "scripts/check-workflow-compile-steps.py"
+
+
+@functools.cache
+def compile_steps_module():
+    """scripts/check-workflow-compile-steps.py, which owns gated_to_main."""
+    return load_module("check_workflow_compile_steps", COMPILE_STEPS_SCRIPT)
+
+
+def gated_to_main(value: object, bare: bool = False) -> bool:
+    """check-workflow-compile-steps.py's gated_to_main, the one owner of the rule."""
+    return compile_steps_module().gated_to_main(value, bare)
+
+
+# setup-gradle's documented form for saving on `main` alone: read-only everywhere else.
+GRADLE_READ_ONLY_OFF_MAIN = re.compile(r"github\.ref\s*!=\s*'refs/heads/main'", re.IGNORECASE)
+
+
+def gradle_read_only_off_main(value: object) -> bool:
+    """Whether a `cache-read-only` value is exactly `${{ github.ref != 'refs/heads/main' }}`."""
+    module = compile_steps_module()
+    body = module.expression_body(value)
+    return body is not None and bool(
+        GRADLE_READ_ONLY_OFF_MAIN.fullmatch(module.strip_parentheses(body))
+    )
+
+
+def cache_action_key(uses: str) -> str:
+    """The CACHE_SAVES key a remote `uses:` names: action_name, or a `docker://` image
+    without its tag or digest."""
+    if uses.lower().startswith("docker://"):
+        image = uses[len("docker://"):].split("@", 1)[0].lower()
+        head, _, last = image.rpartition("/")
+        return "docker://" + (f"{head}/" if head else "") + last.split(":", 1)[0]
+    return action_name(uses)
+
+
+def unclassified_actions(permitted: dict[str, str], table: dict[str, CacheSaving]) -> list[str]:
+    """Each permitted action CACHE_SAVES does not classify, and each classification
+    that names an action PERMITTED_ACTIONS does not permit (a `docker://` image
+    excepted, which remote_action_gaps reads by digest)."""
+    missing = [f"{name} has no CACHE_SAVES entry" for name in sorted(set(permitted) - set(table))]
+    stray = [
+        f"CACHE_SAVES classifies {name}, which PERMITTED_ACTIONS does not list"
+        for name in sorted(set(table) - set(permitted))
+        if not name.startswith("docker://")
+    ]
+    return missing + stray
+
+
+def local_actions() -> dict[str, dict]:
+    """Every local composite action, by the `uses:` that calls it."""
+    return {
+        f"./{path.parent.relative_to(REPO).as_posix()}": yaml.safe_load(path.read_text()) or {}
+        for path in sorted((REPO / ".github/actions").glob("*/action.y*ml"))
+    }
+
+
+CALLER_INPUT = re.compile(r"\binputs\.([\w-]+)", re.IGNORECASE)
+
+
+def step_inputs(step: dict) -> dict[str, object]:
+    """A step's `with:`, keyed by lower-cased input name.
+
+    GitHub exports each input as `INPUT_<NAME>` upper-cased, and the actions read them
+    through `getInput`, which upper-cases the name it asks for, so `Cache-To` and
+    `cache-to` are one input. Every reader of a step's inputs reads them through here.
+    """
+    return {str(key).lower(): value for key, value in (step.get("with") or {}).items()}
+
+
+def fill_inputs(value: object, inputs: dict[str, object], condition: bool = False) -> object:
+    """A composite step's field with each `inputs.<name>` replaced by what the caller passed.
+
+    A `with:` field that is `${{ inputs.<name> }}` alone takes the caller's value
+    whole, so a literal `false` stays the literal false. An `if:` field (`condition`)
+    does so only when the caller passed an expression: a caller's literal text there is
+    a string, which is true whenever it is not empty, so it becomes a quoted string
+    expression, never an expression to read. Inside a longer expression, a caller's
+    expression is put in parentheses and a literal is quoted. An input the caller
+    leaves out reads the action's default, which `inputs` already holds.
+    """
+    if not isinstance(value, str):
+        return value
+
+    def quoted(given: object) -> str:
+        literal = str(given).lower() if isinstance(given, bool) else str(given)
+        return "'" + literal.replace("'", "''") + "'"
+
+    whole = re.fullmatch(r"\$\{\{\s*inputs\.([\w-]+)\s*\}\}", value.strip(), re.IGNORECASE)
+    if whole:
+        given = inputs.get(whole.group(1).lower(), "")
+        if not condition or compile_steps_module().expression_body(given) is not None:
+            return given
+        return "${{ " + quoted(given) + " }}"
+
+    def replace(match: re.Match) -> str:
+        given = inputs.get(match.group(1).lower(), "")
+        body = compile_steps_module().expression_body(given)
+        return f"({body})" if body is not None else quoted(given)
+
+    return CALLER_INPUT.sub(replace, value)
+
+
+def literal_value(value: object) -> str | None:
+    """A field's literal text, lower-cased, or None when it holds an expression."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    text = str(value).strip()
+    return None if "${{" in text else text.lower()
+
+
+# Every `type=` field of one `cache-to` export line; buildx keeps the last it reads.
+CACHE_EXPORT_TYPE = re.compile(r"(?:^|,)\s*type\s*=\s*([^,]*)", re.IGNORECASE)
+
+
+def save_gate(name: str, inputs: dict) -> tuple[str, list[object]]:
+    """How the step running action `name` with `inputs` (step_inputs) saves an entry.
+
+    ("never", []): it saves nothing. ("own-rule", []): it saves on `main` alone by a
+    rule this function read, not by a condition. ("gated", texts): it saves wherever
+    it runs, unless a gate holds it to `main`; `texts` are the input values that gate
+    it, besides its `if:` conditions. The inputs read for each action are the ones
+    CACHE_SAVES names.
+    """
+    saving = CACHE_SAVES[name]
+    if not saving.saves:
+        return "never", []
+    if name in ("actions/cache", "actions/cache/save"):
+        return "gated", []
+    if name == "swatinem/rust-cache":
+        if literal_value(inputs.get("save-if")) == "false":
+            return "never", []
+        return "gated", [inputs.get("save-if")]
+    if name == "gradle/actions/setup-gradle":
+        if literal_value(inputs.get("cache-disabled")) == "true":
+            return "never", []
+        write_only = literal_value(inputs.get("cache-write-only"))
+        if "cache-write-only" in inputs and write_only not in ("", "false"):
+            # cache-write-only overrides cache-read-only and the default-branch rule.
+            return "gated", []
+        if "cache-read-only" not in inputs:
+            # The action's default keys on `github.ref_name` and a non-null
+            # `github.event.repository`, so a tag named `main` saves; every step
+            # states the value instead.
+            return "gated", []
+        read_only = inputs["cache-read-only"]
+        if literal_value(read_only) == "true":
+            return "never", []
+        if gradle_read_only_off_main(read_only):
+            return "own-rule", []
+        return "gated", []
+    if name == "docker/build-push-action":
+        # Each line of `cache-to` is one export, and its `type=` field alone picks the
+        # backend, so an expression elsewhere in the line (a registry ref) leaves it
+        # read. A line can save unless it holds exactly one `type=` field, whose value
+        # is a literal other than `gha`; buildx reads a repeated field's last value.
+        exports = [line.strip() for line in str(inputs.get("cache-to") or "").splitlines()]
+        for line in filter(None, exports):
+            types = CACHE_EXPORT_TYPE.findall(line)
+            if len(types) != 1 or "${{" in types[0] or types[0].strip().lower() == "gha":
+                return "gated", []
+        return "never", []
+    if name in TOOLCACHE_ACTIONS:
+        if literal_value(inputs.get("cache")) == "":
+            return "never", []
+        return "gated", []
+    if name == "github/codeql-action/init":
+        # init reads the input, and the variable when the input is empty; an earlier
+        # `run:` step can set the variable through $GITHUB_ENV, beyond what this check
+        # reads, so only a literal non-saving input holds the step to no save.
+        if literal_value(inputs.get("dependency-caching")) in ("false", "none", "restore"):
+            return "never", []
+        return "gated", []
+    raise ValueError(f"CACHE_SAVES says {name} saves, and save_gate does not read it")
+
+
+def main_only_gaps(
+    documents: list[tuple[Path, dict]], actions: dict[str, dict] | None = None
+) -> tuple[list[str], list[str]]:
+    """Return (judged, gaps): each Actions-cache writer read, and each step that can
+    save on a ref other than `main` or that this check cannot classify.
+
+    CRITERION: every step that can save an Actions cache entry is held to
+    `refs/heads/main` by gated_to_main: some condition the save depends on (the job's
+    `if:`, each calling step's `if:`, the step's own `if:`, or the input CACHE_SAVES
+    names) has no top-level `||` and has `github.ref == 'refs/heads/main'` as a
+    top-level `&&` term. Those conditions are joined with `&&`, so one such term in
+    any of them holds the whole save. setup-gradle is held by its own rule instead:
+    with `cache-read-only: ${{ github.ref != 'refs/heads/main' }}` it saves on `main`
+    alone. Input names are read without regard to case (step_inputs).
+
+    WHY: GitHub serves an entry to the ref that saved it and to the default branch,
+    never to a sibling branch, a pull request or a merge-queue ref. An entry saved
+    anywhere but `main` can be restored only by a later run on the same ref, while it
+    counts against the repository's 10 GB cap from the moment it is saved. The cap
+    evicts the least recently used entries, so a burst of such entries (three napi
+    release builds on one pull request ref saved 1.9 GB on 2026-11-03) pushes out the
+    entries every pull request restores.
+
+    SCOPE: every step of every workflow, and every step of each local composite action
+    a step calls, read with the caller's `with:` filled into its `inputs.*`. A writer
+    is found through CACHE_SAVES, which classifies every action PERMITTED_ACTIONS
+    allows, so an action is a writer by its entry, not by its spelling. A `uses:` with
+    no entry is a gap. Residual: a `run:` step that saves through the cache API
+    itself. A branch named `MAIN`, which GitHub's case-insensitive `==` reads as
+    `main`, is refused by the repository ruleset "refuse case variants of main".
+    """
+    actions = local_actions() if actions is None else actions
+    judged: list[str] = []
+    gaps: list[str] = []
+
+    def walk(where: str, steps: object, conditions: list[object], depth: int) -> None:
+        for index, step in enumerate(steps or []):
+            if not isinstance(step, dict):
+                continue
+            uses = step_uses(step)
+            label = f"{where}: {step.get('name') or uses or f'step {index}'}"
+            gates = [*conditions, step.get("if")]
+            if not uses:
+                continue
+            if uses.startswith("./"):
+                action = actions.get(uses.rstrip("/"))
+                if action is None or depth > 3:
+                    gaps.append(f"{label} calls {uses}, which this check cannot read")
+                    continue
+                given = step_inputs(step)
+                defaults = {
+                    k.lower(): (spec or {}).get("default", "")
+                    for k, spec in (action.get("inputs") or {}).items()
+                }
+                values = {**defaults, **given}
+                inner = [
+                    {
+                        **inner_step,
+                        "if": fill_inputs(inner_step.get("if"), values, condition=True),
+                        "with": {
+                            k: fill_inputs(v, values) for k, v in step_inputs(inner_step).items()
+                        },
+                    }
+                    for inner_step in ((action.get("runs") or {}).get("steps") or [])
+                    if isinstance(inner_step, dict)
+                ]
+                walk(f"{label} > {uses}", inner, gates, depth + 1)
+                continue
+            name = cache_action_key(uses)
+            if name not in CACHE_SAVES:
+                gaps.append(f"{label} uses {name}, which CACHE_SAVES does not classify")
+                continue
+            kind, texts = save_gate(name, step_inputs(step))
+            if kind == "never":
+                continue
+            judged.append(label)
+            if kind == "own-rule":
+                continue
+            held = any(gated_to_main(text, bare=True) for text in gates) or any(
+                gated_to_main(text) for text in texts
+            )
+            if not held:
+                gaps.append(
+                    f"{label} can save through {name} on a ref other than `main`: no "
+                    "condition it depends on has `github.ref == 'refs/heads/main'` as a "
+                    "top-level `&&` term with no top-level `||`"
+                )
+
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            if isinstance(job, dict):
+                walk(f"{path.name}: {job_id}", job.get("steps"), [job.get("if")], 0)
+    return judged, gaps
+
+
+def check_cache_writers_save_on_main_only(documents: list[tuple[Path, dict]]) -> None:
+    unclassified = unclassified_actions(PERMITTED_ACTIONS, CACHE_SAVES)
+    check("every permitted action has a cache classification", not unclassified, "; ".join(unclassified))
+    # Every `uses:` in every composite action, called or not, is classified too.
+    composite_gaps = [
+        f"{uses}: {step_uses(step)}"
+        for uses, action in local_actions().items()
+        for step in ((action.get("runs") or {}).get("steps") or [])
+        if isinstance(step, dict)
+        and step_uses(step)
+        and not step_uses(step).startswith("./")
+        and cache_action_key(step_uses(step)) not in CACHE_SAVES
+    ]
+    check("every composite action's `uses:` is classified", not composite_gaps, "; ".join(composite_gaps))
+    judged, gaps = main_only_gaps(documents)
+    # Every `uses:` was classified (an unclassified one is a gap), and some writer was
+    # found, so the gap check below cannot pass over an empty set.
+    check("main-only: at least one Actions-cache writer is judged", bool(judged), "nothing judged")
+    check("every Actions-cache writer saves only on `main`", not gaps, "; ".join(gaps))
+
+
+def check_main_only_detects_an_off_main_writer(documents: list[tuple[Path, dict]]) -> None:
+    """Planted cases: each writer marked True must be reported, each False accepted."""
+    sha = "0057852bfaa89a56745cba8c7296529d2fc39830"
+    save = f"actions/cache/save@{sha}"
+    gradle = f"gradle/actions/setup-gradle@{sha}"
+    build = f"docker/build-push-action@{sha}"
+    on_main = "${{ github.ref == 'refs/heads/main' }}"
+    planted_action = "./.github/actions/planted-cache"
+    gated_action = "./.github/actions/planted-gated-save"
+    codeql = f"github/codeql-action/init@{sha}"
+    actions = {
+        **local_actions(),
+        planted_action: {
+            "inputs": {"key": {"default": "k"}},
+            "runs": {
+                "using": "composite",
+                "steps": [{"uses": f"actions/cache@{sha}", "with": {"key": "${{ inputs.key }}"}}],
+            },
+        },
+        gated_action: {
+            "inputs": {"gate": {"default": ""}},
+            "runs": {"using": "composite", "steps": [{"uses": save, "if": "${{ inputs.gate }}"}]},
+        },
+    }
+    cases = (
+        ("mixed-case Actions/cache/save", None, {"uses": f"Actions/cache/save@{sha}"}, True),
+        ("lower-case swatinem/rust-cache with no save-if", None, {"uses": f"swatinem/rust-cache@{sha}"}, True),
+        ("actions/cache inside a planted composite", None, {"uses": planted_action}, True),
+        (
+            "setup-gradle with cache-write-only",
+            None,
+            {"uses": gradle, "with": {"cache-write-only": True}},
+            True,
+        ),
+        (
+            "setup-gradle with cache-write-only beside cache-read-only",
+            None,
+            {"uses": gradle, "with": {"cache-write-only": True, "cache-read-only": True}},
+            True,
+        ),
+        (
+            "codeql init with dependency-caching",
+            None,
+            {"uses": f"github/codeql-action/init@{sha}", "with": {"dependency-caching": True}},
+            True,
+        ),
+        ("codeql init with no dependency-caching input", None, {"uses": codeql}, True),
+        (
+            "codeql init with an empty dependency-caching input",
+            None,
+            {"uses": codeql, "with": {"dependency-caching": ""}},
+            True,
+        ),
+        ("codeql init with dependency-caching false", None, {"uses": codeql, "with": {"dependency-caching": False}}, False),
+        ("setup-gradle with cache-read-only false", None, {"uses": gradle, "with": {"cache-read-only": False}}, True),
+        (
+            "setup-gradle with cache-read-only gated to main, the inverse",
+            None,
+            {"uses": gradle, "with": {"cache-read-only": on_main}},
+            True,
+        ),
+        ("setup-gradle with no cache-read-only", None, {"uses": gradle}, True),
+        ("setup-gradle with cache-read-only true", None, {"uses": gradle, "with": {"cache-read-only": True}}, False),
+        ("mixed-case Cache-Write-Only key", None, {"uses": gradle, "with": {"Cache-Write-Only": True, "cache-read-only": True}}, True),
+        ("mixed-case Cache key on setup-python", None, {"uses": f"actions/setup-python@{sha}", "with": {"Cache": "pip"}}, True),
+        ("mixed-case Dependency-Caching key", None, {"uses": codeql, "with": {"Dependency-Caching": True}}, True),
+        ("mixed-case Cache-To key", None, {"uses": build, "with": {"Cache-To": "type=gha"}}, True),
+        (
+            "a composite `if: ${{ inputs.gate }}` given a plain string",
+            None,
+            {"uses": gated_action, "with": {"gate": "github.ref == 'refs/heads/main'"}},
+            True,
+        ),
+        (
+            "a composite `if: ${{ inputs.gate }}` given a main-gate expression",
+            None,
+            {"uses": gated_action, "with": {"gate": on_main}},
+            False,
+        ),
+        (
+            "a cache-to line with a second type field",
+            None,
+            {"uses": build, "with": {"cache-to": "type=registry,ref=r,type=gha"}},
+            True,
+        ),
+        ("an action CACHE_SAVES does not classify", None, {"uses": f"example/unlisted@{sha}"}, True),
+        ("a gate on github.ref_name", None, {"uses": save, "if": "github.ref_name == 'main'"}, True),
+        (
+            "a gate joined to failure() by ||",
+            None,
+            {"uses": save, "if": "github.ref == 'refs/heads/main' || failure()"},
+            True,
+        ),
+        ("combined actions/cache under no gate", None, {"uses": f"actions/cache@{sha}"}, True),
+        ("gha layer cache", None, {"uses": build, "with": {"cache-to": "type=gha"}}, True),
+        (
+            "setup-gradle read-only off main",
+            None,
+            {"uses": gradle, "with": {"cache-read-only": "${{ github.ref != 'refs/heads/main' }}"}},
+            False,
+        ),
+        ("save gated to main", None, {"uses": save, "if": "always() && github.ref == 'refs/heads/main'"}, False),
+        ("save in a job gated to main", on_main, {"uses": save}, False),
+        (
+            "rust-cache wrapper gated to main",
+            None,
+            {"uses": RUST_CACHE_ACTION, "with": {"shared-key": "g", "save-if": on_main}},
+            False,
+        ),
+        ("registry layer cache", None, {"uses": build, "with": {"cache-to": "type=registry,ref=r"}}, False),
+        (
+            "registry layer cache with an expression in its ref",
+            None,
+            {"uses": build, "with": {"cache-to": "type=registry,ref=ghcr.io/${{ github.repository }}/c"}},
+            False,
+        ),
+        (
+            "layer cache whose type is an expression",
+            None,
+            {"uses": build, "with": {"cache-to": "type=${{ inputs.kind }},ref=r"}},
+            True,
+        ),
+        (
+            "layer cache with a gha export on its second line",
+            None,
+            {"uses": build, "with": {"cache-to": "type=registry,ref=r\ntype=gha,mode=max"}},
+            True,
+        ),
+    )
+    for label, job_if, step, expected in cases:
+        job: dict = {"runs-on": "ubuntu-latest", "steps": [step]}
+        if job_if is not None:
+            job["if"] = job_if
+        judged, gaps = main_only_gaps([(Path("planted.yml"), {"jobs": {"j": job}})], actions)
+        check(
+            f"main-only: {label} is {'reported' if expected else 'accepted'}",
+            bool(gaps) is expected,
+            "; ".join(gaps) or "; ".join(judged) or "nothing judged",
+        )
+    # A newly permitted action with no classification is reported.
+    check(
+        "main-only: a newly permitted action with no cache classification is reported",
+        unclassified_actions({**PERMITTED_ACTIONS, "example/new-action": "planted"}, CACHE_SAVES)
+        == ["example/new-action has no CACHE_SAVES entry"],
+    )
+    # `cache: pip` on toolcache-setup's setup-python step reaches every caller.
+    mutated = copy.deepcopy(actions)
+    for step in mutated[TOOLCACHE_ACTION]["runs"]["steps"]:
+        if action_name(step_uses(step)) == "actions/setup-python":
+            step.setdefault("with", {})["cache"] = "pip"
+    _, gaps = main_only_gaps(documents, mutated)
+    check(
+        "main-only: `cache: pip` on toolcache-setup's setup-python step is reported",
+        any(f"> {TOOLCACHE_ACTION}" in gap for gap in gaps),
+        "; ".join(gaps) or "nothing reported",
+    )
+    # fuzz.yml's corpus saves, with their ref test removed, must be reported.
+    for path, doc in documents:
+        if path.name != "fuzz.yml":
+            continue
+        mutant = copy.deepcopy(doc)
+        changed = 0
+        for job in mutant["jobs"].values():
+            for step in job.get("steps") or []:
+                if isinstance(step, dict) and step.get("name") == "Save corpus cache":
+                    step["if"] = "always()"
+                    changed += 1
+        _, gaps = main_only_gaps([(path, mutant)])
+        check(
+            "main-only: fuzz.yml's corpus saves under `always()` alone are reported",
+            changed == 2 and len(gaps) == 2,
+            f"changed {changed}; {'; '.join(gaps)}",
+        )
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -11655,6 +12160,74 @@ PERMITTED_ACTIONS: dict[str, str] = {
     "gradle/actions/wrapper-validation": (
         "compares the wrapper jar with the checksums services.gradle.org publishes"
     ),
+}
+class CacheSaving(NamedTuple):
+    """Whether an action can save an Actions cache entry, and what decides it.
+
+    `inputs` names each input (or environment variable) that decides whether it saves;
+    empty for an action whose saving only its `if:` decides. save_gate reads them.
+    """
+
+    saves: bool
+    inputs: tuple[str, ...]
+    why: str
+
+
+def never(why: str) -> CacheSaving:
+    return CacheSaving(False, (), why)
+
+
+# The cache classification of every action PERMITTED_ACTIONS allows, and of every
+# `docker://` image a step runs; main-only-writers fails on an allowed action with no
+# entry here, and on any `uses:` whose action has none. Each verdict is for the pinned
+# version the workflows use.
+CACHE_SAVES: dict[str, CacheSaving] = {
+    "actions/checkout": never("fetches the repository; holds no cache client"),
+    "actions/cache": CacheSaving(True, (), "its post step saves whenever the step ran and missed its key"),
+    "actions/cache/restore": never("restores only"),
+    "actions/cache/save": CacheSaving(True, (), "saves whenever it runs"),
+    "swatinem/rust-cache": CacheSaving(
+        True, ("save-if",), "its post step saves unless `save-if` is false; the default is true"
+    ),
+    "actions/upload-artifact": never("writes the artifact store, not the cache"),
+    "actions/download-artifact": never("reads the artifact store"),
+    "actions/upload-pages-artifact": never("writes the artifact store"),
+    "actions/configure-pages": never("reads the Pages configuration"),
+    "actions/deploy-pages": never("deploys an uploaded artifact"),
+    "actions/github-script": never(
+        "bundles no cache client; its `script:` is read by the verified-download word scan"
+    ),
+    "actions/setup-python": CacheSaving(True, ("cache",), "saves a package cache only with `cache:`"),
+    "actions/setup-node": CacheSaving(
+        True, ("cache",), "v4 saves a package cache only with `cache:` (v5 adds a default)"
+    ),
+    "actions/setup-java": CacheSaving(True, ("cache",), "saves a build-tool cache only with `cache:`"),
+    "dorny/paths-filter": never("reads the event's changed files"),
+    "docker/login-action": never("stores registry credentials"),
+    "docker/setup-buildx-action": never("starts buildkit; the build step decides any cache export"),
+    "docker/build-push-action": CacheSaving(
+        True, ("cache-to",), "exports layers to the Actions cache only with `cache-to: type=gha`"
+    ),
+    "taiki-e/install-action": never("installs binaries; holds no cache client"),
+    "github/codeql-action/init": CacheSaving(
+        True,
+        ("dependency-caching",),
+        "turns on dependency caching, which analyze saves on any ref, from the input or, "
+        "when the input is empty, the CODEQL_ACTION_DEPENDENCY_CACHING variable; its TRAP "
+        "cache uploads on the default branch alone",
+    ),
+    "github/codeql-action/analyze": never(
+        "saves only the dependency caches init turned on, judged at the init step"
+    ),
+    "dtolnay/rust-toolchain": never("runs rustup"),
+    "gradle/actions/setup-gradle": CacheSaving(
+        True,
+        ("cache-disabled", "cache-read-only", "cache-write-only"),
+        "saves where `cache-read-only` is not true; its default reads `github.ref_name`, so "
+        "every step sets it, and `cache-write-only` overrides it",
+    ),
+    "gradle/actions/wrapper-validation": never("compares checksums"),
+    "docker://ghcr.io/pypa/gh-action-pypi-publish": never("uploads to PyPI; holds no cache client"),
 }
 # What each kept condition reads, by action.
 TOOLCACHE_ACTIONS = ("actions/setup-python", "actions/setup-node", "actions/setup-java")
@@ -13516,6 +14089,12 @@ def run_push_writers(inputs: Inputs) -> None:
     check_push_writer_mutants(workflow)
 
 
+def run_main_only_writers(inputs: Inputs) -> None:
+    print("main-only-writers — every Actions-cache writer saves only on `main`")
+    check_cache_writers_save_on_main_only(inputs.documents)
+    check_main_only_detects_an_off_main_writer(inputs.documents)
+
+
 def run_macos_bridges(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
@@ -14348,6 +14927,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "package-writers": run_package_writers,
     "needs-condition": run_needs_condition,
     "push-writers": run_push_writers,
+    "main-only-writers": run_main_only_writers,
     "macos-bridges": run_macos_bridges,
     "prose-route": run_prose_route,
     "coverage": run_coverage,
@@ -14408,6 +14988,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "package-writers",
         "needs-condition",
         "push-writers",
+        "main-only-writers",
         "macos-bridges",
         "coverage",
         "path-closure",
