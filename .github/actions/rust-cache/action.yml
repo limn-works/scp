@@ -68,3 +68,52 @@ runs:
         shared-key: ${{ inputs.shared-key }}
         save-if: ${{ inputs.save-if }}
         workspaces: ${{ inputs.workspaces }}
+    # pyo3-build-config's build script records the library directory of the
+    # interpreter it found and reruns only when PYO3_PYTHON or
+    # PYO3_ENVIRONMENT_SIGNATURE changes. Neither changes with the runner image:
+    # the workflows name the bare `python3.12`, and maturin passes its venv's
+    # `.venv/bin/python` and a signature without the patch release. So an entry
+    # written on an image with CPython 3.12.16 makes a job on an image with
+    # 3.12.15 link against a directory that runner lacks (run 42014036838,
+    # `rust-lld: unable to find library -lpython3.12`). This step deletes each
+    # restored run of that build script whose recorded lib_dir differs from the
+    # LIBDIR of the interpreter pyo3 resolves now, with its fingerprint, so cargo
+    # reruns it. A run that records no lib_dir links no libpython and is kept.
+    - name: Drop pyo3 build configuration recorded for another interpreter
+      shell: bash
+      env:
+        CACHE_WORKSPACES: ${{ inputs.workspaces }}
+      run: |
+        set -euo pipefail
+        configs=()
+        while IFS= read -r line; do
+          [[ $line =~ [^[:space:]] ]] || continue
+          root="${line%%->*}"
+          target="target"
+          if [[ $line == *"->"* ]]; then
+            target="${line#*->}"
+          fi
+          root="$(echo "$root" | xargs)"
+          target="$(echo "$target" | xargs)"
+          dir="$GITHUB_WORKSPACE/$root/$target"
+          [[ -d $dir ]] || continue
+          while IFS= read -r -d '' config; do
+            configs+=("$config")
+          done < <(find "$dir" -path '*/build/pyo3-build-config-*/out/pyo3-build-config.txt' -print0)
+        done <<< "$CACHE_WORKSPACES"
+        if (( ${#configs[@]} == 0 )); then
+          exit 0
+        fi
+        interpreter="${PYO3_PYTHON:-python3}"
+        libdir="$("$interpreter" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' 2> /dev/null || true)"
+        for config in "${configs[@]}"; do
+          recorded="$(sed -n 's/^lib_dir=//p' "$config")"
+          if [[ -z $recorded || $recorded == "$libdir" ]]; then
+            continue
+          fi
+          run_dir="${config%/out/pyo3-build-config.txt}"
+          unit="${run_dir##*/}"
+          profile_dir="${run_dir%/build/*}"
+          echo "::notice::pyo3 build configuration $run_dir records lib_dir $recorded, but $interpreter has LIBDIR ${libdir:-<none>}; removing it so cargo reruns the build script"
+          rm -rf -- "$run_dir" "$profile_dir/.fingerprint/$unit"
+        done

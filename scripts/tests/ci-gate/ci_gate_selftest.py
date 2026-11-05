@@ -5156,6 +5156,194 @@ def wrapper_key_gaps(action: dict) -> list[str]:
     return gaps
 
 
+PYO3_CONFIG_FILE = "pyo3-build-config.txt"
+
+
+def pyo3_purge_steps(action: dict) -> list[dict]:
+    """The steps of RUST_CACHE_ACTION_FILE that drop stale pyo3 build configuration.
+
+    CRITERION: a step that runs after the action's one RUST_CACHE_UPSTREAM step,
+    carries no `if:` and no `continue-on-error`, and whose `run` names
+    PYO3_CONFIG_FILE and removes files.
+    """
+    steps = (action.get("runs") or {}).get("steps") or []
+    cache_at = next(
+        (index for index, step in enumerate(steps) if remote_name(step) == RUST_CACHE_UPSTREAM),
+        None,
+    )
+    if cache_at is None:
+        return []
+    return [
+        step
+        for step in steps[cache_at + 1 :]
+        if PYO3_CONFIG_FILE in str(step.get("run") or "")
+        and "rm -rf" in str(step.get("run") or "")
+        and "if" not in step
+        and not step.get("continue-on-error")
+    ]
+
+
+def plant_pyo3_run(profile_dir: Path, unit: str, lib_dir: str | None) -> Path:
+    """Plant one build-script run of pyo3-build-config and its fingerprint; return the run."""
+    run_dir = profile_dir / "build" / unit
+    (run_dir / "out").mkdir(parents=True)
+    lines = ["implementation=CPython", "version=3.12", "shared=true"]
+    if lib_dir is not None:
+        lines.append(f"lib_dir={lib_dir}")
+    (run_dir / "out" / PYO3_CONFIG_FILE).write_text("\n".join(lines) + "\n")
+    (profile_dir / ".fingerprint" / unit).mkdir(parents=True)
+    return run_dir
+
+
+def run_pyo3_purge_step(
+    script: str, workspace: Path, workspaces: str, pyo3_python: str
+) -> tuple[int, str]:
+    """Run a purge step's bash in `workspace`; return (exit code, output)."""
+    env = {k: v for k, v in os.environ.items() if k != "PYO3_PYTHON"}
+    env.update(
+        GITHUB_WORKSPACE=str(workspace), CACHE_WORKSPACES=workspaces, PYO3_PYTHON=pyo3_python
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def pyo3_purge_behavior_gaps(script: str) -> list[str]:
+    """Return each way a purge step's bash mishandles planted pyo3 build configuration.
+
+    CRITERION: run over the workspaces input with PYO3_PYTHON naming this interpreter,
+    the script exits 0; it removes each pyo3-build-config run
+    (`<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt`) whose `lib_dir`
+    differs from this interpreter's LIBDIR, with `<profile>/.fingerprint/<unit>`, under
+    every workspace root and target triple; and it keeps a run whose `lib_dir` matches
+    or that records none, and the build script's own compile unit. With PYO3_PYTHON
+    naming no command it removes every run that records a `lib_dir`. With no target
+    directory restored it exits 0.
+    """
+    import sysconfig
+
+    libdir = str(sysconfig.get_config_var("LIBDIR"))
+    stale_lib = "/planted/Python/3.12.99/lib"
+    gaps = []
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        debug = root / "target" / "debug"
+        cross_profile = root / "fuzz" / "target" / "x86_64-unknown-linux-gnu" / "debug"
+        removed = {
+            "a run recording another lib_dir": plant_pyo3_run(
+                debug, "pyo3-build-config-0a", stale_lib
+            ),
+            "its fingerprint": debug / ".fingerprint" / "pyo3-build-config-0a",
+            "a stale run in a second workspace and target triple": plant_pyo3_run(
+                cross_profile, "pyo3-build-config-0c", stale_lib
+            ),
+            "that run's fingerprint": cross_profile / ".fingerprint" / "pyo3-build-config-0c",
+        }
+        current_profile = root / "target" / "ci-bridge"
+        kept = {
+            "a run recording the current LIBDIR": plant_pyo3_run(
+                current_profile, "pyo3-build-config-0b", libdir
+            ),
+            "that run's fingerprint": current_profile / ".fingerprint" / "pyo3-build-config-0b",
+            "a run recording no lib_dir": plant_pyo3_run(debug, "pyo3-build-config-0d", None),
+            "the build script's compile unit": debug / "build" / "pyo3-build-config-0e",
+        }
+        kept["the build script's compile unit"].mkdir(parents=True)
+        workspaces = ". -> target\nfuzz -> target\n"
+        code, out = run_pyo3_purge_step(script, root, workspaces, sys.executable)
+        if code != 0:
+            gaps.append(f"exits {code} over planted configuration: {out}")
+        gaps += [f"keeps {label}" for label, path in removed.items() if path.exists()]
+        gaps += [f"removes {label}" for label, path in kept.items() if not path.exists()]
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        current = plant_pyo3_run(root / "target" / "debug", "pyo3-build-config-0b", libdir)
+        code, out = run_pyo3_purge_step(script, root, ". -> target", "planted-no-such-python3.12")
+        if code != 0 or current.exists():
+            gaps.append(
+                f"with PYO3_PYTHON naming no command, exits {code} and "
+                f"{'keeps' if current.exists() else 'removes'} a recorded lib_dir: {out}"
+            )
+    with tempfile.TemporaryDirectory() as scratch:
+        code, out = run_pyo3_purge_step(script, Path(scratch), ". -> target", sys.executable)
+        if code != 0:
+            gaps.append(f"exits {code} when no target directory was restored: {out}")
+    return gaps
+
+
+def check_pyo3_build_config_purge() -> None:
+    """RUST_CACHE_ACTION drops restored pyo3 build configuration of another interpreter.
+
+    CRITERION: RUST_CACHE_ACTION_FILE holds exactly one step pyo3_purge_steps accepts,
+    and pyo3_purge_behavior_gaps finds nothing in its `run`.
+
+    WHY: pyo3-build-config reruns its build script only when PYO3_PYTHON or
+    PYO3_ENVIRONMENT_SIGNATURE changes, and neither changes with the runner image: the
+    workflows name the bare `python3.12`, and maturin passes `.venv/bin/python` and a
+    signature without the patch release. A cache entry written on an image with another
+    CPython patch release otherwise links against a library directory the runner lacks.
+    """
+    action = yaml.safe_load(RUST_CACHE_ACTION_FILE.read_text())
+    steps = pyo3_purge_steps(action)
+    check(
+        f"{RUST_CACHE_ACTION} has one unconditional step after the restore that drops "
+        "stale pyo3 build configuration",
+        len(steps) == 1,
+        f"found {len(steps)}",
+    )
+    if len(steps) != 1:
+        return
+    script = str(steps[0]["run"])
+    gaps = pyo3_purge_behavior_gaps(script)
+    check(
+        "the pyo3 purge step removes only runs recording another lib_dir, with their "
+        "fingerprints, in every workspace and target triple",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Controls: scripts that keep the fingerprint, compare nothing, or drop every run.
+    fingerprint = '"$profile_dir/.fingerprint/$unit"'
+    compare = 'if [[ -z $recorded || $recorded == "$libdir" ]]; then'
+    for label, old, new in (
+        ("keeping the fingerprint", fingerprint, ""),
+        ("comparing no lib_dir", compare, "if true; then"),
+        ("dropping every run", compare, "if false; then"),
+    ):
+        check(
+            f"a purge step {label} is reported",
+            script.count(old) == 1 and bool(pyo3_purge_behavior_gaps(script.replace(old, new))),
+            f"{label}: the mutant passes, or {old!r} is not in the step once",
+        )
+    # Controls: the step removed, moved before the restore, or made conditional.
+    purge = pyo3_purge_steps(action)
+    for label, mutate in (
+        ("removed", lambda s: [x for x in s if x not in purge]),
+        (
+            "moved before the restore",
+            lambda s: [x for x in s if x not in purge][:1]
+            + purge
+            + [x for x in s if x not in purge][1:],
+        ),
+        (
+            "made conditional",
+            lambda s: [dict(x, **{"if": "runner.os == 'Linux'"}) if x in purge else x for x in s],
+        ),
+    ):
+        mutated = copy.deepcopy(action)
+        mutated["runs"]["steps"] = mutate(mutated["runs"]["steps"])
+        check(
+            f"the wrapper with its pyo3 purge step {label} is reported",
+            len(pyo3_purge_steps(mutated)) != 1,
+            f"{label}: the mutant still reads as one purge step",
+        )
+
+
 CACHE_WARM_WORKFLOW = REPO / ".github/workflows/cache-warm.yml"
 
 
@@ -5408,6 +5596,7 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
             bool(wrapper_key_gaps(mutated)),
             f"{label}: wrapper_key_gaps returned nothing",
         )
+    check_pyo3_build_config_purge()
 
     manifest_text = (REPO / "Cargo.toml").read_text()
     gaps = manifest_digest_gaps(MANIFEST_DIGEST_SCRIPT, manifest_text)
@@ -14667,116 +14856,12 @@ def run_offline_cargo(inputs: Inputs) -> None:
     check_offline_cargo(inputs.documents)
 
 
-def pyo3_signature_steps(action: dict) -> list[dict]:
-    """The python-only steps of TOOLCACHE_ACTION_FILE that write PYO3_ENVIRONMENT_SIGNATURE."""
-    return [
-        step
-        for step in (action.get("runs") or {}).get("steps") or []
-        if str(step.get("if") or "").replace(" ", "") == "inputs.tool=='python'"
-        and "PYO3_ENVIRONMENT_SIGNATURE=" in str(step.get("run") or "")
-        and "$GITHUB_ENV" in str(step.get("run") or "")
-    ]
-
-
-def run_pyo3_signature_step(script: str, pyo3_python: str | None) -> tuple[int, str, str]:
-    """Run one signature step's bash; return (exit code, GITHUB_ENV text, output)."""
-    with tempfile.TemporaryDirectory() as scratch:
-        github_env = Path(scratch, "github_env")
-        github_env.write_text("")
-        env = {k: v for k, v in os.environ.items() if k != "PYO3_PYTHON"}
-        env["GITHUB_ENV"] = str(github_env)
-        if pyo3_python is not None:
-            env["PYO3_PYTHON"] = pyo3_python
-        result = subprocess.run(
-            ["bash", "-c", script],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        return result.returncode, github_env.read_text(), result.stdout + result.stderr
-
-
-def check_pyo3_environment_signature() -> None:
-    """TOOLCACHE_ACTION gives pyo3 the identity of the interpreter PYO3_PYTHON names.
-
-    CRITERION: TOOLCACHE_ACTION_FILE has exactly one step that runs only for
-    `tool: python` and writes PYO3_ENVIRONMENT_SIGNATURE to $GITHUB_ENV. Run with
-    PYO3_PYTHON naming an interpreter, the step exits 0 and writes a signature holding
-    that interpreter's sys.executable, its full version and its LIBDIR; with PYO3_PYTHON
-    unset it exits 0 and writes nothing; with PYO3_PYTHON naming no command it exits
-    non-zero.
-
-    WHY: pyo3-build-config reruns its build script only when PYO3_PYTHON or
-    PYO3_ENVIRONMENT_SIGNATURE changes. The workflows set PYO3_PYTHON to the bare name
-    `python3.12`, so without a signature a restored cargo cache links against the
-    library directory of the cache writer's interpreter, which a runner image holding
-    another patch release lacks. Every job that compiles pyo3 sets Python up through
-    TOOLCACHE_ACTION (check_pinned_python), so the step reaches each of them.
-    """
-    import sysconfig
-
-    action = yaml.safe_load((REPO / TOOLCACHE_ACTION_FILE).read_text())
-    steps = pyo3_signature_steps(action)
-    check(
-        f"{TOOLCACHE_ACTION_FILE} has one python-only step writing PYO3_ENVIRONMENT_SIGNATURE",
-        len(steps) == 1,
-        f"found {len(steps)}",
-    )
-    if len(steps) != 1:
-        return
-    script = str(steps[0]["run"])
-    code, written, out = run_pyo3_signature_step(script, sys.executable)
-    want = [sys.executable, sys.version.split()[0], str(sysconfig.get_config_var("LIBDIR"))]
-    check(
-        "the signature step names the interpreter's executable, version and LIBDIR",
-        code == 0
-        and written.startswith("PYO3_ENVIRONMENT_SIGNATURE=")
-        and all(part in written for part in want),
-        f"exit {code}, wrote {written!r}, want {want}: {out}",
-    )
-    code, written, out = run_pyo3_signature_step(script, None)
-    check(
-        "the signature step writes nothing when PYO3_PYTHON is unset",
-        code == 0 and written == "",
-        f"exit {code}, wrote {written!r}: {out}",
-    )
-    code, written, out = run_pyo3_signature_step(script, "planted-no-such-python3.12")
-    check(
-        "the signature step fails when PYO3_PYTHON names no command",
-        code != 0 and "planted-no-such-python3.12" in out,
-        f"exit {code}, wrote {written!r}: {out}",
-    )
-    # Controls: an action whose step is gone, or runs for every tool, is reported.
-    for label, edit in (
-        ("removed", lambda steps_: [s for s in steps_ if s not in pyo3_signature_steps(action)]),
-        (
-            "unguarded",
-            lambda steps_: [
-                {k: v for k, v in s.items() if k != "if"}
-                if s in pyo3_signature_steps(action)
-                else s
-                for s in steps_
-            ],
-        ),
-    ):
-        mutated = copy.deepcopy(action)
-        mutated["runs"]["steps"] = edit(mutated["runs"]["steps"])
-        check(
-            f"the action with its signature step {label} is reported",
-            len(pyo3_signature_steps(mutated)) != 1,
-            "the mutant still reads as one python-only signature step",
-        )
-
-
 def run_pinned_python(inputs: Inputs) -> None:
     print(
         "pinned-python — every job that compiles pyo3 runs on a pinned Python 3.12 "
         "that PYO3_PYTHON names"
     )
     check_pinned_python(inputs.documents)
-    check_pyo3_environment_signature()
 
 
 def run_artifact_key(inputs: Inputs) -> None:
