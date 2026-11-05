@@ -516,7 +516,12 @@ jobs:
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
+      # The action's default for cache-read-only reads `github.ref_name`, which a tag
+      # named `main` also matches, so the step states the main-only form that
+      # ci_gate_selftest.py's main-only-writers check accepts.
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
       # Resolves every configuration of every project (the ktlint and detekt tool
       # classpaths among them), and compiles and packages what kotlin-test,
       # kotlin-android-instrumented and kotlin-lint build, so the entry holds their

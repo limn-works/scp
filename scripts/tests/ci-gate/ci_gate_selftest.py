@@ -7741,7 +7741,7 @@ def cache_write(step: dict) -> str | None:
     """
     uses = str(step.get("uses") or "")
     action = uses.rstrip("/") if uses.startswith("./") else action_name(uses)
-    inputs = step.get("with") or {}
+    inputs = step_inputs(step)
 
     def literal(name: str) -> str:
         return str(inputs.get(name, "")).strip().lower()
@@ -11256,27 +11256,45 @@ def local_actions() -> dict[str, dict]:
 CALLER_INPUT = re.compile(r"\binputs\.([\w-]+)", re.IGNORECASE)
 
 
-def fill_inputs(value: object, inputs: dict[str, object]) -> object:
+def step_inputs(step: dict) -> dict[str, object]:
+    """A step's `with:`, keyed by lower-cased input name.
+
+    GitHub exports each input as `INPUT_<NAME>` upper-cased, and the actions read them
+    through `getInput`, which upper-cases the name it asks for, so `Cache-To` and
+    `cache-to` are one input. Every reader of a step's inputs reads them through here.
+    """
+    return {str(key).lower(): value for key, value in (step.get("with") or {}).items()}
+
+
+def fill_inputs(value: object, inputs: dict[str, object], condition: bool = False) -> object:
     """A composite step's field with each `inputs.<name>` replaced by what the caller passed.
 
-    A field that is `${{ inputs.<name> }}` alone takes the caller's value whole. Inside
-    a longer expression, a caller's expression is put in parentheses and a literal is
-    quoted. An input the caller leaves out reads the action's default, which
-    `inputs` already holds.
+    A `with:` field that is `${{ inputs.<name> }}` alone takes the caller's value
+    whole, so a literal `false` stays the literal false. An `if:` field (`condition`)
+    does so only when the caller passed an expression: a caller's literal text there is
+    a string, which is true whenever it is not empty, so it becomes a quoted string
+    expression, never an expression to read. Inside a longer expression, a caller's
+    expression is put in parentheses and a literal is quoted. An input the caller
+    leaves out reads the action's default, which `inputs` already holds.
     """
     if not isinstance(value, str):
         return value
+
+    def quoted(given: object) -> str:
+        literal = str(given).lower() if isinstance(given, bool) else str(given)
+        return "'" + literal.replace("'", "''") + "'"
+
     whole = re.fullmatch(r"\$\{\{\s*inputs\.([\w-]+)\s*\}\}", value.strip(), re.IGNORECASE)
     if whole:
-        return inputs.get(whole.group(1).lower(), "")
+        given = inputs.get(whole.group(1).lower(), "")
+        if not condition or compile_steps_module().expression_body(given) is not None:
+            return given
+        return "${{ " + quoted(given) + " }}"
 
     def replace(match: re.Match) -> str:
         given = inputs.get(match.group(1).lower(), "")
         body = compile_steps_module().expression_body(given)
-        if body is not None:
-            return f"({body})"
-        literal = str(given).lower() if isinstance(given, bool) else str(given)
-        return "'" + literal.replace("'", "''") + "'"
+        return f"({body})" if body is not None else quoted(given)
 
     return CALLER_INPUT.sub(replace, value)
 
@@ -11291,11 +11309,12 @@ def literal_value(value: object) -> str | None:
     return None if "${{" in text else text.lower()
 
 
-CACHE_EXPORT_TYPE = re.compile(r"type=([\w-]+)(?:,|$)")
+# Every `type=` field of one `cache-to` export line; buildx keeps the last it reads.
+CACHE_EXPORT_TYPE = re.compile(r"(?:^|,)\s*type\s*=\s*([^,]*)", re.IGNORECASE)
 
 
-def save_gate(name: str, inputs: dict, env: dict) -> tuple[str, list[object]]:
-    """How the step running action `name` with `inputs` and `env` saves an entry.
+def save_gate(name: str, inputs: dict) -> tuple[str, list[object]]:
+    """How the step running action `name` with `inputs` (step_inputs) saves an entry.
 
     ("never", []): it saves nothing. ("own-rule", []): it saves on `main` alone by a
     rule this function read, not by a condition. ("gated", texts): it saves wherever
@@ -11320,7 +11339,10 @@ def save_gate(name: str, inputs: dict, env: dict) -> tuple[str, list[object]]:
             # cache-write-only overrides cache-read-only and the default-branch rule.
             return "gated", []
         if "cache-read-only" not in inputs:
-            return "own-rule", []
+            # The action's default keys on `github.ref_name` and a non-null
+            # `github.event.repository`, so a tag named `main` saves; every step
+            # states the value instead.
+            return "gated", []
         read_only = inputs["cache-read-only"]
         if literal_value(read_only) == "true":
             return "never", []
@@ -11328,21 +11350,25 @@ def save_gate(name: str, inputs: dict, env: dict) -> tuple[str, list[object]]:
             return "own-rule", []
         return "gated", []
     if name == "docker/build-push-action":
-        # Each line of `cache-to` is one export; its `type=` field alone picks the
+        # Each line of `cache-to` is one export, and its `type=` field alone picks the
         # backend, so an expression elsewhere in the line (a registry ref) leaves it
-        # read. An export with no literal `type=`, or with `type=gha`, can save.
+        # read. A line can save unless it holds exactly one `type=` field, whose value
+        # is a literal other than `gha`; buildx reads a repeated field's last value.
         exports = [line.strip() for line in str(inputs.get("cache-to") or "").splitlines()]
-        types = [CACHE_EXPORT_TYPE.match(line) for line in exports if line]
-        if all(match and match.group(1).lower() != "gha" for match in types):
-            return "never", []
-        return "gated", []
+        for line in filter(None, exports):
+            types = CACHE_EXPORT_TYPE.findall(line)
+            if len(types) != 1 or "${{" in types[0] or types[0].strip().lower() == "gha":
+                return "gated", []
+        return "never", []
     if name in TOOLCACHE_ACTIONS:
         if literal_value(inputs.get("cache")) == "":
             return "never", []
         return "gated", []
     if name == "github/codeql-action/init":
-        value = inputs.get("dependency-caching", env.get("CODEQL_ACTION_DEPENDENCY_CACHING"))
-        if literal_value(value) in ("", "false", "none", "restore"):
+        # init reads the input, and the variable when the input is empty; an earlier
+        # `run:` step can set the variable through $GITHUB_ENV, beyond what this check
+        # reads, so only a literal non-saving input holds the step to no save.
+        if literal_value(inputs.get("dependency-caching")) in ("false", "none", "restore"):
             return "never", []
         return "gated", []
     raise ValueError(f"CACHE_SAVES says {name} saves, and save_gate does not read it")
@@ -11360,8 +11386,8 @@ def main_only_gaps(
     names) has no top-level `||` and has `github.ref == 'refs/heads/main'` as a
     top-level `&&` term. Those conditions are joined with `&&`, so one such term in
     any of them holds the whole save. setup-gradle is held by its own rule instead:
-    with no `cache-read-only`, or with `${{ github.ref != 'refs/heads/main' }}`, it
-    saves on the default branch alone.
+    with `cache-read-only: ${{ github.ref != 'refs/heads/main' }}` it saves on `main`
+    alone. Input names are read without regard to case (step_inputs).
 
     WHY: GitHub serves an entry to the ref that saved it and to the default branch,
     never to a sibling branch, a pull request or a merge-queue ref. An entry saved
@@ -11376,20 +11402,19 @@ def main_only_gaps(
     is found through CACHE_SAVES, which classifies every action PERMITTED_ACTIONS
     allows, so an action is a writer by its entry, not by its spelling. A `uses:` with
     no entry is a gap. Residual: a `run:` step that saves through the cache API
-    itself, and a branch named `MAIN`, which GitHub's case-insensitive `==` reads as
-    `main`.
+    itself. A branch named `MAIN`, which GitHub's case-insensitive `==` reads as
+    `main`, is refused by the repository ruleset "refuse case variants of main".
     """
     actions = local_actions() if actions is None else actions
     judged: list[str] = []
     gaps: list[str] = []
 
-    def walk(where: str, steps: object, env: dict, conditions: list[object], depth: int) -> None:
+    def walk(where: str, steps: object, conditions: list[object], depth: int) -> None:
         for index, step in enumerate(steps or []):
             if not isinstance(step, dict):
                 continue
             uses = step_uses(step)
             label = f"{where}: {step.get('name') or uses or f'step {index}'}"
-            step_env = {**env, **(step.get("env") or {})}
             gates = [*conditions, step.get("if")]
             if not uses:
                 continue
@@ -11398,7 +11423,7 @@ def main_only_gaps(
                 if action is None or depth > 3:
                     gaps.append(f"{label} calls {uses}, which this check cannot read")
                     continue
-                given = {k.lower(): v for k, v in (step.get("with") or {}).items()}
+                given = step_inputs(step)
                 defaults = {
                     k.lower(): (spec or {}).get("default", "")
                     for k, spec in (action.get("inputs") or {}).items()
@@ -11407,22 +11432,21 @@ def main_only_gaps(
                 inner = [
                     {
                         **inner_step,
-                        "if": fill_inputs(inner_step.get("if"), values),
+                        "if": fill_inputs(inner_step.get("if"), values, condition=True),
                         "with": {
-                            k: fill_inputs(v, values)
-                            for k, v in (inner_step.get("with") or {}).items()
+                            k: fill_inputs(v, values) for k, v in step_inputs(inner_step).items()
                         },
                     }
                     for inner_step in ((action.get("runs") or {}).get("steps") or [])
                     if isinstance(inner_step, dict)
                 ]
-                walk(f"{label} > {uses}", inner, step_env, gates, depth + 1)
+                walk(f"{label} > {uses}", inner, gates, depth + 1)
                 continue
             name = cache_action_key(uses)
             if name not in CACHE_SAVES:
                 gaps.append(f"{label} uses {name}, which CACHE_SAVES does not classify")
                 continue
-            kind, texts = save_gate(name, step.get("with") or {}, step_env)
+            kind, texts = save_gate(name, step_inputs(step))
             if kind == "never":
                 continue
             judged.append(label)
@@ -11439,17 +11463,9 @@ def main_only_gaps(
                 )
 
     for path, doc in documents:
-        workflow_env = doc.get("env") or {}
         for job_id, job in sorted((doc.get("jobs") or {}).items()):
-            if not isinstance(job, dict):
-                continue
-            walk(
-                f"{path.name}: {job_id}",
-                job.get("steps"),
-                {**workflow_env, **(job.get("env") or {})},
-                [job.get("if")],
-                0,
-            )
+            if isinstance(job, dict):
+                walk(f"{path.name}: {job_id}", job.get("steps"), [job.get("if")], 0)
     return judged, gaps
 
 
@@ -11482,6 +11498,8 @@ def check_main_only_detects_an_off_main_writer(documents: list[tuple[Path, dict]
     build = f"docker/build-push-action@{sha}"
     on_main = "${{ github.ref == 'refs/heads/main' }}"
     planted_action = "./.github/actions/planted-cache"
+    gated_action = "./.github/actions/planted-gated-save"
+    codeql = f"github/codeql-action/init@{sha}"
     actions = {
         **local_actions(),
         planted_action: {
@@ -11490,6 +11508,10 @@ def check_main_only_detects_an_off_main_writer(documents: list[tuple[Path, dict]
                 "using": "composite",
                 "steps": [{"uses": f"actions/cache@{sha}", "with": {"key": "${{ inputs.key }}"}}],
             },
+        },
+        gated_action: {
+            "inputs": {"gate": {"default": ""}},
+            "runs": {"using": "composite", "steps": [{"uses": save, "if": "${{ inputs.gate }}"}]},
         },
     }
     cases = (
@@ -11514,10 +11536,43 @@ def check_main_only_detects_an_off_main_writer(documents: list[tuple[Path, dict]
             {"uses": f"github/codeql-action/init@{sha}", "with": {"dependency-caching": True}},
             True,
         ),
+        ("codeql init with no dependency-caching input", None, {"uses": codeql}, True),
         (
-            "codeql init with the dependency-caching variable",
+            "codeql init with an empty dependency-caching input",
             None,
-            {"uses": f"github/codeql-action/init@{sha}", "env": {"CODEQL_ACTION_DEPENDENCY_CACHING": "true"}},
+            {"uses": codeql, "with": {"dependency-caching": ""}},
+            True,
+        ),
+        ("codeql init with dependency-caching false", None, {"uses": codeql, "with": {"dependency-caching": False}}, False),
+        ("setup-gradle with cache-read-only false", None, {"uses": gradle, "with": {"cache-read-only": False}}, True),
+        (
+            "setup-gradle with cache-read-only gated to main, the inverse",
+            None,
+            {"uses": gradle, "with": {"cache-read-only": on_main}},
+            True,
+        ),
+        ("setup-gradle with no cache-read-only", None, {"uses": gradle}, True),
+        ("setup-gradle with cache-read-only true", None, {"uses": gradle, "with": {"cache-read-only": True}}, False),
+        ("mixed-case Cache-Write-Only key", None, {"uses": gradle, "with": {"Cache-Write-Only": True, "cache-read-only": True}}, True),
+        ("mixed-case Cache key on setup-python", None, {"uses": f"actions/setup-python@{sha}", "with": {"Cache": "pip"}}, True),
+        ("mixed-case Dependency-Caching key", None, {"uses": codeql, "with": {"Dependency-Caching": True}}, True),
+        ("mixed-case Cache-To key", None, {"uses": build, "with": {"Cache-To": "type=gha"}}, True),
+        (
+            "a composite `if: ${{ inputs.gate }}` given a plain string",
+            None,
+            {"uses": gated_action, "with": {"gate": "github.ref == 'refs/heads/main'"}},
+            True,
+        ),
+        (
+            "a composite `if: ${{ inputs.gate }}` given a main-gate expression",
+            None,
+            {"uses": gated_action, "with": {"gate": on_main}},
+            False,
+        ),
+        (
+            "a cache-to line with a second type field",
+            None,
+            {"uses": build, "with": {"cache-to": "type=registry,ref=r,type=gha"}},
             True,
         ),
         ("an action CACHE_SAVES does not classify", None, {"uses": f"example/unlisted@{sha}"}, True),
@@ -12156,9 +12211,10 @@ CACHE_SAVES: dict[str, CacheSaving] = {
     "taiki-e/install-action": never("installs binaries; holds no cache client"),
     "github/codeql-action/init": CacheSaving(
         True,
-        ("dependency-caching", "CODEQL_ACTION_DEPENDENCY_CACHING"),
-        "turns on dependency caching, which analyze saves on any ref, from the input or the "
-        "variable; its TRAP cache uploads on the default branch alone",
+        ("dependency-caching",),
+        "turns on dependency caching, which analyze saves on any ref, from the input or, "
+        "when the input is empty, the CODEQL_ACTION_DEPENDENCY_CACHING variable; its TRAP "
+        "cache uploads on the default branch alone",
     ),
     "github/codeql-action/analyze": never(
         "saves only the dependency caches init turned on, judged at the init step"
@@ -12167,8 +12223,8 @@ CACHE_SAVES: dict[str, CacheSaving] = {
     "gradle/actions/setup-gradle": CacheSaving(
         True,
         ("cache-disabled", "cache-read-only", "cache-write-only"),
-        "saves on the default branch alone by default; `cache-read-only` changes that, and "
-        "`cache-write-only` overrides both",
+        "saves where `cache-read-only` is not true; its default reads `github.ref_name`, so "
+        "every step sets it, and `cache-write-only` overrides it",
     ),
     "gradle/actions/wrapper-validation": never("compares checksums"),
     "docker://ghcr.io/pypa/gh-action-pypi-publish": never("uploads to PyPI; holds no cache client"),
