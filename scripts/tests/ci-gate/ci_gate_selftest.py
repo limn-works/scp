@@ -427,10 +427,13 @@ nothing:
                runs must pin distributionSha256Sum, and every build it runs
                must carry gradle/verification-metadata.xml with verify-metadata
                on and no `<trust>` entry. It also feeds the shared
-               verified_download module a truncated archive and a body cut
-               short, and fails unless the download is retried a bounded number
-               of times and then fails naming the artifact, and runs guard.py
-               against a planted tool cache.
+               verified_download module a truncated archive, a body cut short,
+               a stalled server, a server that trickles bytes, an oversized body
+               and a wrong Content-Length, and fails unless each is retried a
+               bounded number of times and then fails naming the artifact. It
+               runs android-sdk's install.py main over a planted SDK root, fails a
+               job in which a step before android-sdk writes under the SDK root,
+               and runs guard.py against a planted tool cache.
   group-partition
                CI runs `--group docs` on every pull request and `--group rest`
                only under the `code` output, so a check missing from GROUPS
@@ -12103,11 +12106,21 @@ VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
 #             NDK) and downloads nothing for it, so no digest is checked for it. The
 #             runner image is already trusted, in the same way the toolchain on it is:
 #             the JDK toolcache-setup selects, the keys apt checks against, and the
-#             command-line tools install.py lists packages with all come from it. No
-#             cache restores into the SDK root, so nothing but the image can put a
-#             package there before the step. A package the image lacks is downloaded
-#             and checked against its pinned SHA-256 (android_pin_gaps and
-#             check_android_sdk_keeps_only_the_pinned_revision below).
+#             command-line tools install.py lists packages with all come from it.
+#             The exception holds only while nothing but the image can put a directory
+#             under the SDK root before the step, so it carries a rule of its own:
+#   CRITERION for the SDK root: in a job or action that uses ANDROID_SDK_ACTION, no
+#             step before it writes under the SDK root, and nothing redirects the
+#             root (sdk_root_write_gaps). INDICATORS it reads, not the criterion: a
+#             `with: path:`, a `run:` or an `env:` that names ANDROID_HOME,
+#             ANDROID_SDK_ROOT, an ANDROID_NDK variable or /usr/local/lib/android, in
+#             an earlier step or in a local composite action an earlier step uses;
+#             and a job or step `env:` that sets ANDROID_HOME or ANDROID_SDK_ROOT.
+#             A package the image lacks, holds at another revision or holds at a
+#             revision install.py cannot read is downloaded and checked against its
+#             pinned SHA-256 (android_pin_gaps and
+#             check_android_sdk_keeps_only_the_pinned_revision below, which runs
+#             install.py's main against a planted SDK root).
 #
 # THE STRUCTURE IS CLOSED. A remote action passes only when PERMITTED_ACTIONS lists
 # it, with the verdict on what it fetches recorded there, and only when the conditions
@@ -12633,14 +12646,90 @@ def wasm_pack_gaps(label: str, tools: list[str], steps: list) -> list[str]:
     return gaps
 
 
+SDK_ROOT_NAMES = re.compile(r"ANDROID_HOME|ANDROID_SDK_ROOT|ANDROID_NDK\w*|/usr/local/lib/android")
+SDK_ROOT_VARIABLES = ("ANDROID_HOME", "ANDROID_SDK_ROOT")
+
+
+def local_action_steps(uses: str) -> list:
+    """The steps of a local composite action, or [] for anything else."""
+    if not uses.startswith("./") or uses.endswith((".yml", ".yaml")):
+        return []
+    directory = REPO / uses.removeprefix("./")
+    found = next(
+        (f for f in (directory / "action.yml", directory / "action.yaml") if f.is_file()),
+        None,
+    )
+    if found is None:
+        return []
+    runs = (yaml.safe_load(found.read_text()) or {}).get("runs") or {}
+    steps = runs.get("steps") if runs.get("using") == "composite" else None
+    return steps if isinstance(steps, list) else []
+
+
+def sdk_root_writes(label: str, step: dict, seen: frozenset = frozenset()) -> list[str]:
+    """Each way `step`, or a local action it uses, can write under the SDK root."""
+    found = []
+    path = str((step.get("with") or {}).get("path") or "")
+    if SDK_ROOT_NAMES.search(path):
+        found.append(f"{label} writes to `path:` {path!r}")
+    run = script_text(str(step.get("run") or ""))
+    if SDK_ROOT_NAMES.search(run):
+        found.append(f"{label} runs a command that names {SDK_ROOT_NAMES.search(run)[0]}")
+    for key, value in (step.get("env") or {}).items():
+        if SDK_ROOT_NAMES.search(f"{key}={value}"):
+            found.append(f"{label} sets `env:` {key}={value!r}")
+    uses = step_uses(step)
+    if uses not in seen and uses != ANDROID_SDK_ACTION:
+        for index, inner in enumerate(local_action_steps(uses)):
+            if isinstance(inner, dict):
+                found += sdk_root_writes(f"{label} > {uses} step {index}", inner, seen | {uses})
+    return found
+
+
+def sdk_root_write_gaps(where: str, steps: list, job: dict | None = None) -> list[str]:
+    """No step before ANDROID_SDK_ACTION writes under the SDK root, nor redirects it.
+
+    install.py keeps a directory that already names its pinned revision without
+    checking a digest; that is safe only while the runner image alone wrote it.
+    """
+    first = next(
+        (
+            index
+            for index, step in enumerate(steps)
+            if isinstance(step, dict) and step_uses(step) == ANDROID_SDK_ACTION
+        ),
+        None,
+    )
+    if first is None:
+        return []
+    why = (
+        f"before {ANDROID_SDK_ACTION}, which keeps a directory at its pinned revision "
+        "unchecked and so trusts that only the runner image wrote under the SDK root"
+    )
+    gaps = [
+        f"{where} sets {key} in the job's `env:`, so {ANDROID_SDK_ACTION} reads a root "
+        "the runner image did not fill"
+        for key in (job or {}).get("env") or {}
+        if key in SDK_ROOT_VARIABLES
+    ]
+    for key in steps[first].get("env") or {}:
+        if key in SDK_ROOT_VARIABLES:
+            gaps.append(f"{where} step {first} sets {key} for {ANDROID_SDK_ACTION}")
+    for index, step in enumerate(steps[:first]):
+        if isinstance(step, dict):
+            label = f"{where} step {index} ({step.get('name') or step_uses(step) or 'run'})"
+            gaps += [f"{write}, {why}" for write in sdk_root_writes(label, step)]
+    return gaps
+
+
 def unverified_download_gaps(where: str, steps: object, job: dict | None = None) -> list[str]:
     """Return each way a step under `where` fetches outside the pinned paths.
 
     `job` is the workflow job the steps belong to, None for a local action; image
     references resolve against its `env:` and matrix.
     """
-    gaps = []
     steps = steps if isinstance(steps, list) else []
+    gaps = sdk_root_write_gaps(where, steps, job)
     for index, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
@@ -13108,6 +13197,7 @@ def android_pin_gaps(pins: dict) -> list[str]:
         or not pin.archive
         or "://" in pin.archive
         or pin.archive.startswith("/")
+        or not re.fullmatch(r"\d+(\.\d+)*", pin.revision)
     ]
 
 
@@ -13126,6 +13216,7 @@ def check_android_sdk_keeps_only_the_pinned_revision() -> None:
         "an empty digest": pin._replace(sha256=""),
         "a zero size": pin._replace(size=0),
         "an absolute URL": pin._replace(archive="https://example.com/p.zip"),
+        "a revision install.py cannot read": pin._replace(revision="37.0.2 rc1"),
     }
     for name, bad in planted.items():
         check(
@@ -13157,10 +13248,184 @@ def check_android_sdk_keeps_only_the_pinned_revision() -> None:
             "android-sdk downloads a package the SDK root lacks",
             not installer.held_by_image(Path(scratch, "absent"), pin),
         )
+        rc = Path(scratch, "rc")
+        rc.mkdir()
+        (rc / "source.properties").write_text(f"Pkg.Revision={pin.revision} rc1\n")
+        try:
+            held_rc = installer.held_by_image(rc, pin)
+        except Exception as raised:  # noqa: BLE001 - any escape is the failure reported
+            held_rc = f"{type(raised).__name__}: {raised}"
+        check(
+            "android-sdk downloads over a directory whose revision it cannot read",
+            held_rc is False,
+            f"held_by_image returned {held_rc!r}",
+        )
+    check_android_sdk_main_against_a_planted_root()
 
 
-def check_download_ranges_and_bounds() -> None:
-    """Ranged downloads, a server that ignores Range, a corrupt range and a stalled server."""
+def run_android_sdk_main(
+    directories: dict[str, str | None],
+    archived: dict[str, str],
+    listed: dict[str, str],
+) -> tuple[str, list[str], dict[str, str]]:
+    """Run install.py's main over a planted SDK root and a planted archive server.
+
+    `directories` maps each planted package name to the source.properties line its
+    directory holds before main runs (None: a directory with no source.properties).
+    `archived` maps a name to the Pkg.Revision its served archive records, and `listed`
+    to the revision the stub sdkmanager lists. Every pin names revision PLANTED_REVISION.
+    Returns main's error (empty when it returned), the archive paths requested, and each
+    directory's marker afterwards: "image" when main kept it, "downloaded" when replaced.
+    """
+    import contextlib
+    import hashlib
+    import http.server
+    import io
+    import threading
+    import zipfile
+
+    installer = load_module("android_sdk_install_main", ANDROID_SDK_INSTALLER)
+    archives = {}
+    for name, revision in archived.items():
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("pkg/source.properties", f"Pkg.Revision={revision}\n")
+            archive.writestr("pkg/marker", "downloaded")
+        archives[f"/{name}.zip"] = payload.getvalue()
+    requested: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):  # keep the planted server out of the log
+            pass
+
+        def do_GET(self):  # the name http.server dispatches on
+            requested.append(self.path)
+            data = archives.get(self.path)
+            if data is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    installer.BASE_URL = f"http://127.0.0.1:{server.server_address[1]}/"
+    installer.PINS = {
+        f"planted;{name}": installer.Pin(
+            PLANTED_REVISION,
+            f"{name}.zip",
+            len(archives.get(f"/{name}.zip", b"x")),
+            hashlib.sha256(archives.get(f"/{name}.zip", b"x")).hexdigest(),
+        )
+        for name in directories
+    }
+    keys = ("ANDROID_HOME", "ANDROID_SDK_ROOT", "GITHUB_PATH", "GITHUB_ENV")
+    saved = {key: os.environ.get(key) for key in keys}
+    markers = {}
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch, "sdk")
+            tools = root / "cmdline-tools/latest/bin"
+            tools.mkdir(parents=True)
+            listing = "".join(f"planted;{n} | {r}\\n" for n, r in listed.items())
+            (tools / "sdkmanager").write_text(
+                f"#!/bin/sh\nprintf 'Path | Version\\n------- | -------\\n{listing}'\n"
+            )
+            (tools / "sdkmanager").chmod(0o755)
+            for name, line in directories.items():
+                directory = root / "planted" / name
+                directory.mkdir(parents=True)
+                (directory / "marker").write_text("image")
+                if line is not None:
+                    (directory / "source.properties").write_text(line + "\n")
+            os.environ.pop("ANDROID_SDK_ROOT", None)
+            os.environ["ANDROID_HOME"] = str(root)
+            os.environ["GITHUB_PATH"] = str(Path(scratch, "path"))
+            os.environ["GITHUB_ENV"] = str(Path(scratch, "env"))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    installer.main([f"planted;{name}" for name in directories])
+                error = ""
+            except installer.InstallError as raised:
+                error = str(raised)
+            except Exception as raised:  # noqa: BLE001 - a traceback is the failure reported
+                error = f"TRACEBACK {type(raised).__name__}: {raised}"
+            for name in directories:
+                marker = root / "planted" / name / "marker"
+                markers[name] = marker.read_text() if marker.is_file() else "missing"
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        server.shutdown()
+        server.server_close()
+    return error, requested, markers
+
+
+PLANTED_REVISION = "3.1"
+
+
+def check_android_sdk_main_against_a_planted_root() -> None:
+    """install.py's main keeps only a directory at the pin, and names every bad revision."""
+    pinned = PLANTED_REVISION
+    directories = {
+        "held": f"Pkg.Revision={pinned}.0",
+        "other": "Pkg.Revision=3.0",
+        "bare": None,
+        "rc": f"Pkg.Revision={pinned} rc1",
+    }
+    downloads = {"held": False, "other": True, "bare": True, "rc": True}
+    error, requested, markers = run_android_sdk_main(
+        directories,
+        {name: pinned for name in directories},
+        {name: pinned for name in directories},
+    )
+    check("install.py main installs a planted SDK root", not error, error)
+    for name, line in directories.items():
+        state = "no source.properties" if line is None else line
+        fetched = f"/{name}.zip" in requested
+        if downloads[name]:
+            check(
+                f"install.py main downloads over a directory with {state}",
+                fetched and markers[name] == "downloaded",
+                f"requested {requested}, marker {markers[name]!r}",
+            )
+        else:
+            check(
+                f"install.py main keeps a directory with {state}, downloading nothing",
+                not fetched and markers[name] == "image",
+                f"requested {requested}, marker {markers[name]!r}",
+            )
+    # An archive and a listing whose revision is unreadable each fail the step with an
+    # InstallError that names the package and the revision text, not a traceback.
+    unreadable = f"{pinned} rc1"
+    error, _, _ = run_android_sdk_main(
+        {"archive": None}, {"archive": unreadable}, {"archive": pinned}
+    )
+    check(
+        "install.py main refuses an archive whose revision it cannot read, naming it",
+        not error.startswith("TRACEBACK") and "planted;archive" in error and unreadable in error,
+        f"got {error!r}",
+    )
+    error, requested, _ = run_android_sdk_main(
+        {"listed": f"Pkg.Revision={pinned}"}, {}, {"listed": unreadable}
+    )
+    check(
+        "install.py main refuses a listed revision it cannot read, naming it",
+        not error.startswith("TRACEBACK")
+        and not requested
+        and "planted;listed" in error
+        and unreadable in error,
+        f"got {error!r}, requested {requested}",
+    )
+
+
+def check_download_bounds() -> None:
+    """A whole file, a stalled server, a trickling server, an oversized body and a wrong length."""
     import contextlib
     import hashlib
     import http.server
@@ -13170,47 +13435,63 @@ def check_download_ranges_and_bounds() -> None:
     downloads = load_verified_download()
     body = os.urandom(300_000)
     digest = hashlib.sha256(body).hexdigest()
-    seen: list[str] = []
-    mode = {"name": "ranges"}
+    limits = downloads.Limits(stall=0.5, min_rate=1 << 30, deadline_floor=1.0)
+    # A planted stall holds its connection for `hold` seconds, far past any bound a case
+    # asserts, so a download with no read timeout fails the case on time rather than
+    # passing on the connection closing; shutdown releases it.
+    hold = 10.0
+    release = threading.Event()
+    trickled = 40
+    mode = {"name": "whole"}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the planted server out of the log
             pass
 
-        def do_GET(self):  # noqa: N802 - the name http.server dispatches on
-            requested = self.headers.get("Range")
-            seen.append(requested or "")
-            if mode["name"] == "stall":
-                time.sleep(3)
-                return
-            match = re.fullmatch(r"bytes=(\d+)-(\d+)", requested or "")
-            if mode["name"] == "ignore-range" or not match:
+        def do_GET(self):  # the name http.server dispatches on
+            name = mode["name"]
+            length = {"oversize": None, "wrong-length": len(body) + 1}.get(name, len(body))
+            try:
                 self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
+                if length is not None:
+                    self.send_header("Content-Length", str(length))
                 self.end_headers()
-                self.wfile.write(body)
-                return
-            first, last = int(match[1]), int(match[2])
-            part = bytearray(body[first : last + 1])
-            if mode["name"] == "corrupt" and first == 0:
-                part[0] ^= 0xFF
-            self.send_response(206)
-            self.send_header("Content-Range", f"bytes {first}-{last}/{len(body)}")
-            self.send_header("Content-Length", str(len(part)))
-            self.end_headers()
-            self.wfile.write(bytes(part))
+                if name == "stall":
+                    release.wait(hold)
+                elif name == "trickle":
+                    # One byte every stall / 2 seconds: no read ever waits `stall`.
+                    for byte in body[:trickled]:
+                        if release.wait(limits.stall / 2):
+                            return
+                        self.wfile.write(bytes([byte]))
+                elif name == "oversize":
+                    self.wfile.write(body + os.urandom(4 << 20))
+                elif name == "wrong-length":
+                    self.wfile.write(body + b"\0")
+                else:
+                    self.wfile.write(body)
+            except OSError:  # the client gave up first, which is what most cases want
+                pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/planted.zip"
-    limits = downloads.Limits(
-        stall=0.5, min_rate=1 << 30, deadline_floor=5.0, segments=4, segment_min=1
-    )
     quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
+    real_fetch = downloads.fetch_once
+    written: list[int] = []
 
-    def attempt(name: str, out: Path, attempts: int = 2, **overrides) -> str:
+    def measuring_fetch(url, destination, *rest):
+        # The bytes each attempt left on disk before download_verified removes them.
+        try:
+            return real_fetch(url, destination, *rest)
+        finally:
+            written.append(destination.stat().st_size if destination.exists() else 0)
+
+    def attempt(name: str, out: Path, attempts: int = 2) -> tuple[str, float]:
         mode["name"] = name
-        seen.clear()
+        written.clear()
+        started = time.monotonic()
+        downloads.fetch_once = measuring_fetch
         try:
             with quiet():
                 downloads.download_verified(
@@ -13221,65 +13502,63 @@ def check_download_ranges_and_bounds() -> None:
                     out,
                     attempts=attempts,
                     backoff=0,
-                    limits=limits._replace(**overrides),
+                    limits=limits,
                 )
-            return ""
-        except downloads.InstallError as raised:
-            return str(raised)
+            error = ""
+        except Exception as raised:  # noqa: BLE001 - any escape is the failure reported
+            error = f"{type(raised).__name__}: {raised}"
+        finally:
+            downloads.fetch_once = real_fetch
+        return error, time.monotonic() - started
 
     try:
         with tempfile.TemporaryDirectory() as scratch:
             out = Path(scratch, "out.zip")
-            error = attempt("ranges", out)
+            error, _ = attempt("whole", out)
             check(
-                "verified_download fetches a large file as byte ranges and accepts it",
-                not error
-                and out.read_bytes() == body
-                and len([r for r in seen if r.startswith("bytes=")]) == 4,
-                f"error {error!r}, requests {seen}",
-            )
-            out.unlink(missing_ok=True)
-            error = attempt("ignore-range", out)
-            check(
-                "verified_download falls back to one stream when a server ignores Range",
-                not error and out.read_bytes() == body and "" in seen,
-                f"error {error!r}, requests {seen}",
-            )
-            out.unlink(missing_ok=True)
-            error = attempt("corrupt", out)
-            check(
-                "verified_download refuses a file one of whose ranges is corrupt",
-                "planted;corrupt" in error and url in error and not out.exists(),
+                "verified_download accepts a whole file over HTTP",
+                not error and out.read_bytes() == body,
                 f"error {error!r}",
             )
-            started = time.monotonic()
-            error = attempt("stall", out, segment_retries=1)
-            elapsed = time.monotonic() - started
+            out.unlink(missing_ok=True)
+            error, elapsed = attempt("stall", out)
+            bound = 2 * limits.stall + 1.5
             check(
-                "verified_download fails a stalled server within its bounds, naming it",
-                "planted;stall" in error and url in error and elapsed < 10 and not out.exists(),
-                f"error {error!r} after {elapsed:.1f} s",
+                "verified_download fails a stalled server on the read timeout, within "
+                "attempts x stall",
+                "planted;stall" in error
+                and url in error
+                and "timed out" in error
+                and elapsed < bound
+                and not out.exists(),
+                f"error {error!r} after {elapsed:.1f} s, bound {bound:.1f} s",
             )
-            started = time.monotonic()
-            error = attempt("stall", out, segments=1)
-            elapsed = time.monotonic() - started
+            error, elapsed = attempt("trickle", out)
+            bound = 2 * (limits.deadline_floor + limits.stall) + 1.0
             check(
-                "verified_download fails a stalled single stream within its bounds",
-                "planted;stall" in error and elapsed < 10 and not out.exists(),
-                f"error {error!r} after {elapsed:.1f} s",
+                "verified_download ends a connection that trickles bytes at its deadline",
+                "deadline" in error and elapsed < bound and not out.exists(),
+                f"error {error!r} after {elapsed:.1f} s, bound {bound:.1f} s",
             )
-            # A connection that keeps sending never stalls; the attempt's deadline,
-            # not the read timeout, ends it.
-            started = time.monotonic()
-            error = attempt(
-                "ranges", out, attempts=1, min_rate=1.0, deadline_floor=-len(body) - 1.0
-            )
+            error, _ = attempt("oversize", out)
             check(
-                "verified_download ends an attempt that passes its deadline",
-                "deadline" in error and not out.exists(),
-                f"error {error!r}",
+                "verified_download refuses a body that runs past the pinned size, "
+                "writing no byte past it",
+                "runs past" in error
+                and written
+                and max(written) <= len(body)
+                and not out.exists(),
+                f"error {error!r}, bytes written per attempt {written}",
+            )
+            error, _ = attempt("wrong-length", out)
+            check(
+                "verified_download refuses a Content-Length other than the pin before "
+                "reading the body",
+                "Content-Length" in error and written == [0, 0] and not out.exists(),
+                f"error {error!r}, bytes written per attempt {written}",
             )
     finally:
+        release.set()
         server.shutdown()
         server.server_close()
 
@@ -13550,7 +13829,71 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             {"uses": f"gradle/actions/setup-gradle@{sha}", "with": {"gradle-version": "8.14"}}
         ],
         "a local action that is not composite": [{"uses": "./.github/actions/lib"}],
+        "cache restored into the NDK before android-sdk": [
+            {"uses": f"actions/cache@{sha}",
+             "with": {"path": "/usr/local/lib/android/sdk/ndk", "key": "ndk"}},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+        ],
+        "cache/restore into ANDROID_HOME before android-sdk": [
+            {"uses": f"actions/cache/restore@{sha}",
+             "with": {"path": "${{ env.ANDROID_HOME }}/emulator", "key": "emulator"}},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}},
+        ],
+        "download-artifact into the SDK root before android-sdk": [
+            {"uses": f"actions/download-artifact@{sha}",
+             "with": {"name": "sdk", "path": "/usr/local/lib/android/sdk"}},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+        ],
+        "a run that writes under ANDROID_NDK_HOME before android-sdk": [
+            {"run": 'tar -xf ndk.tar -C "$ANDROID_NDK_HOME"'},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+        ],
+        "an env that moves ANDROID_HOME on android-sdk": [
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"},
+             "env": {"ANDROID_HOME": "/tmp/sdk"}},
+        ],
     }
+    real_local_action_steps = local_action_steps
+    globals()["local_action_steps"] = lambda uses: (
+        [{"run": 'cp -r ndk "$ANDROID_HOME/ndk/27.3.13750724"'}]
+        if uses == "./planted-action"
+        else real_local_action_steps(uses)
+    )
+    try:
+        nested = unverified_download_gaps(
+            "planted",
+            [
+                {"uses": "./planted-action"},
+                {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+            ],
+        )
+    finally:
+        globals()["local_action_steps"] = real_local_action_steps
+    check(
+        "verified-download reports a local action before android-sdk that writes under "
+        "the SDK root",
+        any("planted-action step 0" in gap for gap in nested),
+        f"returned {nested}",
+    )
+    check(
+        "verified-download reports a job env that moves ANDROID_HOME under android-sdk",
+        bool(
+            unverified_download_gaps(
+                "planted",
+                [{"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}}],
+                {"env": {"ANDROID_HOME": "/tmp/sdk"}},
+            )
+        ),
+    )
+    after = [
+        {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}},
+        {"run": 'echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"'},
+    ]
+    check(
+        "verified-download accepts a step after android-sdk that names ANDROID_HOME",
+        not unverified_download_gaps("control", after),
+        f"returned {unverified_download_gaps('control', after)}",
+    )
     for name, steps in planted.items():
         check(
             f"verified-download reports a planted {name} step",
@@ -13814,7 +14157,7 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
     )
     check_installer_rejects_a_corrupt_archive()
     check_android_sdk_keeps_only_the_pinned_revision()
-    check_download_ranges_and_bounds()
+    check_download_bounds()
     check_toolcache_guard()
 
 

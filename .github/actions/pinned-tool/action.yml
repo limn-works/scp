@@ -25,4 +25,5 @@ runs:
       run: |
         # Windows runners have no `python3`; Linux and macOS runners have the image's.
         if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
-        "$py" -I "$GITHUB_ACTION_PATH/install.py" "$PINNED_TOOL"
+        # -u writes each line as it is printed, so the log times each download.
+        "$py" -I -u "$GITHUB_ACTION_PATH/install.py" "$PINNED_TOOL"

@@ -585,8 +585,9 @@ jobs:
           tool: java
           version: "17"
 
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why. The AAR build
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why. The AAR build
       # compiles against android-35.
       - name: Install the Android NDK and platform
         uses: ./.github/actions/android-sdk

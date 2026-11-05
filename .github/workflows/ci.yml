@@ -4466,8 +4466,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
@@ -4835,8 +4836,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
@@ -4996,8 +4998,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       # The emulator, its system image and adb come from the same step: the instrumented
       # run below starts the emulator itself rather than through an action that runs
       # `sdkmanager --install` for each of them on every run.

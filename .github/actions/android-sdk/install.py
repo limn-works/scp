@@ -39,14 +39,17 @@ preinstalls `platforms;android-35`, `platform-tools` 37.0.1 and `ndk;27.3.137507
 default NDK, which is why the repository pins that NDK). A directory whose
 `source.properties` already names the pinned revision came with the image, not from a
 download in this job, so it stays and nothing is fetched for it. The image is trusted as
-its JDK and its command-line tools are, and no cache restores into the SDK root. When an
-image update drops one of these packages, its pinned archive is downloaded and checked
+its JDK and its command-line tools are. Rule `verified-download` of
+scripts/tests/ci-gate/ci_gate_selftest.py fails any job in which a step before this one
+writes under the SDK root, so nothing but the image can put a directory there. When an
+image update drops one of these packages, or ships it at another revision or at one
+`revision_key` cannot read (`37.0.2 rc1`), its pinned archive is downloaded and checked
 instead. The emulator and the system images are not in the image, so each instrumented
 leg downloads about 1.0 GB, where it downloaded 1.7 GB while the NDK came from Google.
 
-DOWNLOADS AND UNPACKING OVERLAP. Archives are downloaded one at a time, each as parallel
-byte ranges (verified_download.py), and each is unpacked on a second thread while the
-next one downloads.
+DOWNLOADS AND UNPACKING OVERLAP. Archives are downloaded one at a time, each over one
+stream (verified_download.py), and each is unpacked on a second thread while the next
+one downloads; the last archive unpacks after every download has finished.
 
 A package not in PINS fails the step: pin it here from the manifest above, with the
 `complete` archive's url and size for host-os linux, and a SHA-256 made as above.
@@ -153,10 +156,19 @@ def properties_revision(directory: Path) -> str | None:
     return None
 
 
+def at_pin(revision: str | None, pin: Pin) -> bool:
+    """True when revision names pin's revision; an absent or unreadable one does not."""
+    if revision is None:
+        return False
+    try:
+        return revision_key(revision) == revision_key(pin.revision)
+    except ValueError:
+        return False
+
+
 def held_by_image(target: Path, pin: Pin) -> bool:
     """True when target already holds pin's revision, so nothing is downloaded for it."""
-    present = properties_revision(target)
-    return present is not None and revision_key(present) == revision_key(pin.revision)
+    return at_pin(properties_revision(target), pin)
 
 
 def unpack(package: str, pin: Pin, archive: Path, target: Path, root: Path) -> None:
@@ -174,7 +186,7 @@ def unpack(package: str, pin: Pin, archive: Path, target: Path, root: Path) -> N
                 f"not one top-level directory"
             )
         revision = properties_revision(tops[0])
-        if revision is None or revision_key(revision) != revision_key(pin.revision):
+        if not at_pin(revision, pin):
             raise InstallError(
                 f"{package}: {pin.archive} names revision {revision!r} in "
                 f"source.properties, not the pinned {pin.revision}"
@@ -216,10 +228,7 @@ def install_archive(
     archive.unlink()
     if pin.display_name is not None:
         (target / "package.xml").write_text(package_xml(package, pin))
-    print(
-        f"{package}: unpacked to {target} in {time.monotonic() - started:.1f} s",
-        flush=True,
-    )
+    print(f"{package}: unpacked to {target} in {time.monotonic() - started:.1f} s")
 
 
 def installed_revisions(sdkmanager: Path, root: Path) -> dict[str, str]:
@@ -270,8 +279,7 @@ def main(packages: list[str]) -> int:
             if held_by_image(target, pin):
                 print(
                     f"{package}: {target} already holds revision {pin.revision} "
-                    f"from the runner image; nothing downloaded",
-                    flush=True,
+                    f"from the runner image; nothing downloaded"
                 )
                 continue
             archive = Path(downloads) / Path(pin.archive).name
@@ -288,8 +296,7 @@ def main(packages: list[str]) -> int:
     wrong = {
         package: installed.get(package)
         for package in packages
-        if installed.get(package) is None
-        or revision_key(installed[package]) != revision_key(PINS[package].revision)
+        if not at_pin(installed.get(package), PINS[package])
     }
     if wrong:
         raise InstallError(

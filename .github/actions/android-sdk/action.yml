@@ -22,5 +22,7 @@ runs:
       shell: bash
       env:
         ANDROID_SDK_PACKAGES: ${{ inputs.packages }}
-      # Word splitting is the point: one argument per package path.
-      run: python3 -I "$GITHUB_ACTION_PATH/install.py" $ANDROID_SDK_PACKAGES
+      # Word splitting is the point: one argument per package path. `-u` writes each
+      # line as it is printed, so the log times every download and unpack; -I makes
+      # python ignore PYTHONUNBUFFERED, so the flag and not the variable does this.
+      run: python3 -I -u "$GITHUB_ACTION_PATH/install.py" $ANDROID_SDK_PACKAGES
