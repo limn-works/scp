@@ -67,21 +67,28 @@ sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:
 # checks that feature before its Apple branch, so an Apple build would drop
 # CommonCrypto for the OpenSSL that `Cargo.lock` pins.
 #
-# Exactly one shipped configuration selects this: the one
-# `bindings/python/pyproject.toml` declares, whose `[tool.maturin] features` list
-# names `vendored-openssl`, the `scp-ffi` feature that forwards to this one. The
-# PyPI wheel and the PyPI sdist both build from that table, the sdist on the
-# installing machine. A Linux or Windows wheel installs onto a machine whose
-# OpenSSL this build never saw, and a `pip install` of it runs no linker.
+# The prebuilt client artifacts select this, each through its bridge crate's
+# `vendored-openssl` feature, which forwards here. Each one installs onto a machine
+# whose OpenSSL this build never saw, through an installer that runs no linker, and no
+# operator upgrades a `libssl3` inside it:
+#   - the PyPI wheel and sdist, through `scp-ffi/vendored-openssl`, which the
+#     `[tool.maturin] features` list of `bindings/python/pyproject.toml` names (the
+#     sdist builds on the installing machine from the same table);
+#   - the npm addon `index.node`, through `scp-ffi-napi/vendored-openssl`;
+#   - the Android AAR's `.so` files, the XCFramework and the C ABI library, through
+#     `scp-ffi-uniffi/vendored-openssl`.
+# Jobs `python-wheels`, `python-wheels-linux`, `typescript-napi`, `kotlin-aar`,
+# `swift-xcframework` and `cbindgen` of `.github/workflows/build-matrix.yml` build
+# them. `scripts/check-vendored-openssl-scope.sh` fails when `openssl-src` is absent
+# from one of those configurations or present in any other. Job `rust` also uploads
+# each bridge library built under its default features, which leave this off.
 #
-# No other shipped artifact selects it. `openssl-sys/vendored` statically links
-# the OpenSSL that `Cargo.lock` pins, so the crypto inside a binary that selects
-# it changes only when someone bumps that lockfile. The `scp-relay` and
-# `scp-node` binaries leave it off and link `libcrypto.so.3` dynamically, and
-# `Dockerfile` installs `libssl3` in their runtime image for that reason. The
-# napi addon and the uniffi library also compile SQLCipher and also leave this
-# feature off. No decision states why any of these four leaves it off; this
-# comment claims none.
+# The `scp-relay` and `scp-node` binaries leave it off. `openssl-sys/vendored`
+# statically links the OpenSSL that `Cargo.lock` pins, so the crypto inside a binary
+# that selects it changes only when someone bumps that lockfile. Those two binaries
+# link `libcrypto.so.3` dynamically instead, so that an operator patches OpenSSL by
+# upgrading `libssl3` in the runtime layer; `Dockerfile` and
+# `templates/personal-relay/README.md` install `libssl3` for that reason.
 #
 # `libsqlite3-sys?/` rather than `libsqlite3-sys/`: this feature adds a build mode
 # to a SQLCipher that `sqlite` already asked for, and never pulls SQLCipher into a

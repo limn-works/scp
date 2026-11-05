@@ -181,7 +181,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# TWELVE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# FOURTEEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -199,10 +199,13 @@ cd "$REPO_ROOT"
 #   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
 #     to leave the Python symbols to the interpreter that loads the cdylib. It
 #     activates no SCP-crate feature and no dependency edge.
-#   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, the
-#     wheel-only feature that forwards to the platform crate.
-#   - `scp-platform/vendored-openssl` — what `scp-ffi/vendored-openssl`
-#     activates on the platform crate. It is
+#   - `scp-ffi/vendored-openssl`, `scp-ffi-napi/vendored-openssl`,
+#     `scp-ffi-uniffi/vendored-openssl` — each `["scp-platform/vendored-openssl"]`,
+#     which the PyPI wheel, the npm addon, and the uniffi client artifacts (the
+#     Android AAR's `.so` files, the XCFramework, the C ABI library) select so that
+#     each carries the OpenSSL it was built with.
+#   - `scp-platform/vendored-openssl` — what those three activate on the platform
+#     crate. It is
 #     `["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]`, on an edge the
 #     crate declares for non-Apple targets only. For a Linux or Windows target it
 #     compiles the same SQLCipher against an OpenSSL this build produces instead
@@ -224,18 +227,19 @@ cd "$REPO_ROOT"
 # PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
 # `scp-ffi` rows above that no other entry reaches. This gate does not read which
 # artifacts reach `openssl-src`; see `scripts/check-vendored-openssl-scope.sh`.
-# None of the twelve forwards a `testing` edge or an `allow_unencrypted_storage`
+# None of the fourteen forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
 # permitting a `default` row therefore admits nothing beyond that row.
 # NULLIFIER_CONTROL_FEATURES names all five bridge/binary `testing` features, so
 # `assert_allowlist_has_no_nullifier` rejects an edit that adds one here.
 #
-# Ten artifact configurations are gated: the three shipped FFI bridges under
+# Twelve artifact configurations are gated: the three shipped FFI bridges under
 # `--no-default-features --features server`, the same three under their DEFAULT
 # features, `scp-core`, the scp-node and scp-relay binaries (built with DEFAULT
-# features — neither binary has a `server` feature), and the PyPI wheel under
-# `--features extension-module,vendored-openssl`. Each artifact's resolved set is
+# features — neither binary has a `server` feature), the PyPI wheel under
+# `--features extension-module,vendored-openssl`, and the npm addon and the uniffi
+# client artifacts under `--features vendored-openssl`. Each artifact's resolved set is
 # the UNION of the two renderings the header describes. This single allowlist is a
 # SUPERSET covering all ten plus the bare default-members build — one list
 # suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
@@ -258,8 +262,10 @@ scp-ffi-common/resolvers
 scp-ffi-common/server
 scp-ffi-napi/default
 scp-ffi-napi/server
+scp-ffi-napi/vendored-openssl
 scp-ffi-uniffi/default
 scp-ffi-uniffi/server
+scp-ffi-uniffi/vendored-openssl
 scp-ffi/default
 scp-ffi/extension-module
 scp-ffi/server
@@ -457,6 +463,16 @@ ARTIFACTS=(
   # is not in this list, so an edit to that table changes what this gate
   # resolves or fails the gate.
   "scp-ffi|--features extension-module,vendored-openssl"
+  # The client artifacts `.github/workflows/build-matrix.yml` builds with
+  # `--features vendored-openssl`: the npm addon (job typescript-napi), and the
+  # Android AAR's `.so` files, the XCFramework and the C ABI library (jobs
+  # kotlin-aar, swift-xcframework, cbindgen). Half 2 of
+  # assert_shipping_invocations_are_gated accepts a shipping line that selects
+  # features only when shipping_line_artifact_entry derives one of these strings
+  # from it, so a line that changes its feature selection fails this gate until
+  # the configuration it builds is resolved here.
+  "scp-ffi-napi|--features vendored-openssl"
+  "scp-ffi-uniffi|--features vendored-openssl"
 )
 
 # ---------------------------------------------------------------------------
@@ -1749,6 +1765,50 @@ packages_built_by_shipping_lines() {
 }
 
 # ---------------------------------------------------------------------------
+# shipping_line_artifact_entry <line>
+#   Pure. Print the ARTIFACTS string (`<package>|<args>`) naming the one
+#   configuration <line> builds, and return 0; return 1, printing nothing, when
+#   the line does not name exactly one configuration this function can state.
+#
+#   CRITERION: the line passes `-p`/`--package` exactly once, under the grammar
+#   above, and that value is an `scp-` package name after the quote and
+#   `@version` stripping packages_built_by_shipping_lines applies; it carries no
+#   `for pkg in` loop and no `--workspace`, `--all` or `--manifest-path`, each
+#   of which builds a package set the `-p` value does not state. <args> renders
+#   the line's feature selection in one fixed order — `--no-default-features`,
+#   then `--all-features`, then `--features <v>`, where <v> is every value the
+#   line passes to `--features`/`-F`, split on commas and spaces, sorted unique
+#   and joined by commas — so two spellings of one selection derive one string.
+#
+#   A line this function cannot read returns 1, and half 2 then reports it, so
+#   every reading it declines fails closed.
+# ---------------------------------------------------------------------------
+shipping_line_artifact_entry() {
+  local line="$1" tok packages features args="" count
+  local -a toks
+  read -r -a toks <<<"$line"
+  for tok in "${toks[@]+"${toks[@]}"}"; do
+    case "$tok" in
+      --workspace|--all|--manifest-path|--manifest-path=*) return 1 ;;
+    esac
+  done
+  [[ "$line" =~ (^|[[:space:]])for[[:space:]]+pkg[[:space:]]+in[[:space:]] ]] && return 1
+  packages="$(cargo_option_values "$line" package p | sed -E "s/^[\"']//; s/[\"']$//; s/@.*$//")"
+  count="$(printf '%s\n' "$packages" | sed -E '/^$/d' | wc -l | tr -d ' ')"
+  [[ "$count" == 1 ]] || return 1
+  printf '%s\n' "$packages" | grep -xE 'scp-[a-z0-9-]+' >/dev/null || return 1
+  for tok in "${toks[@]}"; do
+    [[ "$tok" == --no-default-features ]] && { args="--no-default-features"; break; }
+  done
+  for tok in "${toks[@]}"; do
+    [[ "$tok" == --all-features ]] && { args="${args:+$args }--all-features"; break; }
+  done
+  features="$(cargo_option_values "$line" features F | tr ', ' '\n\n' | sed -E '/^$/d' | sort -u | paste -sd, -)"
+  [[ -n "$features" ]] && args="${args:+$args }--features $features"
+  printf '%s|%s\n' "$packages" "$args"
+}
+
+# ---------------------------------------------------------------------------
 # packages_built_by_shipping_files
 #   The one source of "which SCP packages a shipping file builds": half 1 of
 #   assert_shipping_invocations_are_gated and the crate dimension in run_gate
@@ -1771,9 +1831,11 @@ packages_built_by_shipping_files() {
 # packages_without_default_artifact_entry <packages> <artifact-specs>
 #   Pure. Emit each of <packages> for which <artifact-specs> (one `crate|args`
 #   per line, as ARTIFACTS holds them) carries no exact `<package>|` entry. A
-#   shipping line builds its `-p` packages under default features, because
-#   assert_shipping_invocations_are_gated half 2 fails on any undeclared
-#   feature-selection line, so each package emitted here is one whose
+#   shipping line that selects no feature builds its `-p` packages under default
+#   features; a line that does select one passes
+#   assert_shipping_invocations_are_gated half 2 only when it is declared to ship
+#   nothing or when the one configuration it builds is itself an ARTIFACTS entry
+#   (shipping_line_artifact_entry). So each package emitted here is one whose
 #   default-feature graph no ARTIFACTS entry resolves.
 # ---------------------------------------------------------------------------
 packages_without_default_artifact_entry() {
@@ -2040,7 +2102,9 @@ assert_maturin_project_files_are_complete() {
 #        invocation unifies, so a package inside that clean tree cannot carry a
 #        feature the allowlist rejects.
 #     2. Every line of a shipping file carrying a cargo feature-selection flag
-#        appears verbatim in DECLARED_SHIPPING_FEATURE_FLAG_LINES. The set of
+#        appears verbatim in DECLARED_SHIPPING_FEATURE_FLAG_LINES, or names one
+#        configuration that shipping_line_artifact_entry states and ARTIFACTS
+#        carries, so run_gate resolves exactly what that line builds. The set of
 #        options that changes cargo's feature resolution is closed —
 #        `--features`, `-F`, `--all-features`, `--no-default-features` — and
 #        lines_carrying_cargo_feature_selection reads each one in every spelling
@@ -2114,6 +2178,7 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
   flag_lines="$(normalize_shipping_lines "$(lines_carrying_cargo_feature_selection "$shipping_lines")")"
   undeclared="$(comm -23 <(printf '%s\n' "$flag_lines" | sed -E '/^$/d' | sort -u) \
                          <(printf '%s\n' "$DECLARED_SHIPPING_FEATURE_FLAG_LINES" | sed -E '/^$/d' | sort -u))"
+  undeclared="$(lines_without_artifact_entry "$undeclared" "$(printf '%s\n' "${ARTIFACTS[@]}")")"
   if [[ -n "$undeclared" ]]; then
     echo "   FAIL — a shipping file carries a cargo feature-selection flag this gate never declared:"
     printf '%s\n' "$undeclared" | sed 's/^/       x /'
@@ -2134,7 +2199,23 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
     fixture_failures=$((fixture_failures + 1))
     return
   fi
-  echo "   ok   — every package a shipping file builds is gated, every feature-flag line in one is declared, and each declaration still names a line a shipping file carries"
+  echo "   ok   — every package a shipping file builds is gated, every feature-flag line in one is declared or builds an ARTIFACTS configuration, and each declaration still names a line a shipping file carries"
+}
+
+# lines_without_artifact_entry <lines> <artifact-specs>
+#   Pure. Emit each of <lines> from which shipping_line_artifact_entry derives no
+#   string, or derives one that <artifact-specs> (one `crate|args` per line, as
+#   ARTIFACTS holds them) does not carry exactly.
+lines_without_artifact_entry() {
+  local line entry
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if entry="$(shipping_line_artifact_entry "$line")" \
+        && printf '%s\n' "$2" | grep -xF -- "$entry" >/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done <<<"$1"
 }
 
 assert_allowlist_has_no_nullifier() {
@@ -2606,6 +2687,32 @@ TREE
   done
   lines_carrying_cargo_feature_selection "$joined_probe" | grep -xF 'run: cargo build --release --features scp-node/testing' >/dev/null; rc=$?
   expect "(shipping-drift, continuation) the flag reader sees the joined feature line" "PASS" "$rc"
+
+  # (shipping-drift, entries) half 2 accepts an undeclared feature-selection
+  #     line only when shipping_line_artifact_entry states the one configuration
+  #     it builds and ARTIFACTS carries that string. Each probe below is a line a
+  #     shipping file could carry; the specs are a synthetic ARTIFACTS.
+  local entry entry_specs entry_left
+  entry_specs="$(printf '%s\n' 'scp-ffi-uniffi|--features vendored-openssl' 'scp-ffi|--no-default-features --features server')"
+  entry="$(shipping_line_artifact_entry 'cargo build --release --target "$target" -p scp-ffi-uniffi --features vendored-openssl')"; rc=$?
+  [[ "$rc" == 0 && "$entry" == 'scp-ffi-uniffi|--features vendored-openssl' ]]; rc=$?
+  expect "(shipping-drift, entries) a one-package line derives its package and feature selection" "PASS" "$rc"
+  entry="$(shipping_line_artifact_entry 'run: cargo build -Fserver,server --release -p "scp-ffi" --no-default-features')"; rc=$?
+  [[ "$rc" == 0 && "$entry" == 'scp-ffi|--no-default-features --features server' ]]; rc=$?
+  expect "(shipping-drift, entries) another spelling of one selection derives the same string" "PASS" "$rc"
+  entry_left="$(lines_without_artifact_entry "$(printf '%s\n' \
+    'run: cargo build --release --target x -p scp-ffi-uniffi --features vendored-openssl' \
+    'run: cargo build --release --target x -p scp-ffi-uniffi --features vendored-openssl,testing' \
+    'run: cargo build --release --target x -p scp-ffi-napi --features vendored-openssl' \
+    'run: cargo build --release -p scp-ffi-uniffi -p scp-ffi --features vendored-openssl' \
+    'run: cargo build --release -p "$pkg" --features vendored-openssl' \
+    'run: cargo build --release --workspace -p scp-ffi-uniffi --features vendored-openssl' \
+    'for pkg in scp-ffi-uniffi; do cargo build -p scp-ffi-uniffi --features vendored-openssl; done' \
+    'run: cargo build --release --features vendored-openssl')" "$entry_specs")"
+  printf '%s\n' "$entry_left" | grep -xF 'run: cargo build --release --target x -p scp-ffi-uniffi --features vendored-openssl' >/dev/null; rc=$?
+  expect "(shipping-drift, entries) a line building a configuration ARTIFACTS carries is NOT reported" "FAIL" "$rc"
+  printf '%s\n' "$entry_left" | sed '/^$/d' | wc -l | tr -d ' ' | grep -xF 7 >/dev/null; rc=$?
+  expect "(shipping-drift, entries) an extra feature, an ungated package, two packages, a shell variable, --workspace, a pkg loop, and no package are each REPORTED" "PASS" "$rc"
 
   # (wheel-drift) maturin takes the wheel's cargo feature list from the
   #     `[tool.maturin]` table of a pyproject.toml, which no shipping file

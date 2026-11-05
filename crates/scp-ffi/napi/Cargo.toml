@@ -14,6 +14,15 @@ crate-type = ["cdylib", "lib"]
 default = ["server"]
 # Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
+# On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
+# linking the build host's libcrypto. The npm addon `index.node` that job
+# `typescript-napi` of `.github/workflows/build-matrix.yml` builds selects it on
+# every target: `npm install` runs no linker and puts the addon on a machine whose
+# libcrypto this build never saw, and no operator upgrades a `libssl3` inside an
+# installed npm package. On an Apple target it changes nothing, and SQLCipher keeps
+# CommonCrypto. The `vendored-openssl` comment in `crates/scp-platform/Cargo.toml`
+# says how the Apple exclusion works and which shipped artifacts leave it off.
+vendored-openssl = ["scp-platform/vendored-openssl"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production builds; the parity harness (ADR-046) enables it.
 # Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
