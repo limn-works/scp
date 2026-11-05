@@ -53,3 +53,25 @@ runs:
       run: |
         if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
         "$py" -I "$GITHUB_ACTION_PATH/guard.py" after "$TOOLCACHE_TOOL"
+    # pyo3's build script resolves PYO3_PYTHON by name (ci.yml, cache-warm.yml and
+    # compile-timings.yml set `python3.12`) and reruns only when PYO3_PYTHON or
+    # PYO3_ENVIRONMENT_SIGNATURE changes (pyo3-build-config 0.24.2, src/impl_.rs,
+    # find_interpreter). A restored cargo cache therefore keeps the library directory of
+    # the interpreter on the cache writer's runner image: in run 42004309416 a runner
+    # holding CPython 3.12.15 linked against /opt/hostedtoolcache/Python/3.12.16/x64/lib,
+    # which it lacks. The signature names the interpreter's executable, version and
+    # LIBDIR, so a different interpreter reruns the build script and the same one
+    # rebuilds nothing. A PYO3_PYTHON that names no command fails the step.
+    - if: inputs.tool == 'python'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${PYO3_PYTHON:-}" ]; then
+          exit 0
+        fi
+        if ! command -v "$PYO3_PYTHON" > /dev/null; then
+          echo "::error::PYO3_PYTHON names $PYO3_PYTHON, which is no command on PATH"
+          exit 1
+        fi
+        signature="$("$PYO3_PYTHON" -I -c 'import sys, sysconfig; print(sys.executable, sys.version.split()[0], sysconfig.get_config_var("LIBDIR"))')"
+        echo "PYO3_ENVIRONMENT_SIGNATURE=$signature" >> "$GITHUB_ENV"

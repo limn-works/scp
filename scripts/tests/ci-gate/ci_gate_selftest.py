@@ -14667,12 +14667,116 @@ def run_offline_cargo(inputs: Inputs) -> None:
     check_offline_cargo(inputs.documents)
 
 
+def pyo3_signature_steps(action: dict) -> list[dict]:
+    """The python-only steps of TOOLCACHE_ACTION_FILE that write PYO3_ENVIRONMENT_SIGNATURE."""
+    return [
+        step
+        for step in (action.get("runs") or {}).get("steps") or []
+        if str(step.get("if") or "").replace(" ", "") == "inputs.tool=='python'"
+        and "PYO3_ENVIRONMENT_SIGNATURE=" in str(step.get("run") or "")
+        and "$GITHUB_ENV" in str(step.get("run") or "")
+    ]
+
+
+def run_pyo3_signature_step(script: str, pyo3_python: str | None) -> tuple[int, str, str]:
+    """Run one signature step's bash; return (exit code, GITHUB_ENV text, output)."""
+    with tempfile.TemporaryDirectory() as scratch:
+        github_env = Path(scratch, "github_env")
+        github_env.write_text("")
+        env = {k: v for k, v in os.environ.items() if k != "PYO3_PYTHON"}
+        env["GITHUB_ENV"] = str(github_env)
+        if pyo3_python is not None:
+            env["PYO3_PYTHON"] = pyo3_python
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return result.returncode, github_env.read_text(), result.stdout + result.stderr
+
+
+def check_pyo3_environment_signature() -> None:
+    """TOOLCACHE_ACTION gives pyo3 the identity of the interpreter PYO3_PYTHON names.
+
+    CRITERION: TOOLCACHE_ACTION_FILE has exactly one step that runs only for
+    `tool: python` and writes PYO3_ENVIRONMENT_SIGNATURE to $GITHUB_ENV. Run with
+    PYO3_PYTHON naming an interpreter, the step exits 0 and writes a signature holding
+    that interpreter's sys.executable, its full version and its LIBDIR; with PYO3_PYTHON
+    unset it exits 0 and writes nothing; with PYO3_PYTHON naming no command it exits
+    non-zero.
+
+    WHY: pyo3-build-config reruns its build script only when PYO3_PYTHON or
+    PYO3_ENVIRONMENT_SIGNATURE changes. The workflows set PYO3_PYTHON to the bare name
+    `python3.12`, so without a signature a restored cargo cache links against the
+    library directory of the cache writer's interpreter, which a runner image holding
+    another patch release lacks. Every job that compiles pyo3 sets Python up through
+    TOOLCACHE_ACTION (check_pinned_python), so the step reaches each of them.
+    """
+    import sysconfig
+
+    action = yaml.safe_load((REPO / TOOLCACHE_ACTION_FILE).read_text())
+    steps = pyo3_signature_steps(action)
+    check(
+        f"{TOOLCACHE_ACTION_FILE} has one python-only step writing PYO3_ENVIRONMENT_SIGNATURE",
+        len(steps) == 1,
+        f"found {len(steps)}",
+    )
+    if len(steps) != 1:
+        return
+    script = str(steps[0]["run"])
+    code, written, out = run_pyo3_signature_step(script, sys.executable)
+    want = [sys.executable, sys.version.split()[0], str(sysconfig.get_config_var("LIBDIR"))]
+    check(
+        "the signature step names the interpreter's executable, version and LIBDIR",
+        code == 0
+        and written.startswith("PYO3_ENVIRONMENT_SIGNATURE=")
+        and all(part in written for part in want),
+        f"exit {code}, wrote {written!r}, want {want}: {out}",
+    )
+    code, written, out = run_pyo3_signature_step(script, None)
+    check(
+        "the signature step writes nothing when PYO3_PYTHON is unset",
+        code == 0 and written == "",
+        f"exit {code}, wrote {written!r}: {out}",
+    )
+    code, written, out = run_pyo3_signature_step(script, "planted-no-such-python3.12")
+    check(
+        "the signature step fails when PYO3_PYTHON names no command",
+        code != 0 and "planted-no-such-python3.12" in out,
+        f"exit {code}, wrote {written!r}: {out}",
+    )
+    # Controls: an action whose step is gone, or runs for every tool, is reported.
+    for label, edit in (
+        ("removed", lambda steps_: [s for s in steps_ if s not in pyo3_signature_steps(action)]),
+        (
+            "unguarded",
+            lambda steps_: [
+                {k: v for k, v in s.items() if k != "if"}
+                if s in pyo3_signature_steps(action)
+                else s
+                for s in steps_
+            ],
+        ),
+    ):
+        mutated = copy.deepcopy(action)
+        mutated["runs"]["steps"] = edit(mutated["runs"]["steps"])
+        check(
+            f"the action with its signature step {label} is reported",
+            len(pyo3_signature_steps(mutated)) != 1,
+            "the mutant still reads as one python-only signature step",
+        )
+
+
 def run_pinned_python(inputs: Inputs) -> None:
     print(
         "pinned-python — every job that compiles pyo3 runs on a pinned Python 3.12 "
         "that PYO3_PYTHON names"
     )
     check_pinned_python(inputs.documents)
+    check_pyo3_environment_signature()
 
 
 def run_artifact_key(inputs: Inputs) -> None:
