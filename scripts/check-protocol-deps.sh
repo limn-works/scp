@@ -66,14 +66,18 @@ workspace_member_dirs() {
 # `scp-runtime-types` and `scp-runtime-core`; each may depend on types and
 # core, and on a sibling only as a dev-dependency (kind "dev"). Returns 2 when
 # METADATA does not parse.
+#
+# The metadata goes through stdin: the workspace's output exceeds Linux's
+# per-argument limit (MAX_ARG_STRLEN, 128 KiB), so passing it as argv fails the
+# exec before python runs.
 runtime_sibling_edges() {
-    python3.12 -I -c '
+    printf '%s' "$1" | python3.12 -I -c '
 import json, sys
 SHARED = {"scp-runtime-types", "scp-runtime-core"}
 def is_domain(name):
     return name.startswith("scp-runtime-") and name not in SHARED
 try:
-    packages = json.loads(sys.argv[1])["packages"]
+    packages = json.load(sys.stdin)["packages"]
     edges = [(p["name"], d["name"], d.get("kind")) for p in packages for d in p.get("dependencies", [])]
 except (ValueError, KeyError, TypeError):
     print("runtime_sibling_edges: metadata does not parse", file=sys.stderr)
@@ -81,7 +85,7 @@ except (ValueError, KeyError, TypeError):
 for line in sorted({f"{pkg} depends on {dep}" for pkg, dep, kind in edges
                     if is_domain(pkg) and is_domain(dep) and kind in (None, "build")}):
     print(line)
-' "$1"
+'
 }
 
 # --self-test feeds network_crates_in a canned listing with two network crates
@@ -162,6 +166,20 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "ERROR: runtime_sibling_edges self-test: unparseable metadata passed"
         exit 1
     fi
+    # The real workspace metadata, larger than one argv string may be on Linux,
+    # must reach the helper and yield no edge.
+    real_meta=$(cargo metadata --no-deps --format-version 1 2>/dev/null) || {
+        echo "ERROR: runtime_sibling_edges self-test: cargo metadata failed"
+        exit 1
+    }
+    if ! got=$(runtime_sibling_edges "$real_meta"); then
+        echo "ERROR: runtime_sibling_edges self-test: the helper did not run on the real workspace metadata"
+        exit 1
+    fi
+    if [ -n "$got" ]; then
+        echo "ERROR: runtime_sibling_edges self-test: the real workspace reported [$got]"
+        exit 1
+    fi
     echo "runtime_sibling_edges self-test passed: refused a normal and a build sibling edge, allowed a dev edge."
     exit 0
 fi
@@ -175,8 +193,10 @@ runtime_domains_are_siblings() {
         echo "ERROR: cargo metadata failed"
         exit 1
     }
-    if ! edges=$(runtime_sibling_edges "$metadata"); then
-        echo "ERROR: runtime sibling check could not read cargo metadata"
+    edges_rc=0
+    edges=$(runtime_sibling_edges "$metadata") || edges_rc=$?
+    if [ "$edges_rc" -ne 0 ]; then
+        echo "ERROR: the runtime sibling check did not run (helper exit $edges_rc), so no edge was checked"
         exit 1
     fi
     if [ -n "$edges" ]; then

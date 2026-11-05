@@ -1258,16 +1258,27 @@ run_gate() {
   assert_resolver_sees_own_feature_table_activation || failures=$((failures + 1))
   echo
   echo ">> every scp-runtime* gating feature is a NULLIFIER_CONTROL_FEATURES entry"
-  local runtime_meta unlisted
+  local runtime_meta unlisted unlisted_rc
   if ! runtime_meta="$(cargo metadata --no-deps --format-version 1 2>/dev/null)"; then
     echo "   FAIL — cargo metadata failed"
     failures=$((failures + 1))
-  elif unlisted="$(runtime_gating_features_unlisted "$runtime_meta")"; then
-    echo "   ok   — each scp-runtime* testing / allow_unencrypted_storage / saga-witness-test-mint / outlet-capability-test-grant feature is listed"
   else
-    echo "   FAIL — scp-runtime* gating feature(s) missing from NULLIFIER_CONTROL_FEATURES:"
-    printf '          %s\n' "$unlisted"
-    failures=$((failures + 1))
+    unlisted_rc=0
+    unlisted="$(runtime_gating_features_unlisted "$runtime_meta")" || unlisted_rc=$?
+    case "$unlisted_rc" in
+      0)
+        echo "   ok   — each scp-runtime* testing / allow_unencrypted_storage / saga-witness-test-mint / outlet-capability-test-grant feature is listed"
+        ;;
+      1)
+        echo "   FAIL — scp-runtime* gating feature(s) missing from NULLIFIER_CONTROL_FEATURES:"
+        printf '          %s\n' "$unlisted"
+        failures=$((failures + 1))
+        ;;
+      *)
+        echo "   FAIL — the gating-feature check did not run (helper exit $unlisted_rc), so no feature was checked"
+        failures=$((failures + 1))
+        ;;
+    esac
   fi
   echo
   local reached_union=""
@@ -2232,12 +2243,12 @@ import json, sys
 GATING = {"testing", "allow_unencrypted_storage", "saga-witness-test-mint",
           "outlet-capability-test-grant"}
 try:
-    packages = json.loads(sys.argv[1])["packages"]
+    packages = json.load(sys.stdin)["packages"]
     names = [(p["name"], list(p.get("features", {}))) for p in packages]
 except (ValueError, KeyError, TypeError):
     print("runtime_gating_features_unlisted: metadata does not parse", file=sys.stderr)
     sys.exit(2)
-listed = set(sys.argv[2].split("\n"))
+listed = set(sys.argv[1].split("\n"))
 missing = sorted(
     name + "/" + f
     for name, features in names
@@ -2252,7 +2263,10 @@ sys.exit(1 if missing else 0)
 runtime_gating_features_unlisted() {
   local listed
   listed="$(printf '%s\n' "${NULLIFIER_CONTROL_FEATURES[@]}")"
-  python3.12 -I -c "$RUNTIME_GATING_PROGRAM" "$1" "$listed"
+  # The metadata goes through stdin: the workspace's `cargo metadata` output
+  # exceeds Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB), so passing it
+  # as argv fails the exec before python runs.
+  printf '%s' "$1" | python3.12 -I -c "$RUNTIME_GATING_PROGRAM" "$listed"
 }
 
 # assert_permitted_crates_have_no_nullifier_crate <permitted-crate-list>
@@ -2955,6 +2969,15 @@ TREE
   expect "(runtime-gating) a listed scp-runtime-core/testing and a non-runtime package are ACCEPTED" "PASS" "$rc"
   runtime_gating_features_unlisted 'not json' >/dev/null 2>&1; rc=$?
   expect "(runtime-gating) unparseable metadata is REJECTED" "FAIL" "$rc"
+  # The real workspace metadata, which is larger than one argv string may be on
+  # Linux, must reach the helper and pass.
+  local real_meta
+  if real_meta="$(cargo metadata --no-deps --format-version 1 2>/dev/null)"; then
+    runtime_gating_features_unlisted "$real_meta" >/dev/null; rc=$?
+  else
+    rc=1
+  fi
+  expect "(runtime-gating) this workspace's real cargo metadata is read and ACCEPTED" "PASS" "$rc"
 
   echo ">> fixture: the crate dimension (local-path provenance, closed PERMITTED_CRATES)"
   run_crate_dimension_fixtures
