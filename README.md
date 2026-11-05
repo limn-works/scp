@@ -117,7 +117,7 @@ All three commands are idempotent — safe to re-run at any time. Together they 
 | Rust | The compiler version and cross-compilation targets `rust-toolchain.toml` names, so a local build and a CI build use one compiler | rustup (reads `rust-toolchain.toml`) |
 | Cargo tools | cargo-nextest, maturin, cargo-deny | mise (cargo backend) |
 | npm globals | @napi-rs/cli | mise (npm backend) |
-| Android | SDK command-line tools, NDK 27.2 | sdkmanager (via Homebrew) |
+| Android | SDK command-line tools, NDK 27.3 | sdkmanager (via Homebrew) |
 
 Swift uses Xcode — not managed by mise.
 

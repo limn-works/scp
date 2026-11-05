@@ -70,7 +70,7 @@ gradle = "8.14.4"
 package_manager = "bun"
 
 [env]
-ANDROID_NDK_VERSION = "27.2.12479018"
+ANDROID_NDK_VERSION = "27.3.13750724"
 ANDROID_HOME = "{% if os() == 'macos' %}{{ env.HOME }}/Library/Android/sdk{% else %}{{ env.HOME }}/Android/Sdk{% endif %}"
 ANDROID_NDK_HOME = "{{ env.ANDROID_HOME }}/ndk/{{ env.ANDROID_NDK_VERSION }}"
 

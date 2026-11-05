@@ -4466,8 +4466,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
@@ -4835,8 +4836,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
         with:
           packages: platforms;android-35
@@ -4996,8 +4998,9 @@ jobs:
         with:
           tool: java
           version: "17"
-      # Each package comes from an archive checked against a pinned digest before it is
-      # unpacked; .github/actions/android-sdk/install.py states why.
+      # A package the runner image already holds at its pinned revision is kept from the
+      # image; every other package is downloaded and checked against a pinned SHA-256
+      # before it is unpacked. .github/actions/android-sdk/install.py states why.
       # The emulator, its system image and adb come from the same step: the instrumented
       # run below starts the emulator itself rather than through an action that runs
       # `sdkmanager --install` for each of them on every run.
@@ -5005,7 +5008,7 @@ jobs:
         with:
           packages: >-
             platforms;android-35
-            ndk;27.2.12479018
+            ndk;27.3.13750724
             platform-tools
             emulator
             system-images;android-${{ matrix.api-level }};default;x86_64
@@ -5016,7 +5019,7 @@ jobs:
           # which otherwise looks for unversioned `x86_64-linux-android-clang` and
           # `x86_64-linux-android-ranlib` tools that NDK 27 does not ship, so the C
           # compiler, archiver and ranlib are named too.
-          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ndk_bin="$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
             echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ndk_bin/x86_64-linux-android21-clang"
             echo "CC_x86_64_linux_android=$ndk_bin/x86_64-linux-android21-clang"
