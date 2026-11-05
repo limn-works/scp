@@ -570,6 +570,7 @@ jobs:
               - 'crates/scp-alloc/**'
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
+              - 'scripts/ci-await-artifact.py'
               - '.github/workflows/ci.yml'
             swift:
               - 'bindings/swift/**'
@@ -4968,12 +4969,28 @@ jobs:
   # so UniFFI's contract checksums match; a mismatch fails every test at load time. The
   # library goes under src/androidTest/jniLibs only, never src/main, so no published
   # artifact can carry the testing build.
+  #
+  # This job does not list uniffi-cdylib-linux in `needs:`. It takes one file from that
+  # job, the generated `scp.kt`, and reads it only from the Gradle step on, so it builds
+  # its Android cdylib while that job builds the Linux one and then waits for the
+  # artifact in step "Wait for the UniFFI Kotlin bindings". As a `needs:` edge, that
+  # wait put the whole producer ahead of this job's own build: in run 41991735658 the
+  # API 30 leg started at 5.9 minutes and ended at 15.4. The wait step fails this job
+  # when the producer completes without the artifact, which is what a skipped or failed
+  # `needs:` entry did through the `ci` aggregate. Check `needs-condition` in
+  # scripts/tests/ci-gate/ci_gate_selftest.py compares this job's `if:` with the
+  # producer's as it does for a `needs:` entry, and fails a download whose producer is
+  # neither in `needs:` nor awaited.
   kotlin-android-instrumented:
-    needs: [changes, uniffi-cdylib-linux]
+    needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.kotlin == 'true'
     name: Kotlin / instrumented (API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # `actions: read` lets the wait step list this run's artifacts and jobs.
+    permissions:
+      contents: read
+      actions: read
     # cache-warm.yml's `gradle` job writes the Gradle home this job restores; its
     # comment says why every Kotlin job shares this key.
     env:
@@ -5031,21 +5048,6 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux). This
-      # job reads only the generated `scp.kt`; it builds its own Android cdylib below.
-      - name: Download the UniFFI Kotlin bindings
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: uniffi-kotlin-linux
-          path: .
-      - name: Assert the downloaded bindings are present
-        run: |
-          set -euo pipefail
-          bindings=bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          if [ ! -s "$bindings" ]; then
-            echo "::error::artifact uniffi-kotlin-linux placed nothing at $bindings"
-            exit 1
-          fi
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-linux-android
@@ -5069,6 +5071,32 @@ jobs:
           cp target/x86_64-linux-android/debug/libscp_ffi_uniffi.so "$jni/"
           if [ -e bindings/kotlin/scp-kt-android/src/main/jniLibs ]; then
             echo "::error::src/main/jniLibs exists; the testing cdylib must reach no main source set"
+            exit 1
+          fi
+      # uniffi-cdylib-linux is not in this job's `needs:`; the comment above the job says
+      # why. The timeout leaves this job's own 45 minutes room for the Gradle step after a
+      # producer that compiled cold.
+      - name: Wait for the UniFFI Kotlin bindings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci-await-artifact.py
+          --artifact uniffi-kotlin-linux
+          --producer 'Bridge artifact / UniFFI cdylib + Kotlin bindings (linux)'
+          --timeout 1800
+      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux). This
+      # job reads only the generated `scp.kt`; it builds its own Android cdylib above.
+      - name: Download the UniFFI Kotlin bindings
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: uniffi-kotlin-linux
+          path: .
+      - name: Assert the downloaded bindings are present
+        run: |
+          set -euo pipefail
+          bindings=bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          if [ ! -s "$bindings" ]; then
+            echo "::error::artifact uniffi-kotlin-linux placed nothing at $bindings"
             exit 1
           fi
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3

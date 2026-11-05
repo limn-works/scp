@@ -4206,7 +4206,13 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
     """Return every (dependant, dependency) pair whose conditions can disagree.
 
     CRITERION: wherever a job's own `if:` selects it, the `if:` of every job in its
-    `needs` list must select that job too.
+    `needs` list must select that job too, and so must the `if:` of every job that
+    uploads an artifact the job downloads.
+
+    An artifact's producer counts as a dependency whether or not `needs` lists it. A
+    consumer that waits for the artifact in a step instead (see awaited_download_gaps)
+    runs when the producer skips, and its wait fails it, so a narrower producer
+    condition fails that consumer on exactly the runs it would have skipped it on.
 
     WHY: GitHub skips a job when any job in its `needs` list is skipped, so a
     dependency selected by a narrower condition than its dependant skips the
@@ -4228,9 +4234,16 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
     jobs = doc["jobs"]
     gaps: list[str] = []
     for job_id, job in sorted(jobs.items()):
-        needs = job.get("needs") or []
-        needs = [needs] if isinstance(needs, str) else list(needs)
-        if not needs:
+        needs = job_needs(job)
+        awaited = sorted(
+            {
+                producer
+                for artifact in downloaded_artifacts(job)
+                for producer in artifact_producers(doc, artifact)
+                if producer not in needs and producer != job_id
+            }
+        )
+        if not needs and not awaited:
             continue
         condition = job.get("if")
         if condition is None:
@@ -4240,9 +4253,10 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
             # the criterion states, so substitute the constant-true expression,
             # written in the grammar `selects` reads, and compare normally.
             condition = "true == 'true'"
-        if RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)):
-            continue
-        for dependency in needs:
+        # A consumer that runs over a skipped `needs` entry is exempt from that entry,
+        # but never from a producer it awaits: the wait fails it whatever its `if:`.
+        runs_over_a_skip = bool(RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)))
+        for dependency in ([] if runs_over_a_skip else needs) + awaited:
             upstream = jobs.get(dependency, {}).get("if")
             if upstream is None:
                 continue
@@ -4254,26 +4268,65 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
                     and not selects(upstream, outputs, event)
                 ]
             except ValueError as unreadable:
+                relation = "needs" if dependency in needs else "awaits an artifact of"
                 gaps.append(
-                    f"{job_id} needs {dependency} and this check cannot decide whether "
+                    f"{job_id} {relation} {dependency} and this check cannot decide whether "
                     f"{dependency} runs wherever {job_id} does ({unreadable})"
                 )
                 continue
             if pairs:
                 outputs, event = pairs[0]
                 selected = sorted(key for key, on in outputs.items() if on == "true")
+                effect = (
+                    f"which skips {job_id}"
+                    if dependency in needs
+                    else f"so {job_id} waits for an artifact nothing uploads and fails"
+                )
                 gaps.append(
                     f"{job_id} runs and {dependency} skips on event {event} with "
-                    f"filters {selected or ['none']} true, which skips {job_id} "
+                    f"filters {selected or ['none']} true, {effect} "
                     f"and fails the `ci` aggregate on every such pull request"
                 )
     return gaps
 
 
+def job_needs(job: dict) -> list[str]:
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def downloaded_artifacts(job: dict) -> list[str]:
+    """Every artifact name a job downloads from its own workflow run.
+
+    A download that names `run-id` reads another run's artifacts, which no job of
+    this run produces.
+    """
+    return [
+        str((step.get("with") or {}).get("name"))
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/download-artifact")
+        and "run-id" not in (step.get("with") or {})
+    ]
+
+
+def artifact_producers(doc: dict, artifact: str) -> list[str]:
+    """Every job id with an `actions/upload-artifact` step uploading `artifact`."""
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if any(
+            str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and (step.get("with") or {}).get("name") == artifact
+            for step in job.get("steps") or []
+        )
+    )
+
+
 def check_dependency_conditions(doc: dict) -> None:
     gaps = dependency_condition_gaps(doc)
     check(
-        "ci.yml: every job's `needs` are selected wherever the job is",
+        "ci.yml: every job's `needs`, and every producer it awaits, are selected "
+        "wherever the job is",
         not gaps,
         "; ".join(gaps),
     )
@@ -4398,6 +4451,52 @@ def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
         )
 
 
+def check_dependency_conditions_detect_a_narrowed_awaited_producer(doc: dict) -> None:
+    """A producer a consumer awaits, without a `needs` edge, is compared like one.
+
+    kotlin-android-instrumented downloads uniffi-kotlin-linux and does not list
+    uniffi-cdylib-linux in `needs`. Dropping the producer's `kotlin` clause leaves a
+    Kotlin-only pull request running the consumer while the producer skips.
+    """
+    consumer, producer_id = "kotlin-android-instrumented", "uniffi-cdylib-linux"
+    narrowed = copy.deepcopy(doc)
+    producer = narrowed["jobs"][producer_id]
+    producer["if"] = narrow_condition(producer["if"], "outputs.kotlin")
+    gaps = dependency_condition_gaps(narrowed)
+    check(
+        f"dropping the kotlin clause from {producer_id} is reported against {consumer}, "
+        f"which awaits it without a `needs` edge",
+        producer_id not in job_needs(narrowed["jobs"][consumer])
+        and any(
+            f"{consumer} runs and {producer_id} skips" in gap
+            and "waits for an artifact nothing uploads" in gap
+            for gap in gaps
+        ),
+        f"an awaited producer that no longer covers {consumer} went unreported: {gaps}",
+    )
+    check(
+        f"the narrowed awaited {producer_id} is reported by the comparison, not by a "
+        f"parse refusal",
+        not any("cannot decide" in gap for gap in gaps),
+        f"the mutant expression went unread: {gaps}",
+    )
+    # A consumer whose `if:` runs over a skipped dependency is not exempted from a
+    # producer it awaits, because the wait fails it. This grammar cannot read
+    # `always()`, so the gap it reports is a parse refusal, which also fails the check.
+    guarded = copy.deepcopy(narrowed)
+    guarded["jobs"][consumer]["if"] = "always() && " + str(
+        guarded["jobs"][consumer]["if"]
+    )
+    check(
+        f"an `always()` {consumer} is not exempted from the producer it awaits",
+        any(
+            gap.startswith(consumer) and producer_id in gap
+            for gap in dependency_condition_gaps(guarded)
+        ),
+        f"{dependency_condition_gaps(guarded)}",
+    )
+
+
 def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
     """A job with no `if:` whose dependency carries one is compared, not exempted."""
     mutated = copy.deepcopy(doc)
@@ -4452,6 +4551,431 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
                 "a consumer that skips with its dependency was exempted, and "
                 "the gate reported nothing about it",
             )
+
+
+AWAIT_SCRIPT = "scripts/ci-await-artifact.py"
+
+
+def awaits(script: str, artifact: str, producer_name: str) -> bool:
+    """Whether one `run:` text invokes AWAIT_SCRIPT for `artifact` from `producer_name`."""
+    try:
+        words = shlex.split(script)
+    except ValueError:
+        return False
+    if AWAIT_SCRIPT not in words:
+        return False
+    pairs = set(itertools.pairwise(words))
+    return ("--artifact", artifact) in pairs and ("--producer", producer_name) in pairs
+
+
+def awaited_download_gaps(doc: dict) -> list[str]:
+    """Return every download whose producer the job neither needs nor awaits.
+
+    CRITERION: for each `actions/download-artifact` step in ci.yml that reads its own
+    run, and each job that uploads that artifact, either the downloading job lists the
+    producer in `needs`, or an earlier step of the downloading job that runs on every
+    run of the job and can fail it invokes AWAIT_SCRIPT with `--artifact` set to the
+    artifact name and `--producer` set to the producer's `name:`.
+
+    WHY: a `needs` entry makes the consumer start after the producer ends, and a
+    skipped or failed producer keeps the consumer from running at all, which the `ci`
+    aggregate reports. Without that entry the consumer starts with the run, so its
+    download would race the upload, and a producer that never uploads would leave the
+    download to fail with a message that names no producer. AWAIT_SCRIPT returns only
+    once the artifact exists, and fails the job, naming the producer, once the producer
+    has completed without it. The jobs API reports a job by its display name, which is
+    why the argument has to equal the producer's `name:`.
+    """
+    jobs = doc["jobs"]
+    gaps: list[str] = []
+    for job_id, job in sorted(jobs.items()):
+        needs = job_needs(job)
+        steps = job.get("steps") or []
+        for index, step in enumerate(steps):
+            if not str(step.get("uses") or "").startswith("actions/download-artifact"):
+                continue
+            inputs = step.get("with") or {}
+            if "run-id" in inputs:
+                continue
+            artifact = str(inputs.get("name"))
+            for producer in artifact_producers(doc, artifact):
+                if producer in needs or producer == job_id:
+                    continue
+                name = str(jobs[producer].get("name") or producer)
+                if "${{" in name:
+                    gaps.append(
+                        f"{job_id} downloads {artifact} from {producer}, whose `name:` "
+                        f"is an expression the wait step cannot name"
+                    )
+                    continue
+                if not any(
+                    a_step_that_runs_and_can_fail_its_job(earlier)
+                    and awaits(str(earlier.get("run") or ""), artifact, name)
+                    for earlier in steps[:index]
+                ):
+                    gaps.append(
+                        f"{job_id} downloads {artifact} without {producer} in `needs` "
+                        f"and with no earlier unguarded step running {AWAIT_SCRIPT} "
+                        f"--artifact {artifact} --producer {name!r}"
+                    )
+    return gaps
+
+
+def check_awaited_downloads(doc: dict) -> None:
+    gaps = awaited_download_gaps(doc)
+    check(
+        "ci.yml: every download either needs its producer or awaits it first",
+        not gaps,
+        "; ".join(gaps),
+    )
+    consumer = "kotlin-android-instrumented"
+    if consumer not in doc["jobs"] or "uniffi-cdylib-linux" in job_needs(
+        doc["jobs"][consumer]
+    ):
+        check(
+            f"{consumer} awaits uniffi-kotlin-linux, so the controls below have a "
+            f"wait step to mutate",
+            False,
+            f"{consumer} is absent or lists uniffi-cdylib-linux in `needs`",
+        )
+        return
+
+    def wait_index(steps: list) -> int:
+        return next(
+            i for i, s in enumerate(steps) if AWAIT_SCRIPT in str(s.get("run") or "")
+        )
+
+    def mutate(edit: Callable[[list], None]) -> list[str]:
+        mutated = copy.deepcopy(doc)
+        edit(mutated["jobs"][consumer]["steps"])
+        return [
+            gap for gap in awaited_download_gaps(mutated) if gap.startswith(consumer)
+        ]
+
+    def drop(steps: list) -> None:
+        del steps[wait_index(steps)]
+
+    def move_after_download(steps: list) -> None:
+        step = steps.pop(wait_index(steps))
+        download = next(
+            i
+            for i, s in enumerate(steps)
+            if str(s.get("uses") or "").startswith("actions/download-artifact")
+        )
+        steps.insert(download + 1, step)
+
+    def guard(steps: list) -> None:
+        steps[wait_index(steps)]["if"] = "github.event_name == 'pull_request'"
+
+    def fail_open(steps: list) -> None:
+        steps[wait_index(steps)]["continue-on-error"] = True
+
+    def rename(old: str, new: str) -> Callable[[list], None]:
+        def edit(steps: list) -> None:
+            step = steps[wait_index(steps)]
+            step["run"] = str(step["run"]).replace(old, new)
+
+        return edit
+
+    for label, edit in (
+        ("with no wait step", drop),
+        ("whose wait step runs after the download", move_after_download),
+        ("whose wait step carries an `if:`", guard),
+        ("whose wait step continues on error", fail_open),
+        (
+            "whose wait step names another producer",
+            rename("UniFFI cdylib + Kotlin bindings", "UniFFI cdylib"),
+        ),
+        (
+            "whose wait step names another artifact",
+            rename("--artifact uniffi-kotlin-linux", "--artifact uniffi-kotlin"),
+        ),
+    ):
+        check(
+            f"a {consumer} {label} is reported",
+            bool(mutate(edit)),
+            "the mutant went unreported",
+        )
+
+
+AWAIT_PRODUCER = "Bridge artifact / planted producer"
+AWAIT_ARTIFACT = "planted-artifact"
+
+
+def run_await_script(
+    respond: Callable[[str, int], tuple[int, dict]],
+    timeout: str = "5",
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    """Run AWAIT_SCRIPT against a planted API; `respond(kind, n)` answers the nth call.
+
+    `kind` is "artifacts" or "jobs"; the answer is (HTTP status, JSON body). The jobs
+    answer also receives the requested page through the path the script builds.
+    """
+    import http.server
+    import threading
+
+    calls: dict[str, int] = {"artifacts": 0, "jobs": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):  # keep the planted server out of the log
+            pass
+
+        def do_GET(self):  # the name http.server dispatches on
+            path, _, query = self.path.partition("?")
+            prefix = "/repos/planted/repo/actions/runs/7/"
+            kind = path[len(prefix) :] if path.startswith(prefix) else ""
+            if kind not in calls:
+                self.send_error(404)
+                return
+            calls[kind] += 1
+            page = dict(p.split("=", 1) for p in query.split("&") if "=" in p).get(
+                "page", "1"
+            )
+            status, body = respond(
+                kind, calls[kind] if kind == "artifacts" else int(page)
+            )
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    env = {
+        **os.environ,
+        "GITHUB_API_URL": f"http://127.0.0.1:{server.server_address[1]}",
+        "GITHUB_REPOSITORY": "planted/repo",
+        "GITHUB_RUN_ID": "7",
+        "GH_TOKEN": "planted-token",
+        **(env_overrides or {}),
+    }
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO / AWAIT_SCRIPT),
+                "--artifact",
+                AWAIT_ARTIFACT,
+                "--producer",
+                AWAIT_PRODUCER,
+                "--timeout",
+                timeout,
+                "--interval",
+                "0.02",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    return result.returncode, result.stdout + result.stderr
+
+
+def await_artifacts(present: bool, expired: bool = False) -> tuple[int, dict]:
+    listed = [{"name": AWAIT_ARTIFACT, "expired": expired}] if present else []
+    return 200, {"total_count": len(listed), "artifacts": listed}
+
+
+def await_jobs(status: str, conclusion: str | None, page: int = 1) -> tuple[int, dict]:
+    if page > 1:
+        return 200, {"jobs": []}
+    job = {"name": AWAIT_PRODUCER, "status": status, "conclusion": conclusion}
+    return 200, {"jobs": [{"name": "other", "status": "completed"}, job]}
+
+
+def check_await_script() -> None:
+    """AWAIT_SCRIPT exits 0 only once the artifact exists, and fails every other way."""
+    cases: list[tuple[str, Callable[[str, int], tuple[int, dict]], str, int, str]] = [
+        (
+            "an artifact already uploaded",
+            lambda kind, n: (
+                await_artifacts(True)
+                if kind == "artifacts"
+                else await_jobs("in_progress", None)
+            ),
+            "5",
+            0,
+            "is in this run",
+        ),
+        (
+            "an artifact uploaded on the third poll while the producer runs",
+            lambda kind, n: (
+                await_artifacts(n >= 3)
+                if kind == "artifacts"
+                else await_jobs("in_progress", None)
+            ),
+            "5",
+            0,
+            "is in this run",
+        ),
+        (
+            "a producer that completed between the two artifact reads of one poll",
+            lambda kind, n: (
+                await_artifacts(n >= 2)
+                if kind == "artifacts"
+                else await_jobs("completed", "success")
+            ),
+            "5",
+            0,
+            "is in this run",
+        ),
+        (
+            "a producer that succeeded without uploading",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else await_jobs("completed", "success")
+            ),
+            "5",
+            1,
+            "uploaded no artifact",
+        ),
+        (
+            "a producer that failed",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else await_jobs("completed", "failure")
+            ),
+            "5",
+            1,
+            "conclusion failure",
+        ),
+        (
+            "a producer that skipped",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else await_jobs("completed", "skipped")
+            ),
+            "5",
+            1,
+            "conclusion skipped",
+        ),
+        (
+            "an expired artifact from a producer that completed",
+            lambda kind, n: (
+                await_artifacts(True, expired=True)
+                if kind == "artifacts"
+                else await_jobs("completed", "success")
+            ),
+            "5",
+            1,
+            "uploaded no artifact",
+        ),
+        (
+            "a producer that never completes",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else await_jobs("in_progress", None)
+            ),
+            "0.3",
+            1,
+            "did not appear within",
+        ),
+        (
+            "a producer not created before the deadline",
+            lambda kind, n: (
+                await_artifacts(False) if kind == "artifacts" else (200, {"jobs": []})
+            ),
+            "0.3",
+            1,
+            "did not appear within",
+        ),
+        (
+            "a producer listed on the second page of jobs",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else (
+                    (
+                        200,
+                        {
+                            "jobs": [
+                                {"name": f"filler {i}", "status": "completed"}
+                                for i in range(100)
+                            ]
+                        },
+                    )
+                    if n == 1
+                    else await_jobs("completed", "failure")
+                )
+            ),
+            "5",
+            1,
+            "conclusion failure",
+        ),
+        (
+            "two jobs with the producer's name",
+            lambda kind, n: (
+                await_artifacts(False)
+                if kind == "artifacts"
+                else (
+                    200,
+                    {"jobs": [await_jobs("in_progress", None)[1]["jobs"][1]] * 2},
+                )
+            ),
+            "5",
+            2,
+            "2 jobs named",
+        ),
+        (
+            "two transient 502 answers before the artifact appears",
+            lambda kind, n: (
+                (502, {}) if kind == "artifacts" and n <= 2 else await_artifacts(True)
+            ),
+            "5",
+            0,
+            "2 in a row",
+        ),
+        (
+            "an API that refuses the token",
+            lambda kind, n: (
+                403,
+                {"message": "Resource not accessible by integration"},
+            ),
+            "5",
+            2,
+            "HTTP 403",
+        ),
+        (
+            "an API that keeps failing",
+            lambda kind, n: (502, {}),
+            "5",
+            2,
+            "failed 5 times in a row",
+        ),
+        (
+            "an answer with no artifacts list",
+            lambda kind, n: (200, {"total_count": 0}),
+            "5",
+            2,
+            "no `artifacts` list",
+        ),
+    ]
+    for label, respond, timeout, want, text in cases:
+        code, out = run_await_script(respond, timeout)
+        check(
+            f"{AWAIT_SCRIPT} over {label} exits {want}",
+            code == want and text in out,
+            f"exit {code}, want {want} with {text!r}: {out}",
+        )
+    code, out = run_await_script(
+        lambda kind, n: await_artifacts(True), env_overrides={"GH_TOKEN": ""}
+    )
+    check(
+        f"{AWAIT_SCRIPT} without GH_TOKEN exits 3",
+        code == 3 and "GH_TOKEN" in out,
+        f"exit {code}: {out}",
+    )
 
 
 # The file each bridge producer uploads, named by the build that writes it rather
@@ -14717,8 +15241,11 @@ def run_needs_condition(inputs: Inputs) -> None:
     check_dependency_conditions(workflow)
     check_draft_condition(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
+    check_dependency_conditions_detect_a_narrowed_awaited_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
+    check_awaited_downloads(workflow)
+    check_await_script()
 
 
 def run_push_writers(inputs: Inputs) -> None:
