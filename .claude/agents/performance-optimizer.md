@@ -40,7 +40,7 @@ Read the relevant files thoroughly. Understand the data flow end-to-end before m
 Each context actor (ADR-049, actor-per-context) runs one command at a time, so a slow handler turn delays every queued command for that context. For each handler the change adds or touches, find awaited network or storage I/O the handler could hand off, supervisor round-trips inside the turn, and Class-C persistence that could coalesce (Class-S state persists before the acknowledgement by design). For each sender, find what it does when the bounded mailbox (`ACTOR_MAILBOX_CAPACITY`) is full.
 
 ### Step 3: Blocking Operation Detection
-Find expensive work on a tokio worker thread — synchronous I/O, heavy computation, a `std::sync` lock held for long, or `block_in_place` and `block_on` (which `crates/scp-runtime/AGENTS.md` bans in the actor scope).
+Find expensive work on a tokio worker thread — synchronous I/O, heavy computation, a `std::sync` lock held for long, or `block_in_place` and `block_on` (which `crates/scp-runtime-core/AGENTS.md` bans in the actor scope).
 
 ### Step 4: Memory Leak Detection
 Find reference cycles in closures, leaked continuations, unfinished async streams, uncancelled observers, and objects retained beyond their intended lifecycle.

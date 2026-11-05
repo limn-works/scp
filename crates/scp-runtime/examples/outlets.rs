@@ -13,8 +13,8 @@ use scp_protocol::context::outlets::registry::{
 };
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextParams, ContextState};
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::invoke::invoke_outlet_aggregating;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::outlets::invoke::invoke_outlet_aggregating;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &creator,
         None, // default timeout
         executor,
-        None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None::<&mut scp_runtime_core::context::outlets::invoke::OutletEconomyContext<'_>>,
         None,
     )
     .await

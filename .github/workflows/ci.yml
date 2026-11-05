@@ -604,6 +604,8 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-relay-client/**'
               - 'crates/scp-runtime/**'
+              - 'crates/scp-runtime-core/**'
+              - 'crates/scp-runtime-types/**'
               # scp-platform's sqlite and apple features pull in scp-sqlite-pools.
               - 'crates/scp-sqlite-pools/**'
               # Every crate above is a member of the root workspace and reads
@@ -1022,10 +1024,41 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
+      # cargo-shear's source, checked against the checksum pinned-tool pins and built
+      # against the Cargo.lock it ships. The install runs before cargo-fetch, after
+      # which every cargo command in this job runs offline.
+      - name: Download the cargo-shear source
+        id: cargo-shear
+        uses: ./.github/actions/pinned-tool
+        with:
+          tool: cargo-shear
+      - name: Install cargo-shear
+        env:
+          CRATE: ${{ steps.cargo-shear.outputs.path }}
+        run: cargo install --locked --path "$CRATE"
       - uses: ./.github/actions/cargo-fetch
+      # check-protocol-deps.sh parses `cargo metadata` with `python3.12`, which
+      # the runner image does not ship.
+      - uses: ./.github/actions/toolcache-setup
+        with:
+          tool: python
+          version: "3.12"
       - run: bash scripts/check-protocol-deps.sh --self-test
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
+      # Each runtime crate (ADR-070) declares only the dependencies its code uses, and
+      # a dependency only its tests use sits under [dev-dependencies]. cargo-shear reads
+      # each crate's sources and exits non-zero on an unused, misplaced or
+      # feature-only dependency, or on an empty source file.
+      - name: Unused dependencies in the runtime crates
+        run: |
+          set -euo pipefail
+          packages=()
+          for manifest in crates/scp-runtime*/Cargo.toml; do
+            crate="${manifest#crates/}"
+            packages+=(-p "${crate%/Cargo.toml}")
+          done
+          cargo shear --frozen --deny-warnings "${packages[@]}"
       # A publishable crate with a normal or build dependency on a
       # `publish = false` crate, or a release.yml publish order that puts a
       # crate before its dependency, breaks `cargo publish` at release time.
@@ -1473,6 +1506,8 @@ jobs:
       - run: bash scripts/check-deleted-primitives.sh
       - name: Run deleted-primitives fixture tests
         run: bash scripts/tests/deleted-primitives/run-tests.sh
+      - run: bash scripts/check-runtime-clippy-config.sh --self-test
+      - run: bash scripts/check-runtime-clippy-config.sh
 
   handler-no-panic:
     needs: check-draft
@@ -2004,7 +2039,7 @@ jobs:
       - name: Run scp-runtime and scp-core tests
         if: matrix.leg == 'runtime'
         run: |
-          cargo nextest run --no-tests=fail -p scp-runtime -p scp-core --features scp-core/testing,scp-core/allow_unencrypted_storage,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io
+          cargo nextest run --no-tests=fail -p scp-runtime -p scp-runtime-types -p scp-runtime-core -p scp-runtime-broadcast -p scp-runtime-economy -p scp-runtime-governance -p scp-runtime-lifecycle -p scp-runtime-lifecycle-control -p scp-runtime-messaging -p scp-runtime-outlets -p scp-runtime-push -p scp-runtime-queries -p scp-runtime-saga -p scp-runtime-standing -p scp-runtime-trust-recovery -p scp-runtime-ttl-close -p scp-core --features scp-core/testing,scp-core/allow_unencrypted_storage,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io
       - name: Run scp-testing and scp-platform tests
         if: matrix.leg == 'testing'
         run: |

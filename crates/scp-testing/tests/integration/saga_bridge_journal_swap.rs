@@ -45,10 +45,11 @@ use scp_core::context::builder::ContextCreationError;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::state::ContextSnapshot;
-use scp_core::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState, Supervisor,
+use scp_core::context::saga_journal::{
+    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState,
 };
+use scp_core::context::state::ContextSnapshot;
+use scp_core::context::supervisor::Supervisor;
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
@@ -191,6 +192,7 @@ fn journal_supervisor(
         // test-only `for_test` constructor — production sites use `from_handle`.
         scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
         scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
+        scp_core::context::domain_handlers(),
     )
 }
 

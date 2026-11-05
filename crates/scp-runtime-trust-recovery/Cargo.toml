@@ -1,0 +1,34 @@
+[package]
+name = "scp-runtime-trust-recovery"
+version = "0.1.0-beta.2"
+description = "The trust recovery domain of the SCP runtime: trust evaluation and key and identity recovery"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Forwards `scp-runtime-core/testing`; the assembly crate's `testing` turns it on in
+# every domain crate. Only test builds enable it.
+testing = ["scp-runtime-core/testing", "scp-runtime-types/testing"]
+
+[dependencies]
+scp-runtime-types = { workspace = true }
+scp-runtime-core = { workspace = true }
+tokio = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+scp-event-log = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-event-log = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

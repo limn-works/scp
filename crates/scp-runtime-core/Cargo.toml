@@ -1,0 +1,107 @@
+[package]
+name = "scp-runtime-core"
+version = "0.1.0-beta.2"
+description = "Per-context actor, supervisor, stores and transports of the SCP runtime"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Turns on the `testing`-gated helpers of this crate and of its scp
+# dependencies. Only test builds enable it: the assembly crate `scp-runtime`
+# forwards its own `testing` here, and `scp-testing` and `fuzz` name it with
+# `features = ["testing"]`. Every domain crate's `testing` forwards here too, so
+# the command variants this crate gates on `testing` and the domains' match arms
+# for them are compiled together (ADR-070 plan §4, unification hazard).
+# It reaches `scp-dht/testing` through `scp-runtime-types/testing`. No shipped artifact
+# resolves `scp-runtime-core/testing`, so `scripts/check-shipped-feature-graph.sh` keeps
+# proving `InMemoryDhtClient` absent from every shipped feature graph.
+testing = ["allow_unencrypted_storage", "scp-runtime-types/testing", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing"]
+# Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
+# without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
+# requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
+# in scp-ffi. See issue #695.
+allow_unencrypted_storage = []
+# Gates `RestoredContexts::for_test` and `CrossContextSagaSeal::for_test` — the
+# test-only minters for the restore-then-replay ordering witness and the
+# cross-context saga input seal, used by the saga-FSM / crash-recovery /
+# supervisor integration suites. Deliberately NOT implied by
+# `testing`: a `testing`-gated minter would leak into every bridge test
+# build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime-core/testing`, re-opening the forge. This feature is
+# enabled ONLY through `scp-runtime/saga-witness-test-mint`: by the
+# `required-features` of the `actor_saga_coordinator` /
+# `actor_saga_crash_recovery` test targets, by the CI test feature list, and by
+# `#[cfg]` on the individual supervisor tests that mint. No crate's non-dev
+# dependency enables it, so no production or FFI build can reach either mint.
+saga-witness-test-mint = []
+# Gates `Supervisor::test_grant_member_capability` — the test-only seam that
+# grants a §7.2.2 Tier-2 capability (e.g. `OutletCallAll`) directly into a
+# member's `role_state.member_capabilities`, bypassing the governance role-
+# assignment round-trip. This is an AUTHORITY-ESCALATION primitive, so it is
+# deliberately NOT implied by `testing`: a `testing`-gated grant would leak into
+# every bridge test build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime-core/testing`, compiling a capability-escalation
+# back-door into test-harness builds. Enabled ONLY by the
+# `required-features` / explicit `--features` of the outlet-stream live-flow test
+# that needs to authorize a member invoker, so no production or FFI build can
+# reach it. Follows the `saga-witness-test-mint` precedent above.
+outlet-capability-test-grant = []
+
+[dependencies]
+scp-runtime-types = { workspace = true }
+openmls = { workspace = true }
+openmls_traits = { workspace = true }
+openmls_basic_credential = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+scp-clock = { workspace = true }
+scp-crypto = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+# The push registrar maps relay `ERR` codes through `scp_relay_client::code`.
+scp-relay-client = { workspace = true }
+scp-mls = { workspace = true }
+scp-platform = { workspace = true }
+scp-event-log = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+z-base-32 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+bs58 = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
+subtle = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
+scp-crypto = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-mls = { workspace = true, features = ["testing"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+# `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
+# `ProtocolRepository::new`: `FilesystemStorage` is a plaintext backend that a
+# `compile_fail,E0277` assertion proves cannot reach a production constructor.
+scp-platform = { workspace = true, features = ["testing", "encrypting", "filesystem"] }
+scp-event-log = { workspace = true, features = ["testing"] }
+openmls_basic_credential = { workspace = true, features = ["test-utils"] }
+proptest = "1"
+static_assertions = { workspace = true }
+
+[lints]
+workspace = true

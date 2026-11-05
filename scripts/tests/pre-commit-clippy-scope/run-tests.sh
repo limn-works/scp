@@ -79,6 +79,7 @@ new_repo() {
     for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml \
         crates/scp-relay/src/main.rs crates/scp-relay/data.json \
         crates/scp-relay/src/extra.rs crates/scp-protocol/src/lib.rs crates/scp-runtime/src/lib.rs \
+        crates/scp-runtime-governance/src/lib.rs \
         fuzz/src/lib.rs docs/notes.md; do
         mkdir -p "$(dirname "$f")"
         echo "// $f" > "$f"
@@ -94,7 +95,7 @@ edit() {
     git add "$1"
 }
 
-ALL_FEATURES="scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing"
+ALL_FEATURES="scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime-types/testing,scp-runtime-core/testing,scp-runtime-core/saga-witness-test-mint,scp-runtime-broadcast/testing,scp-runtime-economy/testing,scp-runtime-governance/testing,scp-runtime-lifecycle/testing,scp-runtime-lifecycle-control/testing,scp-runtime-messaging/testing,scp-runtime-outlets/testing,scp-runtime-push/testing,scp-runtime-queries/testing,scp-runtime-saga/testing,scp-runtime-standing/testing,scp-runtime-trust-recovery/testing,scp-runtime-ttl-close/testing"
 TAIL="--all-targets -- -D warnings"
 
 # assert_clippy <name> <want: the exact `cargo clippy` line, or "none"> [protocol: yes|no]
@@ -163,6 +164,16 @@ edit crates/scp-protocol/src/lib.rs
 g commit -q -m "protocol and runtime change" >/dev/null
 assert_clippy "a commit changing scp-protocol and scp-runtime lints exactly those two" \
     "cargo clippy -p scp-protocol -p scp-runtime --features scp-runtime/testing $TAIL"
+
+# Case 2d: an ADR-070 runtime domain crate, whose testing feature the hook passes. The
+# crate's test targets refuse to compile without it, and scp-runtime, which depends on it,
+# is not linted.
+new_repo "$WORK/runtime-domain"
+edit crates/scp-runtime-governance/src/lib.rs
+: > "$LOG"
+g commit -q -m "runtime domain change" >/dev/null
+assert_clippy "a change in scp-runtime-governance lints it with its testing feature only" \
+    "cargo clippy -p scp-runtime-governance --features scp-runtime-governance/testing $TAIL"
 
 # Case 3: the root manifest beside a leaf change.
 new_repo "$WORK/manifest"

@@ -85,7 +85,10 @@ fi
 #
 # Format: "TOKEN|SCOPE_DIR|FILE_GLOB|REASON"
 #   TOKEN     — grep -E regex to match. Escape regex metacharacters.
-#   SCOPE_DIR — repo-relative directory to search.
+#   SCOPE_DIR — repo-relative directories to search, separated by spaces. Each
+#               word is a shell glob that must match at least one directory:
+#               ADR-070 split scp-runtime into 16 crates, so the runtime rows
+#               name `crates/scp-runtime*`, which covers every one of them.
 #   FILE_GLOB — find -name pattern (e.g. "*.rs").
 #   REASON    — short user-facing explanation.
 #
@@ -103,19 +106,19 @@ fi
 # `.contexts_ref()` accessor without false-matching the legitimate
 # `standing_contexts_ref` / `local_dids_ref` supervisor accessors.
 BAN_ENTRIES=(
-    "Mutex<PerContextState>|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context Mutex; state is actor-owned"
-    "get_context_arc|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
-    "lock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
-    "relock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
-    "[^_]contexts_ref|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
-    "ContextGeneration|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
-    "next_generation|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
-    "take_send_tracker|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
-    "merge_send_tracker|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
-    "MutationStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
-    "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
-    "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
-    "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + NodeMlsFactory::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
+    "Mutex<PerContextState>|crates/scp-runtime*|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context Mutex; state is actor-owned"
+    "get_context_arc|crates/scp-runtime*|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
+    "lock_context|crates/scp-runtime*|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
+    "relock_context|crates/scp-runtime*|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
+    "[^_]contexts_ref|crates/scp-runtime*|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
+    "ContextGeneration|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted this (ADR-049)"
+    "next_generation|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted this (ADR-049)"
+    "take_send_tracker|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
+    "merge_send_tracker|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
+    "MutationStateView|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
+    "QueryStateView|crates/scp-runtime*|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
+    "RwLock<ContextInner>|crates/scp-runtime*|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
+    "pending_joins|crates/scp-runtime-types/src/crypto crates/scp-runtime-core/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + NodeMlsFactory::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
     # The two definition-shaped tokens below ban re-defining the deleted
     # single-slot join methods themselves, completing the pending_joins ban
     # above. Both are shaped to skip the LIVE join surface: the production
@@ -123,8 +126,8 @@ BAN_ENTRIES=(
     # and the scp-testing harness wrapper is 'pub async fn' outside this
     # scope, so neither matches 'pub fn join_from_welcome('. The name
     # prepare_key_package_for_join has zero live definitions in any form.
-    "fn prepare_key_package_for_join|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy prepare_key_package_for_join provider method; joiners reserve KeyPackages via the KeyPackageStoreActor reserve/confirm protocol"
-    "pub fn join_from_welcome\\(|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy synchronous NodeMlsFactory::join_from_welcome provider method; every join flows through the async MlsBackend::join_from_welcome fused-confirm primitive"
+    "fn prepare_key_package_for_join|crates/scp-runtime*|*.rs|ADR-049 2F-residual deleted the legacy prepare_key_package_for_join provider method; joiners reserve KeyPackages via the KeyPackageStoreActor reserve/confirm protocol"
+    "pub fn join_from_welcome\\(|crates/scp-runtime*|*.rs|ADR-049 2F-residual deleted the legacy synchronous NodeMlsFactory::join_from_welcome provider method; every join flows through the async MlsBackend::join_from_welcome fused-confirm primitive"
     # A peer's MLS bytes are decoded only through `crates/scp-mls/src/wire.rs`,
     # which runs tls_codec under `catch_unwind` because tls_codec
     # `debug_assert!`s on a peer-controlled length header. wire.rs decodes
@@ -231,11 +234,24 @@ for entry in "${BAN_ENTRIES[@]}"; do
             "$C_RED" "$C_RESET" "$entry" >&2
         exit 2
     fi
-    if [[ ! -d "$scope" ]]; then
-        printf '%serror:%s scope dir does not exist: %s\n' \
-            "$C_RED" "$C_RESET" "$scope" >&2
-        exit 2
-    fi
+    # Expand each space-separated glob word into the directories it matches.
+    # A word that matches no directory is a configuration error (exit 2), so a
+    # renamed crate cannot silently empty a scope.
+    read -r -a scope_words <<< "$scope"
+    scope_dirs=()
+    for word in "${scope_words[@]}"; do
+        word_matched=0
+        for dir in $word; do
+            [[ -d "$dir" ]] || continue
+            scope_dirs+=("$dir")
+            word_matched=1
+        done
+        if [[ "$word_matched" -eq 0 ]]; then
+            printf '%serror:%s scope dir does not exist: %s\n' \
+                "$C_RED" "$C_RESET" "$word" >&2
+            exit 2
+        fi
+    done
 
     # Run the scan. grep -R with --include for the glob; -E for extended regex.
     # -n for line numbers; -H to always include filename (some greps omit
@@ -251,7 +267,7 @@ for entry in "${BAN_ENTRIES[@]}"; do
             --exclude-dir=.claude \
             -- \
             "$token" \
-            "$scope" 2>/dev/null || true
+            "${scope_dirs[@]}" 2>/dev/null || true
     )
 
     if [[ -n "$matches" ]]; then
@@ -286,6 +302,6 @@ printf '\n' >&2
 printf 'These primitives were deleted by the actor-per-context refactor\n' >&2
 printf '(ADR-049) and must not reappear. See:\n' >&2
 printf '  - .docs/adrs/ADR-049-actor-per-context.md\n' >&2
-printf '  - crates/scp-runtime/src/context/README.md (post-commit 6)\n' >&2
+printf '  - crates/scp-runtime-core/src/context/README.md (post-commit 6)\n' >&2
 
 exit 1

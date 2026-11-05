@@ -180,7 +180,7 @@ jobs:
 
       - name: Verify Cargo.toml version matches input
         run: |
-          for CRATE in scp-kel scp-core scp-protocol scp-runtime; do
+          for CRATE in scp-kel scp-core scp-protocol scp-runtime scp-runtime-types scp-runtime-core scp-runtime-broadcast scp-runtime-economy scp-runtime-governance scp-runtime-lifecycle scp-runtime-lifecycle-control scp-runtime-messaging scp-runtime-outlets scp-runtime-push scp-runtime-queries scp-runtime-saga scp-runtime-standing scp-runtime-trust-recovery scp-runtime-ttl-close; do
             CARGO_VERSION=$(grep -m1 '^version' "crates/$CRATE/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
             if [ "$CARGO_VERSION" != "${{ env.VERSION }}" ]; then
               echo "::error::$CRATE/Cargo.toml version ($CARGO_VERSION) does not match release version (${{ env.VERSION }})"
@@ -208,6 +208,21 @@ jobs:
             "scp-identity@${{ env.VERSION }}"
             "scp-mls@${{ env.VERSION }}"
             "scp-client@${{ env.VERSION }}"
+            "scp-runtime-types@${{ env.VERSION }}"
+            "scp-runtime-core@${{ env.VERSION }}"
+            "scp-runtime-broadcast@${{ env.VERSION }}"
+            "scp-runtime-economy@${{ env.VERSION }}"
+            "scp-runtime-governance@${{ env.VERSION }}"
+            "scp-runtime-lifecycle@${{ env.VERSION }}"
+            "scp-runtime-lifecycle-control@${{ env.VERSION }}"
+            "scp-runtime-messaging@${{ env.VERSION }}"
+            "scp-runtime-outlets@${{ env.VERSION }}"
+            "scp-runtime-push@${{ env.VERSION }}"
+            "scp-runtime-queries@${{ env.VERSION }}"
+            "scp-runtime-saga@${{ env.VERSION }}"
+            "scp-runtime-standing@${{ env.VERSION }}"
+            "scp-runtime-trust-recovery@${{ env.VERSION }}"
+            "scp-runtime-ttl-close@${{ env.VERSION }}"
             "scp-runtime@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
@@ -612,6 +627,126 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-client --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-types
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-types --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-core --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-broadcast
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-broadcast --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-economy
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-economy --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-governance
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-governance --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-lifecycle
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-lifecycle --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-lifecycle-control
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-lifecycle-control --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-messaging
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-messaging --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-outlets
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-outlets --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-push
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-push --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-queries
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-queries --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-saga
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-saga --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-standing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-standing --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-trust-recovery
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-trust-recovery --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-runtime-ttl-close
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-runtime-ttl-close --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -1075,7 +1210,7 @@ jobs:
           done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
-          echo "- crates.io: scp-alloc, scp-sqlite-pools, scp-clock, scp-crypto, scp-did, scp-kel, scp-dht, scp-platform, scp-event-log, scp-protocol, scp-relay-client, scp-identity, scp-mls, scp-client, scp-runtime, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
+          echo "- crates.io: scp-alloc, scp-sqlite-pools, scp-clock, scp-crypto, scp-did, scp-kel, scp-dht, scp-platform, scp-event-log, scp-protocol, scp-relay-client, scp-identity, scp-mls, scp-client, scp-runtime-types, scp-runtime-core, scp-runtime-broadcast, scp-runtime-economy, scp-runtime-governance, scp-runtime-lifecycle, scp-runtime-lifecycle-control, scp-runtime-messaging, scp-runtime-outlets, scp-runtime-push, scp-runtime-queries, scp-runtime-saga, scp-runtime-standing, scp-runtime-trust-recovery, scp-runtime-ttl-close, scp-runtime, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
           echo "- npm: @limn-works/scp-ts + @limn-works/scp-ts-napi-{linux-x64-gnu,linux-arm64-gnu,darwin-x64,darwin-arm64,win32-x64-msvc}" >> $GITHUB_STEP_SUMMARY
           echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY

@@ -833,7 +833,9 @@ mod tests {
             Err(PushRegistrationError::NoLocalIdentity)
         );
         let shim = CoreFields::with_supervisor(std::sync::Arc::new(
-            scp_core::context::supervisor::Supervisor::for_query_shim(),
+            scp_core::context::supervisor::Supervisor::for_query_shim(
+                scp_core::context::domain_handlers(),
+            ),
         ));
         assert_eq!(
             check_push_registration_ready(&shim),
@@ -1142,7 +1144,9 @@ mod tests {
     #[tokio::test]
     async fn an_instance_without_a_local_identity_fails_the_wake() {
         let core = CoreFields::with_supervisor(std::sync::Arc::new(
-            scp_core::context::supervisor::Supervisor::for_query_shim(),
+            scp_core::context::supervisor::Supervisor::for_query_shim(
+                scp_core::context::domain_handlers(),
+            ),
         ));
         let outcome = handle_wake(&core, PushPlatform::Fcm, br#"{"scp":"1"}"#)
             .await

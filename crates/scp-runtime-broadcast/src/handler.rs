@@ -1,0 +1,4469 @@
+#![allow(
+    clippy::unused_async,
+    clippy::doc_markdown,
+    clippy::too_long_first_doc_paragraph
+)]
+//! Broadcast handlers — see
+//! [`BroadcastCommand`]
+//! and plan §"Broadcast contexts".
+//!
+//! # Phase 2A.5 -- actor-shape dispatch
+//!
+//! The handler's primary entry point `dispatch` takes
+//! `(&mut PerContextState, &ActorDeps, BroadcastCommand)` and routes
+//! non-publish variants through `crate::helpers`.
+//! Every valid context has a registered per-context actor, so a command
+//! that finds no actor is replied to with a typed
+//! [`ContextError::ContextNotRegistered`]
+//! by the supervisor's no-actor fallback.
+//!
+//! # Publish signing (ADR-049 Decision 7a)
+//!
+//! [`BroadcastCommand::PublishBroadcast`] and
+//! [`BroadcastCommand::PublishBroadcastContent`] carry the author's
+//! `CommandSigner`. The handler reserves the author's broadcast sequence,
+//! signs the broadcast signing payload through `CommandSigner::sign_bounded_ed25519`, and seals in
+//! one actor turn, under [`SIGNING_HANDLER_TIMEOUT`]. A refused or timed-out
+//! sign rolls the reservation back in the same turn, and the mailbox
+//! serializes publishes, so two publishes never share a sequence. A publish
+//! stalls its own context for up to `SIGN_TIMEOUT` while custody answers.
+
+use scp_protocol::context::ContextError;
+use scp_protocol::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, TokenNbCaveatResolver,
+    ValidationContext,
+};
+use tokio::sync::oneshot;
+
+use scp_runtime_core::context::actor::class_s::ClassSCell;
+use scp_runtime_core::context::actor::commands::{
+    BlockBroadcastSubscriberReply, BroadcastAdmissionReply, BroadcastBlockPayload,
+    BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
+    SubscribeBroadcastPayload, SubscribeBroadcastReply, UnsubscribeBroadcastPayload,
+    UnsubscribeBroadcastReply,
+};
+use scp_runtime_core::context::actor::deps::ActorDeps;
+use scp_runtime_core::context::actor::outcome::{Outcome, outcome_error_sketch};
+use scp_runtime_core::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
+
+use scp_runtime_core::context::shared::economy::ContextRevocationChecker;
+use scp_runtime_core::context::shared::economy::KeyResolverDidResolver;
+
+use scp_runtime_core::context::actor::handle::HANDLER_TIMEOUT;
+
+/// Dispatch a [`BroadcastCommand`] against actor-owned cell and deps.
+///
+/// The publish variants sign through the payload's `CommandSigner` inside
+/// this turn (ADR-049 Decision 7a); see the module docs.
+pub async fn dispatch(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    cmd: BroadcastCommand,
+) -> Outcome<()> {
+    Box::pin(dispatch_inner(cell, deps, cmd)).await
+}
+
+async fn dispatch_inner(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    cmd: BroadcastCommand,
+) -> Outcome<()> {
+    match cmd {
+        BroadcastCommand::SubscribeBroadcast { payload, reply } => {
+            handle_subscribe_broadcast(cell, deps, *payload, reply).await
+        }
+        BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
+            handle_unsubscribe_broadcast(cell, deps, *payload, reply).await
+        }
+        BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
+            handle_block_broadcast_subscriber(cell, deps, *payload, reply).await
+        }
+        BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
+            handle_unblock_broadcast_subscriber(cell, deps, *payload, reply).await
+        }
+        BroadcastCommand::HandleBroadcastKeyRequest {
+            context_id,
+            author_did,
+            requester_did,
+            wrapping_pubkey,
+            reply,
+        } => {
+            handle_handle_broadcast_key_request(
+                cell,
+                deps,
+                &context_id,
+                &author_did,
+                &requester_did,
+                wrapping_pubkey,
+                reply,
+            )
+            .await
+        }
+        BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
+            handle_broadcast_subscriber_count(cell, &context_id, reply).await
+        }
+        BroadcastCommand::IsBroadcastSubscriber {
+            context_id,
+            did,
+            reply,
+        } => handle_is_broadcast_subscriber(cell, &context_id, &did, reply).await,
+        BroadcastCommand::BroadcastAdmission { context_id, reply } => {
+            handle_broadcast_admission(cell, &context_id, reply).await
+        }
+        BroadcastCommand::PublishBroadcast { payload, reply } => {
+            let p = *payload;
+            let publish = PublishRequest {
+                context_id: &p.context_id,
+                author_did: &p.author_did,
+                payload: Ok(p.payload),
+                signer: &p.signer,
+            };
+            handle_publish_broadcast(cell, deps, publish, reply).await
+        }
+        BroadcastCommand::PublishBroadcastContent { payload, reply } => {
+            let p = *payload;
+            let bytes =
+                scp_protocol::context::broadcast_content::serialize_broadcast_content(&p.content)
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!("content serialization failed: {e}"))
+                    });
+            let publish = PublishRequest {
+                context_id: &p.context_id,
+                author_did: &p.author_did,
+                payload: bytes,
+                signer: &p.signer,
+            };
+            handle_publish_broadcast(cell, deps, publish, reply).await
+        }
+        #[cfg(feature = "testing")]
+        BroadcastCommand::SeedBroadcastAuthor {
+            author_did, reply, ..
+        } => handle_seed_broadcast_author(cell, &author_did, reply),
+    }
+}
+
+async fn handle_subscribe_broadcast(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    p: SubscribeBroadcastPayload,
+    reply: SubscribeBroadcastReply,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+
+    // Build the real UCAN [`ValidationContext`] the gated-admission arm of
+    // [`BroadcastContext::subscribe`] requires (spec §5.14.4: a gated
+    // `messages:read` grant MUST be verified with the full validation pipeline,
+    // §07:70). This mirrors `saga::validate_ucan_rebind` — the sole other
+    // in-actor `ValidationContext` builder — reusing the SAME VM-aware DID→key
+    // and per-context revocation adapters so the answer never diverges from the
+    // rest of the runtime.
+    //
+    // Every input is CLONED out of actor-owned state HERE, before the
+    // `&mut cell` borrow that `subscribe_broadcast` takes. `ClassSCell` exposes
+    // state only through `Deref` to `&PerContextState`; a live shared borrow
+    // into `cell` would conflict with the helper's `&mut cell`, so the ceiling /
+    // creator / revocation set are all materialised as owned values first.
+    let ceiling = cell.role_state.ceiling().to_ucan_string_set();
+    let creator_did = cell.role_state.creator_did.clone();
+    let revoked = cell.governance().revoked_spending_ucan_cids.clone();
+    // Proof resolver: EMPTY, by design. Per spec §5.14.4 a gated `messages:read`
+    // grant is issued DIRECTLY by the context admin/creator — a ROOT token
+    // (`prf = []`) whose root issuer IS `context_creator_did`. Intra-context
+    // DELEGATION of `messages:read` is not a supported path (the subscribe API
+    // carries a single token, not a proof bundle, so a subscriber cannot even
+    // supply parent proofs), and there is NO intra-context `messages:read`
+    // delegation proof store — the only runtime proof store, `xctx_ucan_proofs`,
+    // is the CROSS-context outlet-invocation saga store (empty outside an active
+    // saga) and holds `outlet_invoke` proofs, NOT read grants. So we deliberately
+    // do NOT clone `xctx_ucan_proofs` here (that would risk cross-contaminating a
+    // read-grant validation with unrelated outlet proofs). `verify_delegation_chain`
+    // no-ops on a root token's empty `prf`, so this empty resolver is never
+    // consulted on the supported path; an out-of-spec DELEGATED grant instead
+    // fails closed (`DelegationChainBroken`) — the correct rejection.
+    let proof_resolver = InMemoryProofResolver::new();
+    let did_resolver = KeyResolverDidResolver::new(&deps.key_resolver);
+    let revocation_checker = ContextRevocationChecker {
+        revoked_cids: &revoked,
+    };
+    // Per-call fresh (no-op) nonce tracker — the RESOLVED nonce-tracker decision
+    // for gated subscribe. A gated `messages:read` grant is issued once by an
+    // admin/creator and presented on every (re)subscribe, so its `nnc` timestamp
+    // is legitimately stale relative to the §9.14 ±5-minute freshness window a
+    // stateful tracker enforces; a freshness/replay tracker would wrongly reject
+    // a valid long-lived READ grant (exactly the failure
+    // `saga::validate_ucan_rebind` documents for a re-presented delegation proof).
+    // The full pipeline (signature, root-issuer, audience, ceiling, revocation,
+    // expiry) still runs on the presented token. Replay of a READ grant is
+    // defended in DEPTH, not by the nonce tracker:
+    //   - a replay by a NON-audience DID is rejected by audience binding (step 5);
+    //   - a replay by the audience DID while STILL subscribed is rejected by the
+    //     duplicate-subscriber check ("subscriber already registered");
+    //   - a replay by a governance-BANNED audience DID (which the duplicate check
+    //     can no longer catch, because the ban removed it from the roster) is
+    //     rejected by the DURABLE `banned_subscribers` record on the broadcast
+    //     context — checked both at the runtime `subscribe_broadcast` admission
+    //     gate and structurally inside `BroadcastContext::subscribe`. That record
+    //     is authority-only-clearable (`RestoreAccess`) and survives the banned
+    //     subject's own self-leave AND a subsequent admin `RemoveMember`, so the
+    //     ban cannot be laundered by leaving to clear `read_exclusion_list` and
+    //     replaying the retained UCAN (#2088).
+    // Note: a read-access ban is enforced via the durable `banned_subscribers`
+    // record (and, for a still-present read-revoked member, `read_exclusion_list`
+    // as defense-in-depth) — NOT via `revoked_spending_ucan_cids`, which drives
+    // the separate spending-UCAN revocation path and is inert for read grants.
+    // Spec is silent on subscribe-nonce dedup; a fresh no-op tracker is the sound,
+    // documented choice.
+    let mut nonce_tracker = NoOpNonceTracker;
+
+    let mut validation_ctx = ValidationContext {
+        did_resolver: &did_resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        ceiling: &ceiling,
+        context_creator_did: &creator_did,
+        // The `messages:read` grant is issued TO the subscriber, so the
+        // subscriber's DID is the audience the pipeline's step-5 check binds
+        // against.
+        presenting_agent_did: p.subscriber_did.as_ref(),
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: deps.clock.as_ref(),
+        // §7.3.8: Step 11b reads the presented token's own signed `nb`. A
+        // `messages:read` grant is non-outlet and mints with `nb = None`, so
+        // the caveat steps admit it unchanged; a token that does carry an `nb`
+        // has its time-box enforced rather than ignored.
+        caveat_resolver: &TokenNbCaveatResolver,
+    };
+
+    let subscribe_fut = async {
+        crate::helpers::subscribe_broadcast(
+            cell,
+            deps,
+            &p.context_id,
+            &p.subscriber_did,
+            p.ucan.as_ref(),
+            p.timestamp,
+            Some(&mut validation_ctx),
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, subscribe_fut).await {
+        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "subscribe_broadcast exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_unsubscribe_broadcast(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    p: UnsubscribeBroadcastPayload,
+    reply: UnsubscribeBroadcastReply,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+
+    let unsub_fut = async {
+        crate::helpers::unsubscribe_broadcast(
+            cell,
+            deps,
+            &p.context_id,
+            &p.subscriber_did,
+            p.rotate_keys,
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unsub_fut).await {
+        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "unsubscribe_broadcast exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_block_broadcast_subscriber(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    p: BroadcastBlockPayload,
+    reply: BlockBroadcastSubscriberReply,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+
+    let block_fut = async {
+        crate::helpers::block_broadcast_subscriber(
+            cell,
+            deps,
+            &p.context_id,
+            &p.author_did,
+            &p.subscriber_did,
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, block_fut).await {
+        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "block_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_unblock_broadcast_subscriber(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    p: BroadcastBlockPayload,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+
+    let unblock_fut = async {
+        crate::helpers::unblock_broadcast_subscriber(
+            cell,
+            deps,
+            &p.context_id,
+            &p.author_did,
+            &p.subscriber_did,
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unblock_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "unblock_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_handle_broadcast_key_request(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    author_did: &scp_did::DID,
+    requester_did: &scp_did::DID,
+    wrapping_pubkey: scp_protocol::crypto::hpke::p256::P256Point,
+    reply: HandleBroadcastKeyRequestReply,
+) -> Outcome<()> {
+    let key_req_fut = async {
+        scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
+            cell,
+            deps,
+            author_did,
+            requester_did,
+            &wrapping_pubkey,
+        )
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, key_req_fut).await {
+        Ok(Ok(decision)) => (Outcome::ok(()), Ok(decision)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "handle_broadcast_key_request exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_broadcast_subscriber_count(
+    cell: &mut ClassSCell,
+    context_id: &str,
+    reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
+) -> Outcome<()> {
+    let count_fut = async { crate::helpers::broadcast_subscriber_count(cell) };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
+        Ok(count) => (Outcome::ok(()), Ok(count)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "broadcast_subscriber_count exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_is_broadcast_subscriber(
+    cell: &mut ClassSCell,
+    context_id: &str,
+    did: &str,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let is_fut = async { crate::helpers::is_broadcast_subscriber(cell, did) };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, is_fut).await {
+        Ok(is) => (Outcome::ok(()), Ok(is)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "is_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_broadcast_admission(
+    cell: &mut ClassSCell,
+    context_id: &str,
+    reply: BroadcastAdmissionReply,
+) -> Outcome<()> {
+    let admission_fut = async { crate::helpers::broadcast_admission(cell) };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, admission_fut).await {
+        Ok(admission) => (Outcome::ok(()), Ok(admission)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "broadcast_admission exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// One publish request, as the two publish variants deliver it.
+struct PublishRequest<'a> {
+    context_id: &'a str,
+    author_did: &'a scp_did::DID,
+    /// The plaintext, or the error serializing `BroadcastContent` produced.
+    payload: Result<Vec<u8>, ContextError>,
+    signer: &'a CommandSigner,
+}
+
+/// Publishes in one actor turn through
+/// [`publish_broadcast_in_turn`](crate::helpers::publish_broadcast_in_turn),
+/// under [`SIGNING_HANDLER_TIMEOUT`] so a stalled custody fails with
+/// `SCP-CRYPTO-4062` before the turn budget expires. Reports `mutated` on
+/// every publish attempt, because a sealed publish consumes the sequence and
+/// a failed one has reserved and rolled it back.
+async fn handle_publish_broadcast(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    request: PublishRequest<'_>,
+    reply: PublishBroadcastReply,
+) -> Outcome<()> {
+    let payload = match request.payload {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            return Outcome::err(sketch);
+        }
+    };
+
+    let publish = crate::helpers::publish_broadcast_in_turn(
+        cell,
+        deps,
+        request.context_id,
+        request.author_did,
+        &payload,
+        request.signer,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, publish).await
+    {
+        Ok(Ok(env)) => (Outcome::ok_mutated(()), Ok(env)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "publish_broadcast exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {}",
+                request.context_id
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Per-call no-op nonce tracker for the gated broadcast-subscribe validation
+// pipeline.
+//
+// The DID resolver and revocation checker slots of the gated-subscribe
+// [`ValidationContext`] are the REAL runtime adapters (`KeyResolverDidResolver`,
+// `ContextRevocationChecker`); the proof resolver is an empty
+// `InMemoryProofResolver` because gated `messages:read` grants are admin/creator
+// ROOT tokens with no intra-context delegation (see `handle_subscribe_broadcast`).
+// Only the nonce-tracker slot is deliberately a no-op: a gated `messages:read`
+// grant is a long-lived, admin/creator-issued token whose `nnc` is minted once
+// at issuance and re-presented on every (re)subscribe, so a stateful
+// freshness/replay tracker would wrongly reject it (`NonceTooOld`). Replay of a
+// READ grant is defended in DEPTH elsewhere, NOT by the nonce tracker: a
+// non-audience replay by audience binding, an audience replay while still
+// subscribed by the duplicate-subscriber reject, and a replay by a
+// governance-BANNED audience DID by the durable `banned_subscribers` record
+// (authority-only-clearable, survives self-leave and admin-remove; enforced at
+// the `subscribe_broadcast` gate and structurally in `BroadcastContext::subscribe`
+// — #2088). This is the SAME accepted production pattern
+// `saga::validate_ucan_rebind` uses for a re-presented delegation proof (and
+// which its comment cross-references by this name).
+// ---------------------------------------------------------------------------
+
+struct NoOpNonceTracker;
+impl scp_protocol::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
+    fn check_replay(
+        &self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_protocol::crypto::ucan::UcanError> {
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_protocol::crypto::ucan::UcanError> {
+        Ok(())
+    }
+}
+
+/// Handle [`BroadcastCommand::SeedBroadcastAuthor`] (actor-shape, test-only).
+///
+/// Test seam: registers an additional DID as a broadcast author on an existing
+/// broadcast context, bypassing the normal governance round-trip. Mirrors
+/// `handle_seed_peer_pseudonym`
+/// in purpose and gating strategy.
+///
+/// Gated behind `feature = "testing"` — never compiled into production builds.
+#[cfg(feature = "testing")]
+fn handle_seed_broadcast_author(
+    cell: &mut ClassSCell,
+    author_did: &scp_did::DID,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = cell.class_c_view().seed_broadcast_author(author_did);
+    // An upward/additive mutation (author ADD): Class-C, coalesced persist via
+    // the run loop's `mutated` flag — same durability class as subscriber ADD.
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Gated broadcast-subscribe validation tests (spec §5.14.4, §07:70).
+//
+// These drive the REAL actor handler `handle_subscribe_broadcast` against a
+// gated broadcast context, exercising `validate_messages_read_ucan` through the
+// full runtime UCAN validation pipeline for the first time (previously the
+// handler passed `None` for the validation context, so the protocol rejected
+// every gated subscribe on the missing-UCAN check before validation ran — the
+// capability was unreachable). A valid admin-issued `messages:read` UCAN must
+// let the subscribe succeed; an absent, wrong-signer, or wrong-audience token
+// must be rejected.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use scp_protocol::context::governance::GovernanceEngineRawKey as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use scp_did::{DID, SigningKeyId};
+    use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+    use scp_protocol::context::params::ContextMode;
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use scp_protocol::context::ContextState;
+    use scp_runtime_core::context::actor::commands::SubscribeBroadcastPayload;
+    use scp_runtime_core::context::actor::state::PerContextState;
+
+    const CREATOR_DID: &str = "did:example:broadcast-creator";
+    const SUBSCRIBER_DID: &str = "did:example:broadcast-subscriber";
+    /// A context MEMBER who holds a valid `messages:read` grant but never called
+    /// subscribe (e.g. the creator, or a member added via join) — the #2088
+    /// Finding-1 target.
+    const LURKER_DID: &str = "did:example:broadcast-lurker";
+
+    /// Deterministic creator (context admin / UCAN issuer) signing key.
+    fn creator_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x11; 32])
+    }
+
+    /// A different key an attacker might sign a forged token with.
+    fn attacker_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x99; 32])
+    }
+
+    // Recording event log — counts every appended leaf so a test can assert
+    // that a REJECTED subscribe appends NO `MemberJoined` leaf. The membership
+    // leaf append routes through the trait default
+    // `append_membership_change_leaf` → `append_context_event_with_payload` →
+    // `append_event`, so counting `append_event` counts the leaf. The other
+    // methods just need to succeed; the rest of the trait uses its default impls.
+    /// Every appended leaf as `(event type, payload bytes)`, shared between
+    /// the [`TestEventLog`] that fills it and the test that reads it back.
+    /// `std::sync::RwLock` is the one shared lock the runtime's clippy
+    /// `disallowed-types` list admits.
+    type RecordedLeaves = Arc<std::sync::RwLock<Vec<(scp_event_log::EventType, Vec<u8>)>>>;
+
+    struct TestEventLog {
+        appended: Arc<AtomicUsize>,
+        /// Every appended leaf as `(event type, payload bytes)`, so a test can
+        /// decode a payload and assert the bytes a member committed.
+        recorded: RecordedLeaves,
+    }
+    #[async_trait::async_trait]
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.appended.fetch_add(1, Ordering::SeqCst);
+            self.recorded
+                .write()
+                .expect("recorded leaves lock")
+                .push((event, payload.data));
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    struct TestPersistence;
+    #[async_trait::async_trait]
+    impl scp_runtime_core::context::persistence::ContextPersistence for TestPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            _: &scp_runtime_core::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_runtime_core::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build an `ActorDeps` whose `key_resolver` resolves the creator DID's
+    /// `#active` verification key — so a UCAN issued by the creator passes
+    /// signature + root-issuer verification, and anything else fails. Returns the
+    /// deps plus the shared event-log append counter (number of leaves appended),
+    /// so a test can assert that a rejected subscribe appends none.
+    async fn build_deps() -> (ActorDeps, Arc<AtomicUsize>) {
+        let (deps, appended, _recorded) = build_deps_recording().await;
+        (deps, appended)
+    }
+
+    /// [`build_deps`] plus the recorded `(event type, payload bytes)` of every
+    /// appended leaf, for a test that asserts the bytes a leaf carries and not
+    /// only how many leaves landed.
+    async fn build_deps_recording() -> (ActorDeps, Arc<AtomicUsize>, RecordedLeaves) {
+        let (_supervisor, deps, appended, recorded) = build_supervisor_and_deps().await;
+        (deps, appended, recorded)
+    }
+
+    /// [`build_deps_recording`] plus the supervisor the deps reach, for a test
+    /// that registers a second context on it.
+    async fn build_supervisor_and_deps() -> (
+        Arc<scp_runtime_core::context::supervisor::supervisor::Supervisor>,
+        ActorDeps,
+        Arc<AtomicUsize>,
+        RecordedLeaves,
+    ) {
+        use scp_platform::in_memory::InMemoryStorage;
+        use scp_runtime_core::context::supervisor::supervisor::Supervisor;
+
+        let creator_vk = creator_key().verifying_key();
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(move |did: &DID, kid: SigningKeyId| {
+                if did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active {
+                    Some(creator_vk)
+                } else {
+                    None
+                }
+            });
+
+        let crypto = Arc::new(
+            scp_runtime_core::crypto::mls::provider::NodeMlsFactory::new(
+                "did:example:broadcast-actor".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ),
+        );
+        let transport: Box<dyn scp_runtime_core::context::builder::ContextTransportProvider> =
+            Box::new(scp_runtime_core::context::builder::NotConfiguredTransportProvider);
+        let appended = Arc::new(AtomicUsize::new(0));
+        let recorded: RecordedLeaves = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let event_log: Box<dyn scp_runtime_core::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog {
+                appended: Arc::clone(&appended),
+                recorded: Arc::clone(&recorded),
+            });
+        let mls_storage: Arc<
+            dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = Arc::new(
+            scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                Arc::new(InMemoryStorage::new()),
+            ),
+        );
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(TestPersistence)),
+            None,
+            None,
+            None,
+            mls_storage,
+            crate::test_support::test_domain_handlers(),
+        );
+        scp_runtime_core::context::supervisor::supervisor::leak_for_test(&supervisor);
+        let deps = supervisor
+            .build_actor_deps_loaded(&DID("did:example:broadcast-actor".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        (supervisor, deps, appended, recorded)
+    }
+
+    /// Build an ACTIVE broadcast `ClassSCell` with the given admission policy,
+    /// creator [`CREATOR_DID`], and a ceiling admitting `messages:read` +
+    /// `member:ban`. Returns the cell and the hex context id (used to scope the
+    /// UCAN capability).
+    fn build_broadcast_cell(admission: BroadcastAdmission) -> (ClassSCell, String) {
+        build_broadcast_cell_with_authors(admission, &[])
+    }
+
+    /// Like [`build_broadcast_cell`] but also registers `authors` in the broadcast
+    /// context (matching production, where the creator is always an author) — used
+    /// by the serve-path BLACK-303 tests.
+    fn build_broadcast_cell_with_authors(
+        admission: BroadcastAdmission,
+        authors: &[&str],
+    ) -> (ClassSCell, String) {
+        let (state, ctx_hex) = build_broadcast_state_with_authors(admission, authors);
+        (ClassSCell::new_for_test(state), ctx_hex)
+    }
+
+    /// The [`PerContextState`] behind [`build_broadcast_cell_with_authors`],
+    /// handed out BEFORE the [`ClassSCell`] wraps it so a test can seed a field
+    /// the cell exposes no `&mut` for — the governance engine, which
+    /// `execute_governance_action` reads the authoritative proposal from.
+    fn build_broadcast_state_with_authors(
+        admission: BroadcastAdmission,
+        authors: &[&str],
+    ) -> (PerContextState, String) {
+        let ctx_bytes = [0x5b; 32];
+        let mut state = PerContextState::new_for_test_broadcast(
+            ctx_bytes,
+            1_700_000_000_000,
+            DID(CREATOR_DID.to_owned()),
+        );
+        let ctx_hex = state.handle.context_id().to_owned();
+
+        // `MemberBan` is in the ceiling so `execute_revoke` (which requires it)
+        // can drive the durable-ban attack tests (#2088).
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ]);
+        state.role_state = ContextRoleState::new(
+            ctx_hex.clone(),
+            CREATOR_DID,
+            ceiling,
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .expect("role state");
+        let mut bc = BroadcastContext::new(ctx_hex.clone(), &ContextMode::Broadcast, admission)
+            .expect("broadcast context");
+        for author in authors {
+            bc.add_author(author).expect("add_author");
+        }
+        state.broadcast_context = Some(bc);
+        // Seed the admin (creator) as a member so the context does not auto-close
+        // when the single test subscriber/member later self-leaves (the last
+        // member leaving closes the context — an artifact that would mask the ban
+        // gate).
+        state
+            .membership
+            .add_member(DID(CREATOR_DID.to_owned()), "admin".to_owned(), vec![]);
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+
+        (state, ctx_hex)
+    }
+
+    /// Convenience: an ACTIVE, GATED broadcast cell.
+    fn build_gated_cell() -> (ClassSCell, String) {
+        build_broadcast_cell(BroadcastAdmission::Gated)
+    }
+
+    /// Mint a `messages:read` UCAN scoped to `ctx_hex`, issued by `issuer_did`
+    /// to audience `aud_did`, signed by `signing_key`.
+    fn mint_read_ucan(
+        ctx_hex: &str,
+        issuer_did: &str,
+        aud_did: &str,
+        signing_key: &SigningKey,
+    ) -> UcanToken {
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        let now_millis = scp_clock::Clock::now_millis(&scp_clock::SystemClock);
+
+        let header = UcanHeader::new();
+        let payload = UcanPayload {
+            iss: issuer_did.to_owned(),
+            aud: aud_did.to_owned(),
+            exp: now_secs + 3600,
+            nbf: Some(now_secs - 60),
+            nnc: format!("{now_millis}-aabbccdd11223344aabbccdd11223344"),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{ctx_hex}/messages:read"),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+            nb: None,
+        };
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let sig_bytes = signature.to_bytes().to_vec();
+        let encoded = format!(
+            "{header_b64}.{payload_b64}.{}",
+            URL_SAFE_NO_PAD.encode(&sig_bytes)
+        );
+
+        UcanToken {
+            header,
+            payload,
+            signature: sig_bytes,
+            encoded,
+        }
+    }
+
+    async fn dispatch_subscribe(
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        ctx_hex: &str,
+        ucan: Option<UcanToken>,
+    ) -> Result<(), ContextError> {
+        dispatch_subscribe_as(cell, deps, ctx_hex, SUBSCRIBER_DID, ucan).await
+    }
+
+    /// Drive `handle_subscribe_broadcast` for an arbitrary subscriber DID.
+    async fn dispatch_subscribe_as(
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        ctx_hex: &str,
+        subscriber_did: &str,
+        ucan: Option<UcanToken>,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = oneshot::channel();
+        let payload = SubscribeBroadcastPayload {
+            context_id: ctx_hex.to_owned(),
+            subscriber_did: DID(subscriber_did.to_owned()),
+            ucan,
+            timestamp: 1_700_000_000,
+        };
+        let _outcome = handle_subscribe_broadcast(cell, deps, payload, tx).await;
+        rx.await.expect("reply delivered").map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn gated_subscribe_with_valid_ucan_succeeds() {
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let ucan = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(ucan)).await;
+
+        assert!(
+            result.is_ok(),
+            "gated subscribe with a valid admin-issued messages:read UCAN must \
+             succeed, got: {result:?}"
+        );
+        assert!(
+            crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the subscriber must be registered on the roster after a successful \
+             gated subscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_subscribe_without_ucan_is_rejected() {
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, None).await;
+
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "gated subscribe without a UCAN must be PermissionDenied, got: {result:?}"
+        );
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a rejected gated subscribe must NOT register the subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_subscribe_with_wrong_signer_is_rejected() {
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        // Token claims the creator as issuer but is signed by the attacker key;
+        // signature verification against the resolved creator key fails.
+        let forged = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &attacker_key());
+
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(forged)).await;
+
+        assert!(
+            result.is_err(),
+            "a messages:read UCAN not signed by the context creator must be \
+             rejected, got: {result:?}"
+        );
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a rejected gated subscribe must NOT register the subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_subscribe_with_wrong_audience_is_rejected() {
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        // Validly signed by the creator, but issued to a DIFFERENT audience —
+        // the presenting subscriber is not the token's audience, so step-5
+        // audience binding rejects it (a confused-deputy defense).
+        let misaudienced = mint_read_ucan(
+            &ctx_hex,
+            CREATOR_DID,
+            "did:example:someone-else",
+            &creator_key(),
+        );
+
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(misaudienced)).await;
+
+        assert!(
+            result.is_err(),
+            "a messages:read UCAN whose audience is not the presenting subscriber \
+             must be rejected, got: {result:?}"
+        );
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a rejected gated subscribe must NOT register the subscriber"
+        );
+    }
+
+    /// B2 primary security fix: a governance-banned / read-revoked subscriber
+    /// must NOT be able to replay its still-valid `messages:read` grant to
+    /// re-appear on the roster (spec §5.14.4). The ban removes the DID from the
+    /// subscriber roster and inserts it into `read_exclusion_list` (but does NOT
+    /// touch `revoked_spending_ucan_cids`), so without the admission gate the
+    /// replay would sail through: the duplicate-subscriber reject can't fire (the
+    /// ban removed it) and the UCAN still passes every crypto step. The
+    /// `read_exclusion_list` gate in `subscribe_broadcast` closes this.
+    #[tokio::test]
+    async fn banned_subscriber_cannot_replay_valid_ucan() {
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+
+        // (1) M subscribes with a valid admin-issued grant → succeeds, on roster,
+        //     one MemberJoined leaf appended.
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        let first = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant)).await;
+        assert!(
+            first.is_ok(),
+            "initial gated subscribe must succeed: {first:?}"
+        );
+        assert!(
+            crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "M must be on the roster after the initial subscribe"
+        );
+        let appends_after_join = appends.load(Ordering::SeqCst);
+        assert_eq!(
+            appends_after_join, 1,
+            "the successful subscribe must append exactly one MemberJoined leaf"
+        );
+
+        // (2) Governance bans M's read access: the authoritative effect is
+        //     inserting M into `read_exclusion_list` AND removing M from the
+        //     roster (so the duplicate-subscriber check can no longer catch a
+        //     replay). Reproduce both here.
+        let m_did = DID(SUBSCRIBER_DID.to_owned());
+        cell.class_c_view()
+            .access_mut()
+            .read_exclusion_list
+            .insert(m_did.clone());
+        crate::helpers::unsubscribe_broadcast(&mut cell, &deps, &ctx_hex, &m_did, true)
+            .await
+            .expect("ban removes M from the roster");
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the ban must remove M from the roster"
+        );
+        let appends_after_ban = appends.load(Ordering::SeqCst);
+
+        // (3) M replays the SAME still-valid grant → REJECTED at admission with
+        //     the uniform reason, NO roster entry, NO new MemberJoined leaf.
+        let replay = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(replay)).await;
+        match result {
+            Err(ContextError::PermissionDenied(msg)) => {
+                assert_eq!(
+                    msg,
+                    scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON,
+                    "the banned-replay rejection must use the uniform deny reason"
+                );
+            }
+            other => panic!("banned replay must be PermissionDenied, got: {other:?}"),
+        }
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a banned DID must NOT re-appear on the roster after replaying its grant"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            appends_after_ban,
+            "a rejected banned replay must append NO new MemberJoined leaf"
+        );
+    }
+
+    /// Uniform deny-reason constant for the ban admission rejection.
+    fn subscribe_deny_reason() -> &'static str {
+        scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON
+    }
+
+    fn commit_meta(
+        pid_byte: u8,
+    ) -> scp_runtime_core::context::shared::governance::CommitMeta<'static> {
+        scp_runtime_core::context::shared::governance::CommitMeta {
+            pid: [pid_byte; 32],
+            actor_did: CREATOR_DID,
+            timestamp_secs: 1_700_000_000,
+        }
+    }
+
+    /// #1 EXACT ATTACK (the regression test): a read-banned member cannot launder
+    /// the ban by self-leaving (which clears the membership-scoped
+    /// `read_exclusion_list`) and replaying a retained `messages:read` UCAN. The
+    /// durable `banned_subscribers` record survives the self-leave, so the replay
+    /// is rejected at admission — no roster entry, no `MemberJoined` leaf, and M
+    /// is not a member (#2088).
+    #[tokio::test]
+    async fn banned_member_cannot_launder_ban_via_self_leave() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let m = DID(SUBSCRIBER_DID.to_owned());
+
+        // (a) M subscribes with a valid admin-issued grant → roster + membership.
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("initial subscribe must succeed");
+        assert!(cell.membership.contains(SUBSCRIBER_DID));
+
+        // (b) Governance RevokeAccess{M, Read}: durably bans M and writes
+        // read_exclusion_list.
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &m,
+            AccessScope::Read,
+            commit_meta(0x91),
+        )
+        .await
+        .expect("revoke read access");
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "RevokeAccess{{Read}} must record a durable ban"
+        );
+
+        // (c) M self-leaves (needs no capability) — clears the membership-scoped
+        // read_exclusion_list, the laundering vector.
+        let handle = cell.handle.clone();
+        scp_runtime_lifecycle::testing_access::leave_context(&mut cell, &deps, &handle, &m, &m)
+            .await
+            .expect("self-leave");
+        assert!(
+            !cell.access().read_exclusion_list.contains(&m),
+            "self-leave must clear read_exclusion_list (the laundering vector)"
+        );
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "the durable ban MUST survive the banned subject's own self-leave"
+        );
+        assert!(
+            !cell.membership.contains(SUBSCRIBER_DID),
+            "M is no longer a member after leaving"
+        );
+
+        let count_before_replay = crate::helpers::broadcast_subscriber_count(&mut cell);
+        let appends_before_replay = appends.load(Ordering::SeqCst);
+
+        // (d) M replays the SAME still-valid grant → REJECTED at admission.
+        let replay = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(replay)).await;
+        match result {
+            Err(ContextError::PermissionDenied(msg)) => {
+                assert_eq!(msg, subscribe_deny_reason());
+            }
+            other => panic!("banned-replay-after-leave must be PermissionDenied, got: {other:?}"),
+        }
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a laundered replay must NOT re-add M to the roster"
+        );
+        assert!(
+            !cell.membership.contains(SUBSCRIBER_DID),
+            "a laundered replay must NOT re-add M to membership"
+        );
+        assert_eq!(
+            crate::helpers::broadcast_subscriber_count(&mut cell),
+            count_before_replay,
+            "subscriber_count must be unchanged by the rejected replay"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            appends_before_replay,
+            "the rejected replay must append NO MemberJoined leaf for M"
+        );
+    }
+
+    /// #6 NO OVER-EVICTION (§5.9): `RevokeAccess{Read}` on a member suspends ONLY
+    /// `messages:read` and leaves the member in the context — it does not strip
+    /// membership or suspend any other capability (a read-revoked member stays a
+    /// member; stripping would over-evict).
+    #[tokio::test]
+    async fn read_revoke_does_not_over_evict_member() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let m = DID(SUBSCRIBER_DID.to_owned());
+
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("subscribe");
+
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &m,
+            AccessScope::Read,
+            commit_meta(0x92),
+        )
+        .await
+        .expect("revoke read access");
+
+        assert!(
+            cell.membership.contains(SUBSCRIBER_DID),
+            "a read-revoked member MUST remain a member (§5.9 — no over-eviction)"
+        );
+        let suspended = cell.role_state.suspended_for(SUBSCRIBER_DID);
+        assert!(
+            suspended.is_some_and(|s| s.contains(&Capability::MessagesRead)),
+            "messages:read must be suspended after RevokeAccess{{Read}}"
+        );
+        assert!(
+            suspended.is_some_and(|s| s.len() == 1),
+            "ONLY messages:read may be suspended — any other held capability \
+             (e.g. governance:vote) MUST be untouched (§5.9)"
+        );
+    }
+
+    /// #2 DURABLE BAN IS THE SOLE DEFENSE AFTER TEARDOWN HYGIENE. Both membership
+    /// teardown paths — self-leave (`leave_context`, test #1) and admin-remove
+    /// (`execute_remove_member`) — clear the membership-scoped `read_exclusion_list`
+    /// for §5.6.1/§5.9 hygiene but do NOT touch `banned_subscribers`. This test
+    /// ISOLATES the durable ban as the sole remaining defense: it bans M, then
+    /// clears `read_exclusion_list` (the exact effect that teardown has on the
+    /// ban-relevant state — reproduced directly because `execute_remove_member`
+    /// unconditionally does an MLS-group removal that a broadcast context, whose
+    /// subscribers are not MLS members, does not support), and asserts the replay
+    /// is STILL rejected purely by the durable `banned_subscribers` record (#2088).
+    #[tokio::test]
+    async fn durable_ban_alone_rejects_replay_after_read_exclusion_cleared() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let m = DID(SUBSCRIBER_DID.to_owned());
+
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("subscribe");
+
+        // Ban via RevokeAccess{Read}.
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &m,
+            AccessScope::Read,
+            commit_meta(0x93),
+        )
+        .await
+        .expect("revoke read access");
+
+        // Reproduce the membership-teardown hygiene that BOTH self-leave and
+        // admin-remove apply: drop the DID from `read_exclusion_list`. The durable
+        // ban is deliberately left untouched (no teardown path clears it).
+        cell.class_c_view()
+            .access_mut()
+            .read_exclusion_list
+            .remove(&m);
+        assert!(
+            !cell.access().read_exclusion_list.contains(&m),
+            "the read_exclusion_list defense-in-depth is now cleared"
+        );
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "the durable ban MUST survive the teardown that clears read_exclusion_list"
+        );
+
+        // Replay with read_exclusion_list cleared → STILL rejected, purely by the
+        // durable ban record.
+        let replay = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        let result = dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(replay)).await;
+        match result {
+            Err(ContextError::PermissionDenied(msg)) => {
+                assert_eq!(msg, subscribe_deny_reason());
+            }
+            other => panic!(
+                "durable ban alone must reject the replay after read_exclusion_list \
+                 is cleared, got: {other:?}"
+            ),
+        }
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "a banned DID must NOT re-appear on the roster via the durable-ban gate alone"
+        );
+    }
+
+    /// #2088 Finding 1: a read-revoked MEMBER who never subscribed (holds a valid
+    /// retained `messages:read` grant) must ALSO be durably banned — the ban is
+    /// recorded by `RevokeAccess{Read}` despite non-subscription, survives the
+    /// member's self-leave, and rejects the replay. Without the fix the member
+    /// gets only the self-clearable `read_exclusion_list` and launders the ban.
+    #[tokio::test]
+    async fn member_not_subscriber_cannot_launder_ban() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let lurker = DID(LURKER_DID.to_owned());
+
+        // Lurker is a MEMBER but NOT a broadcast subscriber.
+        cell.class_c_view().membership_class_c_mut().add_member(
+            lurker.clone(),
+            "member".to_owned(),
+            vec![],
+        );
+        assert!(cell.membership.contains(LURKER_DID));
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, LURKER_DID),
+            "precondition: lurker never subscribed"
+        );
+
+        // RevokeAccess{Read} MUST record the durable ban despite non-subscription.
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &lurker,
+            AccessScope::Read,
+            commit_meta(0x95),
+        )
+        .await
+        .expect("revoke read access on a member-not-subscriber");
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(LURKER_DID)),
+            "the durable ban MUST be recorded even though the DID was never a subscriber (#2088 Finding 1)"
+        );
+
+        // Self-leave clears read_exclusion_list; the durable ban survives.
+        let handle = cell.handle.clone();
+        scp_runtime_lifecycle::testing_access::leave_context(
+            &mut cell, &deps, &handle, &lurker, &lurker,
+        )
+        .await
+        .expect("self-leave");
+        assert!(
+            !cell.access().read_exclusion_list.contains(&lurker),
+            "self-leave clears the membership-scoped read_exclusion_list"
+        );
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(LURKER_DID)),
+            "the durable ban MUST survive the member's self-leave"
+        );
+
+        let appends_before = appends.load(Ordering::SeqCst);
+
+        // Replay the retained grant → REJECTED at admission by the durable ban.
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, LURKER_DID, &creator_key());
+        let result =
+            dispatch_subscribe_as(&mut cell, &deps, &ctx_hex, LURKER_DID, Some(grant)).await;
+        match result {
+            Err(ContextError::PermissionDenied(msg)) => assert_eq!(msg, subscribe_deny_reason()),
+            other => panic!(
+                "member-not-subscriber replay-after-leave must be PermissionDenied, got: {other:?}"
+            ),
+        }
+        assert!(
+            !crate::helpers::is_broadcast_subscriber(&mut cell, LURKER_DID),
+            "no roster entry for the rejected replay"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            appends_before,
+            "no MemberJoined leaf for the rejected replay"
+        );
+    }
+
+    /// #2088 Finding 1 (OPEN variant): on an OPEN broadcast no UCAN is required to
+    /// subscribe — so the durable ban is the SOLE gate. A read-revoked
+    /// member-not-subscriber who self-leaves still cannot subscribe (even with no
+    /// UCAN) because the durable ban rejects them.
+    #[tokio::test]
+    async fn open_broadcast_banned_member_cannot_subscribe_without_ucan() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_broadcast_cell(BroadcastAdmission::Open);
+        let lurker = DID(LURKER_DID.to_owned());
+
+        cell.class_c_view().membership_class_c_mut().add_member(
+            lurker.clone(),
+            "member".to_owned(),
+            vec![],
+        );
+
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &lurker,
+            AccessScope::Read,
+            commit_meta(0x96),
+        )
+        .await
+        .expect("revoke read access");
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(LURKER_DID))
+        );
+
+        let handle = cell.handle.clone();
+        scp_runtime_lifecycle::testing_access::leave_context(
+            &mut cell, &deps, &handle, &lurker, &lurker,
+        )
+        .await
+        .expect("self-leave");
+
+        // Open broadcast: subscribe with NO UCAN — still rejected because banned.
+        let result = dispatch_subscribe_as(&mut cell, &deps, &ctx_hex, LURKER_DID, None).await;
+        match result {
+            Err(ContextError::PermissionDenied(msg)) => assert_eq!(msg, subscribe_deny_reason()),
+            other => {
+                panic!("open-broadcast banned subscribe (no UCAN) must be rejected, got: {other:?}")
+            }
+        }
+        assert!(!crate::helpers::is_broadcast_subscriber(
+            &mut cell, LURKER_DID
+        ));
+    }
+
+    /// #2088 Finding 2: the durable ban is truly AUTHORITY-CLEARABLE, not
+    /// permanent. After a banned subscriber self-leaves (which wipes both role
+    /// suspension AND `read_exclusion_list` — the two signals the restore guard
+    /// checked), an authority `RestoreAccess{[MessagesRead]}` MUST still reach
+    /// `governance_unban_subscriber`, clear the durable ban, and let the DID
+    /// re-subscribe. Without the fix the restore short-circuits `NothingToRestore`
+    /// and the ban is permanent with no recovery.
+    #[tokio::test]
+    async fn authority_restore_access_clears_ban_after_leave() {
+        use scp_protocol::context::governance::AccessScope;
+        use scp_protocol::context::roles::Capability;
+
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) = build_gated_cell();
+        let m = DID(SUBSCRIBER_DID.to_owned());
+
+        // M subscribes → ban → self-leave (durable ban survives, suspension +
+        // read_exclusion cleared).
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("subscribe");
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &m,
+            AccessScope::Read,
+            commit_meta(0x97),
+        )
+        .await
+        .expect("revoke");
+        let handle = cell.handle.clone();
+        scp_runtime_lifecycle::testing_access::leave_context(&mut cell, &deps, &handle, &m, &m)
+            .await
+            .expect("self-leave");
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "the durable ban survives the leave"
+        );
+
+        // Authority RestoreAccess{[MessagesRead]} — must NOT short-circuit
+        // NothingToRestore, and must clear the durable ban.
+        scp_runtime_governance::testing_access::execute_restore_access(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &m,
+            &[Capability::MessagesRead],
+            commit_meta(0x98),
+        )
+        .await
+        .expect(
+            "RestoreAccess must succeed after a leave (Finding 2) — the ban is authority-clearable",
+        );
+        assert!(
+            !cell
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .is_banned(SUBSCRIBER_DID),
+            "RestoreAccess MUST clear the durable ban (not permanent)"
+        );
+
+        // The un-banned DID can re-subscribe with a fresh grant, emitting a
+        // MemberJoined leaf.
+        let appends_before = appends.load(Ordering::SeqCst);
+        let regrant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(regrant))
+            .await
+            .expect("re-subscribe after RestoreAccess must succeed");
+        assert!(
+            crate::helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the un-banned DID is re-subscribed"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            appends_before + 1,
+            "the successful re-subscribe emits exactly one MemberJoined leaf"
+        );
+    }
+
+    /// BLACK-303 (serve-path laundering): a read-banned AUTHOR (the context
+    /// creator is always an author) is not on any block list (a non-subscriber
+    /// ban writes none) and, after self-leaving, is no longer in
+    /// `read_exclusion_list` — yet remains an author. The broadcast KEY-REQUEST
+    /// SERVE path must consult the durable ban and DENY, so the banned author
+    /// cannot obtain a broadcast key to decrypt content until authority
+    /// `RestoreAccess`.
+    #[tokio::test]
+    async fn banned_author_cannot_launder_ban_via_serve_path() {
+        use scp_protocol::context::broadcast::{KEY_REQUEST_DENY_REASON, KeyRequestDecision};
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, _appends) = build_deps().await;
+        // The creator is registered as an author (production: `add_author(creator)`
+        // at creation).
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Gated, &[CREATOR_DID]);
+        let creator = DID(CREATOR_DID.to_owned());
+
+        // A keeper member so the context does not empty out when the creator leaves.
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID("did:example:keeper".to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // The local node controls the creator's author DID (serves its key).
+        deps.local_dids
+            .store(std::sync::Arc::new(std::collections::HashSet::from([
+                creator.clone(),
+            ])));
+
+        // Baseline: BEFORE the ban, the creator (an author) IS granted a key —
+        // proving the ban is what flips the outcome, not some other check.
+        let (pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        assert!(
+            matches!(
+                scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
+                    &mut cell, &deps, &creator, &creator, &pubkey,
+                )
+                .expect("serve decision"),
+                KeyRequestDecision::Grant { .. }
+            ),
+            "precondition: an un-banned author is granted a broadcast key"
+        );
+
+        // Governance bans the creator (an author, never a subscriber → durable ban
+        // recorded, NO block-list entry).
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &creator,
+            AccessScope::Read,
+            commit_meta(0x9a),
+        )
+        .await
+        .expect("revoke read access on the creator-author");
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(CREATOR_DID))
+        );
+
+        // Creator self-leaves → read_exclusion_list cleared, authorship survives,
+        // durable ban survives.
+        let handle = cell.handle.clone();
+        scp_runtime_lifecycle::testing_access::leave_context(
+            &mut cell, &deps, &handle, &creator, &creator,
+        )
+        .await
+        .expect("self-leave");
+        assert!(
+            !cell.access().read_exclusion_list.contains(&creator),
+            "self-leave clears read_exclusion_list (the laundering vector)"
+        );
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(CREATOR_DID)),
+            "the durable ban survives the self-leave — is_banned throughout"
+        );
+
+        // Serve path: the banned author requests a broadcast key → DENIED.
+        let decision = scp_runtime_core::context::shared::broadcast::handle_broadcast_key_request(
+            &mut cell, &deps, &creator, &creator, &pubkey,
+        )
+        .expect("serve decision");
+        match decision {
+            KeyRequestDecision::Deny { reason } => assert_eq!(reason, KEY_REQUEST_DENY_REASON),
+            KeyRequestDecision::Grant { .. } => {
+                panic!(
+                    "a banned author MUST be DENIED a broadcast key via the serve path (BLACK-303)"
+                )
+            }
+        }
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(CREATOR_DID)),
+            "still banned after the denied request"
+        );
+    }
+
+    /// #2088 forward secrecy (runtime propagation): `execute_revoke{Read}` on a
+    /// NON-subscriber author must rotate every author's broadcast key through the
+    /// runtime path (the rotation rides the Class-S fail-closed persist), so a
+    /// cached peer key held by the banned author goes stale. Confirms the protocol
+    /// rotation is wired through `execute_revoke` for the non-subscriber case.
+    #[tokio::test]
+    async fn read_revoke_of_nonsubscriber_author_rotates_keys() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Gated, &[CREATOR_DID]);
+        let creator = DID(CREATOR_DID.to_owned());
+
+        // Pre-ban: the creator-author is at epoch 0.
+        assert_eq!(
+            cell.broadcast_context
+                .as_ref()
+                .and_then(|bc| bc.get_author(CREATOR_DID))
+                .map(scp_protocol::context::broadcast::AuthorState::epoch),
+            Some(0)
+        );
+
+        scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &creator,
+            AccessScope::Read,
+            commit_meta(0x9b),
+        )
+        .await
+        .expect("revoke read access on the creator-author");
+
+        // Forward secrecy: the runtime read-revoke rotated the author key (0 → 1).
+        assert_eq!(
+            cell.broadcast_context
+                .as_ref()
+                .and_then(|bc| bc.get_author(CREATOR_DID))
+                .map(scp_protocol::context::broadcast::AuthorState::epoch),
+            Some(1),
+            "read-revoke of a non-subscriber author MUST rotate keys via execute_revoke \
+             (forward secrecy) — a cached peer key must go stale"
+        );
+    }
+    // =======================================================================
+    // §9.9.3 checkpoint-leaf accounting + KeyEpochAdvance durability signalling
+    //
+    // `checkpoint_events_since` must equal the number of leaves that actually
+    // became durable. A helper that appends N leaves and bumps once drifts the
+    // checkpoint position by N-1 for every invocation.
+    // =======================================================================
+
+    /// Event log that fails the `fail_kea_at`-th `KeyEpochAdvance` append
+    /// (0-indexed) and succeeds for every other append. This models the exact
+    /// partial-progress shape the governance KEA loops must survive: the anchor
+    /// leaf lands, one KEA leaf mid-sequence does not, and the leaves after it
+    /// still must be attempted.
+    struct KeaFailingEventLog {
+        appended: Arc<AtomicUsize>,
+        /// Appends of `fail_type` seen so far; the `fail_at`-th one fails.
+        kea_seen: AtomicUsize,
+        fail_kea_at: usize,
+        /// The event type whose `fail_at`-th append fails.
+        fail_type: scp_event_log::EventType,
+    }
+    #[async_trait::async_trait]
+    impl scp_runtime_core::context::builder::ContextEventLogProvider for KeaFailingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event == self.fail_type {
+                let seen = self.kea_seen.fetch_add(1, Ordering::SeqCst);
+                if seen == self.fail_kea_at {
+                    return Err(
+                        scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                            format!("fixture: {event:?} append deliberately fails"),
+                        ),
+                    );
+                }
+            }
+            self.appended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Swap `deps.event_log` for a [`KeaFailingEventLog`] and return the shared
+    /// success-append counter.
+    fn inject_kea_failing_log(deps: &mut ActorDeps, fail_kea_at: usize) -> Arc<AtomicUsize> {
+        inject_failing_log(deps, scp_event_log::EventType::KeyEpochAdvance, fail_kea_at)
+    }
+
+    /// Replace `deps.event_log` with a log whose `fail_at`-th append of
+    /// `fail_type` fails and every other append lands; returns the landed count.
+    fn inject_failing_log(
+        deps: &mut ActorDeps,
+        fail_type: scp_event_log::EventType,
+        fail_at: usize,
+    ) -> Arc<AtomicUsize> {
+        let appended = Arc::new(AtomicUsize::new(0));
+        deps.event_log = Arc::new(KeaFailingEventLog {
+            appended: Arc::clone(&appended),
+            kea_seen: AtomicUsize::new(0),
+            fail_kea_at: fail_at,
+            fail_type,
+        });
+        appended
+    }
+
+    /// An engine-tracked, `Approved` proposal for `action`, seeded into `state`
+    /// so `execute_governance_action` can read it. A `SingleAdminEngine`
+    /// approves the admin's own proposal on submission; its resolver returns the
+    /// creator's key so the implicit admin vote verifies.
+    fn seed_approved_proposal(
+        state: &mut PerContextState,
+        ctx_hex: &str,
+        action: scp_protocol::context::governance::GovernanceAction,
+    ) -> scp_protocol::context::governance::ProposalId {
+        use scp_protocol::context::governance::{
+            GovernanceContext, KeyResolver, SingleAdminEngine,
+        };
+        let creator_vk = creator_key().verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+            if did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active {
+                Some(creator_vk)
+            } else {
+                None
+            }
+        });
+        let mut engine = SingleAdminEngine::new(DID(CREATOR_DID.to_owned()), resolver);
+        let (proposal, _events) = engine
+            .propose(
+                &DID(CREATOR_DID.to_owned()),
+                action,
+                &GovernanceContext {
+                    context_id: ctx_hex.to_owned(),
+                    members: vec![(DID(CREATOR_DID.to_owned()), "admin".to_owned())],
+                    admin_dids: vec![DID(CREATOR_DID.to_owned())],
+                    current_epoch: Some(0),
+                    now: 1_700_000_000,
+                },
+                &creator_key(),
+            )
+            .expect("single-admin propose approves immediately");
+        let proposal_id = proposal.proposal_id;
+        state.governance_mut().engine = Box::new(engine);
+        proposal_id
+    }
+
+    /// Seed the conflict-tracking entry `detect_and_handle_conflicts` inserts
+    /// for an approved proposal, so a test can assert that execution consumes
+    /// it. `seed_approved_proposal` seeds only the engine.
+    fn seed_conflict_tracking_entry(
+        state: &mut PerContextState,
+        proposal_id: &scp_protocol::context::governance::ProposalId,
+    ) {
+        let tracked = state
+            .governance()
+            .engine
+            .get_proposal(proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        state
+            .governance_mut()
+            .approved_proposals
+            .insert(*proposal_id, (tracked, 0, 1_700_000_000));
+    }
+
+    /// Three authors, deliberately not in sorted insertion order.
+    const AUTHORS_3: [&str; 3] = [
+        "did:example:author-zulu",
+        "did:example:author-alpha",
+        "did:example:author-mike",
+    ];
+
+    /// Zero the leaf counter so an assertion measures ONLY the operation under
+    /// test, not the fixture's own setup leaves.
+    fn reset_leaf_counter(cell: &mut ClassSCell) {
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+    }
+
+    /// `block_broadcast_subscriber` appends TWO durable leaves — `MemberBlocked`
+    /// and `KeyEpochAdvance` — so it must credit TWO.
+    #[tokio::test]
+    async fn block_broadcast_subscriber_credits_both_durable_leaves() {
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("block succeeds");
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            2,
+            "block appends MemberBlocked + KeyEpochAdvance"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "checkpoint_events_since must equal the durable-leaf count \
+             (MemberBlocked + KeyEpochAdvance); crediting only one drifts the \
+             §9.9.3 checkpoint position by one leaf per block"
+        );
+    }
+
+    /// `unsubscribe_broadcast` with key rotation appends `MemberLeft` plus one
+    /// `KeyEpochAdvance` per author, so it must credit 1 + N.
+    #[tokio::test]
+    async fn unsubscribe_broadcast_credits_every_key_epoch_advance_leaf() {
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await
+        .expect("unsubscribe succeeds");
+
+        let expected = 1 + AUTHORS_3.len() as u64;
+        assert_eq!(
+            appends.load(Ordering::SeqCst) as u64,
+            expected,
+            "unsubscribe appends MemberLeft + one KeyEpochAdvance per author"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, expected,
+            "checkpoint_events_since must credit MemberLeft AND every rotated \
+             author's KeyEpochAdvance leaf"
+        );
+    }
+
+    /// `execute_rotate_content_keys` must RETURN `Ok` when a `KeyEpochAdvance`
+    /// append fails, must keep appending the remaining leaves, and must credit
+    /// exactly the leaves that landed.
+    ///
+    /// The rotation and the `ContentKeysRotated` anchor leaf are already durable
+    /// when the loop runs, so an `Err` here would not undo them — it would tell
+    /// `execute_governance_action` to remove the proposal id from
+    /// `executed_proposals`, re-arming replay of an action that advances every
+    /// author's epoch again (see
+    /// `key_epoch_advance_failure_keeps_executed_proposal_marker`).
+    #[tokio::test]
+    async fn rotate_content_keys_survives_key_epoch_advance_append_failure() {
+        let (mut deps, _appends) = build_deps().await;
+        // Anchor leaf + KEA #0 land; KEA #1 (of three) fails; KEA #2 must still
+        // be attempted and must land.
+        let appends = inject_kea_failing_log(&mut deps, 1);
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        reset_leaf_counter(&mut cell);
+
+        let result = scp_runtime_governance::testing_access::execute_rotate_content_keys(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            None,
+            commit_meta(0xc1),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a KeyEpochAdvance append failure must NOT become the dispatch's \
+             error: `execute_governance_action` rolls back the executed-proposal \
+             replay marker on any dispatch error, and the rotation is already \
+             durable here; got {result:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            3,
+            "ContentKeysRotated + KEA #0 + KEA #2 became durable — the loop must \
+             continue past the failed KEA #1 rather than abort on it"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 3,
+            "the inline per-leaf bump must credit exactly the three leaves that \
+             landed and must not credit the failed one"
+        );
+    }
+
+    /// `execute_revoke`'s governance-ban KeyEpochAdvance loop, same contract.
+    #[tokio::test]
+    async fn revoke_survives_key_epoch_advance_append_failure() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // AccessRevoked + KEA #0 land; KEA #1 (of three) fails; KEA #2 must
+        // still be attempted and must land.
+        let appends = inject_kea_failing_log(&mut deps, 1);
+        reset_leaf_counter(&mut cell);
+
+        let result = scp_runtime_governance::testing_access::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            AccessScope::Read,
+            commit_meta(0xc2),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a KeyEpochAdvance append failure must NOT become the dispatch's \
+             error: the ban and every author-key rotation are already durable \
+             here, and `execute_governance_action` rolls back the \
+             executed-proposal replay marker on any dispatch error; got {result:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            3,
+            "AccessRevoked + KEA #0 + KEA #2 became durable — the loop must \
+             continue past the failed KEA #1 rather than abort on it"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 3,
+            "the inline per-leaf bump must credit exactly the three leaves that \
+             landed and must not credit the failed one"
+        );
+    }
+
+    /// THE REPLAY GATE. A `KeyEpochAdvance` append failure must leave the
+    /// proposal id in `executed_proposals`.
+    ///
+    /// `execute_governance_action` removes that id on ANY dispatch error and
+    /// persists the removal fail-closed, so a dispatch error raised after the
+    /// ban is durable lets a caller re-send the same proposal id.
+    /// `governance_ban_subscriber` has no already-banned early return: the second
+    /// run advances every author's epoch a second time and writes a second
+    /// `AccessRevoked` leaf, so this member's leaf count and Merkle root diverge
+    /// permanently from every member that applied the commit once (§9.9.3).
+    ///
+    /// This test drives the whole `execute_governance_action` path — engine
+    /// proposal, replay marker, dispatch, finalize — because the marker is the
+    /// thing under test and the helper-level tests above cannot observe it.
+    #[tokio::test]
+    async fn key_epoch_advance_failure_keeps_executed_proposal_marker() {
+        use scp_protocol::context::governance::{
+            AccessScope, GovernanceAction, GovernanceContext, KeyResolver, SingleAdminEngine,
+        };
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+
+        // A SingleAdminEngine approves the admin's own proposal on submission,
+        // which is the cheapest way to hand `execute_governance_action` an
+        // engine-tracked `Approved` proposal. Its resolver must return the
+        // creator's key or the implicit admin vote fails verification.
+        let creator_vk = creator_key().verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+            if did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active {
+                Some(creator_vk)
+            } else {
+                None
+            }
+        });
+        let mut engine = SingleAdminEngine::new(DID(CREATOR_DID.to_owned()), resolver);
+        let (proposal, _events) = engine
+            .propose(
+                &DID(CREATOR_DID.to_owned()),
+                GovernanceAction::RevokeAccess {
+                    did: DID(SUBSCRIBER_DID.to_owned()),
+                    access: AccessScope::Read,
+                },
+                &GovernanceContext {
+                    context_id: ctx_hex.clone(),
+                    members: vec![(DID(CREATOR_DID.to_owned()), "admin".to_owned())],
+                    admin_dids: vec![DID(CREATOR_DID.to_owned())],
+                    current_epoch: Some(0),
+                    now: 1_700_000_000,
+                },
+                &creator_key(),
+            )
+            .expect("single-admin propose approves immediately");
+        let proposal_id = proposal.proposal_id;
+        state.governance_mut().engine = Box::new(engine);
+
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // KEA #1 of three fails, after the ban and KEA #0 are durable.
+        let _appends = inject_kea_failing_log(&mut deps, 1);
+
+        let result = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the revoke's effects all landed, so the action must report success; \
+             got {result:?}"
+        );
+        assert!(
+            cell.governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "the executed-proposal replay marker must survive a KeyEpochAdvance \
+             append failure — dropping it lets the same proposal id run \
+             `governance_ban_subscriber` a second time, advancing every author's \
+             epoch again and diverging this member's Merkle root (§9.9.3)"
+        );
+    }
+
+    /// THE CLASS GATE. The anchor-leaf append that follows a helper's
+    /// fail-closed `commit_class_s_keep` fails, so the helper returns `Err`
+    /// after the ban and every author-key rotation are durable. The replay
+    /// marker must survive that error: `execute_governance_action` reads the
+    /// cell's `mutation_epoch` before and after dispatch, the keep-commit
+    /// advanced it, and so the error is classified as post-effect. A second
+    /// execute of the same proposal id must be refused as already executed and
+    /// must append nothing.
+    ///
+    /// Before the epoch rule, this exact sequence removed the marker and let a
+    /// retry run `governance_ban_subscriber` again, which advances every
+    /// author's epoch a second time (§9.9.3 divergence). The same shape sits at
+    /// the anchor leaf of every other `execute_*` helper in
+    /// `governance_helpers.rs`; the rule closes them all at the one caller.
+    #[tokio::test]
+    async fn anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // The first `AccessRevoked` append fails — after `commit_class_s_keep`
+        // has persisted the ban and rotated every author.
+        let appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
+
+        let first = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(first, Err(ContextError::EventLogFailed(_))),
+            "the anchor-leaf append failure must reach the caller unchanged; got {first:?}"
+        );
+        assert!(
+            cell.governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a dispatch error raised AFTER the keep-commit must keep the replay marker"
+        );
+        assert!(
+            !cell
+                .governance()
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a consumed proposal must leave `approved_proposals`: the kept marker \
+             blocks its re-execution, so an entry that stayed would make every \
+             later conflicting proposal lose to a proposal that can never run"
+        );
+        let landed_after_first = appends.load(Ordering::SeqCst);
+        assert_eq!(
+            landed_after_first, 0,
+            "`AccessRevoked` is the first append `execute_revoke` makes and it \
+             failed, so nothing else may land: a `GovernanceActionExecuted` leaf \
+             here would record as completed an action the helper reported as \
+             failed, so `execute_governance_action` must not run finalize on a \
+             post-effect dispatch error"
+        );
+
+        let second = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &second,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("already been executed")
+            ),
+            "the same proposal id must be refused as already executed; got {second:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            landed_after_first,
+            "the refused replay must append no leaf: a second run would rotate \
+             every author again and write a second AccessRevoked leaf"
+        );
+    }
+
+    /// A later proposal that conflicts with a consumed one (a same-DID
+    /// `RevokeAccess`, per `actions_conflict`) must be admitted once the
+    /// consumed proposal's post-effect failure has removed it from
+    /// `approved_proposals`. Before the fix, `detect_and_handle_conflicts`
+    /// found the consumed entry, saw the later proposal's higher sequence,
+    /// returned `ConflictResolved` with the later proposal as loser, and never
+    /// inserted it, so no conflicting action could be approved again in that
+    /// context while the consumed entry itself could never run.
+    #[tokio::test]
+    async fn consumed_proposal_no_longer_wins_conflicts_against_later_proposals() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        let _appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
+        let first = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(first, Err(ContextError::EventLogFailed(_))),
+            "the fixture's anchor-leaf failure must be post-effect; got {first:?}"
+        );
+        assert!(
+            cell.governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "the fixture consumes the proposal: the replay marker is kept"
+        );
+
+        // The later same-DID `RevokeAccess` carries a different scope, so its
+        // deterministic id differs from the consumed proposal's.
+        let (mut scratch, _) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let later_id = seed_approved_proposal(
+            &mut scratch,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Write,
+            },
+        );
+        let later = scratch
+            .governance()
+            .engine
+            .get_proposal(&later_id)
+            .cloned()
+            .expect("the later proposal is engine-tracked");
+        let events = scp_runtime_governance::testing_access::detect_and_handle_conflicts(
+            &mut cell, &deps, &later,
+        );
+        assert!(
+            events.is_empty(),
+            "no conflict may be reported against a consumed proposal; got {events:?}"
+        );
+        assert!(
+            cell.governance().approved_proposals.contains_key(&later_id),
+            "the later conflicting proposal must be tracked for execution"
+        );
+    }
+
+    /// Spec 07 §7.3.1.1 step 1.6: an executed proposal's
+    /// `GovernanceActionExecuted` leaf carries `[target_did, action_type,
+    /// proposal_id, action_bytes]`, where `action_bytes` are the RFC 8785
+    /// bytes the proposal id commits to, so a replayer re-derives the whole
+    /// action, scope and reason included, from the leaf alone.
+    #[tokio::test]
+    async fn executed_leaf_carries_the_full_action_bytes_the_proposal_id_commits_to() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (deps, _appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Read,
+        };
+        let proposal_id = seed_approved_proposal(&mut state, &ctx_hex, action.clone());
+        let proposal = state
+            .governance()
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        recorded.write().expect("recorded leaves lock").clear();
+
+        scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await
+        .expect("the revoke executes");
+
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        let executed: Vec<&Vec<u8>> = leaves
+            .iter()
+            .filter(|(t, _)| *t == scp_event_log::EventType::GovernanceActionExecuted)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            executed.len(),
+            1,
+            "exactly one GovernanceActionExecuted leaf"
+        );
+        let payload: scp_event_log::payload::GovernanceActionExecutedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: executed[0].clone(),
+            })
+            .expect("the leaf decodes as GovernanceActionExecutedPayload");
+        assert_eq!(payload.target_did, SUBSCRIBER_DID);
+        assert_eq!(payload.action_type, "RevokeAccess");
+        assert_eq!(payload.proposal_id, proposal_id);
+        assert_eq!(
+            payload.action_bytes,
+            scp_protocol::jcs::to_vec(&action).expect("jcs"),
+            "the RFC 8785 bytes of the executed action"
+        );
+        assert_eq!(
+            scp_protocol::context::governance::compute_proposal_id(
+                &proposal.context_id,
+                &proposal.proposer_did,
+                &payload.action_bytes,
+                proposal.created_at,
+            ),
+            proposal_id,
+            "the leaf's action bytes are the proposal id's preimage"
+        );
+        let replayed: GovernanceAction =
+            serde_json::from_slice(&payload.action_bytes).expect("the action decodes");
+        assert_eq!(
+            scp_protocol::jcs::to_vec(&replayed).expect("jcs"),
+            payload.action_bytes,
+            "the leaf decodes to the executed action, scope included"
+        );
+        assert!(matches!(
+            replayed,
+            GovernanceAction::RevokeAccess {
+                access: AccessScope::Read,
+                ..
+            }
+        ));
+    }
+
+    /// A proposal whose action does not hash to its own id yields no leaf
+    /// payload: `ExecutedProposal::new`, which `execute_governance_action`
+    /// calls before the replay marker and the dispatch, returns a typed error, so no effect lands for
+    /// an action the leaf could not record.
+    #[test]
+    fn executed_proposal_refuses_a_proposal_whose_action_does_not_hash_to_its_id() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        let mut proposal = state
+            .governance()
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        let executor = DID(CREATOR_DID.to_owned());
+        assert!(
+            scp_runtime_governance::testing_access::ExecutedProposal::new(&proposal, &executor)
+                .is_ok(),
+            "control: the untampered proposal encodes"
+        );
+        proposal.action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Write,
+        };
+        let result =
+            scp_runtime_governance::testing_access::ExecutedProposal::new(&proposal, &executor)
+                .map(|_| ());
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::ProposalIdMismatch { id, recomputed })
+                    if *id == hex::encode(proposal_id) && recomputed != id
+            ),
+            "a tampered action must be refused with ProposalIdMismatch; got {result:?}"
+        );
+    }
+
+    /// A governance engine that hands out `tampered` in place of the tracked
+    /// proposal with the same id and delegates everything else to `inner`. It
+    /// models a proposal whose stored action no longer hashes to its id, which
+    /// no honest engine produces, so the execute entry's own check is the only
+    /// thing between that action and its executor.
+    struct TamperingEngine {
+        inner: Box<dyn scp_protocol::context::governance::GovernanceEngine>,
+        tampered: scp_protocol::context::governance::GovernanceProposal,
+    }
+
+    impl scp_protocol::context::governance::GovernanceEngine for TamperingEngine {
+        fn precheck_propose(
+            &self,
+            proposer: &DID,
+            action: &scp_protocol::context::governance::GovernanceAction,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Result<
+            scp_protocol::context::governance::ProposeIntent,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.precheck_propose(proposer, action, context)
+        }
+
+        fn propose_signed(
+            &mut self,
+            proposer: &DID,
+            action: scp_protocol::context::governance::GovernanceAction,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            proposer_vote: Option<scp_protocol::context::governance::SignedVote>,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::GovernanceProposal,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner
+                .propose_signed(proposer, action, context, proposer_vote)
+        }
+
+        fn check_proposer(
+            &self,
+            proposer: &DID,
+        ) -> Result<(), scp_protocol::context::governance::GovernanceError> {
+            self.inner.check_proposer(proposer)
+        }
+
+        fn precheck_vote(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            vote: &scp_protocol::context::governance::VoteType,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Result<
+            scp_protocol::context::governance::VoteIntent,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.precheck_vote(proposal_id, voter, vote, context)
+        }
+
+        fn approve_signed(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            vote: scp_protocol::context::governance::SignedVote,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::ProposalStatus,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.approve_signed(proposal_id, voter, context, vote)
+        }
+
+        fn reject_signed(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            vote: scp_protocol::context::governance::SignedVote,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::ProposalStatus,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.reject_signed(proposal_id, voter, context, vote)
+        }
+
+        fn boxed_clone(&self) -> Box<dyn scp_protocol::context::governance::GovernanceEngine> {
+            Box::new(Self {
+                inner: self.inner.boxed_clone(),
+                tampered: self.tampered.clone(),
+            })
+        }
+
+        fn model_config(&self) -> scp_protocol::context::governance::GovernanceModelConfig {
+            self.inner.model_config()
+        }
+
+        fn eligible_voters(
+            &self,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Vec<DID> {
+            self.inner.eligible_voters(context)
+        }
+
+        fn get_proposal(
+            &self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+        ) -> Option<&scp_protocol::context::governance::GovernanceProposal> {
+            if *proposal_id == self.tampered.proposal_id {
+                Some(&self.tampered)
+            } else {
+                self.inner.get_proposal(proposal_id)
+            }
+        }
+
+        fn list_proposals(&self) -> Vec<scp_protocol::context::governance::GovernanceProposal> {
+            self.inner.list_proposals()
+        }
+
+        fn pending_proposal_ids(&self) -> Vec<scp_protocol::context::governance::ProposalId> {
+            self.inner.pending_proposal_ids()
+        }
+
+        fn invalidate_proposal(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            reason: String,
+        ) -> Result<
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.invalidate_proposal(proposal_id, reason)
+        }
+
+        fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+            self.inner.checkpoint_cosignature_requirements()
+        }
+
+        fn validate_checkpoint_cosignatures(
+            &self,
+            cosignatures: &[scp_protocol::context::governance::CosignedCheckpoint],
+            checkpoint_hash: &[u8; 32],
+        ) -> Result<
+            scp_protocol::context::governance::CheckpointAttestationStatus,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner
+                .validate_checkpoint_cosignatures(cosignatures, checkpoint_hash)
+        }
+    }
+
+    /// The broadcast context of [`assert_tampered_action_refused_at_entry`]:
+    /// an approved `RevokeAccess` of the subscriber (with a conflict-tracking
+    /// entry when `tracked`) whose engine-stored action reads `Write` in place
+    /// of the `Read` its id was computed over, the subscriber subscribed and a
+    /// member, and no leaf recorded yet.
+    async fn tampered_revoke_cell(
+        tracked: bool,
+    ) -> (
+        ActorDeps,
+        RecordedLeaves,
+        ClassSCell,
+        String,
+        scp_protocol::context::governance::ProposalId,
+    ) {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (deps, _appends, recorded) = build_deps_recording().await;
+
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        if tracked {
+            seed_conflict_tracking_entry(&mut state, &proposal_id);
+        }
+        let mut tampered = state
+            .governance()
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        tampered.action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Write,
+        };
+        state.governance_mut().engine = Box::new(TamperingEngine {
+            inner: state.governance().engine.boxed_clone(),
+            tampered,
+        });
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        recorded.write().expect("recorded leaves lock").clear();
+        (deps, recorded, cell, ctx_hex, proposal_id)
+    }
+
+    /// Runs `execute_governance_action` on an approved `RevokeAccess` of the
+    /// subscriber whose stored action was changed from `Read` to `Write` after
+    /// the proposal id was computed, and asserts the refusal leaves no effect:
+    /// the typed `ProposalIdMismatch`, no replay marker, no leaf, the
+    /// subscriber still a member and not banned, and the proposal out of
+    /// `approved_proposals`. With `tracked` the proposal has a conflict-tracking
+    /// entry, whose fail-closed removal is the one commit the refusal makes, so
+    /// `mutation_epoch` advances by exactly one; without it the epoch is
+    /// unchanged. `executed_leaf_carries_the_full_action_bytes_the_proposal_id_commits_to`
+    /// is the positive control: the same proposal untampered executes and
+    /// writes its leaf.
+    async fn assert_tampered_action_refused_at_entry(tracked: bool) {
+        let (deps, recorded, mut cell, ctx_hex, proposal_id) =
+            Box::pin(tampered_revoke_cell(tracked)).await;
+        let epoch_before = cell.mutation_epoch();
+
+        let result = Box::pin(
+            scp_runtime_governance::testing_access::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+                None,
+            ),
+        )
+        .await
+        .map(|_| ());
+
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::ProposalIdMismatch { id, recomputed })
+                    if *id == hex::encode(proposal_id) && recomputed != id
+            ),
+            "a tampered action must be refused with ProposalIdMismatch; got {result:?}"
+        );
+        assert!(
+            !cell
+                .governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a refused proposal records no replay marker"
+        );
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "a refused proposal appends no leaf"
+        );
+        assert!(
+            !cell
+                .broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "the tampered revoke must not ban the subscriber"
+        );
+        assert!(
+            cell.membership
+                .member_dids()
+                .any(|member| member.as_ref() == SUBSCRIBER_DID),
+            "the subscriber stays a member"
+        );
+        assert!(
+            !cell
+                .governance()
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a refused proposal leaves the conflict-tracking set"
+        );
+        let expected_epoch = if tracked {
+            epoch_before.wrapping_add(1)
+        } else {
+            epoch_before
+        };
+        assert_eq!(
+            cell.mutation_epoch(),
+            expected_epoch,
+            "only the conflict-tracking removal, when there is an entry, commits"
+        );
+    }
+
+    /// Spec 07 §7.3.1.1 "The action, once"; ADR-031 acceptance criterion 7,
+    /// as ADR-066 amends it: a proposal with no conflict-tracking entry is
+    /// refused at the execute entry with no state change at all.
+    #[tokio::test]
+    async fn execute_refuses_a_tampered_action_with_no_effect() {
+        assert_tampered_action_refused_at_entry(false).await;
+    }
+
+    /// The same refusal removes the proposal's conflict-tracking entry,
+    /// fail-closed, so no later conflicting proposal loses to one that can
+    /// never run.
+    #[tokio::test]
+    async fn execute_refusal_of_a_tampered_action_removes_its_conflict_tracking_entry() {
+        assert_tampered_action_refused_at_entry(true).await;
+    }
+
+    /// A finalize error — the `GovernanceActionExecuted` append fails after the
+    /// dispatch applied its effect — keeps the replay marker, so the proposal is
+    /// consumed and must leave `approved_proposals` in the same fail-closed
+    /// persist. Before the fix `finalize_governance_action` owned the removal
+    /// and ran it after that append, so the append failure skipped it and the
+    /// entry outlived its marker.
+    #[tokio::test]
+    async fn finalize_leaf_failure_removes_the_consumed_proposal_from_approved_proposals() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new_for_test(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        let appends = inject_failing_log(
+            &mut deps,
+            scp_event_log::EventType::GovernanceActionExecuted,
+            0,
+        );
+
+        let result = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "the executed-leaf append failure must reach the caller; got {result:?}"
+        );
+        assert!(
+            appends.load(Ordering::SeqCst) >= 1,
+            "the dispatch's own leaves landed before finalize failed"
+        );
+        assert!(
+            cell.governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a finalize error after a landed effect keeps the replay marker"
+        );
+        assert!(
+            !cell
+                .governance()
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "the consumed proposal must leave `approved_proposals` even though \
+             finalize failed before its own tail ran"
+        );
+    }
+
+    /// A dispatch error raised BEFORE any effect must drop the replay marker so
+    /// the proposal stays retryable. `execute_reset_member` rejects a
+    /// non-member through `Deref` reads only, so the cell's `mutation_epoch` is
+    /// unchanged across the dispatch and `execute_governance_action` classifies
+    /// the error as pre-effect.
+    #[tokio::test]
+    async fn pre_effect_dispatch_error_drops_marker_so_the_proposal_is_retryable() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ResetMember {
+                did: DID("did:example:never-a-member".to_owned()),
+                reason: "fixture".to_owned(),
+            },
+        );
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+
+        for attempt in 0..2 {
+            let result = scp_runtime_governance::testing_access::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ContextError::MemberNotFound(_))),
+                "attempt {attempt}: the helper's own pre-check must surface, not \
+                 an already-executed refusal; got {result:?}"
+            );
+            assert!(
+                !cell
+                    .governance()
+                    .class_s
+                    .executed_proposals
+                    .contains_key(&proposal_id),
+                "attempt {attempt}: a pre-effect error must drop the replay marker"
+            );
+        }
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rejected reset appends nothing on either attempt"
+        );
+    }
+
+    /// Destination params whose `min_protocol_version` names a major this SDK
+    /// does not speak, so `lifecycle_helpers::create_context` fails at its
+    /// version check, before it touches any provider or spawns an actor. The
+    /// ceiling is non-empty so the create passes the empty-ceiling check that
+    /// runs before the version check.
+    fn undeliverable_destination_params() -> scp_protocol::context::params::ContextParams {
+        scp_protocol::context::params::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            min_protocol_version: Some((9, 0)),
+            ..scp_protocol::context::params::ContextParams::default()
+        }
+    }
+
+    /// Destination params that pass every `params_validation::validate_params`
+    /// check, so a proposal carrying them passes the proposal-time check and a
+    /// `failing` fixture applied to them fails exactly one check.
+    fn destination_params() -> scp_protocol::context::params::ContextParams {
+        scp_protocol::context::params::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..scp_protocol::context::params::ContextParams::default()
+        }
+    }
+
+    /// The two governance actions whose params a later create consumes.
+    #[derive(Clone, Copy, Debug)]
+    enum ProposedArm {
+        Migration,
+        Child,
+    }
+
+    /// Proposes `arm` carrying `params` on a fresh context, as the admin, and
+    /// returns the outcome with whether a proposal was recorded.
+    async fn propose_destination(
+        arm: ProposedArm,
+        params: scp_protocol::context::params::ContextParams,
+    ) -> (Result<(), ContextError>, bool) {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = match arm {
+            ProposedArm::Migration => GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(params),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+            ProposedArm::Child => GovernanceAction::CreateChildContext {
+                params: Box::new(params),
+            },
+        };
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new_for_test(state);
+        let outcome = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            action,
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await
+        .map(|_| ());
+        let recorded = !scp_runtime_governance::testing_access::list_proposals(&cell).is_empty();
+        (outcome, recorded)
+    }
+
+    /// One test per (arm, check): the proposal carries `destination_params`
+    /// with one `params_validation::failing` fixture applied, so it fails
+    /// that check alone, and the proposal step must refuse it with `$expect`
+    /// and record no proposal.
+    macro_rules! proposal_refuses {
+        ($name:ident, $arm:expr, $fixture:path, $expect:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let expect: fn(&ContextError) -> bool = $expect;
+                let (outcome, recorded) =
+                    propose_destination($arm, $fixture(destination_params())).await;
+                assert!(
+                    outcome.as_ref().is_err_and(expect),
+                    "{:?}: the proposal step must refuse {}; got {outcome:?}",
+                    $arm,
+                    stringify!($fixture)
+                );
+                assert!(!recorded, "a refused proposal must record no proposal");
+            }
+        };
+    }
+
+    fn names(field: &'static str) -> impl Fn(&ContextError) -> bool {
+        move |e| matches!(e, ContextError::CreationFailed(m) if m.contains(field))
+    }
+
+    proposal_refuses!(
+        child_refuses_an_empty_ceiling,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::empty_ceiling,
+        |e| matches!(
+            e,
+            ContextError::CeilingRequired(scp_protocol::context::CeilingDeclaration::Empty)
+        )
+    );
+    proposal_refuses!(
+        migration_refuses_a_malformed_ceiling_entry,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::malformed_ceiling_entry,
+        |e| names("ceiling entry invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_malformed_ceiling_entry,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::malformed_ceiling_entry,
+        |e| names("ceiling entry invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_unsupported_version,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::unsupported_version,
+        |e| matches!(e, ContextError::VersionIncompatible { .. })
+    );
+    proposal_refuses!(
+        child_refuses_an_unsupported_version,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::unsupported_version,
+        |e| matches!(e, ContextError::VersionIncompatible { .. })
+    );
+    proposal_refuses!(
+        migration_refuses_voterless_governance,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::voterless_governance,
+        |e| names("governance invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_voterless_governance,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::voterless_governance,
+        |e| names("governance invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_invalid_consequence_rule,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::empty_suspension_rule,
+        |e| names("consequence_rules[0]")(e)
+    );
+    proposal_refuses!(
+        child_refuses_an_invalid_consequence_rule,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::empty_suspension_rule,
+        |e| names("consequence_rules[0]")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_unavailable_pricing_metric,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::unavailable_pricing_metric,
+        |e| names("economic_policy")(e)
+    );
+    proposal_refuses!(
+        child_refuses_an_unavailable_pricing_metric,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::unavailable_pricing_metric,
+        |e| names("economic_policy")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_a_triggerless_rotation,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::triggerless_rotation,
+        |e| names("pseudonym_rotation")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_triggerless_rotation,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::triggerless_rotation,
+        |e| names("pseudonym_rotation")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_a_property_free_genesis_outlet,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::property_free_outlet,
+        |e| names("outlets invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_property_free_genesis_outlet,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::property_free_outlet,
+        |e| names("outlets invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_ephemeral_broadcast,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::ephemeral_broadcast,
+        |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
+    );
+    proposal_refuses!(
+        child_refuses_an_ephemeral_broadcast,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::ephemeral_broadcast,
+        |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
+    );
+    proposal_refuses!(
+        migration_refuses_a_template_mismatch,
+        ProposedArm::Migration,
+        scp_runtime_core::context::params_validation::failing::template_mismatch,
+        |e| matches!(
+            e,
+            ContextError::TemplateMismatch(
+                scp_protocol::context::templates::TemplateError::Mismatch { .. }
+            )
+        )
+    );
+    proposal_refuses!(
+        child_refuses_a_template_mismatch,
+        ProposedArm::Child,
+        scp_runtime_core::context::params_validation::failing::template_mismatch,
+        |e| matches!(
+            e,
+            ContextError::TemplateMismatch(
+                scp_protocol::context::templates::TemplateError::Mismatch { .. }
+            )
+        )
+    );
+
+    /// The control for every `proposal_refuses!` test: `destination_params`
+    /// itself passes the proposal-time check on both arms.
+    #[tokio::test]
+    async fn valid_destination_params_pass_the_proposal_check() {
+        for arm in [ProposedArm::Migration, ProposedArm::Child] {
+            let (outcome, _recorded) = propose_destination(arm, destination_params()).await;
+            assert!(
+                !matches!(
+                    outcome,
+                    Err(ContextError::CeilingRequired(_)
+                        | ContextError::VersionIncompatible { .. }
+                        | ContextError::InvalidMemoryScopeForBroadcast
+                        | ContextError::TemplateMismatch(_))
+                ) && !matches!(&outcome, Err(ContextError::CreationFailed(m)) if m.contains("invalid")),
+                "{arm:?}: valid destination params must pass the proposal check; got {outcome:?}"
+            );
+        }
+    }
+
+    /// A `ProposeContextMigration` or `CreateChildContext` whose params carry a
+    /// sybil policy that breaks a §9.3.1 validity rule (a device-attestation
+    /// max age one second above the one-year maximum) would fail its create
+    /// after the vote, so the proposal step refuses each with the typed
+    /// `InvalidSybilPolicy` and records no proposal. The control, the same
+    /// proposal at the one-year maximum, passes that check. Each action runs
+    /// on its own fresh context, so a control that records a proposal cannot
+    /// mask the next action's refusal.
+    #[tokio::test]
+    async fn governance_change_rejects_invalid_policy() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::trust::sybil::{
+            ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS, SybilPolicyError,
+        };
+
+        let params = |max_age: u64| {
+            Box::new(ContextParams {
+                sybil_policy: Some(ContextSybilPolicy {
+                    device_attestation_max_age_secs: max_age,
+                    ..ContextSybilPolicy::casual()
+                }),
+                ..destination_params()
+            })
+        };
+        let migrate = |max_age: u64| GovernanceAction::ProposeContextMigration {
+            new_context_params: params(max_age),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+        let child = |max_age: u64| GovernanceAction::CreateChildContext {
+            params: params(max_age),
+        };
+        let actions: [(&str, &dyn Fn(u64) -> GovernanceAction); 2] =
+            [("migration", &migrate), ("child context", &child)];
+
+        let (deps, _appends) = build_deps().await;
+        let proposer = DID(CREATOR_DID.to_owned());
+        for (label, action) in actions {
+            let (state, ctx_hex) =
+                build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let mut cell = ClassSCell::new_for_test(state);
+
+            let refused = scp_runtime_governance::testing_access::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposer,
+                action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    creator_key().clone(),
+                ),
+                false,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(ContextError::TemplateMismatch(
+                        scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(
+                            SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
+                        )
+                    ))
+                ),
+                "an invalid {label} sybil policy must be refused at proposal time; \
+                 got {refused:?}"
+            );
+            assert!(
+                scp_runtime_governance::testing_access::list_proposals(&cell).is_empty(),
+                "a refused {label} proposal must record no proposal"
+            );
+
+            let admitted = scp_runtime_governance::testing_access::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposer,
+                action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    creator_key().clone(),
+                ),
+                false,
+                None,
+            )
+            .await;
+            assert!(
+                !matches!(
+                    admitted,
+                    Err(ContextError::TemplateMismatch(
+                        scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(_)
+                    ))
+                ),
+                "a valid {label} sybil policy must pass the proposal-time check; \
+                 got {admitted:?}"
+            );
+        }
+    }
+
+    /// A `ProposeContextMigration` whose destination ceiling is empty would
+    /// fail its destination create after the vote, so the proposal step
+    /// refuses it with the typed `CeilingRequired(Empty)` and records no
+    /// proposal. The same proposal with a non-empty ceiling passes that check.
+    #[tokio::test]
+    async fn migration_proposal_with_an_empty_destination_ceiling_is_refused() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::roles::Capability;
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new_for_test(state);
+        let proposer = DID(CREATOR_DID.to_owned());
+        let migrate = |ceiling: Vec<Capability>| GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                ceiling,
+                ..undeliverable_destination_params()
+            }),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        // Authorization comes first: a proposer without `governance:propose`
+        // learns `PermissionDenied`, not how the payload would be validated.
+        let unauthorized = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(LURKER_DID.to_owned()),
+            migrate(Vec::new()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(unauthorized, Err(ContextError::PermissionDenied(_))),
+            "an unauthorized empty-ceiling proposal must be refused for permission; \
+             got {unauthorized:?}"
+        );
+
+        let refused = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            migrate(Vec::new()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ContextError::CeilingRequired(
+                    scp_protocol::context::CeilingDeclaration::Empty
+                ))
+            ),
+            "an empty destination ceiling must be refused at proposal time; got {refused:?}"
+        );
+        assert!(
+            scp_runtime_governance::testing_access::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+
+        let admitted = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            migrate(vec![Capability::MessagesRead]),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(ContextError::CeilingRequired(_))),
+            "a non-empty destination ceiling must pass the proposal-time check; got {admitted:?}"
+        );
+    }
+
+    /// On the unchecked proposal path (`check_propose_capability = false`, the
+    /// actor twin of `Supervisor::propose_governance_action`), the
+    /// proposer-eligibility gate still runs before the empty-ceiling check: a
+    /// proposer with a pending ejection who proposes an empty-ceiling migration
+    /// gets `PermissionDenied`, not `CeilingRequired`, and no proposal is
+    /// recorded. `migration_proposal_with_an_empty_destination_ceiling_is_refused`
+    /// is the partner: the same proposer without the pending ejection gets
+    /// `CeilingRequired(Empty)`.
+    #[tokio::test]
+    async fn unchecked_migration_proposal_checks_eligibility_before_the_ceiling() {
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus,
+        };
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new_for_test(state);
+        let proposer = DID(CREATOR_DID.to_owned());
+
+        // An approved, not-yet-executed ejection of the proposer.
+        let ejection = GovernanceProposal {
+            proposal_id: [7u8; 32],
+            context_id: ctx_hex.clone(),
+            proposer_did: proposer.clone(),
+            action: GovernanceAction::RemoveMember {
+                did: proposer.clone(),
+                reason: None,
+            },
+            status: ProposalStatus::Approved,
+            created_at: 0,
+            voting_deadline: 0,
+            approvals: Vec::new(),
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        cell.class_c_view()
+            .governance_class_c_mut()
+            .approved_proposals_mut()
+            .insert(ejection.proposal_id, (ejection, 0, 0));
+
+        let result = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                    ceiling: Vec::new(),
+                    ..undeliverable_destination_params()
+                }),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("pending ejection")),
+            "an ineligible proposer on the unchecked path must be refused for eligibility \
+             before the ceiling is validated; got {result:?}"
+        );
+        assert!(
+            scp_runtime_governance::testing_access::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+    }
+
+    /// The freeze gate and the governance engine's proposer check both run
+    /// before the empty-ceiling check, so a refused proposer of an
+    /// empty-ceiling migration learns why it is refused, not how the payload
+    /// would be validated. On the unchecked path a member the `SingleAdmin`
+    /// engine refuses (not the admin) gets `GovernanceFailed`; in a frozen
+    /// context the admin gets the freeze refusal. Neither records a proposal.
+    /// `migration_proposal_with_an_empty_destination_ceiling_is_refused` is the
+    /// partner: the admin of an unfrozen context gets `CeilingRequired(Empty)`.
+    #[tokio::test]
+    async fn migration_proposal_checks_engine_and_freeze_before_the_ceiling() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) = build_broadcast_state_with_authors(
+            BroadcastAdmission::Open,
+            &[CREATOR_DID, LURKER_DID],
+        );
+        let mut cell = ClassSCell::new_for_test(state);
+        let empty_migration = || GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                ceiling: Vec::new(),
+                ..undeliverable_destination_params()
+            }),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        let non_admin = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(LURKER_DID.to_owned()),
+            empty_migration(),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&non_admin, Err(ContextError::GovernanceFailed(msg)) if !msg.contains("frozen")),
+            "a proposer the engine refuses must get the engine's refusal before the ceiling \
+             is validated; got {non_admin:?}"
+        );
+
+        *cell.class_c_view().governance_class_c_mut().freeze_mut() =
+            Some(([1u8; 32], [2u8; 32], deps.clock.now_secs()));
+        let frozen = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            empty_migration(),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&frozen, Err(ContextError::GovernanceFailed(msg)) if msg.contains("frozen")),
+            "a frozen context must report its freeze before the ceiling is validated; \
+             got {frozen:?}"
+        );
+        assert!(
+            scp_runtime_governance::testing_access::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+    }
+
+    /// `execute_propose_context_migration` applies nothing to the source
+    /// context when the destination creation fails: the handle returns to
+    /// `Active`, `migration_state` stays `None`, the receive buffer keeps its
+    /// length, and no leaf is appended. The cell's `mutation_epoch` must not
+    /// move across that failure, because `execute_governance_action` reads an
+    /// advanced epoch as "an effect landed" and keeps the replay marker. Before
+    /// the fix, the helper staged `migration_state` and two buffered events
+    /// through `class_c_view()` before the fallible `create_context` await and
+    /// undid them through a second `class_c_view()` on failure, so the epoch
+    /// advanced by two with nothing landed.
+    #[tokio::test]
+    async fn rolled_back_migration_leaves_the_mutation_epoch_unchanged() {
+        let (deps, appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+        let epoch_before = cell.mutation_epoch();
+        let buffered_before = cell.receive_buffer.len();
+
+        let result = scp_runtime_governance::testing_access::execute_propose_context_migration(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &undeliverable_destination_params(),
+            "fixture",
+            60,
+            false,
+            scp_runtime_core::context::shared::governance::CommitMeta {
+                pid: [0x77; 32],
+                actor_did: CREATOR_DID,
+                timestamp_secs: 1_700_000_000,
+            },
+            scp_runtime_core::context::shared::governance::MigrationBootstrap::reserve(
+                &deps,
+                &ctx_hex,
+                &[0x77; 32],
+            )
+            .expect("reserve the migration's bootstrap"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::PermissionDenied(msg))
+                    if msg.starts_with("failed to create destination context")
+                        && msg.contains("protocol version incompatible")
+            ),
+            "the helper must reach and report the destination's version-check \
+             failure, not an earlier pre-check; got {result:?}"
+        );
+        assert_eq!(
+            cell.mutation_epoch(),
+            epoch_before,
+            "a rolled-back migration must hand out no view, so the epoch holds"
+        );
+        assert_eq!(cell.handle.state(), ContextState::Active);
+        assert!(cell.migration_state.is_none());
+        assert_eq!(cell.receive_buffer.len(), buffered_before);
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rolled-back migration appends nothing"
+        );
+    }
+
+    /// A migration whose destination id names a running context fails with
+    /// `CreationFailed` before it leaves `Active` or writes anything for the
+    /// destination, so the running context keeps its contact and its actor.
+    #[tokio::test]
+    async fn migration_onto_a_running_destination_is_refused_before_any_write() {
+        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+        let pid = [0x78; 32];
+        let destination = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"SCP-MIGRATION-DEST:");
+            hasher.update(ctx_hex.as_bytes());
+            hasher.update(pid);
+            hex::encode(hasher.finalize())
+        };
+        let mut destination_bytes = [0u8; 32];
+        destination_bytes.copy_from_slice(&hex::decode(&destination).expect("hex id"));
+        let running = PerContextState::new_for_test_encrypted(
+            destination_bytes,
+            1_700_000_000,
+            DID("did:example:broadcast-actor".to_owned()),
+        );
+        let _running_handle = supervisor
+            .spawn_actor_with_state_for_test(running, deps.clone_for_spawn(), None)
+            .await
+            .expect("spawn the destination's actor");
+        let contacts = supervisor.relay_contact_store();
+        contacts
+            .store_last_relay_contact(&destination, 42)
+            .await
+            .expect("store a later contact");
+
+        let result = scp_runtime_governance::testing_access::execute_propose_context_migration(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &undeliverable_destination_params(),
+            "fixture",
+            60,
+            false,
+            scp_runtime_core::context::shared::governance::CommitMeta {
+                pid,
+                actor_did: CREATOR_DID,
+                timestamp_secs: 1_700_000_000,
+            },
+            scp_runtime_core::context::shared::governance::MigrationBootstrap::reserve(
+                &deps, &ctx_hex, &pid,
+            )
+            .expect("reserve the migration's bootstrap"),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::CreationFailed(msg)) if msg.contains("is running")),
+            "{result:?}"
+        );
+        assert_eq!(cell.handle.state(), ContextState::Active);
+        assert!(cell.migration_state.is_none());
+        assert!(
+            supervisor.lookup_for_test(&destination).is_some(),
+            "the destination still runs"
+        );
+        assert_eq!(
+            contacts
+                .load_last_relay_contact(&destination)
+                .await
+                .unwrap(),
+            Some(42),
+            "the destination's contact is kept"
+        );
+    }
+
+    /// A migration's bootstrap reserved while another bootstrap holds
+    /// `bootstrap_spawn_lock`, or while another operation's first state of
+    /// the destination is unsettled, fails at once with a retryable
+    /// `ActorBusy` and leaves neither the lock nor the claim held: the
+    /// reservation runs in the source context's actor turn, and the lock's
+    /// holders wait on actor mailboxes, so it must not wait for the lock.
+    /// The migration itself takes the reservation as an argument, so it
+    /// cannot run without the lock.
+    #[tokio::test]
+    async fn a_busy_migration_bootstrap_fails_at_once_and_holds_nothing() {
+        use scp_runtime_core::context::shared::governance::MigrationBootstrap;
+
+        let (supervisor, deps, _appends, _recorded) = build_supervisor_and_deps().await;
+        let ctx_hex = "ab".repeat(32);
+        let pid = [0x79; 32];
+        let destination =
+            scp_runtime_core::context::shared::governance::migration_destination_id(&ctx_hex, &pid);
+        // Whether some operation holds the first-state claim of `destination`.
+        let claimed = |deps: &ActorDeps| {
+            let free = deps.supervisor.claim_first_state(&destination).is_ok();
+            if free {
+                deps.supervisor.release_first_state_for_test(&destination);
+            }
+            !free
+        };
+        let held = supervisor.lock_bootstrap_spawn_for_test().await;
+        let busy = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid).map(|_| ());
+        assert!(
+            matches!(&busy, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{busy:?}"
+        );
+        assert!(!claimed(&deps), "a busy lock claims no destination");
+        drop(held);
+
+        let reserved = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
+            .expect("the reservation succeeds once the lock is free");
+        let second = MigrationBootstrap::reserve(&deps, &ctx_hex, &[0x7a; 32]).map(|_| ());
+        assert!(
+            matches!(&second, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "a held reservation keeps the lock: {second:?}"
+        );
+        assert!(claimed(&deps), "a reservation claims its destination");
+        drop(reserved);
+        assert!(!claimed(&deps), "a dropped reservation releases its claim");
+
+        deps.supervisor
+            .claim_first_state(&destination)
+            .expect("another operation claims the destination");
+        let unsettled = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid).map(|_| ());
+        assert!(
+            matches!(&unsettled, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{unsettled:?}"
+        );
+        assert!(
+            supervisor.bootstrap_spawn_lock_is_free_for_test(),
+            "a refused claim releases the lock it took"
+        );
+        deps.supervisor.release_first_state_for_test(&destination);
+    }
+
+    /// A single-admin migration proposal made while another bootstrap holds
+    /// `bootstrap_spawn_lock` fails with a retryable `ActorBusy` before the
+    /// proposal is recorded, so the same proposal made again once the lock is
+    /// free reaches the migration instead of a duplicate-proposal refusal.
+    #[tokio::test]
+    async fn a_busy_migration_proposal_records_nothing_and_its_retry_runs() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let creator_vk = creator_key().verifying_key();
+        state.governance_mut().engine =
+            Box::new(scp_protocol::context::governance::SingleAdminEngine::new(
+                DID(CREATOR_DID.to_owned()),
+                Arc::new(move |did: &DID, kid: SigningKeyId| {
+                    (did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active)
+                        .then_some(creator_vk)
+                }),
+            ));
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+        let creator = DID(CREATOR_DID.to_owned());
+        let signer = scp_runtime_core::context::actor::CommandSigner::local_ed25519(creator_key());
+        let migrate = || GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(destination_params()),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        let held = supervisor.lock_bootstrap_spawn_for_test().await;
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scp_runtime_governance::testing_access::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &creator,
+                migrate(),
+                &signer,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("the propose turn must not wait for the bootstrap lock");
+        assert!(
+            matches!(&busy, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{busy:?}"
+        );
+        assert!(
+            scp_runtime_governance::testing_access::list_proposals(&cell).is_empty(),
+            "a busy migration proposal must record no proposal"
+        );
+        assert!(
+            cell.governance().proposal_timestamps.is_empty(),
+            "a busy migration proposal must spend no rate-limit slot"
+        );
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "no event was appended");
+        drop(held);
+
+        let retried = scp_runtime_governance::testing_access::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &creator,
+            migrate(),
+            &signer,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                &retried,
+                Err(ContextError::PermissionDenied(msg))
+                    if msg.starts_with("failed to create destination context")
+            ),
+            "the retry must reach the migration's destination create; got {retried:?}"
+        );
+    }
+
+    /// The same failure through `execute_governance_action`: the epoch is
+    /// unchanged across the dispatch, so the caller classifies the error as
+    /// pre-effect, drops the replay marker, and a second execution of the same
+    /// proposal id reaches the helper again and reports the same
+    /// destination-creation failure, not an already-executed refusal.
+    #[tokio::test]
+    async fn rolled_back_migration_drops_marker_so_the_proposal_is_retryable() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(undeliverable_destination_params()),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+        );
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+
+        for attempt in 0..2 {
+            let result = scp_runtime_governance::testing_access::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContextError::PermissionDenied(msg))
+                        if msg.starts_with("failed to create destination context")
+                            && msg.contains("protocol version incompatible")
+                ),
+                "attempt {attempt}: the destination's version-check failure must surface, \
+                 not an already-executed refusal; got {result:?}"
+            );
+            assert!(
+                !cell
+                    .governance()
+                    .class_s
+                    .executed_proposals
+                    .contains_key(&proposal_id),
+                "attempt {attempt}: a rolled-back migration must drop the replay marker"
+            );
+            assert_eq!(cell.handle.state(), ContextState::Active);
+            assert!(cell.migration_state.is_none());
+        }
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            0,
+            "a rolled-back migration appends nothing on either attempt"
+        );
+    }
+
+    /// A rejected TTL extension is the one dispatch that advances the cell's
+    /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
+    /// appends and credits a `TtlExtensionRejected` leaf, then returns
+    /// `PermissionDenied` with the TTL unchanged. `execute_governance_action`
+    /// keeps the replay marker (a retry would append a second rejection leaf on
+    /// this member only, which §9.9.3 of the security-model spec reads as
+    /// equivocation) and must NOT run finalize: a `GovernanceActionExecuted`
+    /// leaf and the executed event each record an extension that §5.10.1 step 6
+    /// of the contexts spec says failed. The consumed proposal still leaves
+    /// `approved_proposals`: that entry tracks conflicts, not completion.
+    /// Before the fix, finalize ran on every post-effect error, so the log
+    /// carried `TtlExtensionRejected` followed by `GovernanceActionExecuted` for
+    /// the same proposal id.
+    #[tokio::test]
+    async fn unanimity_rejected_extend_ttl_keeps_marker_and_appends_no_executed_leaf() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        seed_conflict_tracking_entry(&mut state, &proposal_id);
+        let mut cell = ClassSCell::new_for_test(state);
+        // A member the single-admin proposal carries no approval for, so the
+        // unanimity check finds one consent missing.
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        let first = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &first,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("unanimous consent")
+            ),
+            "the unanimity rejection must reach the caller unchanged; got {first:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "exactly the `TtlExtensionRejected` leaf lands: a second leaf would be \
+             the `GovernanceActionExecuted` leaf finalize appends, which records \
+             an extension that did not happen"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the rejection leaf is credited once and the executed leaf never lands"
+        );
+        assert!(
+            cell.governance()
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a rejected attempt consumes the proposal: the replay marker stays"
+        );
+        assert!(
+            !cell
+                .governance()
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a rejected attempt consumes the proposal: it leaves `approved_proposals`"
+        );
+
+        let second = scp_runtime_governance::testing_access::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &second,
+                Err(ContextError::PermissionDenied(msg)) if msg.contains("already been executed")
+            ),
+            "the same proposal id must be refused as already executed; got {second:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "the refused replay appends nothing: a second `TtlExtensionRejected` \
+             leaf on this member alone would diverge its Merkle root"
+        );
+    }
+
+    /// `execute_extend_ttl` must credit `checkpoint_events_since` only when
+    /// the `TtlExtended` leaf landed. A broadcast fixture has
+    /// `params.ttl == None`, so `extend_ttl_deadline_and_record` derives no
+    /// convergent deadline, appends no leaf, and the helper must credit zero;
+    /// before the fix the helper credited one unconditionally.
+    #[tokio::test]
+    async fn extend_ttl_credits_nothing_when_no_leaf_lands() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        let approvals = state
+            .governance()
+            .engine
+            .get_proposal(&proposal_id)
+            .expect("engine tracks the proposal")
+            .approvals
+            .clone();
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        scp_runtime_governance::testing_access::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc3),
+        )
+        .await
+        .expect("a no-TTL context extends as a no-op");
+
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "no leaf landed");
+        assert_eq!(
+            cell.checkpoint_events_since, 0,
+            "no leaf landed, so nothing is credited: an unconditional credit would \
+             mint the §9.9.3 checkpoint one position early"
+        );
+    }
+
+    /// Four members in deliberately unsorted insertion order, so a list that
+    /// copies a `HashSet`'s iteration order is sorted by accident with
+    /// probability 1 in 24 per process.
+    const UNSORTED_MEMBERS_4: [&str; 4] = [
+        "did:example:member-zulu",
+        "did:example:member-alpha",
+        "did:example:member-mike",
+        "did:example:member-echo",
+    ];
+
+    /// Add [`UNSORTED_MEMBERS_4`] to the cell's roster in the listed order and
+    /// return the same four DIDs sorted, which is the order a convergent leaf
+    /// field must carry.
+    fn add_unsorted_members(cell: &mut ClassSCell) -> Vec<String> {
+        for did in UNSORTED_MEMBERS_4 {
+            cell.class_c_view().membership_class_c_mut().add_member(
+                DID(did.to_owned()),
+                "member".to_owned(),
+                vec![],
+            );
+        }
+        let mut sorted: Vec<String> = UNSORTED_MEMBERS_4.iter().map(|d| (*d).to_owned()).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    /// An approval whose signature `execute_extend_ttl` never reads: the
+    /// helper tallies `voter_did` only, because the engine verified every
+    /// vote when it approved the proposal.
+    fn unverified_approval(did: &str) -> scp_protocol::context::governance::SignedVote {
+        scp_protocol::context::governance::SignedVote {
+            voter_did: DID(did.to_owned()),
+            vote: scp_protocol::context::governance::VoteType::Approve,
+            timestamp: 1_700_000_000,
+            signature: vec![0; 64],
+        }
+    }
+
+    /// `rejecting_members` in the `TtlExtensionRejected` leaf is a canonical
+    /// leaf field, and §9.9.3 of the security-model spec, the equivocation-
+    /// detection protocol, requires every canonical leaf field to be
+    /// convergent. Before the fix the helper copied the list out of a
+    /// `HashSet<&str>` difference, whose iteration order differs per process,
+    /// so two honest members appending the same rejection computed different
+    /// Merkle roots at equal count. The leaf must carry the four missing
+    /// approvers in sorted order regardless of roster insertion order.
+    #[tokio::test]
+    async fn rejected_extend_ttl_leaf_lists_rejecting_members_sorted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3_600,
+            },
+        );
+        // The creator's approval alone: the four added members never voted.
+        let approvals = state
+            .governance()
+            .engine
+            .get_proposal(&proposal_id)
+            .expect("engine tracks the proposal")
+            .approvals
+            .clone();
+        let mut cell = ClassSCell::new_for_test(state);
+        let expected_sorted = add_unsorted_members(&mut cell);
+        appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
+
+        let result = scp_runtime_governance::testing_access::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc4),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("4 of 5")),
+            "four of five members have not approved; got {result:?}"
+        );
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        assert_eq!(leaves.len(), 1, "exactly the rejection leaf lands");
+        let (event_type, bytes) = &leaves[0];
+        assert_eq!(*event_type, scp_event_log::EventType::TtlExtensionRejected);
+        let payload: scp_event_log::payload::TtlExtensionRejectedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: bytes.clone(),
+            })
+            .expect("the leaf decodes as TtlExtensionRejectedPayload");
+        assert_eq!(payload.proposal_id, [0xc4; 32]);
+        assert_eq!(
+            payload.rejecting_members, expected_sorted,
+            "rejecting_members must be sorted so every honest member appends the same bytes"
+        );
+    }
+
+    /// The consent twin of
+    /// [`rejected_extend_ttl_leaf_lists_rejecting_members_sorted`]:
+    /// `consenting_members` in the `TtlExtended` leaf came from the approval
+    /// `HashSet`'s iteration order before the fix. With unanimous approval on
+    /// a context that has a TTL, the one `TtlExtended` leaf must list all
+    /// five consenting members sorted, matching the sort the bilateral
+    /// `reset_ttl_timer` path already applies through
+    /// `TtlExtension::consented_dids`.
+    #[tokio::test]
+    async fn unanimous_extend_ttl_leaf_lists_consenting_members_sorted() {
+        let (deps, appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        // A TTL, so `extend_ttl_deadline_and_record` derives a convergent
+        // deadline and appends the leaf.
+        state.handle = scp_runtime_core::context::ContextHandle::new(
+            ctx_hex.clone(),
+            scp_protocol::context::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(3_600)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        let mut cell = ClassSCell::new_for_test(state);
+        let mut expected_sorted = add_unsorted_members(&mut cell);
+        expected_sorted.push(CREATOR_DID.to_owned());
+        expected_sorted.sort_unstable();
+        // Approvals in the unsorted roster order, creator last.
+        let approvals: Vec<scp_protocol::context::governance::SignedVote> = UNSORTED_MEMBERS_4
+            .iter()
+            .chain(std::iter::once(&CREATOR_DID))
+            .map(|did| unverified_approval(did))
+            .collect();
+        appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
+        reset_leaf_counter(&mut cell);
+
+        scp_runtime_governance::testing_access::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            3_600,
+            &approvals,
+            commit_meta(0xc5),
+        )
+        .await
+        .expect("unanimous consent extends the TTL");
+
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        assert_eq!(leaves.len(), 1, "exactly the TtlExtended leaf lands");
+        let (event_type, bytes) = &leaves[0];
+        assert_eq!(*event_type, scp_event_log::EventType::TtlExtended);
+        let payload: scp_event_log::payload::TtlExtendedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: bytes.clone(),
+            })
+            .expect("the leaf decodes as TtlExtendedPayload");
+        assert_eq!(payload.proposal_id, [0xc5; 32]);
+        assert_eq!(
+            payload.consenting_members, expected_sorted,
+            "consenting_members must be sorted so every honest member appends the same bytes"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the landed leaf is credited once"
+        );
+    }
+
+    /// The bilateral twin: `reset_ttl_timer` appends a real `TtlExtended`
+    /// leaf on a context that has a TTL and must credit it, so a reset-only
+    /// context reaches `events_since > 0` and mints its checkpoint. The credit
+    /// lives in `extend_ttl_deadline_and_record`, the one place that knows
+    /// whether the leaf landed, so both callers see the same accounting.
+    #[tokio::test]
+    async fn reset_ttl_timer_credits_the_landed_ttl_extended_leaf() {
+        let (deps, appends) = build_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        // Give the context a TTL so the combinator derives a convergent
+        // deadline (`creation + ttl` over an empty log) and appends the leaf.
+        state.handle = scp_runtime_core::context::ContextHandle::new(
+            ctx_hex.clone(),
+            scp_protocol::context::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(3_600)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        let mut cell = ClassSCell::new_for_test(state);
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        scp_runtime_ttl_close::testing_access::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .expect("the reset appends its TtlExtended leaf");
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "the reset appends exactly one TtlExtended leaf"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the landed TtlExtended leaf must be credited by the combinator"
+        );
+    }
+
+    // -- Publish in one actor turn (ADR-049 Decision 7a) -----------------------
+
+    mod publish_in_turn {
+        use super::*;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use scp_runtime_core::context::actor::commands::PublishBroadcastPayload;
+        use scp_runtime_core::context::actor::signer::SIGN_TIMEOUT;
+
+        /// A signer that answers every sign with a fixed outcome: a custody
+        /// refusal of `refusal`, or never when `refusal` is `None`.
+        struct ScriptedSigner {
+            alg: SigAlg,
+            refusal: Option<CustodyFailureKind>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl DynScpSigner for ScriptedSigner {
+            fn algorithm(&self) -> SigAlg {
+                self.alg
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                vec![0; 32]
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match self.refusal {
+                    Some(kind) => Box::pin(async move {
+                        Err(scp_crypto::SignError::Custody(CustodyFailure {
+                            kind,
+                            detail: "refused".to_owned(),
+                        }))
+                    }),
+                    None => Box::pin(std::future::pending()),
+                }
+            }
+        }
+
+        fn scripted(
+            alg: SigAlg,
+            refusal: Option<CustodyFailureKind>,
+        ) -> (CommandSigner, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let signer = CommandSigner::new(Arc::new(ScriptedSigner {
+                alg,
+                refusal,
+                calls: Arc::clone(&calls),
+            }));
+            (signer, calls)
+        }
+
+        /// Deps whose transport accepts every send, so a sealed publish
+        /// completes.
+        async fn publishing_deps() -> ActorDeps {
+            let (mut deps, _appends) = build_deps().await;
+            deps.transport = Arc::new(scp_runtime_core::context::builder::LocalTransportProvider);
+            deps
+        }
+
+        fn next_sequence(cell: &ClassSCell, author: &str) -> u64 {
+            cell.broadcast_context
+                .as_ref()
+                .expect("broadcast context")
+                .publish_metadata(author)
+                .expect("author metadata")
+                .next_sequence
+        }
+
+        async fn publish(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            ctx_hex: &str,
+            author: &str,
+            signer: &CommandSigner,
+        ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+            let (tx, rx) = oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: ctx_hex.to_owned(),
+                    author_did: DID(author.to_owned()),
+                    payload: b"hello".to_vec(),
+                    signer: signer.clone(),
+                }),
+                reply: tx,
+            };
+            let _outcome = dispatch(cell, deps, cmd).await;
+            rx.await.expect("reply delivered")
+        }
+
+        #[tokio::test]
+        async fn publish_signs_in_turn_and_envelope_verifies() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let signer = CommandSigner::local_ed25519(creator_key());
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let envelope = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect("publish succeeds");
+
+            assert_eq!(
+                envelope.sequence, before,
+                "the envelope carries the reserved sequence"
+            );
+            assert_eq!(next_sequence(&cell, CREATOR_DID), before + 1);
+            crate::helpers::check_envelope_signed_by(&envelope, &creator_key().verifying_key())
+                .expect("the envelope verifies under the creator's key");
+        }
+
+        #[tokio::test]
+        async fn publish_custody_refusal_rolls_back_sequence() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, Some(CustodyFailureKind::KeyNotFound));
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a refused sign fails the publish");
+
+            assert!(
+                matches!(
+                    err,
+                    ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::KeyNotFound,
+                        ..
+                    })
+                ),
+                "custody's own kind reaches the caller, got {err:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                next_sequence(&cell, CREATOR_DID),
+                before,
+                "the reserved sequence is rolled back"
+            );
+
+            // The rolled-back sequence is reused by the next publish.
+            let envelope = publish(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                CREATOR_DID,
+                &CommandSigner::local_ed25519(creator_key()),
+            )
+            .await
+            .expect("publish after the refusal succeeds");
+            assert_eq!(envelope.sequence, before, "no sequence gap after a refusal");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn publish_sign_timeout_rolls_back_sequence() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, None);
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let started = tokio::time::Instant::now();
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a stalled sign fails the publish");
+
+            assert!(
+                matches!(
+                    err,
+                    ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::TimedOut,
+                        ..
+                    })
+                ),
+                "a stalled custody fails with SCP-CRYPTO-4062, got {err:?}"
+            );
+            assert!(started.elapsed() >= SIGN_TIMEOUT);
+            assert!(started.elapsed() < SIGNING_HANDLER_TIMEOUT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                next_sequence(&cell, CREATOR_DID),
+                before,
+                "the reserved sequence is rolled back"
+            );
+        }
+
+        #[tokio::test]
+        async fn publish_rejects_non_ed25519_signer_before_reserving() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::EcdsaP256Sha256, None);
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a P-256 signer cannot sign a broadcast envelope");
+
+            assert!(matches!(err, ContextError::CryptoFailed(_)), "got {err:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "custody is never asked");
+            assert_eq!(next_sequence(&cell, CREATOR_DID), before);
+        }
+
+        #[tokio::test]
+        async fn publish_by_non_author_fails_without_signing() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, None);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, SUBSCRIBER_DID, &signer)
+                .await
+                .expect_err("a non-author cannot publish");
+
+            assert!(
+                !matches!(err, ContextError::Custody(_)),
+                "the author check runs before the sign, got {err:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "custody is never asked");
+        }
+    }
+}

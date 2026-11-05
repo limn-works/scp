@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use scp_core::context::actor::CommandSigner;
 use scp_core::context::outlets::stream::OutletStreamChunk;
-use scp_core::context::supervisor::{SagaError, SagaId, Supervisor};
+use scp_core::context::saga_journal::SagaId;
+use scp_core::context::supervisor::{SagaError, Supervisor};
 use tokio::sync::{Mutex, mpsc};
 
 /// One live cross-context streaming saga tracked in a bridge instance.

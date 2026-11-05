@@ -28,10 +28,10 @@ use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as content_access_integration.rs)
@@ -144,12 +144,13 @@ fn supervisor_with_event_channel() -> (
     tokio::sync::broadcast::Sender<(String, ContextEvent)>,
 ) {
     let (event_tx, _seed_rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
-    let mls_storage: Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                scp_platform::in_memory::InMemoryStorage::new(),
-            )),
-        );
+    let mls_storage: Arc<
+        dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+    > = Arc::new(
+        scp_runtime_types::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+        ),
+    );
     let supervisor = Supervisor::with_providers(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
@@ -163,6 +164,7 @@ fn supervisor_with_event_channel() -> (
         Some(event_tx.clone()),
         None,
         mls_storage,
+        scp_runtime::domain_handlers(),
     );
     (supervisor, event_tx)
 }
@@ -219,7 +221,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
                 did: bob(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("proposing AddMember should succeed");
@@ -229,7 +231,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
             &prop.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .expect("Bob voting to approve his own add should succeed");
@@ -247,9 +249,11 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
             &send_handle,
             &alice(),
             plaintext,
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&alice()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&alice()),
+                ),
+            ),
             None,
             None,
         )
@@ -366,7 +370,7 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
 /// panicking — the defensive branch the FFI wiring relies on (ADR-049 §12a).
 #[tokio::test]
 async fn supervisor_without_channel_yields_no_subscriber() {
-    let supervisor = scp_runtime::context::test_supervisor(
+    let supervisor = scp_runtime::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),

@@ -281,6 +281,21 @@ scp-platform/sqlite
 scp-platform/vendored-openssl
 scp-protocol/default
 scp-relay-client/default
+scp-runtime-broadcast/default
+scp-runtime-core/default
+scp-runtime-economy/default
+scp-runtime-governance/default
+scp-runtime-lifecycle-control/default
+scp-runtime-lifecycle/default
+scp-runtime-messaging/default
+scp-runtime-outlets/default
+scp-runtime-push/default
+scp-runtime-queries/default
+scp-runtime-saga/default
+scp-runtime-standing/default
+scp-runtime-trust-recovery/default
+scp-runtime-ttl-close/default
+scp-runtime-types/default
 scp-runtime/default
 scp-sqlite-pools/default
 scp-transport/default
@@ -373,6 +388,21 @@ scp-protocol
 scp-relay
 scp-relay-client
 scp-runtime
+scp-runtime-broadcast
+scp-runtime-core
+scp-runtime-economy
+scp-runtime-governance
+scp-runtime-lifecycle
+scp-runtime-lifecycle-control
+scp-runtime-messaging
+scp-runtime-outlets
+scp-runtime-push
+scp-runtime-queries
+scp-runtime-saga
+scp-runtime-standing
+scp-runtime-trust-recovery
+scp-runtime-ttl-close
+scp-runtime-types
 scp-sqlite-pools
 scp-transport
 EOF
@@ -566,6 +596,23 @@ NULLIFIER_CONTROL_FEATURES=(
   "scp-core/testing"
   "scp-protocol/testing"
   "scp-runtime/testing"
+  # ADR-070 split scp-runtime into types, core and 13 domain crates; each
+  # declares `testing`, and the assembly crate's `testing` forwards to all 15.
+  "scp-runtime-types/testing"
+  "scp-runtime-core/testing"
+  "scp-runtime-broadcast/testing"
+  "scp-runtime-economy/testing"
+  "scp-runtime-governance/testing"
+  "scp-runtime-lifecycle/testing"
+  "scp-runtime-lifecycle-control/testing"
+  "scp-runtime-messaging/testing"
+  "scp-runtime-outlets/testing"
+  "scp-runtime-push/testing"
+  "scp-runtime-queries/testing"
+  "scp-runtime-saga/testing"
+  "scp-runtime-standing/testing"
+  "scp-runtime-trust-recovery/testing"
+  "scp-runtime-ttl-close/testing"
   "scp-mls/testing"
   "scp-client/testing"
   "scp-client-wasm/testing"
@@ -592,19 +639,24 @@ NULLIFIER_CONTROL_FEATURES=(
   # `allow_unencrypted_storage` block below gives.
   "scp-core/outlet-capability-test-grant"
   "scp-runtime/outlet-capability-test-grant"
+  "scp-runtime-core/outlet-capability-test-grant"
+  "scp-runtime-messaging/outlet-capability-test-grant"
   "scp-ffi/outlet-capability-test-grant"
   "scp-ffi-napi/outlet-capability-test-grant"
   "scp-ffi-uniffi/outlet-capability-test-grant"
   "scp-runtime/saga-witness-test-mint"
+  "scp-runtime-core/saga-witness-test-mint"
   # `allow_unencrypted_storage` gates `ProtocolRepository::new_for_testing`,
   # which takes any `Storage` where `ProtocolRepository::new` demands a sealed
   # `EncryptedStorage` bound, so this feature unseals encryption at rest — a
   # confidentiality nullifier, not a durability-only capability (spec §17.17.2).
-  # Each of three crates re-exports one gate down one dependency chain
-  # (scp-core → scp-runtime; scp-node → scp-core), so all three names appear.
+  # Each of four crates re-exports one gate down one dependency chain
+  # (scp-core → scp-runtime → scp-runtime-core; scp-node → scp-core), so all
+  # four names appear.
   "scp-core/allow_unencrypted_storage"
   "scp-node/allow_unencrypted_storage"
   "scp-runtime/allow_unencrypted_storage"
+  "scp-runtime-core/allow_unencrypted_storage"
 )
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1256,30 @@ run_gate() {
   # BEFORE reading any artifact, so a blind resolver cannot print a run of OK
   # lines ahead of its own failure.
   assert_resolver_sees_own_feature_table_activation || failures=$((failures + 1))
+  echo
+  echo ">> every scp-runtime* gating feature is a NULLIFIER_CONTROL_FEATURES entry"
+  local runtime_meta unlisted unlisted_rc
+  if ! runtime_meta="$(cargo metadata --no-deps --format-version 1 2>/dev/null)"; then
+    echo "   FAIL — cargo metadata failed"
+    failures=$((failures + 1))
+  else
+    unlisted_rc=0
+    unlisted="$(runtime_gating_features_unlisted "$runtime_meta")" || unlisted_rc=$?
+    case "$unlisted_rc" in
+      0)
+        echo "   ok   — each scp-runtime* testing / allow_unencrypted_storage / saga-witness-test-mint / outlet-capability-test-grant feature is listed"
+        ;;
+      1)
+        echo "   FAIL — scp-runtime* gating feature(s) missing from NULLIFIER_CONTROL_FEATURES:"
+        printf '          %s\n' "$unlisted"
+        failures=$((failures + 1))
+        ;;
+      *)
+        echo "   FAIL — the gating-feature check did not run (helper exit $unlisted_rc), so no feature was checked"
+        failures=$((failures + 1))
+        ;;
+    esac
+  fi
   echo
   local reached_union=""
   for spec in "${ARTIFACTS[@]}"; do
@@ -2153,6 +2229,46 @@ assert_allowlist_has_no_nullifier() {
   echo "   ok   — no custody/attestation/DHT/did:key/test-harness/encryption-at-rest-unseal nullifier control-feature appears on this allowlist"
 }
 
+# runtime_gating_features_unlisted <cargo-metadata-json>
+#   Pure. Print one `<pkg>/<feature>` line for each feature named `testing`,
+#   `allow_unencrypted_storage`, `saga-witness-test-mint` or
+#   `outlet-capability-test-grant` that a package whose name starts with
+#   `scp-runtime` declares and NULLIFIER_CONTROL_FEATURES does not name. Return 1
+#   when any line printed, 2 when the metadata does not parse, 0 otherwise.
+#   ADR-070 split scp-runtime into 16 crates, each declaring its own `testing`;
+#   a new runtime crate whose gating feature this list misses would leave the
+#   positive control blind to it.
+RUNTIME_GATING_PROGRAM='
+import json, sys
+GATING = {"testing", "allow_unencrypted_storage", "saga-witness-test-mint",
+          "outlet-capability-test-grant"}
+try:
+    packages = json.load(sys.stdin)["packages"]
+    names = [(p["name"], list(p.get("features", {}))) for p in packages]
+except (ValueError, KeyError, TypeError):
+    print("runtime_gating_features_unlisted: metadata does not parse", file=sys.stderr)
+    sys.exit(2)
+listed = set(sys.argv[1].split("\n"))
+missing = sorted(
+    name + "/" + f
+    for name, features in names
+    if name.startswith("scp-runtime")
+    for f in features
+    if f in GATING and name + "/" + f not in listed
+)
+for m in missing:
+    print(m)
+sys.exit(1 if missing else 0)
+'
+runtime_gating_features_unlisted() {
+  local listed
+  listed="$(printf '%s\n' "${NULLIFIER_CONTROL_FEATURES[@]}")"
+  # The metadata goes through stdin: the workspace's `cargo metadata` output
+  # exceeds Linux's per-argument limit (MAX_ARG_STRLEN, 128 KiB), so passing it
+  # as argv fails the exec before python runs.
+  printf '%s' "$1" | python3.12 -I -c "$RUNTIME_GATING_PROGRAM" "$listed"
+}
+
 # assert_permitted_crates_have_no_nullifier_crate <permitted-crate-list>
 #   Every NULLIFIER_CONTROL_FEATURES entry without a `/` names a whole crate
 #   (`scp-testing`), and none may appear on <permitted-crate-list>. Increments
@@ -2377,6 +2493,9 @@ run_fixtures() {
   for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing" \
             "scp-core/allow_unencrypted_storage" "scp-node/allow_unencrypted_storage" \
             "scp-runtime/allow_unencrypted_storage" \
+            "scp-runtime-core/allow_unencrypted_storage" \
+            "scp-runtime-core/testing" \
+            "scp-runtime-core/saga-witness-test-mint" \
             "scp-node/testing" "scp-ffi/testing" "scp-ffi-napi/testing" \
             "scp-ffi-uniffi/testing" "scp-ffi-common/testing" \
             "scp-event-log/testing" "scp-identity/testing" \
@@ -2840,6 +2959,25 @@ TREE
   assert_print_modes_emit_what_this_gate_holds
 
   assert_allowlist_has_no_nullifier
+
+  echo ">> fixture: an scp-runtime* gating feature missing from NULLIFIER_CONTROL_FEATURES is REJECTED"
+  runtime_gating_features_unlisted \
+    '{"packages":[{"name":"scp-runtime-x","features":{"testing":[]}}]}' >/dev/null; rc=$?
+  expect "(runtime-gating) scp-runtime-x/testing, which the list does not name, is REJECTED" "FAIL" "$rc"
+  runtime_gating_features_unlisted \
+    '{"packages":[{"name":"scp-runtime-core","features":{"testing":[],"default":[]}},{"name":"scp-other","features":{"testing":[]}}]}' >/dev/null; rc=$?
+  expect "(runtime-gating) a listed scp-runtime-core/testing and a non-runtime package are ACCEPTED" "PASS" "$rc"
+  runtime_gating_features_unlisted 'not json' >/dev/null 2>&1; rc=$?
+  expect "(runtime-gating) unparseable metadata is REJECTED" "FAIL" "$rc"
+  # The real workspace metadata, which is larger than one argv string may be on
+  # Linux, must reach the helper and pass.
+  local real_meta
+  if real_meta="$(cargo metadata --no-deps --format-version 1 2>/dev/null)"; then
+    runtime_gating_features_unlisted "$real_meta" >/dev/null; rc=$?
+  else
+    rc=1
+  fi
+  expect "(runtime-gating) this workspace's real cargo metadata is read and ACCEPTED" "PASS" "$rc"
 
   echo ">> fixture: the crate dimension (local-path provenance, closed PERMITTED_CRATES)"
   run_crate_dimension_fixtures

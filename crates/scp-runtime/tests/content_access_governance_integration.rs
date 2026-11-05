@@ -36,10 +36,10 @@ use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::state::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as governance_integration.rs)
@@ -161,7 +161,7 @@ fn dave() -> DID {
 fn new_manager() -> std::sync::Arc<Supervisor> {
     // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
     // `Supervisor` directly via `test_supervisor`.
-    scp_runtime::context::test_supervisor(
+    scp_runtime::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
@@ -219,7 +219,7 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Super
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -231,7 +231,7 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Super
             &proposal.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -280,7 +280,7 @@ fn propose_and_approve_threshold<'a>(
                 ctx_id,
                 &alice(),
                 action,
-                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
             )
             .await
             .unwrap();
@@ -295,7 +295,7 @@ fn propose_and_approve_threshold<'a>(
                     &outcome.proposal.proposal_id,
                     &bob(),
                     true,
-                    &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                    &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
                 )
                 .await
                 .unwrap();
@@ -471,7 +471,7 @@ async fn revoke_write_access_full_blocks_publishing() {
     );
 
     // Verify Dave cannot publish messages.
-    let handle = scp_runtime::context::ContextHandle::new(
+    let handle = scp_runtime_core::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -487,9 +487,11 @@ async fn revoke_write_access_full_blocks_publishing() {
             &handle,
             &dave(),
             b"should fail",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -527,7 +529,7 @@ async fn revoke_write_access_future_only() {
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
     // Verify Dave cannot publish future messages.
-    let handle = scp_runtime::context::ContextHandle::new(
+    let handle = scp_runtime_core::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -543,9 +545,11 @@ async fn revoke_write_access_future_only() {
             &handle,
             &dave(),
             b"future message",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -607,7 +611,7 @@ async fn restore_write_access_forward_only() {
     // Dave should be able to send messages again.
     // (Forward-only: previously suppressed content remains suppressed,
     // but new messages are allowed.)
-    let handle = scp_runtime::context::ContextHandle::new(
+    let handle = scp_runtime_core::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -623,9 +627,11 @@ async fn restore_write_access_forward_only() {
             &handle,
             &dave(),
             b"after restore",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -705,7 +711,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -715,7 +721,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &add_dave.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -732,7 +738,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 access: AccessScope::Write,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -742,7 +748,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &proposal.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -763,7 +769,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: alice(),
                 new_role: "admin".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -778,7 +784,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &proposal.proposal_id,
             &dave(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
         )
         .await
         .unwrap();
@@ -807,7 +813,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -817,7 +823,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &proposal.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -838,7 +844,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: bob(),
                 new_role: "admin".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -851,7 +857,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &proposal.proposal_id,
             &dave(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
         )
         .await;
     assert!(
@@ -897,7 +903,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -912,7 +918,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -966,7 +972,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -980,7 +986,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
                 did: dave(),
                 access: AccessScope::Write,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1024,7 +1030,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1037,7 +1043,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1051,7 +1057,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 capabilities: vec![Capability::MessagesRead],
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1092,7 +1098,7 @@ async fn single_admin_auto_executes_rotate_content_keys() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("compromise detected".into()),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1135,7 +1141,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("unanimity test".into()),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1150,7 +1156,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
             &proposal.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -1168,7 +1174,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
             &proposal.proposal_id,
             &carol(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
         )
         .await
         .unwrap();
@@ -1217,7 +1223,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("should be rejected".into()),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1230,7 +1236,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
             &proposal.proposal_id,
             &bob(),
             false,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -1286,7 +1292,7 @@ async fn full_content_access_lifecycle() {
     );
 
     // Verify Dave cannot write.
-    let handle = scp_runtime::context::ContextHandle::new(
+    let handle = scp_runtime_core::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -1302,9 +1308,11 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"blocked",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -1335,9 +1343,11 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"restored",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -1391,7 +1401,7 @@ async fn majority_revoke_write_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1402,7 +1412,7 @@ async fn majority_revoke_write_access() {
             &add_proposal.proposal_id,
             &alice(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1415,7 +1425,7 @@ async fn majority_revoke_write_access() {
                 &add_proposal.proposal_id,
                 &bob(),
                 true,
-                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
             )
             .await
             .unwrap();
@@ -1431,7 +1441,7 @@ async fn majority_revoke_write_access() {
                 did: dave(),
                 access: AccessScope::Both,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1444,7 +1454,7 @@ async fn majority_revoke_write_access() {
             &proposal.proposal_id,
             &alice(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1458,7 +1468,7 @@ async fn majority_revoke_write_access() {
                 &proposal.proposal_id,
                 &bob(),
                 true,
-                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
             )
             .await
             .unwrap();

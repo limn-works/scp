@@ -1,0 +1,71 @@
+[package]
+name = "scp-runtime-messaging"
+version = "0.1.0-beta.2"
+description = "The messaging domain of the SCP runtime: sending, receiving and decrypting application and management messages"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Turns on the `testing`-gated command variants of `scp-runtime-core` together with
+# this crate's match arms for them (ADR-070 plan §4, unification hazard), and the
+# `testing_access` module other runtime crates' tests call. Only test builds enable it.
+testing = ["scp-runtime-core/testing", "scp-runtime-types/testing"]
+# Forwards to `scp-runtime-core/outlet-capability-test-grant`, which gates the
+# `MessagingCommand` variant this crate's handler matches. Deliberately NOT implied
+# by `testing` (see `scp-runtime-core`'s manifest).
+outlet-capability-test-grant = ["scp-runtime-core/outlet-capability-test-grant"]
+
+[dependencies]
+scp-runtime-types = { workspace = true }
+scp-runtime-core = { workspace = true }
+tokio = { workspace = true }
+rmp-serde = { workspace = true }
+scp-clock = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+scp-platform = { workspace = true }
+scp-event-log = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
+scp-crypto = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-mls = { workspace = true, features = ["testing"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-platform = { workspace = true, features = ["testing", "encrypting"] }
+scp-event-log = { workspace = true, features = ["testing"] }
+# The 12 sibling domains: `test_support::test_domain_handlers` installs every domain in
+# this crate's test Supervisor, and the tests call the `testing_access` items of
+# `scp-runtime-governance` and `scp-runtime-lifecycle`. No `version`: `cargo publish` strips them, and no
+# domain crate has a non-dev dependency on a sibling (ADR-070 §3).
+scp-runtime-lifecycle = { path = "../scp-runtime-lifecycle", features = ["testing"] }
+scp-runtime-governance = { path = "../scp-runtime-governance", features = ["testing"] }
+scp-runtime-broadcast = { path = "../scp-runtime-broadcast", features = ["testing"] }
+scp-runtime-economy = { path = "../scp-runtime-economy", features = ["testing"] }
+scp-runtime-trust-recovery = { path = "../scp-runtime-trust-recovery", features = ["testing"] }
+scp-runtime-standing = { path = "../scp-runtime-standing", features = ["testing"] }
+scp-runtime-ttl-close = { path = "../scp-runtime-ttl-close", features = ["testing"] }
+scp-runtime-outlets = { path = "../scp-runtime-outlets", features = ["testing"] }
+scp-runtime-push = { path = "../scp-runtime-push", features = ["testing"] }
+scp-runtime-queries = { path = "../scp-runtime-queries", features = ["testing"] }
+scp-runtime-saga = { path = "../scp-runtime-saga", features = ["testing"] }
+scp-runtime-lifecycle-control = { path = "../scp-runtime-lifecycle-control", features = ["testing"] }
+openmls = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+# The pseudonym-rotation tests read `scp_relay_client::MAX_BLOB_TTL`.
+scp-relay-client = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

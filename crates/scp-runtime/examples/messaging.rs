@@ -18,7 +18,7 @@ use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::KeyPackage;
 use scp_protocol::context::{Capability, ContextMode, ContextParams};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor, single_custody_source};
+use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor, single_custody_source};
 
 mod support;
 
@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Each identity's wrapping key lives in its key custody; a host passes
         // its own custody here.
         single_custody_source(Arc::new(InMemoryKeyCustody::new())),
+        scp_runtime::domain_handlers(),
     );
 
     // 2. Register two participants.

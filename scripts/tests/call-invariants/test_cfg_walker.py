@@ -341,5 +341,50 @@ fn prod() {
     )
 
 
+# ---------------------------------------------------------------------------
+# _rules_matching_no_caller — a rule whose caller pattern names no function
+# ---------------------------------------------------------------------------
+
+
+def _records(src: str):
+    tree, source = _parse(src)
+    return _MOD._walk_functions(tree.root_node, source, Path("<test>.rs"))
+
+
+def _rule(caller: str) -> dict:
+    return {
+        "rule_id": "fixture-rule",
+        "applies_to": ["runtime"],
+        "pattern": {"caller_matches": caller, "required_callee": "callee"},
+    }
+
+
+def test_rule_with_no_matching_caller_fails() -> None:
+    """A caller pattern that fullmatches no production function is an error.
+
+    The rule would otherwise check nothing and pass, as
+    ``callback-custody-record-store-at-create`` did after ``build_key_custody``
+    was renamed.
+    """
+    bridge_fns = {"runtime": _records("fn other() {}\n")}
+    errors = _MOD._rules_matching_no_caller([_rule("^absent$")], bridge_fns)
+    assert len(errors) == 1
+    assert "fixture-rule" in errors[0]
+    assert "'^absent$'" in errors[0]
+
+
+def test_rule_with_a_matching_caller_passes() -> None:
+    """The positive control: a pattern that fullmatches one function passes."""
+    bridge_fns = {"runtime": _records("fn other() {}\n")}
+    assert _MOD._rules_matching_no_caller([_rule("^other$")], bridge_fns) == []
+
+
+def test_rule_caller_pattern_skips_test_only_functions() -> None:
+    """A caller that exists only under ``#[cfg(test)]`` matches no production function."""
+    src = "#[cfg(test)]\nmod tests {\n    fn absent() {}\n}\n"
+    bridge_fns = {"runtime": _records(src)}
+    assert len(_MOD._rules_matching_no_caller([_rule("^absent$")], bridge_fns)) == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -12,7 +12,7 @@
 //! already cover):
 //!
 //! 1. Cases 1 & 2 — the
-//!    [`SequenceReservation`](scp_runtime::context::actor::SequenceReservation)
+//!    [`SequenceReservation`](scp_runtime_types::context::actor::sequence::SequenceReservation)
 //!    RAII TYPE CONTRACT (ADR-049 §8 "`SequenceReservation` RAII": rollback
 //!    fires on `Drop` unless `commit()` ran; monotonicity "holds across
 //!    panics, cancellations, and early `?` returns"). These are
@@ -111,9 +111,10 @@ use std::time::Duration;
 
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::actor::{SendSequenceTracker, SequenceReservation};
-use scp_runtime::context::supervisor::{
-    ProtocolRepositorySagaJournal, SagaInput, SagaJournal, Supervisor, SupervisorConfig,
+use scp_runtime_core::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::actor::sequence::{SendSequenceTracker, SequenceReservation};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    ProtocolRepositorySagaJournal, SagaJournal,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,12 +254,17 @@ async fn send_future_cancelled_after_commit_keeps_sequence() {
 /// in `tests/actor_saga_coordinator.rs` (integration test files cannot share
 /// a module, so the constructor is replicated).
 fn test_supervisor() -> Supervisor {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(scp_runtime::context::persistence::NoOpContextPersistence);
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
+        Arc::new(scp_runtime_core::context::persistence::NoOpContextPersistence);
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
     )));
-    Supervisor::new(persistence, journal, SupervisorConfig::default())
+    Supervisor::new(
+        persistence,
+        journal,
+        SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
+    )
 }
 
 /// ADR-049 §3a / spec §5.15.4: a saga reserves its participant-context SET

@@ -78,7 +78,7 @@ use scp_protocol::trust::challenge::{
     challenge_response_signing_digest, challenge_suite_digest, challenge_verification_id,
     challenge_verification_signing_digest,
 };
-use scp_runtime::sync::weeks_offline::{ResetReason, ResetRequest};
+use scp_runtime_types::sync::weeks_offline::{ResetReason, ResetRequest};
 
 // ---------------------------------------------------------------------------
 // §25.2 Reference key material

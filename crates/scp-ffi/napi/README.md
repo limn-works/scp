@@ -13,7 +13,7 @@ zero-argument constructor. It owns a `NapiBridgeInstance` that holds a shared
 `Arc<Supervisor>` in its `BridgeInstanceCore.supervisor` slot; the Supervisor
 owns all context lifecycle state -- membership, roles, governance, broadcast,
 TTL. It is built by `build_supervisor_arc` in `runtime.rs` via
-`Supervisor::with_providers_and_journal(...)` (durable saga journal) and reached
+`Supervisor::with_providers_and_journal(..., scp_core::context::domain_handlers())` (durable saga journal) and reached
 through `runtime::supervisor()`. This replaced the previously-shared
 `Arc<ContextManager>`, now deleted (see
 [ADR-049](../../../.docs/adrs/ADR-049-actor-per-context.md)). See

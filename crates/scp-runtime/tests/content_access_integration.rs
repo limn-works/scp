@@ -35,17 +35,17 @@ use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wra
 use scp_protocol::crypto::access_keys::{AccessKeyStore, ContentAccessState, generate_access_key};
 use scp_protocol::crypto::sender_keys::{BlockNotification, SenderKeyStore, generate_sender_key};
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::state::ProposalOutcome;
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::access_keys::lifecycle::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::state::ProposalOutcome;
+use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_types::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
 };
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
-use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
-use scp_runtime::identity::blocking::{
+use scp_runtime_types::crypto::sender_keys::key_protocol::send_block_notification;
+use scp_runtime_types::identity::blocking::{
     BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
     is_block_effective,
 };
@@ -189,10 +189,10 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> std::sync::Arc<scp_runtime::context::supervisor::Supervisor> {
+fn new_manager() -> std::sync::Arc<scp_runtime_core::context::supervisor::Supervisor> {
     // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
     // `Supervisor` directly via `test_supervisor`.
-    scp_runtime::context::test_supervisor(
+    scp_runtime::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
@@ -235,7 +235,7 @@ fn propose_and_approve_threshold<'a>(
                 ctx_id,
                 &alice(),
                 action,
-                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
             )
             .await
             .unwrap();
@@ -248,7 +248,7 @@ fn propose_and_approve_threshold<'a>(
                     &outcome.proposal.proposal_id,
                     &bob(),
                     true,
-                    &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                    &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
                 )
                 .await
                 .unwrap();
@@ -777,7 +777,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
                 did: author_did(),
                 role: "author".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -787,7 +787,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &add_author.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -818,9 +818,11 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"blocked message",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&author_did()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&author_did()),
+                ),
+            ),
             None,
             None,
         )
@@ -875,9 +877,11 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"restored message",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&author_did()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&author_did()),
+                ),
+            ),
             None,
             None,
         )
@@ -1503,7 +1507,7 @@ async fn governance_tier_stacking_via_context_manager() {
                 did: dave(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1513,7 +1517,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &add_dave.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -1548,9 +1552,11 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"should fail",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -1578,9 +1584,11 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"still blocked",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )
@@ -1606,9 +1614,11 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"success",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                signing_key_for_did(&dave()),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(
+                    signing_key_for_did(&dave()),
+                ),
+            ),
             None,
             None,
         )

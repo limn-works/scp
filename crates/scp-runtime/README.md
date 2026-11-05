@@ -39,14 +39,15 @@ Three types anchor the model:
 ## Quick Start
 
 The `Supervisor` is the single entry point. In production, FFI bridges build
-one via `Supervisor::with_providers_and_journal` (durable saga journal). Tests
+one via `Supervisor::with_providers_and_journal` (durable saga journal), passing
+`scp_runtime::domain_handlers()` as its last argument (ADR-070). Tests
 and local setups use the `test_supervisor` convenience constructor, which
 wires an in-memory MLS storage backend and no-op persistence:
 
 ```rust,ignore
 use std::sync::Arc;
-use scp_runtime::context::test_supervisor;
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime::test_supervisor;
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextParams, ContextState};
 
@@ -97,8 +98,8 @@ identity's key custody; the private key never leaves it (ADR-049 Decision 7a):
 ```rust,ignore
 use scp_crypto::SigAlg;
 use scp_platform::CustodySigner;
-use scp_runtime::context::actor::CommandSigner;
-use scp_runtime::context::supervisor::MessageSigner;
+use scp_runtime_core::context::actor::CommandSigner;
+use scp_runtime_core::context::supervisor::MessageSigner;
 
 // `custody` is the host's `Arc<impl KeyCustody>`; `handle` names the key.
 let signer = CommandSigner::from_custody(

@@ -4550,6 +4550,7 @@ pub(crate) mod tests {
             None,
             None,
             test_mls_storage(),
+            scp_core::context::domain_handlers(),
         )
     }
 
@@ -6448,6 +6449,7 @@ pub(crate) mod tests {
             None,
             None,
             test_mls_storage(),
+            scp_core::context::domain_handlers(),
         );
         supervisor
             .create_context(
@@ -7493,6 +7495,7 @@ pub(crate) mod tests {
             None,
             None,
             test_mls_storage(),
+            scp_core::context::domain_handlers(),
         );
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::Capability::MessagesRead],

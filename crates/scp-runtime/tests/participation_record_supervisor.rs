@@ -32,11 +32,11 @@ use scp_event_log::payload::{MembershipChangePayload, RoleAssignedPayload, encod
 use scp_event_log::{EventPayload, EventType};
 use scp_protocol::trust::attestation::{Attestation, RevocationStatus};
 use scp_protocol::trust::{AttestationType, ParticipationFacts};
-use scp_runtime::context::builder::{ContextEventLogProvider, NotConfiguredTransportProvider};
-use scp_runtime::context::providers::MerkleEventLogProvider;
-use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
-use scp_runtime::crypto::mls::storage_adapter::{
+use scp_runtime_core::context::builder::{ContextEventLogProvider, NotConfiguredTransportProvider};
+use scp_runtime_core::context::providers::MerkleEventLogProvider;
+use scp_runtime_core::context::supervisor::Supervisor;
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_types::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
 };
 
@@ -116,7 +116,7 @@ fn active_attestation(id: &str, subject: &str) -> Attestation {
 /// carries a representative spread of subject-bearing and target-bearing leaves.
 async fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     let provider = MerkleEventLogProvider::new();
-    let ctx_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
+    let ctx_bytes = scp_runtime_core::context::state::context_id_to_bytes(CONTEXT_ID);
     provider.init_event_log(&ctx_bytes).await.expect("init log");
 
     // Walk the log in timestamp order. Bob joins at t=100, leaves at t=400 →
@@ -178,6 +178,7 @@ async fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     )
 }
 
@@ -280,6 +281,7 @@ fn participation_record_empty_log_errors() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
     // No log for this context → empty event set → core returns EmptyEventLog,
     // surfaced as the DEDICATED, machine-detectable `NoParticipationFacts`
@@ -311,8 +313,8 @@ async fn participation_record_is_context_isolated() {
     const CONTEXT_B: &str = "ctx-participation-2c1-other";
 
     let provider = MerkleEventLogProvider::new();
-    let a_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
-    let b_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_B);
+    let a_bytes = scp_runtime_core::context::state::context_id_to_bytes(CONTEXT_ID);
+    let b_bytes = scp_runtime_core::context::state::context_id_to_bytes(CONTEXT_B);
     provider.init_event_log(&a_bytes).await.expect("init A");
     provider.init_event_log(&b_bytes).await.expect("init B");
 
@@ -366,6 +368,7 @@ async fn participation_record_is_context_isolated() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
 
     // A sees ONLY A's single role assignment and none of B's activity.
@@ -403,7 +406,7 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
     async fn init_event_log(
         &self,
         _context_id: &[u8; 32],
-    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+    ) -> Result<(), scp_runtime_core::context::builder::ContextCreationError> {
         Ok(())
     }
 
@@ -414,14 +417,14 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
         _actor_did: &str,
         _payload: EventPayload,
         _timestamp_secs: u64,
-    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+    ) -> Result<(), scp_runtime_core::context::builder::ContextCreationError> {
         Ok(())
     }
 
     async fn destroy_event_log(
         &self,
         _context_id: &[u8; 32],
-    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+    ) -> Result<(), scp_runtime_core::context::builder::ContextCreationError> {
         Ok(())
     }
 
@@ -470,6 +473,7 @@ fn participation_record_fails_closed_on_root_error_with_events() {
         None,
         None,
         test_mls_storage(),
+        scp_runtime::domain_handlers(),
     );
 
     let err = supervisor

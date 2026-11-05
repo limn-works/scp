@@ -586,6 +586,22 @@ CI_FEATURES=(
     scp-core/testing
     scp-runtime/testing
     scp-runtime/saga-witness-test-mint
+    scp-runtime-types/testing
+    scp-runtime-core/testing
+    scp-runtime-core/saga-witness-test-mint
+    scp-runtime-broadcast/testing
+    scp-runtime-economy/testing
+    scp-runtime-governance/testing
+    scp-runtime-lifecycle/testing
+    scp-runtime-lifecycle-control/testing
+    scp-runtime-messaging/testing
+    scp-runtime-outlets/testing
+    scp-runtime-push/testing
+    scp-runtime-queries/testing
+    scp-runtime-saga/testing
+    scp-runtime-standing/testing
+    scp-runtime-trust-recovery/testing
+    scp-runtime-ttl-close/testing
     scp-ffi/testing
     scp-ffi/outlet-capability-test-grant
     scp-ffi-napi/testing
@@ -965,6 +981,7 @@ GATES=(
     scripts/check-publish-graph.py
     scripts/check-pyi-generated.sh
     scripts/check-python-falsy-optionals.py
+    scripts/check-runtime-clippy-config.sh
     scripts/check-saga-gating-granularity.sh
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh

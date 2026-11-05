@@ -178,7 +178,7 @@ async fn sqlite_storage_rejects_mismatched_key() {
 /// `StorageConfig::Sqlite` is selected:
 /// `SqliteStorage::new(dir, key)` → `ProtocolRepository::new(Arc<SqliteStorage>)`
 /// → `ProtocolRepositoryContextBridge::new(repo)` → attached to a
-/// `Supervisor` via `Supervisor::with_providers(.., persistence, ..)`.
+/// `Supervisor` via `Supervisor::with_providers(.., persistence, .., scp_core::context::domain_handlers())`.
 /// ADR-049 §15 deleted `ContextManager`; the bridges and tests now
 /// compose providers directly through this constructor.
 #[cfg(feature = "sqlite")]
@@ -222,6 +222,7 @@ async fn context_create_persists_membership_to_sqlite() {
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             ))) as Arc<dyn OpenMlsStorageAdapter>,
+            scp_core::context::domain_handlers(),
         );
 
         manager.register_local_did(alice.clone()).await;
@@ -332,6 +333,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             ))) as Arc<dyn OpenMlsStorageAdapter>,
+            scp_core::context::domain_handlers(),
         );
 
         manager.register_local_did(alice.clone()).await;
@@ -409,6 +411,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
             InMemoryStorage::new(),
         ))) as Arc<dyn OpenMlsStorageAdapter>,
+        scp_core::context::domain_handlers(),
     );
 
     manager2.register_local_did(alice.clone()).await;
@@ -468,6 +471,7 @@ fn supervisor_over(storage: Arc<SqliteStorage>) -> Arc<Supervisor> {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
             InMemoryStorage::new(),
         ))) as Arc<dyn OpenMlsStorageAdapter>,
+        scp_core::context::domain_handlers(),
     )
 }
 

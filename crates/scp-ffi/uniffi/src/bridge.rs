@@ -19461,7 +19461,7 @@ impl Scp {
                 // bridges, so the JSON contract (string currency, numeric
                 // amount, `ok` vs `valid`/`all_valid` semantics) cannot drift
                 // across PyO3, napi, and UniFFI. See
-                // `scp_runtime::economy::receipt::verification_results_to_json`.
+                // `scp_runtime_types::economy::receipt::verification_results_to_json`.
                 Ok(scp_core::economy::verification_results_to_json(results))
             })
             .await
@@ -34453,9 +34453,8 @@ mod tests {
     // per-context Active Signing Key resolution, driven to a real `Committed`
     // terminal through a governance-established `OutletInterface`.
 
-    use scp_core::context::supervisor::{
-        SagaAbortReason, SagaError as CoreSagaError, SagaId as CoreSagaId,
-    };
+    use scp_core::context::saga_journal::SagaId as CoreSagaId;
+    use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError};
 
     // The saga-error classification (the `RateLimited → Option<u64>` read, the
     // `None`-never-`0` rule, the `SCP-SAGA-{code}` formatting, the fixed

@@ -1072,7 +1072,6 @@
         "crates/scp-runtime/src/context/actor/handlers/messaging.rs",
         "crates/scp-runtime/src/context/processed_commit_tests.rs",
         "crates/scp-runtime/src/context/supervisor/two_instance_seams.rs",
-        "crates/scp-testing/tests/perf_baseline.rs",
         "crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs",
         "crates/scp-testing/tests/integration/fullstack.rs",
         "crates/scp-testing/tests/integration/sdk_usability.rs",

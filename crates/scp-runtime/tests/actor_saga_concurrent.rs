@@ -37,17 +37,18 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_runtime::context::supervisor::{
-    ProtocolRepositorySagaJournal, SagaInput, SagaJournal, Supervisor, SupervisorConfig,
+use scp_runtime_core::context::supervisor::{SagaInput, Supervisor, SupervisorConfig};
+use scp_runtime_types::context::supervisor::saga_journal::{
+    ProtocolRepositorySagaJournal, SagaJournal,
 };
 
 struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
+impl scp_runtime_core::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
-        _: &scp_runtime::context::state::ContextSnapshot,
+        _: &scp_runtime_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -55,7 +56,7 @@ impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
         &self,
         _: &str,
     ) -> Result<
-        Option<scp_runtime::context::state::ContextSnapshot>,
+        Option<scp_runtime_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -74,7 +75,7 @@ impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
 }
 
 fn test_supervisor() -> Arc<Supervisor> {
-    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime_core::context::persistence::ContextPersistence> =
         Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
@@ -83,6 +84,7 @@ fn test_supervisor() -> Arc<Supervisor> {
         persistence,
         journal,
         SupervisorConfig::default(),
+        scp_runtime::domain_handlers(),
     ))
 }
 
@@ -111,7 +113,7 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
 /// ABSENCE of `ActorBusy`, not the specific terminal error.
 #[track_caller]
 fn assert_non_busy_terminal(
-    result: &Result<scp_runtime::context::supervisor::SagaOutput, ContextError>,
+    result: &Result<scp_runtime_core::context::supervisor::SagaOutput, ContextError>,
     ctx: &str,
 ) {
     match result {

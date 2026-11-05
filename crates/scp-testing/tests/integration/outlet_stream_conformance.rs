@@ -40,12 +40,12 @@ use scp_protocol::context::roles::{Capability, ContextRoleState, default_ceiling
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::dispatch::{
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::outlets::dispatch::{
     CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamSessionHandle, open_stream_session,
 };
-use scp_runtime::context::outlets::signer::InProcessStreamSigner;
-use scp_runtime::context::outlets::stream::{
+use scp_runtime_types::context::outlets::signer::InProcessStreamSigner;
+use scp_runtime_types::context::outlets::stream::{
     AdmissionCaps, OriginAdmissionTracker, StreamAdmissionTracker, StreamIdentity,
 };
 
