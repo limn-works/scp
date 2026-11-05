@@ -60,16 +60,15 @@
 //!
 //! # Supervisor-iterating sweep entry points
 //!
-//! These iterate the actor registry
-//! ([`Supervisor::actor_ids`](scp_runtime_core::context::supervisor::Supervisor::actor_ids),
-//! NOT a legacy `contexts` `DashMap`) and dispatch one typed sweep
-//! command per actor through the per-context mailbox. They live in this
-//! module:
+//! These iterate the actor registry (`Supervisor::actor_ids`, NOT a
+//! legacy `contexts` `DashMap`) and dispatch one typed sweep command per
+//! actor through the per-context mailbox. They live in core, not in this
+//! crate:
 //!
-//! - [`restore_all_contexts`] (iterates persistence snapshots — no
-//!   actors exist before restore)
+//! - `Supervisor::restore_all_contexts` (iterates persistence snapshots —
+//!   no actors exist before restore)
 //! - [`scp_runtime_core::context::shared::lifecycle::flush_all_contexts`]
-//! - [`shutdown_all_contexts`]
+//! - [`Supervisor::shutdown_all_contexts`](scp_runtime_core::context::supervisor::Supervisor::shutdown_all_contexts)
 
 #![allow(clippy::significant_drop_tightening)]
 
@@ -1720,19 +1719,17 @@ pub async fn create_context(
     // The creator's leaf publishes the owning identity's wrapping key (spec 09
     // §9.16.1); with none loaded the creation fails closed before any group exists.
     let wrapping_public_key = *deps.my_wrapping_key()?.public();
-    let (handle, created_owned_crypto) = scp_runtime_core::context::builder::create_context(
-        context_id.clone(),
-        params.clone(),
-        deps.crypto.as_ref(),
-        deps.transport.as_ref(),
-        deps.event_log.as_ref(),
-        scp_runtime_core::context::builder::ContextCreator {
-            did: creator_did.as_ref(),
-            wrapping_public_key: &wrapping_public_key,
-        },
-        creation_timestamp_secs,
-    )
-    .await?;
+    let (handle, created_owned_crypto) = deps
+        .create_context(
+            context_id.clone(),
+            params.clone(),
+            scp_runtime_core::context::builder::ContextCreator {
+                did: creator_did.as_ref(),
+                wrapping_public_key: &wrapping_public_key,
+            },
+            creation_timestamp_secs,
+        )
+        .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
     // `ContextRoleState::new` enforces the ceiling-entry grammar (spec §5.3.1.1):
     // a malformed entry fails here with `InvalidCeilingCategory`, preserved as a

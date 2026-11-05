@@ -100,9 +100,9 @@ pub struct MigrationBootstrap {
     /// The held `bootstrap_spawn_lock`.
     guard: tokio::sync::OwnedMutexGuard<()>,
     /// The first-state guard that holds the destination id's claim.
-    pub first_state: crate::context::shared::lifecycle::FirstStateRollback,
+    pub(crate) first_state: crate::context::shared::lifecycle::FirstStateRollback,
     /// The destination context id the claim covers.
-    pub destination_context_id: String,
+    pub(crate) destination_context_id: String,
 }
 
 /// A [`MigrationBootstrap`] split by [`MigrationBootstrap::into_parts`].

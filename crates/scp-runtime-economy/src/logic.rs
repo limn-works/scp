@@ -31,10 +31,8 @@ use scp_runtime_types::economy::integration::IntegrationError;
 
 /// Maps an [`IntegrationError`] to a [`ContextError`] with proper SCP error codes.
 ///
-/// Visibility widened in ADR-049 §15 so the hoisted
-/// [`crate::helpers`] free functions can map the same
-/// way the legacy methods did. The enclosing `economy` module is
-/// `pub(crate)` so the effective visibility is unchanged.
+/// [`crate::helpers`] maps errors through it (ADR-049 §15). The enclosing
+/// `logic` module is private, so it is crate-internal despite `pub`.
 pub fn integration_error_to_context(err: IntegrationError) -> ContextError {
     match err {
         IntegrationError::CostEvaluationOverflow => {

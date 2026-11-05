@@ -1934,10 +1934,9 @@ impl PerContextState {
     }
 
     /// Read-only view of the staged cross-context saga slot
-    /// (`ClassSState::saga_pending`). A `pub` accessor (the field itself is
-    /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape
-    /// integration test can witness the slot without naming the crate-internal
-    /// sub-struct path.
+    /// (`ClassSState::saga_pending`). A `pub` accessor, because the
+    /// `class_s` field that holds the slot is `pub(in crate::context)`, so
+    /// no crate but core can reach the slot through the field.
     #[inline]
     #[must_use]
     pub const fn saga_pending(&self) -> &HashMap<SagaId, SagaPreparedState> {

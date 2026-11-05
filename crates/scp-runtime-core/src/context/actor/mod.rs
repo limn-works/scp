@@ -56,10 +56,12 @@ pub use commands::{
 };
 pub use deps::ActorDeps;
 pub use handle::{ContextActorHandle, HANDLER_TIMEOUT, REPLY_TIMEOUT, SEND_TIMEOUT};
-// Bounded reply-await mechanics: the supervisor reply-await sites, the `?Send`
-// recovery path (`crate::identity::recovery`) and the domain crates all route
-// through the single helper.
-pub use handle::{BoundedReplyError, bounded_reply_await};
+// Bounded reply-await mechanics: the supervisor reply-await sites and the `?Send`
+// recovery path (`crate::identity::recovery`) route through the single helper.
+pub(crate) use handle::bounded_reply_await;
+scp_runtime_types::pub_under_testing! {
+    pub(crate) use handle::BoundedReplyError;
+}
 pub use outcome::Outcome;
 pub use signer::{CommandSigner, SIGN_TIMEOUT};
 pub use state::{
@@ -336,70 +338,71 @@ pub struct ContextActor {
 }
 
 impl ContextActor {
-    /// Construct a fresh actor that owns [`PerContextState`] and
-    /// [`ActorDeps`] directly (introduced by ADR-049 §15).
-    ///
-    /// This is the production constructor. The owned-state spawn path
-    /// `crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`
-    /// uses it to hand drained `PerContextState` + `ActorDeps` into the
-    /// actor task, making the actor their sole owner.
-    ///
-    /// Visibility is `pub(in crate::context)` — only
-    /// `crate::context::supervisor::supervisor` constructs actors.
-    ///
-    /// # Construction of auxiliary fields
-    ///
-    /// - `ttl_timer`, `governance_timeout`, `ttl_armed_deadline` start as
-    ///   `None`. The run loop's `Self::reconcile_timers` arms them from
-    ///   owned state at the top of every turn (TTL from
-    ///   `state.ttl.timer.deadline_unix_secs`, governance while `Active`).
-    /// - `last_persist_attempt_at` starts at `Instant::now()` so a fresh
-    ///   actor's first coalescing window runs for the full duration
-    ///   before the first persist.
-    /// - `dirty` starts `false` — no mutations yet.
-    ///
-    /// # `context_id` derivation
-    ///
-    /// The actor's `String` id is the state's handle id: the key the
-    /// supervisor registers the actor under, persists its snapshot under,
-    /// and tags its events with. It is not re-derived from the 32-byte
-    /// `state.context_id`: that hash is the SHA-256 of any id that is not
-    /// lowercase hex, so its hex differs from the key, and a snapshot the
-    /// actor wrote under it would be a second persisted context that no
-    /// restore can reach. Callers therefore do not pass `context_id`
-    /// separately — it is sourced from the state payload.
-    #[allow(dead_code)] // production caller: Supervisor::spawn_actor_with_state
-    pub fn new(
-        state: state::PerContextState,
-        deps: deps::ActorDeps,
-        inbox: mpsc::Receiver<ContextCommand>,
-        exit: handle::ExitRecord,
-    ) -> Self {
-        let context_id = state.handle.context_id().to_owned();
-        let push_routes_seen = crate::context::push_routes::push_routes(&state);
-        Self {
-            context_id,
-            inbox,
-            exit,
-            // Wrap the owned state in the Class-S fail-closed-persist cell. The
-            // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
-            // `state_mut`); every handler mutates through the cell's persist-on-
-            // commit combinators or the airtight `class_c_view()` (ADR-049 §9).
-            state: class_s::ClassSCell::new(state),
-            deps,
-            ttl_timer: None,
-            governance_timeout: None,
-            ttl_armed_deadline: None,
-            ttl_expiry_completed: 0,
-            ttl_expiry_retry: None,
-            ttl_expiry_retries: 0,
-            last_persist_attempt_at: Instant::now(),
-            dirty: false,
-            consecutive_inbox: 0,
-            rotation_timer: None,
-            rotation_armed_key: None,
-            rotation_signals: 0,
-            push_routes_seen,
+    scp_runtime_types::pub_under_testing! {
+        /// Construct a fresh actor that owns [`PerContextState`] and
+        /// [`ActorDeps`] directly (introduced by ADR-049 §15).
+        ///
+        /// This is the production constructor. The owned-state spawn path
+        /// `crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`
+        /// uses it to hand drained `PerContextState` + `ActorDeps` into the
+        /// actor task, making the actor their sole owner.
+        ///
+        /// # Construction of auxiliary fields
+        ///
+        /// - `ttl_timer`, `governance_timeout`, `ttl_armed_deadline` start as
+        ///   `None`. The run loop's `Self::reconcile_timers` arms them from
+        ///   owned state at the top of every turn (TTL from
+        ///   `state.ttl.timer.deadline_unix_secs`, governance while `Active`).
+        /// - `last_persist_attempt_at` starts at `Instant::now()` so a fresh
+        ///   actor's first coalescing window runs for the full duration
+        ///   before the first persist.
+        /// - `dirty` starts `false` — no mutations yet.
+        ///
+        /// # `context_id` derivation
+        ///
+        /// The actor's `String` id is the state's handle id: the key the
+        /// supervisor registers the actor under, persists its snapshot under,
+        /// and tags its events with. It is not re-derived from the 32-byte
+        /// `state.context_id`: that hash is the SHA-256 of any id that is not
+        /// lowercase hex, so its hex differs from the key, and a snapshot the
+        /// actor wrote under it would be a second persisted context that no
+        /// restore can reach. Callers therefore do not pass `context_id`
+        /// separately — it is sourced from the state payload.
+        ///
+        /// `pub(crate)`: only `Supervisor::spawn_actor_with_state` constructs actors.
+        /// `pub` under `testing`, because `scp-runtime`'s actor tests build one directly.
+        pub(crate) fn new(
+            state: state::PerContextState,
+            deps: deps::ActorDeps,
+            inbox: mpsc::Receiver<ContextCommand>,
+            exit: handle::ExitRecord,
+        ) -> Self {
+            let context_id = state.handle.context_id().to_owned();
+            let push_routes_seen = crate::context::push_routes::push_routes(&state);
+            Self {
+                context_id,
+                inbox,
+                exit,
+                // Wrap the owned state in the Class-S fail-closed-persist cell. The
+                // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
+                // `state_mut`); every handler mutates through the cell's persist-on-
+                // commit combinators or the airtight `class_c_view()` (ADR-049 §9).
+                state: class_s::ClassSCell::new(state),
+                deps,
+                ttl_timer: None,
+                governance_timeout: None,
+                ttl_armed_deadline: None,
+                ttl_expiry_completed: 0,
+                ttl_expiry_retry: None,
+                ttl_expiry_retries: 0,
+                last_persist_attempt_at: Instant::now(),
+                dirty: false,
+                consecutive_inbox: 0,
+                rotation_timer: None,
+                rotation_armed_key: None,
+                rotation_signals: 0,
+                push_routes_seen,
+            }
         }
     }
 

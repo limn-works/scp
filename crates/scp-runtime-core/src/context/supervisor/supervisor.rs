@@ -976,17 +976,21 @@ fn encode_repair_records_evidence(
     rmp_serde::to_vec_named(records).map_err(|e| format!("encode repair records: {e}"))
 }
 
-/// Decode the `MessagePack` repair-record set from a durable `NeedsRepair`
-/// journal entry's `evidence` (the inverse of `encode_repair_records_evidence`).
-///
-/// # Errors
-///
-/// A description of the decode failure when `bytes` is not a `MessagePack` repair-record
-/// set.
-pub fn decode_repair_records_evidence(
-    bytes: &[u8],
-) -> Result<Vec<SagaDivergenceRepairRecord>, String> {
-    rmp_serde::from_slice(bytes).map_err(|e| format!("decode repair records: {e}"))
+scp_runtime_types::pub_under_testing! {
+    /// Decode the `MessagePack` repair-record set from a durable `NeedsRepair`
+    /// journal entry's `evidence` (the inverse of `encode_repair_records_evidence`).
+    ///
+    /// # Errors
+    ///
+    /// A description of the decode failure when `bytes` is not a `MessagePack` repair-record
+    /// set.
+    ///
+    /// `pub(crate)`; `pub` under `testing`, because `scp-runtime`'s supervisor tests decode the evidence they assert on.
+    pub(crate) fn decode_repair_records_evidence(
+        bytes: &[u8],
+    ) -> Result<Vec<SagaDivergenceRepairRecord>, String> {
+        rmp_serde::from_slice(bytes).map_err(|e| format!("decode repair records: {e}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6091,21 +6095,11 @@ impl Supervisor {
     /// Look up the actor handle for a context ID. Lock-free
     /// (`DashMap::get` + `Clone`).
     ///
-    /// Visibility is `pub(in crate::context::supervisor)` — external
-    /// callers reach the supervisor only through
-    /// [`super::handle::SupervisorHandle`], which does NOT expose an
-    /// actor-handle accessor. Cross-actor messaging is impossible
-    /// through `SupervisorHandle`; see plan §"ActorDeps and
-    /// SupervisorHandle".
-    ///
-    /// Every per-context dispatch method routes through this accessor
-    /// (`self.lookup(ctx).send(...)`), as do the per-actor sweep entry
-    /// points in `governance_helpers` / `lifecycle_helpers`.
-    ///
-    /// Visibility widened to `pub(in crate::context)` at Phase 2A
-    /// finalization (sweep helper relocation) so the sweep entry
-    /// points in `governance_helpers` / `lifecycle_helpers` can route
-    /// per-actor sweep commands through the mailbox.
+    /// Visibility is `pub(in crate::context)`, so no crate but core names
+    /// it. Every per-context dispatch method routes through it
+    /// (`self.lookup(ctx).send(...)`). Other crates reach the same registry
+    /// through [`super::handle::SupervisorHandle::lookup`], which returns
+    /// the same `ContextActorHandle`.
     #[must_use]
     pub(in crate::context) fn lookup(&self, ctx_id: &str) -> Option<ContextActorHandle> {
         self.actors.get(ctx_id).map(|r| r.value().clone())

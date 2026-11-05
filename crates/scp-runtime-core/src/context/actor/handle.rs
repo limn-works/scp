@@ -82,24 +82,26 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 // Bounded reply-await mechanics
 // ---------------------------------------------------------------------------
 
-/// Classifies why a bounded reply-await did not yield a handler reply.
-///
-/// The two variants let a caller that wants to distinguish the failure modes
-/// do so (e.g. log "wedged actor" vs "dropped reply channel"); callers that
-/// treat any non-reply uniformly match both with `Err(_)` and never inspect
-/// the value. See [`bounded_reply_await`].
-///
-/// Visibility is `pub(crate)` (not `pub(in crate::context)`) because the
-/// `?Send` recovery reply-await in `crate::identity::recovery` — a sibling of
-/// `crate::context`, not nested within it — routes through the same helper.
-#[derive(Debug)]
-pub enum BoundedReplyError {
-    /// The actor dropped the reply sender before answering (the underlying
-    /// [`oneshot`] channel closed) — typically a terminated/replaced actor.
-    Dropped,
-    /// The actor did not reply within [`REPLY_TIMEOUT`] — a wedged/deadlocked
-    /// actor whose reply sender is still alive (so the channel never closed).
-    Elapsed,
+scp_runtime_types::pub_under_testing! {
+    /// Classifies why a bounded reply-await did not yield a handler reply.
+    ///
+    /// The two variants let a caller that wants to distinguish the failure modes
+    /// do so (e.g. log "wedged actor" vs "dropped reply channel"); callers that
+    /// treat any non-reply uniformly match both with `Err(_)` and never inspect
+    /// the value. See [`bounded_reply_await`].
+    ///
+    /// `pub(crate)`: its users are the Supervisor's reply-await sites and the
+    /// `?Send` recovery reply-await in `crate::identity::recovery`. Under `testing`
+    /// it is `pub`, so `scp-runtime`'s supervisor tests can build both variants.
+    #[derive(Debug)]
+    pub(crate) enum BoundedReplyError {
+        /// The actor dropped the reply sender before answering (the underlying
+        /// [`oneshot`] channel closed) — typically a terminated/replaced actor.
+        Dropped,
+        /// The actor did not reply within [`REPLY_TIMEOUT`] — a wedged/deadlocked
+        /// actor whose reply sender is still alive (so the channel never closed).
+        Elapsed,
+    }
 }
 
 /// Bounds a reply-oneshot await by [`REPLY_TIMEOUT`] and classifies the
@@ -118,13 +120,16 @@ pub enum BoundedReplyError {
 /// `Result<_, ContextError>`, riding through untouched on the `Ok` arm). The
 /// helper imposes no `Send` bound of its own, so it also works in the `?Send`
 /// recovery path (`identity::recovery`, ADR-049 Decision 7). Visibility is
-/// `pub(crate)` because that recovery path is a sibling of `crate::context`.
+/// `pub(crate)`: the Supervisor and that recovery path, both in this crate, are
+/// its only callers.
 ///
 /// # Errors
 ///
 /// [`BoundedReplyError::Elapsed`] when no reply arrives within `REPLY_TIMEOUT`, and
 /// [`BoundedReplyError::Dropped`] when the actor drops the reply sender.
-pub async fn bounded_reply_await<T>(rx: oneshot::Receiver<T>) -> Result<T, BoundedReplyError> {
+pub(crate) async fn bounded_reply_await<T>(
+    rx: oneshot::Receiver<T>,
+) -> Result<T, BoundedReplyError> {
     match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
         Ok(Ok(reply)) => Ok(reply),
         Ok(Err(_dropped)) => Err(BoundedReplyError::Dropped),
@@ -155,12 +160,17 @@ scp_runtime_types::pub_under_testing! {
     }
 }
 
-/// The cell an actor records its [`DeliberateExit`] in, shared with every
-/// [`ContextActorHandle`] clone for that actor. Empty while the actor runs,
-/// and empty forever after an exit that was not deliberate: a panic
-/// unwinds past every recording site.
-#[derive(Debug, Clone, Default)]
-pub struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
+scp_runtime_types::pub_under_testing! {
+    /// The cell an actor records its [`DeliberateExit`] in, shared with every
+    /// [`ContextActorHandle`] clone for that actor. Empty while the actor runs,
+    /// and empty forever after an exit that was not deliberate: a panic
+    /// unwinds past every recording site.
+    ///
+    /// `pub(crate)`; `pub` under `testing`, because `scp-runtime`'s actor tests
+    /// pass one to [`ContextActor::new`](super::ContextActor::new).
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
+}
 
 impl ExitRecord {
     /// Test-only reach into [`Self::record`] for tests outside this crate.

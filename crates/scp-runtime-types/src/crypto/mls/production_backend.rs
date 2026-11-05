@@ -173,23 +173,28 @@ impl ProductionMlsBackend {
         }
     }
 
-    /// Derive the durable consumed-init-key set key for a KP's TLS-serialized
-    /// public bytes: `scp-kp-consumed-initkey/{hex(SHA-256(hpke_init_key))}`.
-    ///
-    /// The HPKE init key is the cryptographically-unique single-use element of
-    /// a `KeyPackage` (RFC 9420 §10): each KP carries a fresh init key, and a
-    /// Welcome is HPKE-sealed to it. Keying the consumed set by the init key
-    /// (not the whole KP bytes) binds the marker to the exact one-time secret
-    /// `OpenMLS` consumes on join.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
-    /// not deserialize / validate as an SCP `KeyPackage`.
-    pub fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
-        Self::init_key_marker(key_package_public_bytes, |e| {
-            MlsError::WelcomeProcessingFailed(format!("validating key package for init-key: {e}"))
-        })
+    crate::pub_under_testing! {
+        /// Derive the durable consumed-init-key set key for a KP's TLS-serialized
+        /// public bytes: `scp-kp-consumed-initkey/{hex(SHA-256(hpke_init_key))}`.
+        ///
+        /// The HPKE init key is the cryptographically-unique single-use element of
+        /// a `KeyPackage` (RFC 9420 §10): each KP carries a fresh init key, and a
+        /// Welcome is HPKE-sealed to it. Keying the consumed set by the init key
+        /// (not the whole KP bytes) binds the marker to the exact one-time secret
+        /// `OpenMLS` consumes on join.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
+        /// not deserialize / validate as an SCP `KeyPackage`.
+        ///
+        /// `pub(crate)`; `pub` under `testing`, so `scp-runtime-core`'s key-package
+        /// tests can derive the marker a consumed `KeyPackage` leaves.
+        pub(crate) fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
+            Self::init_key_marker(key_package_public_bytes, |e| {
+                MlsError::WelcomeProcessingFailed(format!("validating key package for init-key: {e}"))
+            })
+        }
     }
 
     /// [`Self::consumed_init_key_key`] for the signer state's own

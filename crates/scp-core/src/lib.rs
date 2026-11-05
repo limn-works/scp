@@ -14,8 +14,9 @@
 //! actor handle, reads or writes key material, or bypasses a dispatch-time
 //! check is callable only inside `scp-runtime-core` and the 13 domain crates
 //! core lends a capability to. A crate that depends on `scp-core`, as every FFI
-//! bridge does, reaches none of them. Each case below compiled when those items
-//! were `pub`; each now fails with a privacy error.
+//! bridge does, reaches none of them. Each case below but the `ActorDeps`
+//! literal compiled when those items were `pub`; each now fails with a
+//! privacy error.
 //!
 //! The Supervisor's actor lookup:
 //!
@@ -82,6 +83,61 @@
 //! use scp_core::context::outlets::invoke::authorize_outlet_payment;
 //! ```
 //!
+//! Creating a context without the Supervisor's running-context and
+//! terminal-snapshot refusals (a domain crate reaches it only through
+//! `ActorDeps::create_context`):
+//!
+//! ```compile_fail,E0603
+//! use scp_core::context::builder::create_context;
+//! ```
+//!
+//! Building the dependency bundle core lends a domain crate. This case never
+//! compiled outside core: `owned_identity` was crate-internal before the seal
+//! as well.
+//!
+//! ```compile_fail,E0451
+//! use scp_core::context::actor::deps::ActorDeps;
+//! fn forge() -> ActorDeps {
+//!     ActorDeps { ..todo!() }
+//! }
+//! ```
+//!
+//! Clearing every identity's wrapping key:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::supervisor::Supervisor;
+//! fn clear(sup: &Supervisor) {
+//!     sup.clear_wrapping_keys(todo!());
+//! }
+//! ```
+//!
+//! Closing the spawn gate:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::supervisor::Supervisor;
+//! fn close(sup: &Supervisor) {
+//!     sup.close_spawn_gate();
+//! }
+//! ```
+//!
+//! Stopping every identity's key-package actor:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::supervisor::Supervisor;
+//! fn stop(sup: &Supervisor) {
+//!     let _ = sup.stop_key_package_actors();
+//! }
+//! ```
+//!
+//! The local-DID set's backing cell:
+//!
+//! ```compile_fail,E0624
+//! use scp_core::context::supervisor::Supervisor;
+//! fn dids(sup: &Supervisor) {
+//!     let _ = sup.local_dids_ref();
+//! }
+//! ```
+//!
 //! The control: the same paths resolve, and the public items beside the
 //! sealed ones compile. It also runs as `tests/runtime_seal.rs`, because
 //! `cargo nextest` runs no doctest.
@@ -89,7 +145,9 @@
 //! ```
 //! use std::sync::Arc;
 //! use scp_core::context::actor::class_s::ClassSCell;
+//! use scp_core::context::actor::deps::ActorDeps;
 //! use scp_core::context::actor::state::PerContextState;
+//! use scp_core::context::builder::ContextCreator;
 //! use scp_core::context::outlets::invoke::InvocationError;
 //! use scp_core::context::supervisor::{Supervisor, SupervisorHandle};
 //! fn reach(
@@ -98,6 +156,8 @@
 //!     _cell: Option<&ClassSCell>,
 //!     _handle: Option<&SupervisorHandle>,
 //!     _err: Option<&InvocationError>,
+//!     _deps: Option<&ActorDeps>,
+//!     _creator: Option<&ContextCreator<'_>>,
 //! ) -> [u8; 32] {
 //!     state.context_id
 //! }

@@ -1367,11 +1367,10 @@ pub struct VelocityTrackerSnapshot {
 
 /// Governance-related per-context state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
-/// actor's [`crate::context::actor::state::PerContextState`] can carry a
-/// field of this type while the handler-body migration is under way.
-/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
-/// module.
+/// **Visibility:** `pub`, so the actor's
+/// [`crate::context::actor::state::PerContextState`] can carry a field of
+/// this type and the domain crates' helpers can read and write its fields
+/// (ADR-049 §15, ADR-070).
 pub struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
     pub engine: Box<dyn GovernanceEngine>,
@@ -1638,11 +1637,10 @@ impl GovernanceState {
 
 /// MLS epoch and reconnection state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
-/// actor's [`crate::context::actor::state::PerContextState`] can carry a
-/// field of this type while the handler-body migration is under way.
-/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
-/// module.
+/// **Visibility:** `pub`, so the actor's
+/// [`crate::context::actor::state::PerContextState`] can carry a field of
+/// this type and the domain crates' helpers can read and write its fields
+/// (ADR-049 §15, ADR-070).
 pub struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
@@ -1678,11 +1676,10 @@ pub struct EpochState {
 /// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
 /// This struct retains the CEK exclusion list and per-member access key store.
 ///
-/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
-/// actor's [`crate::context::actor::state::PerContextState`] can carry a
-/// field of this type while the handler-body migration is under way.
-/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
-/// module.
+/// **Visibility:** `pub`, so the actor's
+/// [`crate::context::actor::state::PerContextState`] can carry a field of
+/// this type and the domain crates' helpers can read and write its fields
+/// (ADR-049 §15, ADR-070).
 pub struct AccessControlState {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
     /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
@@ -1811,11 +1808,10 @@ impl GovernanceState {
 
 /// TTL timer and extension state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
-/// actor's [`crate::context::actor::state::PerContextState`] can carry a
-/// field of this type while the handler-body migration is under way.
-/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
-/// module.
+/// **Visibility:** `pub`, so the actor's
+/// [`crate::context::actor::state::PerContextState`] can carry a field of
+/// this type and the domain crates' helpers can read and write its fields
+/// (ADR-049 §15, ADR-070).
 pub struct TtlState {
     /// TTL timer management (SCP-021).
     pub timer: TtlTimer,

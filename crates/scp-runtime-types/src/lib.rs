@@ -67,7 +67,6 @@ pub mod economy;
 pub mod envelope;
 pub mod identity;
 pub mod metrics;
-pub mod provenance;
 pub mod sync;
 pub mod trust;
 pub mod well_known;

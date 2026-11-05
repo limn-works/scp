@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use scp_core::context::actor::class_s::ClassSCell;
+use scp_core::context::actor::deps::ActorDeps;
 use scp_core::context::actor::state::PerContextState;
+use scp_core::context::builder::ContextCreator;
 use scp_core::context::outlets::invoke::InvocationError;
 use scp_core::context::supervisor::{Supervisor, SupervisorHandle};
 
@@ -19,6 +21,8 @@ type Reach = fn(
     Option<&ClassSCell>,
     Option<&SupervisorHandle>,
     Option<&InvocationError>,
+    Option<&ActorDeps>,
+    Option<&ContextCreator<'_>>,
 ) -> [u8; 32];
 
 const fn reach(
@@ -27,6 +31,8 @@ const fn reach(
     _cell: Option<&ClassSCell>,
     _handle: Option<&SupervisorHandle>,
     _err: Option<&InvocationError>,
+    _deps: Option<&ActorDeps>,
+    _creator: Option<&ContextCreator<'_>>,
 ) -> [u8; 32] {
     state.context_id
 }

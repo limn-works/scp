@@ -259,15 +259,19 @@ impl IdentityWrappingKey {
         read_public_point(self.custody.as_ref(), &self.handle).await
     }
 
-    /// The ECDH x-coordinate of the private key and `enc`, computed inside
-    /// custody under the custody budget.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::Custody`] if custody refuses (key-not-found is
-    /// `SCP-CRYPTO-4006`) or times out (`SCP-CRYPTO-4062`).
-    pub async fn agree(&self, enc: &ValidatedEnc) -> Result<Zeroizing<[u8; 32]>, ContextError> {
-        custody_bounded(self.custody.dh_agree(&self.handle, enc), "dh_agree").await
+    scp_runtime_types::pub_under_testing! {
+        /// The ECDH x-coordinate of the private key and `enc`, computed inside
+        /// custody under the custody budget.
+        ///
+        /// # Errors
+        ///
+        /// [`ContextError::Custody`] if custody refuses (key-not-found is
+        /// `SCP-CRYPTO-4006`) or times out (`SCP-CRYPTO-4062`).
+        ///
+        /// `pub(crate)`; `pub` under `testing`, because `scp-runtime`'s actor-state tests run the agreement directly.
+        pub(crate) async fn agree(&self, enc: &ValidatedEnc) -> Result<Zeroizing<[u8; 32]>, ContextError> {
+            custody_bounded(self.custody.dh_agree(&self.handle, enc), "dh_agree").await
+        }
     }
 
     /// Destroys the key in custody, best effort: the caller is already

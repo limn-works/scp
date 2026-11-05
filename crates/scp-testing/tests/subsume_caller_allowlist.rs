@@ -37,11 +37,11 @@ const KNOWN_SUBSUME_SITES: [(&str, usize); 2] = [
 const DEFINING_FILE: &str = "crates/scp-runtime-core/src/context/actor/class_s.rs";
 
 fn workspace_root() -> Result<PathBuf, String> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "scp-testing sits two levels below the repository root".to_owned())
+        .ok_or("scp-testing sits two levels below the repository root")?
+        .to_path_buf())
 }
 
 fn read_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -90,9 +90,8 @@ fn count_subsume_calls(stream: TokenStream) -> usize {
 
 #[test]
 fn subsume_callers_equal_the_allowlist() -> Result<(), String> {
-    let root = workspace_root()?;
     let mut files = Vec::new();
-    for dir in read_dir(&root.join("crates"))? {
+    for dir in read_dir(&workspace_root()?.join("crates"))? {
         let is_runtime = dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -105,7 +104,7 @@ fn subsume_callers_equal_the_allowlist() -> Result<(), String> {
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
     for file in &files {
         let rel = file
-            .strip_prefix(&root)
+            .strip_prefix(workspace_root()?)
             .map_err(|e| format!("{} is outside the repository root: {e}", file.display()))?
             .to_string_lossy()
             .into_owned();

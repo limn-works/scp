@@ -238,11 +238,12 @@ impl ActorDeps {
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — only lifecycle bootstrap calls this.
-    /// External crates and FFI bridges never construct or duplicate
-    /// `ActorDeps`.
+    /// `pub`: the lifecycle crate's create, import and restore bootstraps
+    /// call it, as do the Supervisor's own spawn paths. It duplicates a
+    /// bundle the caller already holds and reissues the token for the same
+    /// owning identity, so it mints no capability the caller lacks; only
+    /// core constructs an `ActorDeps` from nothing.
     #[must_use]
-    #[allow(dead_code)] // first production caller lands with the bootstrap wiring in this PR
     pub fn clone_for_spawn(&self) -> Self {
         Self {
             crypto: Arc::clone(&self.crypto),
@@ -404,6 +405,45 @@ impl ActorDeps {
         let adapter = self.require_payment_adapter()?;
         crate::context::outlets::invoke::complete_outlet_payment(adapter, policy, prepared, metrics)
             .await
+    }
+
+    /// Creates a context over this bundle's MLS factory, transport and event
+    /// log: the atomic multi-phase creation of
+    /// [`crate::context::builder::create_context`].
+    ///
+    /// Domain crates call it through the `ActorDeps` core lends their trait
+    /// method, so only the Supervisor's create path, which runs its running-context
+    /// and terminal-snapshot refusals and the lifecycle parameter checks first,
+    /// reaches the builder (ADR-070 §4).
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextCreationError`](crate::context::builder::ContextCreationError) the
+    /// builder returns; after an error no group, sender key or event-log state
+    /// persists.
+    pub async fn create_context(
+        &self,
+        context_id: String,
+        params: scp_protocol::context::ContextParams,
+        creator: crate::context::builder::ContextCreator<'_>,
+        creation_timestamp_secs: u64,
+    ) -> Result<
+        (
+            crate::context::ContextHandle,
+            Option<crate::crypto::mls::provider::OwnedMlsCryptoState>,
+        ),
+        crate::context::builder::ContextCreationError,
+    > {
+        crate::context::builder::create_context(
+            context_id,
+            params,
+            self.crypto.as_ref(),
+            self.transport.as_ref(),
+            self.event_log.as_ref(),
+            creator,
+            creation_timestamp_secs,
+        )
+        .await
     }
 
     /// This context's payment adapter, or the typed error an outlet payment
