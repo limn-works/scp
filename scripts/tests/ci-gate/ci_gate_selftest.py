@@ -12110,12 +12110,13 @@ VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
 #             The exception holds only while nothing but the image can put a directory
 #             under the SDK root before the step, so it carries a rule of its own:
 #   CRITERION for the SDK root: in a job or action that uses ANDROID_SDK_ACTION, no
-#             step before it writes under the SDK root, and nothing redirects the
-#             root (sdk_root_write_gaps). INDICATORS it reads, not the criterion: a
-#             `with: path:`, a `run:` or an `env:` that names ANDROID_HOME,
-#             ANDROID_SDK_ROOT, an ANDROID_NDK variable or /usr/local/lib/android, in
-#             an earlier step or in a local composite action an earlier step uses;
-#             and a job or step `env:` that sets ANDROID_HOME or ANDROID_SDK_ROOT.
+#             step before any use writes under the SDK root, and nothing redirects the
+#             root at any use (sdk_root_write_gaps). INDICATORS it reads, not the
+#             criterion: a `with: path:`, a `run:` or an `env:` that names
+#             ANDROID_HOME, ANDROID_SDK_ROOT, an ANDROID_NDK variable or
+#             /usr/local/lib/android, in an earlier step or in a local composite action
+#             an earlier step uses; and a workflow, job or use `env:` that sets
+#             ANDROID_HOME or ANDROID_SDK_ROOT.
 #             A package the image lacks, holds at another revision or holds at a
 #             revision install.py cannot read is downloaded and checked against its
 #             pinned SHA-256 (android_pin_gaps and
@@ -12687,36 +12688,39 @@ def sdk_root_writes(label: str, step: dict, seen: frozenset = frozenset()) -> li
 
 
 def sdk_root_write_gaps(where: str, steps: list, job: dict | None = None) -> list[str]:
-    """No step before ANDROID_SDK_ACTION writes under the SDK root, nor redirects it.
+    """No step before any ANDROID_SDK_ACTION use writes under the SDK root, nor redirects it.
 
     install.py keeps a directory that already names its pinned revision without
-    checking a digest; that is safe only while the runner image alone wrote it.
+    checking a digest; that is safe only while the runner image alone wrote it. So for
+    each use, every earlier step is read, and the env in effect at the use (`job`'s
+    `env:`, which download_step_lists merges over the workflow's, and the use's own)
+    must not set the root.
     """
-    first = next(
-        (
-            index
-            for index, step in enumerate(steps)
-            if isinstance(step, dict) and step_uses(step) == ANDROID_SDK_ACTION
-        ),
-        None,
-    )
-    if first is None:
+    uses = [
+        index
+        for index, step in enumerate(steps)
+        if isinstance(step, dict) and step_uses(step) == ANDROID_SDK_ACTION
+    ]
+    if not uses:
         return []
     why = (
         f"before {ANDROID_SDK_ACTION}, which keeps a directory at its pinned revision "
         "unchecked and so trusts that only the runner image wrote under the SDK root"
     )
     gaps = [
-        f"{where} sets {key} in the job's `env:`, so {ANDROID_SDK_ACTION} reads a root "
-        "the runner image did not fill"
+        f"{where} sets {key} in the workflow's or job's `env:`, so {ANDROID_SDK_ACTION} "
+        "reads a root the runner image did not fill"
         for key in (job or {}).get("env") or {}
         if key in SDK_ROOT_VARIABLES
     ]
-    for key in steps[first].get("env") or {}:
-        if key in SDK_ROOT_VARIABLES:
-            gaps.append(f"{where} step {first} sets {key} for {ANDROID_SDK_ACTION}")
-    for index, step in enumerate(steps[:first]):
-        if isinstance(step, dict):
+    for use in uses:
+        for key in steps[use].get("env") or {}:
+            if key in SDK_ROOT_VARIABLES:
+                gaps.append(f"{where} step {use} sets {key} for {ANDROID_SDK_ACTION}")
+    # Every step before the last use precedes some use; an earlier use is itself read,
+    # so an `env:` it sets for its own run is reported once, above, not twice.
+    for index, step in enumerate(steps[: uses[-1]]):
+        if isinstance(step, dict) and index not in uses:
             label = f"{where} step {index} ({step.get('name') or step_uses(step) or 'run'})"
             gaps += [f"{write}, {why}" for write in sdk_root_writes(label, step)]
     return gaps
@@ -12861,8 +12865,13 @@ def download_step_lists(
     """Every workflow job's steps, with the job, and every local composite action's steps."""
     found = []
     for path, doc in documents:
+        workflow_env = doc.get("env") if isinstance(doc.get("env"), dict) else {}
         for job_id, job in sorted((doc.get("jobs") or {}).items()):
-            found.append((f"{path.name}:{job_id}", job.get("steps"), job))
+            # A job's steps see the workflow's `env:` under the job's own, so the job
+            # passed on carries the env in effect for its steps.
+            job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+            effective = {**job, "env": {**workflow_env, **job_env}}
+            found.append((f"{path.name}:{job_id}", job.get("steps"), effective))
     for action in sorted((REPO / ".github/actions").glob("*/action.y*ml")):
         doc = yaml.safe_load(action.read_text()) or {}
         found.append(
@@ -13478,7 +13487,30 @@ def check_download_bounds() -> None:
     url = f"http://127.0.0.1:{server.server_address[1]}/planted.zip"
     quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
     real_fetch = downloads.fetch_once
+    real_urlopen = downloads.urllib.request.urlopen
     written: list[int] = []
+    # Per read: the bytes accepted before it plus the bytes it asks the connection for.
+    reach: list[int] = []
+
+    class CountingResponse:
+        def __init__(self, response):
+            self.response, self.got = response, 0
+            self.headers = response.headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.response.__exit__(*exc)
+
+        def read1(self, n=-1):
+            reach.append(self.got + n)
+            chunk = self.response.read1(n)
+            self.got += len(chunk)
+            return chunk
+
+    def counting_urlopen(*args, **kwargs):
+        return CountingResponse(real_urlopen(*args, **kwargs))
 
     def measuring_fetch(url, destination, *rest):
         # The bytes each attempt left on disk before download_verified removes them.
@@ -13540,7 +13572,18 @@ def check_download_bounds() -> None:
                 "deadline" in error and elapsed < bound and not out.exists(),
                 f"error {error!r} after {elapsed:.1f} s, bound {bound:.1f} s",
             )
-            error, _ = attempt("oversize", out)
+            reach.clear()
+            downloads.urllib.request.urlopen = counting_urlopen
+            try:
+                error, _ = attempt("oversize", out)
+            finally:
+                downloads.urllib.request.urlopen = real_urlopen
+            check(
+                "verified_download never asks the connection for more than one byte past "
+                "the pinned size",
+                "runs past" in error and reach and max(reach) == len(body) + 1,
+                f"error {error!r}, furthest byte each read asked for {sorted(set(reach))}",
+            )
             check(
                 "verified_download refuses a body that runs past the pinned size, "
                 "writing no byte past it",
@@ -13884,6 +13927,61 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
                 {"env": {"ANDROID_HOME": "/tmp/sdk"}},
             )
         ),
+    )
+    between = unverified_download_gaps(
+        "planted",
+        [
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "platforms;android-35"}},
+            {"uses": f"actions/cache/restore@{'0' * 40}",
+             "with": {"path": "/usr/local/lib/android/sdk/ndk", "key": "ndk"}},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+        ],
+    )
+    check(
+        "verified-download reports a cache restored into the NDK between two android-sdk "
+        "uses",
+        any("planted step 1" in gap and "writes to `path:`" in gap for gap in between),
+        f"returned {between}",
+    )
+    workflow = [
+        (
+            Path("planted.yml"),
+            {
+                "env": {"ANDROID_HOME": "/tmp/sdk"},
+                "jobs": {
+                    "sdk": {
+                        "steps": [
+                            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}}
+                        ]
+                    }
+                },
+            },
+        )
+    ]
+    moved = [
+        gap
+        for where, steps, job in download_step_lists(workflow)
+        if where == "planted.yml:sdk"
+        for gap in unverified_download_gaps(where, steps, job)
+    ]
+    check(
+        "verified-download reports a workflow env that moves ANDROID_HOME under "
+        "android-sdk",
+        any("sets ANDROID_HOME in the workflow's or job's `env:`" in gap for gap in moved),
+        f"returned {moved}",
+    )
+    through_env = unverified_download_gaps(
+        "planted",
+        [
+            {"env": {"DEST": "/usr/local/lib/android/sdk/ndk"}, "run": 'cp -r ndk "$DEST"'},
+            {"uses": ANDROID_SDK_ACTION, "with": {"packages": "ndk;27.3.13750724"}},
+        ],
+    )
+    check(
+        "verified-download reports an earlier step whose `env:` points a copy into the "
+        "SDK root",
+        any("sets `env:` DEST=" in gap for gap in through_env),
+        f"returned {through_env}",
     )
     after = [
         {"uses": ANDROID_SDK_ACTION, "with": {"packages": "emulator"}},
