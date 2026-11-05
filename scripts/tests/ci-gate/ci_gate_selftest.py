@@ -12097,6 +12097,18 @@ VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
 #             runner image or the digest-pinned container image holds, and Homebrew
 #             checks each bottle against the SHA-256 in its JWS-signed API.
 #
+# NAMED EXCEPTION, fetching nothing: the runner image's own Android SDK packages.
+#   android-sdk keeps a package the runner image already holds at the revision its
+#             pin names (on ubuntu-24.04: platforms;android-35, platform-tools and the
+#             NDK) and downloads nothing for it, so no digest is checked for it. The
+#             runner image is already trusted, in the same way the toolchain on it is:
+#             the JDK toolcache-setup selects, the keys apt checks against, and the
+#             command-line tools install.py lists packages with all come from it. No
+#             cache restores into the SDK root, so nothing but the image can put a
+#             package there before the step. A package the image lacks is downloaded
+#             and checked against its pinned SHA-256 (android_pin_gaps and
+#             check_android_sdk_keeps_only_the_pinned_revision below).
+#
 # THE STRUCTURE IS CLOSED. A remote action passes only when PERMITTED_ACTIONS lists
 # it, with the verdict on what it fetches recorded there, and only when the conditions
 # that verdict names hold. A remote reference names a full commit SHA. A local action
@@ -12931,9 +12943,9 @@ def check_installer_rejects_a_corrupt_archive() -> None:
             digest = hashlib.new(algorithm, whole).hexdigest()
             fetched = []
 
-            def counting_fetch(url, destination, algorithm, fetched=fetched):
+            def counting_fetch(url, destination, algorithm, *rest, fetched=fetched):
                 fetched.append(url)
-                return real_fetch(url, destination, algorithm)
+                return real_fetch(url, destination, algorithm, *rest)
 
             downloads.fetch_once = counting_fetch
             try:
@@ -12994,11 +13006,11 @@ def check_installer_rejects_a_corrupt_archive() -> None:
         digest = hashlib.sha256(whole).hexdigest()
         dropped = []
 
-        def dropping_fetch(url, destination, algorithm, dropped=dropped):
+        def dropping_fetch(url, destination, algorithm, *rest, dropped=dropped):
             dropped.append(url)
             if len(dropped) == 1:
                 raise http.client.IncompleteRead(b"partial", 100)
-            return real_fetch(url, destination, algorithm)
+            return real_fetch(url, destination, algorithm, *rest)
 
         downloads.fetch_once = dropping_fetch
         try:
@@ -13084,6 +13096,192 @@ def check_installer_rejects_a_corrupt_archive() -> None:
         result.returncode != 0 and "no pin" in result.stdout and "bun" in result.stdout,
         f"exit {result.returncode}: {result.stdout.strip()!r}",
     )
+
+
+def android_pin_gaps(pins: dict) -> list[str]:
+    """Every android-sdk pin without a relative archive path, a size and a whole SHA-256."""
+    return [
+        f"{package}: {pin!r}"
+        for package, pin in pins.items()
+        if not re.fullmatch(r"[0-9a-f]{64}", getattr(pin, "sha256", "") or "")
+        or pin.size <= 0
+        or not pin.archive
+        or "://" in pin.archive
+        or pin.archive.startswith("/")
+    ]
+
+
+def check_android_sdk_keeps_only_the_pinned_revision() -> None:
+    """Every android-sdk pin carries a SHA-256, and only the pinned revision skips a download."""
+    installer = load_module("android_sdk_install", ANDROID_SDK_INSTALLER)
+    gaps = android_pin_gaps(installer.PINS)
+    check(
+        "every android-sdk pin names an archive path, a size and a SHA-256",
+        not gaps,
+        "; ".join(gaps),
+    )
+    pin = installer.PINS["platform-tools"]
+    planted = {
+        "a SHA-1 in place of a SHA-256": pin._replace(sha256=pin.sha256[:40]),
+        "an empty digest": pin._replace(sha256=""),
+        "a zero size": pin._replace(size=0),
+        "an absolute URL": pin._replace(archive="https://example.com/p.zip"),
+    }
+    for name, bad in planted.items():
+        check(
+            f"android_pin_gaps reports a planted pin with {name}",
+            bool(android_pin_gaps({"planted": bad})),
+        )
+    with tempfile.TemporaryDirectory() as scratch:
+        held = Path(scratch, "held")
+        held.mkdir()
+        (held / "source.properties").write_text(f"Pkg.Revision={pin.revision}.0\n")
+        other = Path(scratch, "other")
+        other.mkdir()
+        (other / "source.properties").write_text("Pkg.Revision=36.0.0\n")
+        bare = Path(scratch, "bare")
+        bare.mkdir()
+        check(
+            "android-sdk keeps a directory that holds the pinned revision",
+            installer.held_by_image(held, pin),
+        )
+        check(
+            "android-sdk downloads over a directory at another revision",
+            not installer.held_by_image(other, pin),
+        )
+        check(
+            "android-sdk downloads over a directory with no source.properties",
+            not installer.held_by_image(bare, pin),
+        )
+        check(
+            "android-sdk downloads a package the SDK root lacks",
+            not installer.held_by_image(Path(scratch, "absent"), pin),
+        )
+
+
+def check_download_ranges_and_bounds() -> None:
+    """Ranged downloads, a server that ignores Range, a corrupt range and a stalled server."""
+    import contextlib
+    import hashlib
+    import http.server
+    import io
+    import threading
+
+    downloads = load_verified_download()
+    body = os.urandom(300_000)
+    digest = hashlib.sha256(body).hexdigest()
+    seen: list[str] = []
+    mode = {"name": "ranges"}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):  # keep the planted server out of the log
+            pass
+
+        def do_GET(self):  # noqa: N802 - the name http.server dispatches on
+            requested = self.headers.get("Range")
+            seen.append(requested or "")
+            if mode["name"] == "stall":
+                time.sleep(3)
+                return
+            match = re.fullmatch(r"bytes=(\d+)-(\d+)", requested or "")
+            if mode["name"] == "ignore-range" or not match:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            first, last = int(match[1]), int(match[2])
+            part = bytearray(body[first : last + 1])
+            if mode["name"] == "corrupt" and first == 0:
+                part[0] ^= 0xFF
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {first}-{last}/{len(body)}")
+            self.send_header("Content-Length", str(len(part)))
+            self.end_headers()
+            self.wfile.write(bytes(part))
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/planted.zip"
+    limits = downloads.Limits(
+        stall=0.5, min_rate=1 << 30, deadline_floor=5.0, segments=4, segment_min=1
+    )
+    quiet = functools.partial(contextlib.redirect_stdout, io.StringIO())
+
+    def attempt(name: str, out: Path, attempts: int = 2, **overrides) -> str:
+        mode["name"] = name
+        seen.clear()
+        try:
+            with quiet():
+                downloads.download_verified(
+                    f"planted;{name}",
+                    url,
+                    len(body),
+                    digest,
+                    out,
+                    attempts=attempts,
+                    backoff=0,
+                    limits=limits._replace(**overrides),
+                )
+            return ""
+        except downloads.InstallError as raised:
+            return str(raised)
+
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            out = Path(scratch, "out.zip")
+            error = attempt("ranges", out)
+            check(
+                "verified_download fetches a large file as byte ranges and accepts it",
+                not error
+                and out.read_bytes() == body
+                and len([r for r in seen if r.startswith("bytes=")]) == 4,
+                f"error {error!r}, requests {seen}",
+            )
+            out.unlink(missing_ok=True)
+            error = attempt("ignore-range", out)
+            check(
+                "verified_download falls back to one stream when a server ignores Range",
+                not error and out.read_bytes() == body and "" in seen,
+                f"error {error!r}, requests {seen}",
+            )
+            out.unlink(missing_ok=True)
+            error = attempt("corrupt", out)
+            check(
+                "verified_download refuses a file one of whose ranges is corrupt",
+                "planted;corrupt" in error and url in error and not out.exists(),
+                f"error {error!r}",
+            )
+            started = time.monotonic()
+            error = attempt("stall", out, segment_retries=1)
+            elapsed = time.monotonic() - started
+            check(
+                "verified_download fails a stalled server within its bounds, naming it",
+                "planted;stall" in error and url in error and elapsed < 10 and not out.exists(),
+                f"error {error!r} after {elapsed:.1f} s",
+            )
+            started = time.monotonic()
+            error = attempt("stall", out, segments=1)
+            elapsed = time.monotonic() - started
+            check(
+                "verified_download fails a stalled single stream within its bounds",
+                "planted;stall" in error and elapsed < 10 and not out.exists(),
+                f"error {error!r} after {elapsed:.1f} s",
+            )
+            # A connection that keeps sending never stalls; the attempt's deadline,
+            # not the read timeout, ends it.
+            started = time.monotonic()
+            error = attempt(
+                "ranges", out, attempts=1, min_rate=1.0, deadline_floor=-len(body) - 1.0
+            )
+            check(
+                "verified_download ends an attempt that passes its deadline",
+                "deadline" in error and not out.exists(),
+                f"error {error!r}",
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def check_toolcache_guard() -> None:
@@ -13615,6 +13813,8 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         f"{verification_metadata_gaps('control', verifying)}",
     )
     check_installer_rejects_a_corrupt_archive()
+    check_android_sdk_keeps_only_the_pinned_revision()
+    check_download_ranges_and_bounds()
     check_toolcache_guard()
 
 

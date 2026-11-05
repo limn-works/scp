@@ -446,12 +446,12 @@ jobs:
       # unpacked; .github/actions/android-sdk/install.py states why.
       - uses: ./.github/actions/android-sdk
         with:
-          packages: ndk;27.2.12479018
+          packages: ndk;27.3.13750724
       # The same linker and C toolchain variables kotlin-android-instrumented writes, before
       # rust-cache, which hashes every CARGO* variable into the key.
       - name: Point cargo at the NDK linker
         run: |
-          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ndk_bin="$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
             echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ndk_bin/x86_64-linux-android21-clang"
             echo "CC_x86_64_linux_android=$ndk_bin/x86_64-linux-android21-clang"

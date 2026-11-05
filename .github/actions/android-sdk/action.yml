@@ -1,9 +1,9 @@
 name: Install pinned Android SDK packages from checked archives
 description: >-
-  Downloads each requested Android SDK package's archive, checks its size and the SHA-1
-  Google's repository manifest publishes against a pin, retries a mismatch, and unpacks
-  only an archive that matches; when every attempt mismatches the step fails naming the
-  package. Puts the command-line tools, platform-tools and emulator on PATH and turns off
+  Keeps each requested Android SDK package the runner image already holds at its pinned
+  revision. Downloads every other one's archive under a time bound, checks its size and
+  SHA-256 against a pin, retries a failed attempt, and unpacks only an archive that
+  matches; when every attempt fails the step fails naming the package. Puts the command-line tools, platform-tools and emulator on PATH and turns off
   the Android Gradle plugin's own SDK downloads. install.py beside this file states why
   and holds the pins. Every CI job that needs an Android SDK package installs it here,
   never through `sdkmanager --install`, android-actions/setup-android or
@@ -13,7 +13,7 @@ inputs:
   packages:
     description: >-
       Space-separated SDK package paths as sdkmanager spells them, each one install.py
-      pins (for example `ndk;27.2.12479018`).
+      pins (for example `ndk;27.3.13750724`).
     required: true
 runs:
   using: composite

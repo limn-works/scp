@@ -591,7 +591,7 @@ jobs:
       - name: Install the Android NDK and platform
         uses: ./.github/actions/android-sdk
         with:
-          packages: ndk;27.2.12479018 platforms;android-35
+          packages: ndk;27.3.13750724 platforms;android-35
 
       # cc-rs, which ring's build script and the vendored OpenSSL compile C through,
       # otherwise looks for unversioned `aarch64-linux-android-clang` and
@@ -600,9 +600,9 @@ jobs:
       # ci.yml names the same four tools for x86_64.
       - name: Set NDK environment
         run: |
-          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ndk_bin="$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
-            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724"
             for pair in aarch64-linux-android:aarch64-linux-android21 \
                 armv7-linux-androideabi:armv7a-linux-androideabi21 \
                 x86_64-linux-android:x86_64-linux-android21 \
