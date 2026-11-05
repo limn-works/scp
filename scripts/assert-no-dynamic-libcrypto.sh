@@ -10,7 +10,8 @@
 #     OpenSSL symbol undefined;
 #   - a PE image imports from no DLL whose name starts with `libcrypto` or `libssl`;
 #   - a static archive defines every OpenSSL symbol one of its members leaves
-#     undefined, so the program linking it needs no OpenSSL of its own.
+#     undefined, so the program linking it needs no OpenSSL of its own; a universal
+#     (fat) archive meets that for each architecture it holds.
 # An OpenSSL symbol is one whose name starts with `EVP_`, `OPENSSL_`, `CRYPTO_`,
 # `ERR_`, `RAND_`, `HMAC_` or `PKCS5_`, after the leading underscore Mach-O adds;
 # those prefixes are indicators of the OpenSSL API SQLCipher calls, not the whole of
@@ -30,9 +31,12 @@
 #
 # Tools, each replaceable through the variable named, which the self-test uses:
 #   ELF      $READELF (readelf) -d, and $NM (nm) -D --undefined-only
-#   Mach-O   $OTOOL (otool) -L, and $NM (nm) -u
+#   Mach-O   $OTOOL (otool) -L, and $NM (nm) -u --arch=all
 #   PE       $READOBJ (llvm-readobj) --coff-imports, else $OBJDUMP (objdump) -p
-#   archive  $NM (nm) -g -P
+#   archive  $NM (nm) -g -P, adding --arch=all for a universal archive
+# A Rust static archive carries LLVM bitcode, which an nm on an older LLVM than rustc's
+# rejects (Xcode's does), so a caller checking one names in $NM the llvm-nm of the Rust
+# toolchain's `llvm-tools` component.
 #
 # Usage:
 #   assert-no-dynamic-libcrypto.sh <library>...
@@ -42,15 +46,26 @@ set -euo pipefail
 SYMBOLS='^_?(EVP|OPENSSL|CRYPTO|ERR|RAND|HMAC|PKCS5)_'
 LIBRARIES='^(lib)?(crypto|ssl)([-.0-9_]|x64|$)'
 
-# format_of <file>: elf, macho, pe, archive, or nothing.
+ARCHIVE_MAGIC=213c617263683e0a
+
+# format_of <file>: elf, macho, pe, archive, fat-archive, or nothing. A universal file
+# (big-endian magic cafebabe) is an archive when its first slice is one; the first
+# slice's offset is the big-endian word at byte 16 of the fat header.
 format_of() {
-  local magic
+  local magic offset
   magic="$(od -An -tx1 -N8 "$1" | tr -d ' \n')"
   case "$magic" in
     7f454c46*) echo elf ;;
-    cffaedfe*|cefaedfe*|feedfacf*|feedface*|cafebabe*|bebafeca*) echo macho ;;
+    cafebabe*)
+      offset="$(od -An -tu1 -j16 -N4 "$1" | awk 'NF == 4 { print (($1 * 256 + $2) * 256 + $3) * 256 + $4 }')"
+      if [[ -n "$offset" && "$(od -An -tx1 -j"$offset" -N8 "$1" | tr -d ' \n')" == "$ARCHIVE_MAGIC" ]]; then
+        echo fat-archive
+      else
+        echo macho
+      fi ;;
+    cffaedfe*|cefaedfe*|feedfacf*|feedface*|bebafeca*) echo macho ;;
     4d5a*) echo pe ;;
-    213c617263683e0a) echo archive ;;
+    "$ARCHIVE_MAGIC") echo archive ;;
   esac
 }
 
@@ -85,20 +100,22 @@ elf_undefined() {
   out="$("${NM:-nm}" -D --undefined-only "$1")" || return 1
   printf '%s\n' "$out" | awk '{print $NF}' | grep -E "$SYMBOLS" || true
 }
+# --arch=all lists every slice of a universal image, and changes nothing for a thin one.
 macho_undefined() {
   local out
-  out="$("${NM:-nm}" -u "$1")" || return 1
+  out="$("${NM:-nm}" -u --arch=all "$1")" || return 1
   printf '%s\n' "$out" | awk '{print $NF}' | grep -E "$SYMBOLS" || true
 }
-# An archive's members reference each other, so only an OpenSSL symbol some member
-# leaves undefined and no member defines reaches the final link. Apple's nm exits 1 when
+# archive_unresolved <file> [--arch=all]: an archive's members reference each other, so
+# only an OpenSSL symbol some member leaves undefined and no member of the same
+# architecture defines reaches the final link. With --arch=all, nm heads each member of
+# a universal archive "<file>(<member>) (for architecture <arch>):", and the symbols
+# resolve per architecture, so one slice cannot supply another's. LLVM's nm exits 1 when
 # any member has no symbols (a Rust staticlib holds several), so a non-zero exit fails
-# only when nm wrote some other diagnostic. Rust also embeds LLVM bitcode in each member,
-# which an nm built on an older LLVM (Xcode's) rejects; --no-llvm-bc, where nm offers it,
-# reads the object's own symbol table instead.
+# only when nm wrote some other diagnostic.
 archive_unresolved() {
   local out errors rc=0 flags=(-g -P)
-  "${NM:-nm}" --help 2>&1 | grep -q -- '--no-llvm-bc' && flags+=(--no-llvm-bc)
+  [[ $# -lt 2 ]] || flags+=("$2")
   errors="$(mktemp)" || return 1
   out="$("${NM:-nm}" "${flags[@]}" "$1" 2>"$errors")" || rc=$?
   if [[ "$rc" -ne 0 ]] && grep -vE '(^[[:space:]]*$|: no symbols$)' "$errors" >&2; then
@@ -107,8 +124,9 @@ archive_unresolved() {
   if [[ "$rc" -ne 0 && ! -s "$errors" ]]; then rm -f "$errors"; return 1; fi
   rm -f "$errors"
   printf '%s\n' "$out" | awk -v re="$SYMBOLS" '
-    NF >= 2 && $1 ~ re { if ($2 == "U") u[$1] = 1; else d[$1] = 1 }
-    END { for (s in u) if (!(s in d)) print s }' | sort
+    match($0, /\(for architecture [^)]*\):$/) { arch = substr($0, RSTART + 18, RLENGTH - 20); next }
+    NF >= 2 && $1 ~ re { k = arch SUBSEP $1; if ($2 == "U") u[k] = 1; else d[k] = 1 }
+    END { for (k in u) if (!(k in d)) { split(k, p, SUBSEP); print p[2] (p[1] == "" ? "" : " (" p[1] ")") } }' | sort
 }
 
 # check_one <file>: print the file's dependency list, then return 1 on a violation.
@@ -124,10 +142,12 @@ check_one() {
     pe)      needed="$(pe_needed "$file")" || { echo "FAIL — could not list $file's imports"; return 1; } ;;
     archive) needed=""
              undefined="$(archive_unresolved "$file")" || { echo "FAIL — could not list $file's symbols"; return 1; } ;;
+    fat-archive) needed=""
+             undefined="$(archive_unresolved "$file" --arch=all)" || { echo "FAIL — could not list $file's symbols"; return 1; } ;;
     *)       echo "FAIL — $file is not an ELF, Mach-O, PE or ar file"; return 1 ;;
   esac
   echo "--- $file ($format)"
-  if [[ "$format" == archive ]]; then
+  if [[ "$format" == archive || "$format" == fat-archive ]]; then
     echo "    a static archive; the program that links it resolves its undefined symbols"
   else
     printf '%s\n' "$needed" | sed -E '/^$/d; s/^/    needs /'
@@ -160,11 +180,15 @@ self_test() {
   printf '\xcf\xfa\xed\xfe\x07\x00\x00\x01' > "$dir/a.dylib"
   printf 'MZ\x90\x00\x03\x00\x00\x00' > "$dir/a.dll"
   printf '!<arch>\n' > "$dir/a.a"
+  # Universal files with one slice at offset 32: an archive slice, then a dylib slice.
+  printf '\xca\xfe\xba\xbe\x00\x00\x00\x01\x01\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00!<arch>\n' > "$dir/fat.a"
+  printf '\xca\xfe\xba\xbe\x00\x00\x00\x01\x01\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\xcf\xfa\xed\xfe\x07\x00\x00\x01' > "$dir/fat.dylib"
   printf 'not a library' > "$dir/a.txt"
   # Each stub prints the variable it is named after, so a case sets the output it needs.
   local tool
   for tool in readelf nm otool readobj; do
-    printf '#!/bin/sh\n[ -n "$STUB_FAIL" ] && exit 1\nprintf "%%s\\n" "$STUB_%s"\n[ -z "$STUB_STDERR" ] || { printf "%%s\\n" "$STUB_STDERR" >&2; exit 1; }\n' "$(echo "$tool" | tr a-z A-Z)" > "$dir/$tool"
+    # shellcheck disable=SC2016 # the stub expands these variables when it runs, not now.
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$STUB_ARGS"\n[ -n "$STUB_FAIL" ] && exit 1\nprintf "%%s\\n" "$STUB_%s"\n[ -z "$STUB_STDERR" ] || { printf "%%s\\n" "$STUB_STDERR" >&2; exit 1; }\n' "$(echo "$tool" | tr '[:lower:]' '[:upper:]')" > "$dir/$tool"
     chmod +x "$dir/$tool"
   done
   expect() { # <label> <PASS|FAIL> <command>...
@@ -184,7 +208,7 @@ self_test() {
   local clean_pe='  Name: KERNEL32.dll
   Name: ntdll.dll'
   export READELF="$dir/readelf" NM="$dir/nm" OTOOL="$dir/otool" READOBJ="$dir/readobj" OBJDUMP="$dir/absent-objdump"
-  export STUB_FAIL="" STUB_STDERR="" STUB_READELF="" STUB_NM="" STUB_OTOOL="" STUB_READOBJ=""
+  export STUB_ARGS="$dir/args" STUB_FAIL="" STUB_STDERR="" STUB_READELF="" STUB_NM="" STUB_OTOOL="" STUB_READOBJ=""
 
   STUB_READELF="$clean_elf" STUB_NM='                 U memcpy' expect "an ELF object needing only libc PASSES" PASS run "$dir/a.so"
   STUB_READELF="$crypto_elf" STUB_NM='' expect "an ELF object needing libcrypto.so.3 FAILS" FAIL run "$dir/a.so"
@@ -201,6 +225,27 @@ self_test() {
   STUB_NM='_ring_core_0_17_14__CRYPTO_memcmp U' expect "an archive leaving only a prefixed ring symbol undefined PASSES" PASS run "$dir/a.a"
   STUB_NM='_CCCrypt U' STUB_STDERR="$dir/a.a[empty.o]: no symbols" expect "an archive whose nm exits 1 over a member with no symbols PASSES" PASS run "$dir/a.a"
   STUB_NM='_CCCrypt U' STUB_STDERR="$dir/a.a: truncated or malformed archive" expect "an archive whose nm exits 1 with another diagnostic FAILS" FAIL run "$dir/a.a"
+  local fat_ok="$dir/fat.a(a.o) (for architecture x86_64):
+_EVP_x U 0 0
+
+$dir/fat.a(b.o) (for architecture x86_64):
+_EVP_x T 0 0
+
+$dir/fat.a(a.o) (for architecture arm64):
+_EVP_x U 0 0
+
+$dir/fat.a(b.o) (for architecture arm64):
+_EVP_x T 0 0"
+  STUB_NM="$fat_ok" expect "a universal archive whose every slice defines what it needs PASSES" PASS run "$dir/fat.a"
+  STUB_NM="${fat_ok%$'\n\n'*}" expect "a universal archive whose arm64 slice leaves _EVP_x unresolved FAILS" FAIL run "$dir/fat.a"
+  : > "$dir/args"; STUB_NM="$fat_ok" run "$dir/fat.a" >/dev/null 2>&1 || true
+  expect "a universal archive is listed with --arch=all" PASS grep -q -- '--arch=all' "$dir/args"
+  : > "$dir/args"; STUB_NM='_CCCrypt U' run "$dir/a.a" >/dev/null 2>&1 || true
+  expect "a thin archive is listed without --arch" FAIL grep -q -- '--arch' "$dir/args"
+  STUB_OTOOL="$clean_macho" STUB_NM='_CCCrypt' expect "a universal dylib is read as a Mach-O image and PASSES" PASS run "$dir/fat.dylib"
+  STUB_OTOOL="$clean_macho" STUB_NM='_OPENSSL_init_crypto' expect "a universal dylib leaving _OPENSSL_init_crypto undefined FAILS" FAIL run "$dir/fat.dylib"
+  : > "$dir/args"; STUB_OTOOL="$clean_macho" STUB_NM='_CCCrypt' run "$dir/fat.dylib" >/dev/null 2>&1 || true
+  expect "a Mach-O image's undefined symbols are listed with --arch=all" PASS grep -qx -- '-u --arch=all .*' "$dir/args"
   STUB_READELF="$clean_elf" STUB_NM='' STUB_FAIL=1 expect "a listing tool that exits non-zero FAILS" FAIL run "$dir/a.so"
   expect "a file of no known format FAILS" FAIL run "$dir/a.txt"
   expect "a missing file FAILS" FAIL run "$dir/absent.so"
