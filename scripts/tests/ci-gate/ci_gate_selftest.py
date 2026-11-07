@@ -5309,8 +5309,10 @@ def pyo3_purge_behavior_gaps(manifest_step: dict, purge_step: dict) -> list[str]
       `lib_dir` holding a control character;
     - deletes nothing outside the target directory's physical path, through a
       symlinked `.fingerprint`, profile or target directory;
-    - percent-encodes `%` in what it prints, and prints no line the runner reads as
-      another workflow command;
+    - percent-encodes `%`, CR and LF in what it prints, and prints no line the runner
+      reads as another workflow command, for a profile directory or unit name holding
+      CR or LF followed by a command, and for a `lib_dir` holding one;
+    - reads the target directory a `workspaces` line names after `->`;
     - exits 0 and deletes nothing when PYO3_PYTHON names no command or nothing was
       restored, and exits non-zero and deletes nothing on Windows.
     """
@@ -5324,17 +5326,17 @@ def pyo3_purge_behavior_gaps(manifest_step: dict, purge_step: dict) -> list[str]
     ):
         root = Path(scratch)
         victim = Path(outside)
-        for workspace in (root, root / "fuzz"):
+        for workspace in (root, root / "fuzz", root / "x"):
             workspace.mkdir(exist_ok=True)
             (workspace / "Cargo.toml").write_text((REPO / "Cargo.toml").read_text())
         code, outputs, out = run_manifest_step(
-            manifest_step, root, "  .  ->  target \n\n fuzz->target\n"
+            manifest_step, root, "  .  ->  target \n\n fuzz->target\n x -> out/t \n"
         )
         targets = outputs.get("targets", "")
-        if code != 0 or targets.split("\n") != ["./target", "fuzz/target"]:
+        if code != 0 or targets.split("\n") != ["./target", "fuzz/target", "x/out/t"]:
             gaps.append(
                 f"the manifest step printed targets {targets!r}, exit {code}, where "
-                f"['./target', 'fuzz/target'] was expected: {out}"
+                f"['./target', 'fuzz/target', 'x/out/t'] was expected: {out}"
             )
         debug = root / "target" / "debug"
         current_profile = root / "target" / "ci-bridge"
@@ -5360,6 +5362,9 @@ def pyo3_purge_behavior_gaps(manifest_step: dict, purge_step: dict) -> list[str]
                 cross_profile, "pyo3-build-config-0c", STALE_LIB
             ),
             "that run's fingerprint": cross_profile / ".fingerprint" / "pyo3-build-config-0c",
+            "a stale run under a workspace whose target directory is not `target`": plant_pyo3_run(
+                root / "x" / "out" / "t" / "debug", "pyo3-build-config-0d", STALE_LIB
+            ),
             "a run whose lib_dir holds `%`": plant_pyo3_run(
                 debug, "pyo3-build-config-1a", "/planted/100%/lib"
             ),
@@ -5388,6 +5393,18 @@ def pyo3_purge_behavior_gaps(manifest_step: dict, purge_step: dict) -> list[str]
             / "secret",
             "a stale run behind a symlinked .fingerprint": evil / "build" / "pyo3-build-config-2a",
             "a stale run outside target/ behind a symlinked profile": linked_run,
+            "a profile directory whose name holds LF and a workflow command": plant_pyo3_run(
+                root / "target" / "de\n::warning::FORGED", "pyo3-build-config-4a", STALE_LIB
+            ),
+            "a profile directory whose name holds CR and a workflow command": plant_pyo3_run(
+                root / "target" / "de\r::warning::FORGED", "pyo3-build-config-4b", STALE_LIB
+            ),
+            "a unit name holding LF and a workflow command": plant_pyo3_run(
+                debug, "pyo3-build-config-4c\n::warning::FORGED", STALE_LIB
+            ),
+            "a unit name holding CR and a workflow command": plant_pyo3_run(
+                debug, "pyo3-build-config-4d\r::warning::FORGED", STALE_LIB
+            ),
         }
         kept["the build script's compile unit"].mkdir(parents=True)
         code, out = run_pyo3_purge_step(purge_step, root, targets, sys.executable)
@@ -5508,6 +5525,8 @@ def check_pyo3_build_config_purge() -> None:
         ("reading the last lib_dir line", edit_run("break", ":")),
         ("accepting a control character in lib_dir", edit_run("[[ $recorded == *[[:cntrl:]]* ]]", "false")),
         ("not encoding `%`", edit_run('s="${s//"%"/%25}"', ":")),
+        ("not encoding CR", edit_run("s=\"${s//$'\\r'/%0D}\"", ":")),
+        ("not encoding LF", edit_run("s=\"${s//$'\\n'/%0A}\"", ":")),
         (
             "following a symlinked fingerprint",
             edit_run('notice "keeping $config: its fingerprint is a symlink or not a directory"\n      continue', ":"),
@@ -5562,14 +5581,48 @@ def pyo3_layout_steps(doc: dict) -> list[dict]:
     ]
 
 
+def pyo3_layout_build_args(doc: dict) -> list[str] | None:
+    """The arguments after `cargo` of the first `cargo build -p scp-ffi` line in PYO3_LAYOUT_JOB."""
+    for step in ((doc.get("jobs") or {}).get(PYO3_LAYOUT_JOB) or {}).get("steps") or []:
+        for line in str(step.get("run") or "").splitlines():
+            if line.strip().startswith("cargo build -p scp-ffi"):
+                return shlex.split(line)[1:]
+    return None
+
+
+# A stand-in for cargo on the layout step's PATH: it records its arguments and prints
+# the planted JSON messages, as `cargo build --message-format=json` prints them.
+FAKE_CARGO = """#!/bin/sh
+printf '%s\\n' "$*" > "$FAKE_CARGO_ARGS"
+cat "$FAKE_CARGO_MESSAGES"
+exit "${FAKE_CARGO_EXIT:-0}"
+"""
+PYO3_BUILD_CONFIG_ID = "registry+https://github.com/rust-lang/crates.io-index#pyo3-build-config@0.24.2"
+
+
+def build_script_message(package_id: str, out_dir: Path) -> str:
+    return json.dumps(
+        {"reason": "build-script-executed", "package_id": package_id, "out_dir": str(out_dir)}
+    )
+
+
 def pyo3_layout_gaps(doc: dict) -> list[str]:
     """Return each way ci.yml fails to check the layout the purge step reads.
 
     CRITERION: PYO3_LAYOUT_JOB holds exactly one step pyo3_layout_steps accepts. Run
-    with PYO3_PYTHON naming this interpreter, it exits 0 when a
-    `target/<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt`, or one
-    under a target triple, has a first `lib_dir=` line equal to this interpreter's
-    LIBDIR, and non-zero when no file exists or every file records another lib_dir.
+    with PYO3_PYTHON naming this interpreter and a `cargo` that prints planted JSON
+    messages, the step:
+    - runs `cargo` with the job's `cargo build -p scp-ffi` arguments plus
+      `--message-format=json`, so cargo reports the units that build used;
+    - exits 0 when the one `build-script-executed` message for pyo3-build-config names
+      an `out_dir` of `target/<profile>/build/pyo3-build-config-<hex>/out`, or one
+      under a target triple, whose PYO3_CONFIG_FILE has a first `lib_dir=` line equal
+      to this interpreter's LIBDIR;
+    - exits non-zero otherwise: when that run sits in another layout or outside
+      target/, records another lib_dir or none, when cargo reports no such run or two,
+      and when cargo fails. Each failing case also plants a restored run under
+      target/ that records the current LIBDIR, so a step that globs target/ in place
+      of reading cargo's `out_dir` passes where it must fail.
     """
     import sysconfig
 
@@ -5577,22 +5630,67 @@ def pyo3_layout_gaps(doc: dict) -> list[str]:
     steps = pyo3_layout_steps(doc)
     if len(steps) != 1:
         return [f"{len(steps)} layout steps after the build in job {PYO3_LAYOUT_JOB}, expected 1"]
+    build_args = pyo3_layout_build_args(doc)
+    if build_args is None:
+        return [f"no `cargo build -p scp-ffi` line in job {PYO3_LAYOUT_JOB}"]
     script = str(steps[0]["run"])
-    gaps = []
-    for label, plant, want in (
-        ("a file recording the current LIBDIR", lambda r: plant_pyo3_run(r / "target" / "debug", "pyo3-build-config-0a", libdir), 0),
+    other = build_script_message(
+        "path+file:///planted/crates/scp-ffi/napi#scp-ffi-napi@0.1.0", Path("/planted/out")
+    )
+
+    def stale(root: Path) -> None:
+        plant_pyo3_run(root / "target" / "debug", "pyo3-build-config-00", libdir)
+
+    def used(root: Path, profile: str, unit: str, *lib_dirs: str) -> list[str]:
+        run = plant_pyo3_run(root / profile, unit, *lib_dirs)
+        return [other, build_script_message(PYO3_BUILD_CONFIG_ID, run / "out")]
+
+    def renamed_key(root: Path) -> list[str]:
+        messages = used(root, "target/debug", "pyo3-build-config-1b")
+        config = root / "target/debug/build/pyo3-build-config-1b/out" / PYO3_CONFIG_FILE
+        config.write_text(config.read_text() + f"python_lib_dir={libdir}\n")
+        return messages
+
+    def two_runs(root: Path) -> list[str]:
+        return used(root, "target/debug", "pyo3-build-config-1b", libdir) + used(
+            root, "target/release", "pyo3-build-config-1c", libdir
+        )
+
+    cases: tuple[tuple[str, Callable[[Path], list[str]], int, bool], ...] = (
+        ("a run recording the current LIBDIR", lambda r: used(r, "target/debug", "pyo3-build-config-1b", libdir), 0, False),
         (
-            "a file under a target triple recording the current LIBDIR",
-            lambda r: plant_pyo3_run(r / "target" / "x86_64-unknown-linux-gnu" / "debug", "pyo3-build-config-0a", libdir),
+            "a run under a target triple recording the current LIBDIR",
+            lambda r: used(r, "target/x86_64-unknown-linux-gnu/debug", "pyo3-build-config-1b", libdir),
             0,
+            False,
         ),
-        ("no file", lambda r: (r / "target" / "debug").mkdir(parents=True), 1),
-        ("only a file recording another lib_dir", lambda r: plant_pyo3_run(r / "target" / "debug", "pyo3-build-config-0a", STALE_LIB), 1),
-    ):
+        ("the build's run in another layout", lambda r: used(r, "target/debug", "pyo3-config-1b", libdir), 1, True),
+        ("the build's run outside target/", lambda r: used(r, "elsewhere/debug", "pyo3-build-config-1b", libdir), 1, True),
+        ("the build's run recording another lib_dir", lambda r: used(r, "target/debug", "pyo3-build-config-1b", STALE_LIB), 1, True),
+        ("the build's run recording the LIBDIR under a renamed key", renamed_key, 1, True),
+        ("no pyo3-build-config run reported", lambda r: [other], 1, True),
+        ("two pyo3-build-config runs reported", two_runs, 1, True),
+        ("cargo failing", lambda r: used(r, "target/debug", "pyo3-build-config-1b", libdir), 101, True),
+    )
+    gaps = []
+    for label, plant, want, plant_stale in cases:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            plant(root)
-            env = dict(os.environ, PYO3_PYTHON=sys.executable)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "cargo").write_text(FAKE_CARGO)
+            (bin_dir / "cargo").chmod(0o755)
+            if plant_stale:
+                stale(root)
+            (root / "messages").write_text("".join(f"{m}\n" for m in plant(root)))
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                PYO3_PYTHON=sys.executable,
+                FAKE_CARGO_ARGS=str(root / "args"),
+                FAKE_CARGO_MESSAGES=str(root / "messages"),
+                FAKE_CARGO_EXIT="0" if want != 101 else "101",
+            )
             result = subprocess.run(
                 ["bash", "-c", script],
                 env=env,
@@ -5604,7 +5702,36 @@ def pyo3_layout_gaps(doc: dict) -> list[str]:
             )
             if (result.returncode == 0) != (want == 0):
                 gaps.append(f"with {label}, the layout step exits {result.returncode}")
+            if want == 0:
+                ran = (root / "args").read_text().strip() if (root / "args").exists() else None
+                expected = " ".join([*build_args, "--message-format=json"])
+                if ran != expected:
+                    gaps.append(f"the layout step ran `cargo {ran}`, not `cargo {expected}`")
     return gaps
+
+
+# The layout step as this pull request first wrote it: it globs target/ for any run,
+# so a run a restored cache entry left there satisfies it. check_pyo3_layout_step plants
+# it as a mutant.
+PYO3_LAYOUT_GLOB_STEP = """set -euo pipefail
+shopt -s nullglob
+libdir="$("${PYO3_PYTHON:-python3}" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+for config in target/*/build/pyo3-build-config-*/out/pyo3-build-config.txt \\
+  target/*/*/build/pyo3-build-config-*/out/pyo3-build-config.txt; do
+  recorded=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == lib_dir=* ]]; then
+      recorded="${line#lib_dir=}"
+      break
+    fi
+  done < "$config"
+  if [[ $recorded == "$libdir" ]]; then
+    exit 0
+  fi
+done
+echo "::error::no file records lib_dir=$libdir"
+exit 1
+"""
 
 
 def check_pyo3_layout_step() -> None:
@@ -5616,26 +5743,45 @@ def check_pyo3_layout_step() -> None:
     path and a key that pyo3-build-config 0.24.2 writes. A pyo3 bump that moves either
     would make the purge find nothing and bring the stale-link failure back silently,
     and the planted trees above encode the same assumption, so only a read of a real
-    build's output detects the drift.
+    build's output detects the drift. The job restores a cache entry first, and
+    rust-cache keeps a `pyo3-build-config-<hash>` directory across a pyo3 bump, so the
+    step must read the run cargo reports the build used, not any run under target/.
     """
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     gaps = pyo3_layout_gaps(doc)
     check(
         f"ci.yml job {PYO3_LAYOUT_JOB} checks, after its build, that pyo3-build-config "
-        "wrote the lib_dir the purge step reads",
+        "wrote the lib_dir the purge step reads, in the run cargo reports the build used",
         not gaps,
         "; ".join(gaps),
     )
     layout = pyo3_layout_steps(doc)[0] if len(pyo3_layout_steps(doc)) == 1 else None
+
+    def edit(old: str, new: str) -> Callable[[list[dict]], object]:
+        def mutate(steps: list[dict]) -> None:
+            step = next(x for x in steps if x == layout)
+            if old not in str(step["run"]):
+                raise AssertionError(f"{old!r} is not in the layout step")
+            step["run"] = str(step["run"]).replace(old, new)
+
+        return mutate
+
     for label, mutate in (
         ("removed", lambda s: s.remove(next(x for x in s if x == layout))),
-        ("passing with no file", lambda s: next(x for x in s if x == layout).update({"run": str(layout["run"]).replace("exit 1", "exit 0")})),
+        ("passing on every failure", edit("exit 1", "exit 0")),
         ("moved before the build", lambda s: s.insert(0, s.pop(s.index(next(x for x in s if x == layout))))),
+        ("globbing target/ for any run", lambda s: next(x for x in s if x == layout).update({"run": PYO3_LAYOUT_GLOB_STEP})),
+        ("building without the build step's features", edit("--features server --message-format", "--message-format")),
+        ("accepting any layout", edit('if [[ $relative == "$real_out" ||', 'if false && [[ $relative == "$real_out" ||')),
     ):
         if layout is None:
             break
         mutated = copy.deepcopy(doc)
-        mutate(mutated["jobs"][PYO3_LAYOUT_JOB]["steps"])
+        try:
+            mutate(mutated["jobs"][PYO3_LAYOUT_JOB]["steps"])
+        except AssertionError as error:
+            check(f"the planting for a layout step {label} applies", False, str(error))
+            continue
         check(
             f"a layout step {label} is reported",
             bool(pyo3_layout_gaps(mutated)),
