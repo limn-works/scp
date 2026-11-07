@@ -61,7 +61,7 @@ VENDOR_CRATE="openssl-src"
 SQLCIPHER_FEATURE="bundled-sqlcipher-vendored-openssl"
 FEATURE_GRAPH_GATE="$REPO_ROOT/scripts/check-shipped-feature-graph.sh"
 # Every Cargo workspace root in this repository, as a directory relative to its root.
-WORKSPACE_ROOTS=(. scaffolds/relay scaffolds/rust-client templates/cross-context-bridge templates/personal-relay fuzz)
+WORKSPACE_ROOTS=(. scaffolds/relay scaffolds/rust-client templates/cross-context-bridge templates/personal-relay tools/uniffi-bindgen fuzz)
 # The WORKSPACE_ROOTS entries absence does not resolve. `fuzz` builds libFuzzer harnesses
 # that no release, scaffold or template ships.
 NOT_SHIPPED_ROOTS=(fuzz)

@@ -1,0 +1,30 @@
+# The uniffi-bindgen command-line tool, built without compiling scp-ffi-uniffi.
+#
+# uniffi-bindgen's library mode reads the UniFFI metadata symbols out of a compiled
+# cdylib with goblin and never loads it, so it can generate bindings from a library
+# built for a target the host cannot run (kotlin-android-instrumented in
+# .github/workflows/ci.yml generates `scp.kt` from its x86_64-linux-android cdylib).
+# The tool needs only the `uniffi` crate; a `[[bin]]` inside scp-ffi-uniffi compiled
+# that crate's whole dependency graph for the host first.
+#
+# This is its own workspace, with its own Cargo.lock, so adding it changed neither the
+# root Cargo.toml nor the root Cargo.lock: both feed the key of every cargo cache group
+# (.github/actions/rust-cache). scripts/uniffi-bindgen.sh builds it with `--locked` and
+# first fails unless every package this Cargo.lock names appears at the same version in
+# the root Cargo.lock, so the tool reads metadata with the uniffi version that wrote it
+# and compiles only crate versions the root lock's `cargo deny` run already checks.
+[package]
+name = "uniffi-bindgen"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "0.29", features = ["cli"] }

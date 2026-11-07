@@ -3,7 +3,7 @@
 #
 # UniFFI proc-macro binding generation requires the compiled Rust cdylib because
 # metadata is embedded at compile time via uniffi::include_scaffolding!. This script
-# builds the library then invokes uniffi-bindgen to produce Kotlin source files.
+# builds the library then runs scripts/uniffi-bindgen.sh to produce Kotlin source files.
 #
 # Usage:
 #   ./scripts/generate-uniffi-kotlin.sh [--release] [--features=FEAT] [--skip-build]
@@ -81,31 +81,13 @@ if [[ ! -f "$LIB_FILE" ]]; then
     exit 1
 fi
 
-# Step 2: Build the uniffi-bindgen binary from the crate, under the profile step 1
-# used. Cargo shares no artifact between the debug and release directories, so a
-# `--release` step 1 followed by a dev-profile bindgen build compiles the crate graph
-# a second time; passing the same profile here compiles the bindgen binary alone.
-echo "==> Building uniffi-bindgen tool ($PROFILE)..."
-BINDGEN_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --bin uniffi-bindgen)
-if [[ "$PROFILE" == "release" ]]; then
-    BINDGEN_ARGS+=(--release)
-fi
-if [[ -n "$FEATURES" ]]; then
-    BINDGEN_ARGS+=(--features "$FEATURES")
-fi
-cargo "${BINDGEN_ARGS[@]}"
-
-BINDGEN_BIN="$LIB_DIR/uniffi-bindgen"
-if [[ ! -f "$BINDGEN_BIN" ]]; then
-    echo "ERROR: uniffi-bindgen binary not found at $BINDGEN_BIN" >&2
-    exit 1
-fi
-
-# Step 3: Generate Kotlin bindings.
+# Step 2: Generate Kotlin bindings. scripts/uniffi-bindgen.sh builds the tool from
+# tools/uniffi-bindgen, which compiles the `uniffi` crate alone; the tool reads the
+# UniFFI metadata symbols out of the library and never loads it.
 echo "==> Generating Kotlin bindings..."
 mkdir -p "$OUTPUT_DIR"
 
-"$BINDGEN_BIN" generate \
+"$SCRIPT_DIR/uniffi-bindgen.sh" generate \
     --library "$LIB_FILE" \
     --language kotlin \
     --out-dir "$OUTPUT_DIR"

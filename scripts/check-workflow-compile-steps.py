@@ -1385,6 +1385,10 @@ SCRIPTS_COMPILING_ELSEWHERE = {
         "each case runs cargo inside a workspace it creates under `mktemp -d`, whose own "
         "`target/` no cache group holds"
     ),
+    "scripts/uniffi-bindgen.sh": (
+        "it builds tools/uniffi-bindgen, a workspace of its own with its own Cargo.lock, "
+        "into `--target-dir tools/uniffi-bindgen/target`, which no cache group holds"
+    ),
 }
 CARGO_TEMPLATE = re.compile(
     r"\bcargo\s+(?:\+\S+\s+)?(?P<sub>[a-z][a-z-]*)(?P<rest>[^;|&<>\n]*)"
