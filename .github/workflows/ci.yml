@@ -2710,6 +2710,34 @@ jobs:
           export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
+      # The pyo3 purge step in .github/actions/rust-cache reads the first `lib_dir=`
+      # line of `<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt`, the
+      # file pyo3-build-config 0.24.2 writes. A pyo3 bump that moves the file or
+      # renames the key would leave that step finding nothing, and stale library
+      # directories would come back silently. This reads the real output of the
+      # pinned version, after the build above, and fails when no file records the
+      # LIBDIR of the interpreter the build used.
+      - name: pyo3-build-config wrote the lib_dir the cache purge step reads
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          libdir="$("${PYO3_PYTHON:-python3}" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          for config in target/*/build/pyo3-build-config-*/out/pyo3-build-config.txt \
+            target/*/*/build/pyo3-build-config-*/out/pyo3-build-config.txt; do
+            recorded=""
+            while IFS= read -r line || [[ -n $line ]]; do
+              if [[ $line == lib_dir=* ]]; then
+                recorded="${line#lib_dir=}"
+                break
+              fi
+            done < "$config"
+            if [[ $recorded == "$libdir" ]]; then
+              echo "$config records lib_dir $libdir"
+              exit 0
+            fi
+          done
+          echo "::error::no target/<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt records lib_dir=$libdir; the pyo3 purge step in .github/actions/rust-cache reads that file, so check where the pinned pyo3-build-config writes it"
+          exit 1
       - name: No build script reruns when an unrelated file of its package changes
         run: |
           # A build script that prints no rerun-if line is rerun, and its crate and

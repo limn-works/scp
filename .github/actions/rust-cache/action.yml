@@ -41,12 +41,25 @@ runs:
         CACHE_GROUP: ${{ inputs.shared-key }}
       run: |
         set -euo pipefail
+        # One `<root> -> <target>` per line, `target` when the arrow is absent: the
+        # format rust-cache reads. This is the only parser of the input; the purge
+        # step below takes the target directories from this step's `targets` output.
+        trim() {
+          local s="$1"
+          s="${s#"${s%%[![:space:]]*}"}"
+          printf '%s' "${s%"${s##*[![:space:]]}"}"
+        }
         roots=()
+        targets=()
         while IFS= read -r line; do
-          root="${line%%->*}"
-          root="${root#"${root%%[![:space:]]*}"}"
-          root="${root%"${root##*[![:space:]]}"}"
-          [[ -n $root ]] && roots+=("$root")
+          root="$(trim "${line%%->*}")"
+          [[ -n $root ]] || continue
+          target=target
+          if [[ $line == *"->"* ]]; then
+            target="$(trim "${line#*->}")"
+          fi
+          roots+=("$root")
+          targets+=("$root/$target")
         done <<< "$CACHE_WORKSPACES"
         digest="$(bash "$GITHUB_ACTION_PATH/manifest-digest.sh" "${roots[@]}")"
         # The commands .github/workflows/cache-warm.yml compiles decide what each
@@ -60,7 +73,14 @@ runs:
         if grep -Eq "^[[:space:]]+shared-key:[[:space:]]+${CACHE_GROUP}[[:space:]]*$" "$warm_file"; then
           key="${key}-$(shasum -a 256 "$warm_file" | cut -c1-16)"
         fi
-        echo "digest=${key}" >> "$GITHUB_OUTPUT"
+        # Each target is one line of the input, so none holds a newline, and each
+        # holds a `/`, so none equals the delimiter.
+        {
+          echo "digest=${key}"
+          echo "targets<<rust_cache_targets"
+          printf '%s\n' "${targets[@]}"
+          echo "rust_cache_targets"
+        } >> "$GITHUB_OUTPUT"
     - id: cache
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
@@ -79,41 +99,103 @@ runs:
     # restored run of that build script whose recorded lib_dir differs from the
     # LIBDIR of the interpreter pyo3 resolves now, with its fingerprint, so cargo
     # reruns it. A run that records no lib_dir links no libpython and is kept.
+    #
+    # The restored tree is data: the step deletes only a real directory whose
+    # physical path is the cargo layout under the target directory's physical
+    # path, refuses symlinks and control characters, and percent-encodes what it
+    # prints into a workflow command. When the interpreter cannot run, it deletes
+    # nothing: cargo could only rebuild a deleted run with that interpreter.
     - name: Drop pyo3 build configuration recorded for another interpreter
       shell: bash
       env:
-        CACHE_WORKSPACES: ${{ inputs.workspaces }}
+        CACHE_TARGETS: ${{ steps.manifest.outputs.targets }}
       run: |
         set -euo pipefail
-        configs=()
-        while IFS= read -r line; do
-          [[ $line =~ [^[:space:]] ]] || continue
-          root="${line%%->*}"
-          target="target"
-          if [[ $line == *"->"* ]]; then
-            target="${line#*->}"
-          fi
-          root="$(echo "$root" | xargs)"
-          target="$(echo "$target" | xargs)"
-          dir="$GITHUB_WORKSPACE/$root/$target"
-          [[ -d $dir ]] || continue
-          while IFS= read -r -d '' config; do
-            configs+=("$config")
-          done < <(find "$dir" -path '*/build/pyo3-build-config-*/out/pyo3-build-config.txt' -print0)
-        done <<< "$CACHE_WORKSPACES"
-        if (( ${#configs[@]} == 0 )); then
+        # pyo3 records `<base_prefix>\libs` on Windows, never sysconfig LIBDIR, so
+        # the comparison below would delete every run there.
+        if [[ ${RUNNER_OS:-} == Windows ]]; then
+          echo "::error::the pyo3 purge step in .github/actions/rust-cache compares lib_dir with sysconfig LIBDIR, which pyo3 does not record on Windows"
+          exit 1
+        fi
+        # The runner's escaping for a workflow command's data.
+        escape() {
+          local s="$1"
+          s="${s//"%"/%25}"
+          s="${s//$'\r'/%0D}"
+          s="${s//$'\n'/%0A}"
+          printf '%s' "$s"
+        }
+        notice() {
+          echo "::notice::$(escape "$1")"
+        }
+        shopt -s nullglob
+        candidates=()
+        while IFS= read -r target; do
+          [[ -n $target ]] || continue
+          dir="$GITHUB_WORKSPACE/$target"
+          [[ -d $dir && ! -L $dir ]] || continue
+          real_dir="$(cd -- "$dir" && pwd -P)"
+          # `<target>/<profile>/` or `<target>/<triple>/<profile>/`; a glob `*`
+          # never matches `/`, so nothing deeper is reached.
+          for config in "$dir"/*/build/pyo3-build-config-*/out/pyo3-build-config.txt \
+            "$dir"/*/*/build/pyo3-build-config-*/out/pyo3-build-config.txt; do
+            candidates+=("$real_dir" "$dir" "$config")
+          done
+        done <<< "$CACHE_TARGETS"
+        if (( ${#candidates[@]} == 0 )); then
           exit 0
         fi
         interpreter="${PYO3_PYTHON:-python3}"
-        libdir="$("$interpreter" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' 2> /dev/null || true)"
-        for config in "${configs[@]}"; do
-          recorded="$(sed -n 's/^lib_dir=//p' "$config")"
+        if ! libdir="$("$interpreter" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' 2> /dev/null)" \
+          || [[ -z $libdir || $libdir == None ]]; then
+          notice "$interpreter reports no LIBDIR, so this step keeps every restored pyo3 build configuration"
+          exit 0
+        fi
+        for (( i = 0; i < ${#candidates[@]}; i += 3 )); do
+          real_dir="${candidates[i]}"
+          dir="${candidates[i + 1]}"
+          config="${candidates[i + 2]}"
+          run_dir="${config%/out/pyo3-build-config.txt}"
+          unit="${run_dir##*/}"
+          profile_dir="${run_dir%/build/"$unit"}"
+          relative="${profile_dir#"$dir"/}"
+          fingerprints="$profile_dir/.fingerprint"
+          fingerprint="$fingerprints/$unit"
+          if [[ ! $unit =~ ^pyo3-build-config-[0-9a-f]+$ || $relative == *[[:cntrl:]]* ]]; then
+            notice "keeping $config: its path is not cargo's layout"
+            continue
+          fi
+          # A physical path equal to the expected one proves no component is a
+          # symlink; the -L tests cover the last component of each.
+          if [[ -L $run_dir || -L $run_dir/out || -L $config || ! -f $config ]] \
+            || [[ "$(cd -- "$run_dir" && pwd -P)" != "$real_dir/$relative/build/$unit" ]]; then
+            notice "keeping $config: a component is a symlink or not a regular file"
+            continue
+          fi
+          if [[ -e $fingerprint || -L $fingerprint ]]; then
+            if [[ -L $fingerprints || -L $fingerprint || ! -d $fingerprint ]] \
+              || [[ "$(cd -- "$fingerprint" && pwd -P)" != "$real_dir/$relative/.fingerprint/$unit" ]]; then
+              notice "keeping $config: its fingerprint is a symlink or not a directory"
+              continue
+            fi
+          fi
+          recorded=""
+          while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == lib_dir=* ]]; then
+              recorded="${line#lib_dir=}"
+              break
+            fi
+          done < "$config"
+          if [[ $recorded == *[[:cntrl:]]* ]]; then
+            notice "keeping $config: its lib_dir holds a control character"
+            continue
+          fi
           if [[ -z $recorded || $recorded == "$libdir" ]]; then
             continue
           fi
-          run_dir="${config%/out/pyo3-build-config.txt}"
-          unit="${run_dir##*/}"
-          profile_dir="${run_dir%/build/*}"
-          echo "::notice::pyo3 build configuration $run_dir records lib_dir $recorded, but $interpreter has LIBDIR ${libdir:-<none>}; removing it so cargo reruns the build script"
-          rm -rf -- "$run_dir" "$profile_dir/.fingerprint/$unit"
+          notice "pyo3 build configuration $run_dir records lib_dir $recorded, but $interpreter has LIBDIR $libdir; removing it so cargo reruns the build script"
+          rm -rf -- "$run_dir"
+          if [[ -d $fingerprint ]]; then
+            rm -rf -- "$fingerprint"
+          fi
         done
