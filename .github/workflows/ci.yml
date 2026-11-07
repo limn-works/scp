@@ -2742,9 +2742,10 @@ jobs:
         run: |
           # A build script that prints no rerun-if line is rerun, and its crate and
           # every dependent recompiled, whenever any file of its package changes.
-          # The self-test proves the check catches such a script.
+          # The self-test proves the check catches such a script. scp-ffi has no
+          # build script, so the check runs over the workspace packages that do,
+          # in jobs rust-test-napi-production and rust-build-uniffi-production.
           python3 scripts/check-build-script-rerun.py --self-test
-          python3 scripts/check-build-script-rerun.py build -p scp-ffi --features server
       - name: Shipped pyo3 fail-closed assertions
         run: |
           # Assigned before an export so a failing python3 stops this step
