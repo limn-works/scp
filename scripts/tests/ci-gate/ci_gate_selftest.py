@@ -461,6 +461,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -5156,6 +5157,638 @@ def wrapper_key_gaps(action: dict) -> list[str]:
     return gaps
 
 
+PYO3_CONFIG_FILE = "pyo3-build-config.txt"
+PYO3_PURGE_STEP_NAME = "Drop pyo3 build configuration recorded for another interpreter"
+MANIFEST_TARGETS = "${{ steps.manifest.outputs.targets }}"
+WORKSPACES_INPUT = "${{ inputs.workspaces }}"
+PYO3_LAYOUT_JOB = "rust-build-pyo3-production"
+STALE_LIB = "/planted/Python/3.12.99/lib"
+
+
+def pyo3_purge_steps(action: dict) -> list[dict]:
+    """The steps of RUST_CACHE_ACTION_FILE that drop stale pyo3 build configuration.
+
+    CRITERION: a step that runs after the action's one RUST_CACHE_UPSTREAM step, that
+    a_step_that_runs_and_can_fail_its_job accepts, and whose `run` names
+    PYO3_CONFIG_FILE and removes files.
+    """
+    steps = (action.get("runs") or {}).get("steps") or []
+    cache_at = next(
+        (index for index, step in enumerate(steps) if remote_name(step) == RUST_CACHE_UPSTREAM),
+        None,
+    )
+    if cache_at is None:
+        return []
+    return [
+        step
+        for step in steps[cache_at + 1 :]
+        if PYO3_CONFIG_FILE in str(step.get("run") or "")
+        and "rm -rf" in str(step.get("run") or "")
+        and a_step_that_runs_and_can_fail_its_job(step)
+    ]
+
+
+def resolve_step_env(step: dict, values: dict[str, str]) -> dict[str, str]:
+    """The variables a step's `env:` gives its shell, each `${{ x }}` replaced by values[x].
+
+    An expression `values` lacks becomes the empty string, as the runner expands an
+    input or step output that does not exist, so a misspelt mapping reaches the
+    script as an empty variable.
+    """
+    return {
+        str(name): re.sub(
+            r"\$\{\{\s*(.*?)\s*\}\}", lambda match: values.get(match.group(1), ""), str(value)
+        )
+        for name, value in (step.get("env") or {}).items()
+    }
+
+
+def step_outputs(text: str) -> dict[str, str]:
+    """Parse a $GITHUB_OUTPUT file: `name=value` lines and `name<<DELIMITER` blocks."""
+    outputs: dict[str, str] = {}
+    lines = iter(text.split("\n"))
+    for line in lines:
+        if "<<" in line and ("=" not in line or line.index("<<") < line.index("=")):
+            name, delimiter = line.split("<<", 1)
+            block = []
+            for body in lines:
+                if body == delimiter:
+                    break
+                block.append(body)
+            outputs[name] = "\n".join(block)
+        elif "=" in line:
+            name, value = line.split("=", 1)
+            outputs[name] = value
+    return outputs
+
+
+def run_manifest_step(step: dict, root: Path, workspaces: str) -> tuple[int, dict[str, str], str]:
+    """Run the wrapper's `manifest` step in `root`; return (exit code, outputs, output)."""
+    workflows = root / ".github/workflows"
+    workflows.mkdir(parents=True, exist_ok=True)
+    (workflows / "cache-warm.yml").write_text("jobs: {}\n")
+    output = root / "github_output"
+    output.write_text("")
+    env = dict(
+        os.environ,
+        GITHUB_WORKSPACE=str(root),
+        GITHUB_OUTPUT=str(output),
+        GITHUB_ACTION_PATH=str(MANIFEST_DIGEST_SCRIPT.parent),
+    )
+    env.update(
+        resolve_step_env(step, {"inputs.workspaces": workspaces, "inputs.shared-key": "planted"})
+    )
+    result = subprocess.run(
+        ["bash", "-c", str(step.get("run") or "")],
+        env=env,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return result.returncode, step_outputs(output.read_text()), result.stdout + result.stderr
+
+
+def run_pyo3_purge_step(
+    step: dict, root: Path, targets: str, pyo3_python: str, runner_os: str | None = None
+) -> tuple[int, str]:
+    """Run a purge step in `root`, its `env:` resolved against a `targets` output."""
+    env = {k: v for k, v in os.environ.items() if k not in ("PYO3_PYTHON", "RUNNER_OS")}
+    env.update(GITHUB_WORKSPACE=str(root), PYO3_PYTHON=pyo3_python)
+    if runner_os is not None:
+        env["RUNNER_OS"] = runner_os
+    env.update(resolve_step_env(step, {"steps.manifest.outputs.targets": targets}))
+    result = subprocess.run(
+        ["bash", "-c", str(step.get("run") or "")],
+        env=env,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def plant_pyo3_run(profile_dir: Path, unit: str, *lib_dirs: str) -> Path:
+    """Plant one build-script run of pyo3-build-config and its fingerprint; return the run.
+
+    Each of `lib_dirs` becomes one `lib_dir=` line, in order.
+    """
+    run_dir = profile_dir / "build" / unit
+    (run_dir / "out").mkdir(parents=True)
+    lines = ["implementation=CPython", "version=3.12", "shared=true"]
+    lines += [f"lib_dir={lib_dir}" for lib_dir in lib_dirs]
+    (run_dir / "out" / PYO3_CONFIG_FILE).write_text("\n".join(lines) + "\n")
+    (profile_dir / ".fingerprint" / unit).mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def forged_command_lines(output: str) -> list[str]:
+    """Lines of a step's output that the runner would read as a forged workflow command."""
+    return [
+        line
+        for line in re.split(r"[\r\n]", output)
+        if line.startswith("::") and not line.startswith("::notice::")
+    ]
+
+
+def pyo3_purge_behavior_gaps(manifest_step: dict, purge_step: dict) -> list[str]:
+    """Return each way the wrapper's manifest and purge steps mishandle planted target trees.
+
+    CRITERION: the `manifest` step, given the `workspaces` input through its own
+    `env:`, prints a `targets` output holding `<root>/<target>` for each non-blank
+    line, trimmed, with `target` when the line has no `->`. The purge step, given that
+    output through its own `env:` and PYO3_PYTHON naming this interpreter:
+    - exits 0, and removes each `<profile>/build/pyo3-build-config-<hex>` run whose
+      first `lib_dir=` line differs from this interpreter's LIBDIR, with
+      `<profile>/.fingerprint/<unit>`, under every target and target triple;
+    - keeps a run whose first `lib_dir` matches, one that records none, the build
+      script's compile unit, a unit name that is not `pyo3-build-config-<hex>`, and a
+      `lib_dir` holding a control character;
+    - deletes nothing outside the target directory's physical path, through a
+      symlinked `.fingerprint`, profile or target directory;
+    - percent-encodes `%`, CR and LF in what it prints, and prints no line the runner
+      reads as another workflow command, for a profile directory or unit name holding
+      CR or LF followed by a command, and for a `lib_dir` holding one;
+    - reads the target directory a `workspaces` line names after `->`;
+    - exits 0 and deletes nothing when PYO3_PYTHON names no command or nothing was
+      restored, and exits non-zero and deletes nothing on Windows.
+    """
+    import sysconfig
+
+    libdir = str(sysconfig.get_config_var("LIBDIR"))
+    gaps: list[str] = []
+    with (
+        tempfile.TemporaryDirectory() as scratch,
+        tempfile.TemporaryDirectory() as outside,
+    ):
+        root = Path(scratch)
+        victim = Path(outside)
+        for workspace in (root, root / "fuzz", root / "x"):
+            workspace.mkdir(exist_ok=True)
+            (workspace / "Cargo.toml").write_text((REPO / "Cargo.toml").read_text())
+        code, outputs, out = run_manifest_step(
+            manifest_step, root, "  .  ->  target \n\n fuzz->target\n x -> out/t \n"
+        )
+        targets = outputs.get("targets", "")
+        if code != 0 or targets.split("\n") != ["./target", "fuzz/target", "x/out/t"]:
+            gaps.append(
+                f"the manifest step printed targets {targets!r}, exit {code}, where "
+                f"['./target', 'fuzz/target', 'x/out/t'] was expected: {out}"
+            )
+        debug = root / "target" / "debug"
+        current_profile = root / "target" / "ci-bridge"
+        cross_profile = root / "fuzz" / "target" / "x86_64-unknown-linux-gnu" / "debug"
+        evil = root / "target" / "evil"
+        (victim / "pyo3-build-config-2a").mkdir()
+        (victim / "pyo3-build-config-2a" / "secret").write_text("kept\n")
+        plant_pyo3_run(evil, "pyo3-build-config-2a", STALE_LIB)
+        shutil.rmtree(evil / ".fingerprint")
+        (evil / ".fingerprint").symlink_to(victim)
+        linked_target = victim / "linked"
+        linked_run = plant_pyo3_run(linked_target, "pyo3-build-config-2b", STALE_LIB)
+        # No fingerprint, so only the run directory's own path check keeps it.
+        shutil.rmtree(linked_target / ".fingerprint")
+        (root / "target" / "linked").parent.mkdir(parents=True, exist_ok=True)
+        (root / "target" / "linked").symlink_to(linked_target)
+        removed = {
+            "a run recording another lib_dir": plant_pyo3_run(
+                debug, "pyo3-build-config-0a", STALE_LIB
+            ),
+            "its fingerprint": debug / ".fingerprint" / "pyo3-build-config-0a",
+            "a stale run in a second workspace and target triple": plant_pyo3_run(
+                cross_profile, "pyo3-build-config-0c", STALE_LIB
+            ),
+            "that run's fingerprint": cross_profile / ".fingerprint" / "pyo3-build-config-0c",
+            "a stale run under a workspace whose target directory is not `target`": plant_pyo3_run(
+                root / "x" / "out" / "t" / "debug", "pyo3-build-config-0d", STALE_LIB
+            ),
+            "a run whose lib_dir holds `%`": plant_pyo3_run(
+                debug, "pyo3-build-config-1a", "/planted/100%/lib"
+            ),
+            "a stale run whose second lib_dir line is a workflow command": plant_pyo3_run(
+                debug, "pyo3-build-config-1c", STALE_LIB, "::warning::INJECTED"
+            ),
+        }
+        kept = {
+            "a run recording the current LIBDIR": plant_pyo3_run(
+                current_profile, "pyo3-build-config-0b", libdir
+            ),
+            "that run's fingerprint": current_profile / ".fingerprint" / "pyo3-build-config-0b",
+            "a run recording no lib_dir": plant_pyo3_run(debug, "pyo3-build-config-0d"),
+            "the build script's compile unit": debug / "build" / "pyo3-build-config-0e",
+            "a run whose first lib_dir matches and a later one does not": plant_pyo3_run(
+                debug, "pyo3-build-config-0f", libdir, STALE_LIB
+            ),
+            "a run whose lib_dir holds a carriage return": plant_pyo3_run(
+                debug, "pyo3-build-config-1b", "/planted\r::warning::INJECTED"
+            ),
+            "a unit name that is not pyo3-build-config-<hex>": plant_pyo3_run(
+                debug, "pyo3-build-config-zz", STALE_LIB
+            ),
+            "a directory outside target/ behind a symlinked .fingerprint": victim
+            / "pyo3-build-config-2a"
+            / "secret",
+            "a stale run behind a symlinked .fingerprint": evil / "build" / "pyo3-build-config-2a",
+            "a stale run outside target/ behind a symlinked profile": linked_run,
+            "a profile directory whose name holds LF and a workflow command": plant_pyo3_run(
+                root / "target" / "de\n::warning::FORGED", "pyo3-build-config-4a", STALE_LIB
+            ),
+            "a profile directory whose name holds CR and a workflow command": plant_pyo3_run(
+                root / "target" / "de\r::warning::FORGED", "pyo3-build-config-4b", STALE_LIB
+            ),
+            "a unit name holding LF and a workflow command": plant_pyo3_run(
+                debug, "pyo3-build-config-4c\n::warning::FORGED", STALE_LIB
+            ),
+            "a unit name holding CR and a workflow command": plant_pyo3_run(
+                debug, "pyo3-build-config-4d\r::warning::FORGED", STALE_LIB
+            ),
+        }
+        kept["the build script's compile unit"].mkdir(parents=True)
+        code, out = run_pyo3_purge_step(purge_step, root, targets, sys.executable)
+        if code != 0:
+            gaps.append(f"exits {code} over planted configuration: {out}")
+        gaps += [f"keeps {label}" for label, path in removed.items() if path.exists()]
+        gaps += [f"removes {label}" for label, path in kept.items() if not path.exists()]
+        if "/planted/100%25/lib" not in out or "/planted/100%/lib" in out:
+            gaps.append(f"does not percent-encode `%` in its notice: {out}")
+        if forged := forged_command_lines(out):
+            gaps.append(f"prints lines the runner reads as workflow commands: {forged}")
+    with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as outside:
+        root = Path(scratch)
+        linked = plant_pyo3_run(Path(outside) / "debug", "pyo3-build-config-3a", STALE_LIB)
+        (root / "target").symlink_to(outside)
+        code, out = run_pyo3_purge_step(purge_step, root, "./target", sys.executable)
+        if code != 0 or not linked.exists():
+            gaps.append(f"with target/ a symlink, exits {code} or removes a run outside: {out}")
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        stale = plant_pyo3_run(root / "target" / "debug", "pyo3-build-config-0a", STALE_LIB)
+        code, out = run_pyo3_purge_step(
+            purge_step, root, "./target", "planted-no-such-python3.12"
+        )
+        if code != 0 or not stale.exists():
+            gaps.append(
+                f"with PYO3_PYTHON naming no command, exits {code} and "
+                f"{'keeps' if stale.exists() else 'removes'} a recorded lib_dir: {out}"
+            )
+        code, out = run_pyo3_purge_step(
+            purge_step, root, "./target", sys.executable, runner_os="Windows"
+        )
+        if code == 0 or not stale.exists():
+            gaps.append(f"on Windows, exits {code} and may remove a run: {out}")
+    with tempfile.TemporaryDirectory() as scratch:
+        code, out = run_pyo3_purge_step(purge_step, Path(scratch), "./target", sys.executable)
+        if code != 0:
+            gaps.append(f"exits {code} when no target directory was restored: {out}")
+    return gaps
+
+
+def pyo3_purge_gaps(action: dict) -> list[str]:
+    """Return each way RUST_CACHE_ACTION_FILE fails to drop stale pyo3 build configuration.
+
+    CRITERION: the action holds exactly one step pyo3_purge_steps accepts; its `env:`
+    maps CACHE_TARGETS to MANIFEST_TARGETS; the `manifest` step's `env:` maps
+    CACHE_WORKSPACES to WORKSPACES_INPUT; and pyo3_purge_behavior_gaps finds nothing
+    in the two steps.
+    """
+    steps = (action.get("runs") or {}).get("steps") or []
+    purge = pyo3_purge_steps(action)
+    manifest = next((step for step in steps if step.get("id") == "manifest"), None)
+    gaps = []
+    if len(purge) != 1:
+        gaps.append(f"{len(purge)} unconditional purge steps after the restore, expected 1")
+    if manifest is None:
+        gaps.append("no step with id `manifest`")
+    if gaps:
+        return gaps
+    if (purge[0].get("env") or {}).get("CACHE_TARGETS") != MANIFEST_TARGETS:
+        gaps.append(f"the purge step does not map CACHE_TARGETS to {MANIFEST_TARGETS}")
+    if (manifest.get("env") or {}).get("CACHE_WORKSPACES") != WORKSPACES_INPUT:
+        gaps.append(f"the manifest step does not map CACHE_WORKSPACES to {WORKSPACES_INPUT}")
+    return gaps + pyo3_purge_behavior_gaps(manifest, purge[0])
+
+
+def check_pyo3_build_config_purge() -> None:
+    """RUST_CACHE_ACTION drops restored pyo3 build configuration of another interpreter.
+
+    CRITERION: pyo3_purge_gaps finds nothing in RUST_CACHE_ACTION_FILE.
+
+    WHY: pyo3-build-config reruns its build script only when PYO3_PYTHON or
+    PYO3_ENVIRONMENT_SIGNATURE changes, and neither changes with the runner image: the
+    workflows name the bare `python3.12`, and maturin passes `.venv/bin/python` and a
+    signature without the patch release. A cache entry written on an image with another
+    CPython patch release otherwise links against a library directory the runner lacks.
+    The restored tree is data, so the step must not follow it outside target/ or let it
+    write workflow commands.
+    """
+    action = yaml.safe_load(RUST_CACHE_ACTION_FILE.read_text())
+    gaps = pyo3_purge_gaps(action)
+    check(
+        f"{RUST_CACHE_ACTION} drops only restored pyo3 runs recording another lib_dir, "
+        "inside target/, from the targets its manifest step parses",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+    def by_name(steps: list[dict]) -> dict:
+        return next(step for step in steps if step.get("name") == PYO3_PURGE_STEP_NAME)
+
+    def edit_run(old: str, new: str) -> Callable[[list[dict]], object]:
+        def mutate(steps: list[dict]) -> None:
+            step = by_name(steps)
+            if str(step["run"]).count(old) != 1:
+                raise AssertionError(f"{old!r} is not in the purge step once")
+            step["run"] = str(step["run"]).replace(old, new)
+
+        return mutate
+
+    def manifest_env(steps: list[dict]) -> None:
+        next(step for step in steps if step.get("id") == "manifest")["env"][
+            "CACHE_WORKSPACES"
+        ] = "${{ inputs.workspace }}"
+
+    # Each mutant edits the action by step name or id, never through
+    # pyo3_purge_steps, so a predicate that stops finding the step fails the control.
+    mutants: tuple[tuple[str, Callable[[list[dict]], object]], ...] = (
+        ("with the purge step removed", lambda s: s.remove(by_name(s))),
+        ("with the purge step moved before the restore", lambda s: s.insert(0, s.pop(s.index(by_name(s))))),
+        ("with the purge step made conditional", lambda s: by_name(s).update({"if": "runner.os == 'Linux'"})),
+        ("with continue-on-error on the purge step", lambda s: by_name(s).update({"continue-on-error": True})),
+        ("mapping CACHE_TARGETS to a misspelt output", lambda s: by_name(s)["env"].update({"CACHE_TARGETS": "${{ steps.manifest.outputs.target }}"})),
+        ("mapping CACHE_WORKSPACES to a misspelt input", manifest_env),
+        ("keeping the fingerprint", edit_run('rm -rf -- "$fingerprint"', ":")),
+        ("comparing no lib_dir", edit_run('if [[ -z $recorded || $recorded == "$libdir" ]]; then', "if true; then")),
+        ("dropping every run", edit_run('if [[ -z $recorded || $recorded == "$libdir" ]]; then', "if false; then")),
+        ("reading the last lib_dir line", edit_run("break", ":")),
+        ("accepting a control character in lib_dir", edit_run("[[ $recorded == *[[:cntrl:]]* ]]", "false")),
+        ("not encoding `%`", edit_run('s="${s//"%"/%25}"', ":")),
+        ("not encoding CR", edit_run("s=\"${s//$'\\r'/%0D}\"", ":")),
+        ("not encoding LF", edit_run("s=\"${s//$'\\n'/%0A}\"", ":")),
+        (
+            "following a symlinked fingerprint",
+            edit_run('notice "keeping $config: its fingerprint is a symlink or not a directory"\n      continue', ":"),
+        ),
+        ("following a symlinked profile", edit_run('notice "keeping $config: a component is a symlink or not a regular file"\n    continue', ":")),
+        ("deleting when the interpreter cannot run", edit_run('every restored pyo3 build configuration"\n  exit 0', '"; libdir=none')),
+        ("running on Windows", edit_run("== Windows ]]", "== Planted ]]")),
+    )
+    for label, mutate in mutants:
+        mutated = copy.deepcopy(action)
+        try:
+            mutate(mutated["runs"]["steps"])
+        except AssertionError as error:
+            check(f"the planting for a wrapper {label} applies", False, str(error))
+            continue
+        check(
+            f"a wrapper {label} is reported",
+            bool(pyo3_purge_gaps(mutated)),
+            f"{label}: pyo3_purge_gaps found nothing",
+        )
+    # Control: the string "false", which a_step_that_runs_and_can_fail_its_job
+    # accepts, does not hide the step.
+    mutated = copy.deepcopy(action)
+    by_name(mutated["runs"]["steps"])["continue-on-error"] = "false"
+    check(
+        'a purge step with continue-on-error: "false" still counts',
+        len(pyo3_purge_steps(mutated)) == 1,
+        "the string false hid the step",
+    )
+
+
+def pyo3_layout_steps(doc: dict) -> list[dict]:
+    """The steps of PYO3_LAYOUT_JOB, after its `cargo build`, that read the pyo3 layout.
+
+    CRITERION: a step after the job's first step running `cargo build -p scp-ffi`, that
+    a_step_that_runs_and_can_fail_its_job accepts, and whose `run` names
+    PYO3_CONFIG_FILE and `lib_dir=`.
+    """
+    steps = ((doc.get("jobs") or {}).get(PYO3_LAYOUT_JOB) or {}).get("steps") or []
+    build_at = next(
+        (index for index, step in enumerate(steps) if "cargo build -p scp-ffi" in str(step.get("run") or "")),
+        None,
+    )
+    if build_at is None:
+        return []
+    return [
+        step
+        for step in steps[build_at + 1 :]
+        if PYO3_CONFIG_FILE in str(step.get("run") or "")
+        and "lib_dir=" in str(step.get("run") or "")
+        and a_step_that_runs_and_can_fail_its_job(step)
+    ]
+
+
+def pyo3_layout_build_args(doc: dict) -> list[str] | None:
+    """The arguments after `cargo` of the first `cargo build -p scp-ffi` line in PYO3_LAYOUT_JOB."""
+    for step in ((doc.get("jobs") or {}).get(PYO3_LAYOUT_JOB) or {}).get("steps") or []:
+        for line in str(step.get("run") or "").splitlines():
+            if line.strip().startswith("cargo build -p scp-ffi"):
+                return shlex.split(line)[1:]
+    return None
+
+
+# A stand-in for cargo on the layout step's PATH: it records its arguments and prints
+# the planted JSON messages, as `cargo build --message-format=json` prints them.
+FAKE_CARGO = """#!/bin/sh
+printf '%s\\n' "$*" > "$FAKE_CARGO_ARGS"
+cat "$FAKE_CARGO_MESSAGES"
+exit "${FAKE_CARGO_EXIT:-0}"
+"""
+PYO3_BUILD_CONFIG_ID = "registry+https://github.com/rust-lang/crates.io-index#pyo3-build-config@0.24.2"
+
+
+def build_script_message(package_id: str, out_dir: Path) -> str:
+    return json.dumps(
+        {"reason": "build-script-executed", "package_id": package_id, "out_dir": str(out_dir)}
+    )
+
+
+def pyo3_layout_gaps(doc: dict) -> list[str]:
+    """Return each way ci.yml fails to check the layout the purge step reads.
+
+    CRITERION: PYO3_LAYOUT_JOB holds exactly one step pyo3_layout_steps accepts. Run
+    with PYO3_PYTHON naming this interpreter and a `cargo` that prints planted JSON
+    messages, the step:
+    - runs `cargo` with the job's `cargo build -p scp-ffi` arguments plus
+      `--message-format=json`, so cargo reports the units that build used;
+    - exits 0 when the one `build-script-executed` message for pyo3-build-config names
+      an `out_dir` of `target/<profile>/build/pyo3-build-config-<hex>/out`, or one
+      under a target triple, whose PYO3_CONFIG_FILE has a first `lib_dir=` line equal
+      to this interpreter's LIBDIR;
+    - exits non-zero otherwise: when that run sits in another layout or outside
+      target/, records another lib_dir or none, when cargo reports no such run or two,
+      and when cargo fails. Each failing case also plants a restored run under
+      target/ that records the current LIBDIR, so a step that globs target/ in place
+      of reading cargo's `out_dir` passes where it must fail.
+    """
+    import sysconfig
+
+    libdir = str(sysconfig.get_config_var("LIBDIR"))
+    steps = pyo3_layout_steps(doc)
+    if len(steps) != 1:
+        return [f"{len(steps)} layout steps after the build in job {PYO3_LAYOUT_JOB}, expected 1"]
+    build_args = pyo3_layout_build_args(doc)
+    if build_args is None:
+        return [f"no `cargo build -p scp-ffi` line in job {PYO3_LAYOUT_JOB}"]
+    script = str(steps[0]["run"])
+    other = build_script_message(
+        "path+file:///planted/crates/scp-ffi/napi#scp-ffi-napi@0.1.0", Path("/planted/out")
+    )
+
+    def stale(root: Path) -> None:
+        plant_pyo3_run(root / "target" / "debug", "pyo3-build-config-00", libdir)
+
+    def used(root: Path, profile: str, unit: str, *lib_dirs: str) -> list[str]:
+        run = plant_pyo3_run(root / profile, unit, *lib_dirs)
+        return [other, build_script_message(PYO3_BUILD_CONFIG_ID, run / "out")]
+
+    def renamed_key(root: Path) -> list[str]:
+        messages = used(root, "target/debug", "pyo3-build-config-1b")
+        config = root / "target/debug/build/pyo3-build-config-1b/out" / PYO3_CONFIG_FILE
+        config.write_text(config.read_text() + f"python_lib_dir={libdir}\n")
+        return messages
+
+    def two_runs(root: Path) -> list[str]:
+        return used(root, "target/debug", "pyo3-build-config-1b", libdir) + used(
+            root, "target/release", "pyo3-build-config-1c", libdir
+        )
+
+    cases: tuple[tuple[str, Callable[[Path], list[str]], int, bool], ...] = (
+        ("a run recording the current LIBDIR", lambda r: used(r, "target/debug", "pyo3-build-config-1b", libdir), 0, False),
+        (
+            "a run under a target triple recording the current LIBDIR",
+            lambda r: used(r, "target/x86_64-unknown-linux-gnu/debug", "pyo3-build-config-1b", libdir),
+            0,
+            False,
+        ),
+        ("the build's run in another layout", lambda r: used(r, "target/debug", "pyo3-config-1b", libdir), 1, True),
+        ("the build's run outside target/", lambda r: used(r, "elsewhere/debug", "pyo3-build-config-1b", libdir), 1, True),
+        ("the build's run recording another lib_dir", lambda r: used(r, "target/debug", "pyo3-build-config-1b", STALE_LIB), 1, True),
+        ("the build's run recording the LIBDIR under a renamed key", renamed_key, 1, True),
+        ("no pyo3-build-config run reported", lambda r: [other], 1, True),
+        ("two pyo3-build-config runs reported", two_runs, 1, True),
+        ("cargo failing", lambda r: used(r, "target/debug", "pyo3-build-config-1b", libdir), 101, True),
+    )
+    gaps = []
+    for label, plant, want, plant_stale in cases:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "cargo").write_text(FAKE_CARGO)
+            (bin_dir / "cargo").chmod(0o755)
+            if plant_stale:
+                stale(root)
+            (root / "messages").write_text("".join(f"{m}\n" for m in plant(root)))
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                PYO3_PYTHON=sys.executable,
+                FAKE_CARGO_ARGS=str(root / "args"),
+                FAKE_CARGO_MESSAGES=str(root / "messages"),
+                FAKE_CARGO_EXIT="0" if want != 101 else "101",
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=env,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if (result.returncode == 0) != (want == 0):
+                gaps.append(f"with {label}, the layout step exits {result.returncode}")
+            if want == 0:
+                ran = (root / "args").read_text().strip() if (root / "args").exists() else None
+                expected = " ".join([*build_args, "--message-format=json"])
+                if ran != expected:
+                    gaps.append(f"the layout step ran `cargo {ran}`, not `cargo {expected}`")
+    return gaps
+
+
+# The layout step as this pull request first wrote it: it globs target/ for any run,
+# so a run a restored cache entry left there satisfies it. check_pyo3_layout_step plants
+# it as a mutant.
+PYO3_LAYOUT_GLOB_STEP = """set -euo pipefail
+shopt -s nullglob
+libdir="$("${PYO3_PYTHON:-python3}" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+for config in target/*/build/pyo3-build-config-*/out/pyo3-build-config.txt \\
+  target/*/*/build/pyo3-build-config-*/out/pyo3-build-config.txt; do
+  recorded=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == lib_dir=* ]]; then
+      recorded="${line#lib_dir=}"
+      break
+    fi
+  done < "$config"
+  if [[ $recorded == "$libdir" ]]; then
+    exit 0
+  fi
+done
+echo "::error::no file records lib_dir=$libdir"
+exit 1
+"""
+
+
+def check_pyo3_layout_step() -> None:
+    """ci.yml fails when the pinned pyo3-build-config stops writing what the purge reads.
+
+    CRITERION: pyo3_layout_gaps finds nothing in .github/workflows/ci.yml.
+
+    WHY: the purge step in RUST_CACHE_ACTION_FILE finds pyo3's recorded lib_dir by a
+    path and a key that pyo3-build-config 0.24.2 writes. A pyo3 bump that moves either
+    would make the purge find nothing and bring the stale-link failure back silently,
+    and the planted trees above encode the same assumption, so only a read of a real
+    build's output detects the drift. The job restores a cache entry first, and
+    rust-cache keeps a `pyo3-build-config-<hash>` directory across a pyo3 bump, so the
+    step must read the run cargo reports the build used, not any run under target/.
+    """
+    doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    gaps = pyo3_layout_gaps(doc)
+    check(
+        f"ci.yml job {PYO3_LAYOUT_JOB} checks, after its build, that pyo3-build-config "
+        "wrote the lib_dir the purge step reads, in the run cargo reports the build used",
+        not gaps,
+        "; ".join(gaps),
+    )
+    layout = pyo3_layout_steps(doc)[0] if len(pyo3_layout_steps(doc)) == 1 else None
+
+    def edit(old: str, new: str) -> Callable[[list[dict]], object]:
+        def mutate(steps: list[dict]) -> None:
+            step = next(x for x in steps if x == layout)
+            if old not in str(step["run"]):
+                raise AssertionError(f"{old!r} is not in the layout step")
+            step["run"] = str(step["run"]).replace(old, new)
+
+        return mutate
+
+    for label, mutate in (
+        ("removed", lambda s: s.remove(next(x for x in s if x == layout))),
+        ("passing on every failure", edit("exit 1", "exit 0")),
+        ("moved before the build", lambda s: s.insert(0, s.pop(s.index(next(x for x in s if x == layout))))),
+        ("globbing target/ for any run", lambda s: next(x for x in s if x == layout).update({"run": PYO3_LAYOUT_GLOB_STEP})),
+        ("building without the build step's features", edit("--features server --message-format", "--message-format")),
+        ("accepting any layout", edit('if [[ $relative == "$real_out" ||', 'if false && [[ $relative == "$real_out" ||')),
+    ):
+        if layout is None:
+            break
+        mutated = copy.deepcopy(doc)
+        try:
+            mutate(mutated["jobs"][PYO3_LAYOUT_JOB]["steps"])
+        except AssertionError as error:
+            check(f"the planting for a layout step {label} applies", False, str(error))
+            continue
+        check(
+            f"a layout step {label} is reported",
+            bool(pyo3_layout_gaps(mutated)),
+            f"{label}: pyo3_layout_gaps found nothing",
+        )
+
+
 CACHE_WARM_WORKFLOW = REPO / ".github/workflows/cache-warm.yml"
 
 
@@ -5408,6 +6041,8 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
             bool(wrapper_key_gaps(mutated)),
             f"{label}: wrapper_key_gaps returned nothing",
         )
+    check_pyo3_build_config_purge()
+    check_pyo3_layout_step()
 
     manifest_text = (REPO / "Cargo.toml").read_text()
     gaps = manifest_digest_gaps(MANIFEST_DIGEST_SCRIPT, manifest_text)
