@@ -256,7 +256,7 @@ listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
 // Cargo features
 // --------------
 // `-Pscp.uniffi.cargoFeatures=<comma list>` names the cargo features the generator
-// passes to `cargo build` for the scp-ffi-uniffi cdylib and for uniffi-bindgen. A
+// passes to `cargo build` for the scp-ffi-uniffi cdylib. A
 // build that does not pass the property builds the crate with its default features,
 // which are its production features. The `testing` feature gates the in-memory
 // custody arm and the `signed_at_override` parity affordance. So `testing` reaches

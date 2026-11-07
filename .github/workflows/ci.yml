@@ -183,7 +183,9 @@ env:
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
 #   android-x86_64-testing
-#                     `target/x86_64-linux-android/debug` under `--features testing` —
+#                     `target/x86_64-linux-android/debug` under `--features testing`, and
+#                     `tools/uniffi-bindgen/target/debug`, the uniffi-bindgen tool
+#                     scripts/uniffi-bindgen.sh builds from its own workspace —
 #                     kotlin-android-instrumented, whose API 30 and API 33 legs restore
 #                     it.
 #
@@ -570,6 +572,12 @@ jobs:
               - 'crates/scp-alloc/**'
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
+              # Both Kotlin binding generators build and run this tool, and
+              # scripts/uniffi-bindgen.sh checks the tool's lock against the root
+              # Cargo.lock before it builds.
+              - 'scripts/uniffi-bindgen.sh'
+              - 'tools/uniffi-bindgen/**'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             swift:
               - 'bindings/swift/**'
@@ -651,6 +659,9 @@ jobs:
               - 'examples/**'
               - 'scaffolds/**'
               - 'templates/**'
+              # tools/uniffi-bindgen, the crate scripts/uniffi-bindgen.sh builds; job
+              # ci-workflow-selftest checks its Cargo.lock against the root Cargo.lock.
+              - 'tools/**'
               - 'ratchet/**'
               - '.config/**'
               - 'docs/examples/**'
@@ -3430,7 +3441,8 @@ jobs:
   #     every crate any bridge reaches, hashed whole so that no hand-kept crate list
   #     can go stale), bindings/python/pyproject.toml for the two PyO3 jobs,
   #     bindings/swift/build-xcframework.sh for job xcframework, and
-  #     scripts/generate-uniffi-kotlin.sh for job uniffi-cdylib-linux;
+  #     scripts/generate-uniffi-kotlin.sh, scripts/uniffi-bindgen.sh and
+  #     tools/uniffi-bindgen/** for job uniffi-cdylib-linux;
   #   * a digest the `artifact-inputs` step computes over the job's own definition in
   #     this file (its build command and feature list), the workflow-level `env:`
   #     block every build inherits, the list of tracked paths under crates/
@@ -4711,8 +4723,9 @@ jobs:
           } > "$inputs"
           digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      # The key also hashes scripts/generate-uniffi-kotlin.sh, which runs uniffi-bindgen
-      # over the cdylib and so decides the bindings this cache holds.
+      # The key also hashes scripts/generate-uniffi-kotlin.sh, scripts/uniffi-bindgen.sh
+      # and tools/uniffi-bindgen/**, which build and run uniffi-bindgen over the cdylib
+      # and so decide the bindings this cache holds.
       - name: Restore the UniFFI cdylib and Kotlin bindings a run with the same inputs built
         id: artifact-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -4720,7 +4733,7 @@ jobs:
           path: |
             target/debug/libscp_ffi_uniffi.so
             bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'scripts/generate-uniffi-kotlin.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'scripts/generate-uniffi-kotlin.sh', 'scripts/uniffi-bindgen.sh', 'tools/uniffi-bindgen/**') }}-${{ steps.artifact-inputs.outputs.digest }}
       - name: Mark the start of the build
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
@@ -4963,13 +4976,19 @@ jobs:
   # API 30 is the last level without Keystore ECDH, so its leg runs the software HPKE
   # store; API 33 runs the Keystore agreement store.
   #
-  # The cdylib is built here for x86_64-linux-android with `--features testing`, from
-  # the same commit and features as the `scp.kt` bindings uniffi-cdylib-linux uploads,
-  # so UniFFI's contract checksums match; a mismatch fails every test at load time. The
-  # library goes under src/androidTest/jniLibs only, never src/main, so no published
-  # artifact can carry the testing build.
+  # The cdylib is built here for x86_64-linux-android with `--features testing`, and
+  # the `scp.kt` bindings are generated from that same library, the one the emulator
+  # loads, so UniFFI's contract checksums match by construction; a mismatch fails every
+  # test at load time. The library goes under src/androidTest/jniLibs only, never
+  # src/main, so no published artifact can carry the testing build.
+  #
+  # The job needs no other build job. It took `scp.kt` from uniffi-cdylib-linux's
+  # artifact before, and that `needs:` edge put the whole Linux build ahead of this
+  # job's own: in run 41991735658 the API 30 leg started at 5.9 minutes and ended at
+  # 15.4. scripts/uniffi-bindgen.sh builds uniffi-bindgen from tools/uniffi-bindgen,
+  # which compiles the `uniffi` crate alone, not scp-ffi-uniffi for the host.
   kotlin-android-instrumented:
-    needs: [changes, uniffi-cdylib-linux]
+    needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.kotlin == 'true'
     name: Kotlin / instrumented (API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
@@ -5031,30 +5050,19 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux). This
-      # job reads only the generated `scp.kt`; it builds its own Android cdylib below.
-      - name: Download the UniFFI Kotlin bindings
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: uniffi-kotlin-linux
-          path: .
-      - name: Assert the downloaded bindings are present
-        run: |
-          set -euo pipefail
-          bindings=bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          if [ ! -s "$bindings" ]; then
-            echo "::error::artifact uniffi-kotlin-linux placed nothing at $bindings"
-            exit 1
-          fi
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-linux-android
-      # One writer for the group: the API 33 leg on main. Both legs compile the same
-      # units, so the API 30 leg restores what the API 33 leg saved.
+      # The group's one writer is job android-x86_64-testing of cache-warm.yml, which
+      # names the same two workspaces: the root one, and tools/uniffi-bindgen, whose
+      # target directory holds the tool the bindings step below builds.
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: android-x86_64-testing
           save-if: false
+          workspaces: |
+            . -> target
+            tools/uniffi-bindgen -> target
       - uses: ./.github/actions/cargo-fetch
       - name: Build the UniFFI cdylib for the emulator
         run: |
@@ -5071,6 +5079,17 @@ jobs:
             echo "::error::src/main/jniLibs exists; the testing cdylib must reach no main source set"
             exit 1
           fi
+      # The same generator scripts/generate-uniffi-kotlin.sh runs for uniffi-cdylib-linux,
+      # pointed at the library the step above built, so the bindings and the library the
+      # emulator loads come from one compile. The script fails unless the tool wrote a
+      # non-empty `scp.kt`, and prints that file's SHA-256 as a `::notice` annotation, as
+      # it does in uniffi-cdylib-linux, so the two jobs' files compare byte for byte.
+      - name: Generate the Kotlin bindings from the emulator's cdylib
+        run: |
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true

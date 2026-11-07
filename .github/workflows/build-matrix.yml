@@ -630,18 +630,18 @@ jobs:
             cargo build --release --target "$target" -p scp-ffi-uniffi
           done
 
-      # The four builds above are Android triples and this runner is x86_64 Linux, so no
-      # step before this one produces a library the host can load, and `cargo run` has to
-      # compile the crate graph for the host once. It does so under the dev profile,
-      # cargo's cheapest, into `target/debug`, and the `--library` it reads is the cdylib
-      # that same compile wrote: uniffi-bindgen reads the UniFFI metadata symbols the
-      # crate exports, which the profile does not change. The path this step named
-      # before, `target/release/libscp_ffi_uniffi.so`, was written by no step in this job.
-      # `scripts/check-workflow-compile-steps.py` holds every uniffi-bindgen step to this.
+      # uniffi-bindgen reads the UniFFI metadata symbols out of a library and never loads
+      # it, so it generates from the x86_64 Android cdylib the step above built, and the
+      # bindings describe a library this AAR ships. scripts/uniffi-bindgen.sh builds the
+      # tool from tools/uniffi-bindgen, which compiles the `uniffi` crate alone; the
+      # `[[bin]]` in scp-ffi-uniffi this step ran before compiled that crate's whole graph
+      # a second time, for the host. The tool exits 0 and writes nothing for a library
+      # whose `.symtab` was stripped, so the script fails unless it wrote a non-empty
+      # `uniffi/scp/scp.kt` under the out-dir.
       - name: Generate Kotlin bindings
         run: |
-          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
-            --library target/debug/libscp_ffi_uniffi.so \
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/release/libscp_ffi_uniffi.so \
             --language kotlin \
             --out-dir bindings/kotlin/src/main/kotlin
 

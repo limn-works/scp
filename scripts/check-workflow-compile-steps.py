@@ -33,16 +33,22 @@ CHECK 1 — every `./.github/actions/rust-cache` step names its group and says w
   axis, the keys GitHub expands it to on the job's legs, so a templated writer and a
   literal writer of one expanded key count as two writers of that group.
 
-CHECK 2 — every uniffi-bindgen step reads the library out of the directory its own
-`cargo run` writes.
+CHECK 2 — every uniffi-bindgen step reads the library out of a directory a cargo
+build of its own writes.
 
   The criterion: for every `run:` command of the form
   `cargo run [flags] --bin uniffi-bindgen -- generate … --library <path>`, the directory
-  cargo writes for those flags — `target/<triple>/<profile>/` when `--target` is passed,
-  `target/<profile>/` otherwise, where `<profile>` is `release` under `--release`, the
-  profile's own name under `--profile <name>` (`debug` for `dev` and `test`, `release`
-  for `bench`), and `debug` otherwise —
-  is a prefix of `<path>`.
+  cargo writes for those flags — `<base>/<triple>/<profile>/` when `--target` is passed,
+  `<base>/<profile>/` otherwise, where `<base>` is `--target-dir` or `target` and
+  `<profile>` is `release` under `--release`, the profile's own name under
+  `--profile <name>` (`debug` for `dev` and `test`, `release` for `bench`), and `debug`
+  otherwise — is a prefix of `<path>`. For every `run:` command of the form
+  `scripts/uniffi-bindgen.sh generate … --library <path>`, which builds only the tool
+  and reads a library some other command built, the directory one `cargo build`,
+  `cargo b` or `cargo rustc` writes, by the same rule, is a prefix of `<path>`, where
+  that command runs earlier in the same job, in an earlier step or on an earlier line of
+  the same step, with a `for <var> in <words>; do` list expanded into one command per
+  word.
 
   Why: cargo shares no artifact between two target directories. When the `--library`
   path sits in a directory the `cargo run` does not write, one of two things is true:
@@ -51,7 +57,9 @@ CHECK 2 — every uniffi-bindgen step reads the library out of the directory its
   34724307976), or no step built it and the path does not exist. The check reads only
   the `cargo run` command and the path, so it cannot tell the two apart and rejects
   both, because both are fixed the same way: pass the flags that name the directory
-  the library sits in.
+  the library sits in. A `scripts/uniffi-bindgen.sh` step compiles no library, so the
+  defect can take only the second form there, which surfaces when the job runs; the
+  release jobs of build-matrix.yml run after the merge.
 
 CHECK 3 — every reader of a cache group compiles only what a writer of a group it
 restores compiles.
@@ -152,6 +160,18 @@ TARGET_FLAG = re.compile(r"(?:^|\s)--target[=\s]+(?P<triple>\S+)")
 PROFILE_FLAG = re.compile(r"(?:^|\s)--profile[=\s]+(?P<name>\S+)")
 RELEASE_FLAG = re.compile(r"(?:^|\s)--release(?:\s|$)")
 LIBRARY_FLAG = re.compile(r"(?:^|\s)--library[=\s]+(?P<path>\S+)")
+TARGET_DIR_FLAG = re.compile(r"(?:^|\s)--target-dir[=\s]+(?P<dir>\S+)")
+# `scripts/uniffi-bindgen.sh generate` under any path prefix (`./`, `"$GITHUB_WORKSPACE/`)
+# and through any runner, then the rest of the command.
+BINDGEN_SCRIPT = re.compile(
+    r"scripts/uniffi-bindgen\.sh[\"']?\s+generate\b(?P<rest>[^;&|\n]*)"
+)
+# A cargo command that writes a library: `build`, `b` or `rustc`, then its flags.
+CARGO_BUILD = re.compile(
+    r"\bcargo(?:\s+\+\S+)?\s+(?:build|b|rustc)\b(?P<flags>[^;&|\n]*)"
+)
+FOR_LIST = re.compile(r"\bfor\s+(?P<var>[A-Za-z_]\w*)\s+in\s+(?P<words>[^;\n]*?)\s*;\s*do\b")
+DONE = re.compile(r"(?:^|[\s;])done\b")
 
 
 def profile_directory(flags: str) -> str:
@@ -165,12 +185,26 @@ def profile_directory(flags: str) -> str:
 
 
 def written_directory(flags: str) -> str:
-    """The directory `cargo run <flags>` writes its artifacts into, relative to the cwd."""
+    """The directory `cargo run|build <flags>` writes its artifacts into, relative to
+    the cwd."""
     target = TARGET_FLAG.search(flags)
     profile = profile_directory(flags)
+    target_dir = TARGET_DIR_FLAG.search(flags)
+    base = target_dir.group("dir").strip("\"'").rstrip("/") if target_dir else "target"
     if target is None:
-        return f"target/{profile}/"
-    return f"target/{target.group('triple')}/{profile}/"
+        return f"{base}/{profile}/"
+    return f"{base}/{target.group('triple').strip(chr(34) + chr(39))}/{profile}/"
+
+
+def substitute_loop_variables(flags: str, loops: list[tuple[str, list[str]]]) -> list[str]:
+    """`flags` once per combination of the enclosing `for` lists' words."""
+    expanded = [flags]
+    for var, words in loops:
+        pattern = re.compile(r'"?\$(?:\{' + var + r"\}|" + var + r'\b)"?')
+        expanded = [
+            pattern.sub(lambda _m, w=word: w, item) for item in expanded for word in words
+        ]
+    return expanded
 
 
 def join_continuations(script: str) -> str:
@@ -297,6 +331,7 @@ def check_workflows(workflows_dir: Path) -> list[str]:
             steps = job.get("steps")
             if not isinstance(steps, list):
                 continue
+            written: list[str] = []
             for index, step in enumerate(steps):
                 if not isinstance(step, dict):
                     continue
@@ -308,6 +343,9 @@ def check_workflows(workflows_dir: Path) -> list[str]:
                 run = step.get("run")
                 if isinstance(run, str):
                     found, step_failures = check_bindgen_run(where, run)
+                    bindgen_steps += found
+                    failures.extend(step_failures)
+                    found, step_failures = check_bindgen_script(where, run, written)
                     bindgen_steps += found
                     failures.extend(step_failures)
 
@@ -333,7 +371,8 @@ def check_workflows(workflows_dir: Path) -> list[str]:
     if not failures:
         print(
             f"OK: {bindgen_steps} uniffi-bindgen step(s), each reading the library out of "
-            f"the directory its own `cargo run` writes"
+            f"a directory its own `cargo run`, or an earlier `cargo build` in its job, "
+            f"writes"
         )
     return failures
 
@@ -453,6 +492,50 @@ def check_bindgen_run(where: str, script: str) -> tuple[int, list[str]]:
                 f"flags that name the library's directory, or the crate graph compiles "
                 f"twice (or the path does not exist)"
             )
+    return found, failures
+
+
+def check_bindgen_script(
+    where: str, script: str, written: list[str]
+) -> tuple[int, list[str]]:
+    """CHECK 2 for `scripts/uniffi-bindgen.sh generate`. `written` holds the directories
+    the job's earlier `cargo build` commands write, and gains this step's own."""
+    failures: list[str] = []
+    found = 0
+    loops: list[tuple[str, list[str]]] = []
+    for line in join_continuations(script).splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for loop in FOR_LIST.finditer(line):
+            loops.append((loop.group("var"), loop.group("words").split()))
+        for build in CARGO_BUILD.finditer(line):
+            for flags in substitute_loop_variables(build.group("flags"), loops):
+                directory = written_directory(flags)
+                # A directory still holding `$` (a variable no `for` list sets, a
+                # matrix expression) prefixes no literal `--library`, so it matches
+                # nothing and the failure below names it.
+                if directory not in written:
+                    written.append(directory)
+        for call in BINDGEN_SCRIPT.finditer(line):
+            found += 1
+            library = LIBRARY_FLAG.search(call.group("rest"))
+            if library is None:
+                failures.append(
+                    f"{where}: `scripts/uniffi-bindgen.sh generate` passes no "
+                    f"`--library`, so this check cannot tell which directory it reads"
+                )
+                continue
+            path = library.group("path").strip("\"'")
+            if not any(path.startswith(directory) for directory in written):
+                failures.append(
+                    f"{where}: `scripts/uniffi-bindgen.sh generate` reads the `--library` "
+                    f"{path}, and no earlier `cargo build` in this job writes its "
+                    f"directory (they write: {', '.join(written) or 'nothing'}); pass "
+                    f"the path the build's `--release`/`--target` flags name, or the "
+                    f"path does not exist"
+                )
+        if DONE.search(line) and loops:
+            loops.pop()
     return found, failures
 
 
@@ -1774,6 +1857,7 @@ VERSION_ARGUMENTS = frozenset({"--version", "-version", "-V", "-VV"})
 PUSH_SCRIPTS = {
     "scripts/compile-examples.sh": "compiles every example target, asserting nothing",
     "scripts/generate-uniffi-kotlin.sh": "builds the UniFFI library and generates Kotlin",
+    "scripts/uniffi-bindgen.sh": "builds tools/uniffi-bindgen and generates Kotlin with it",
     "bindings/swift/build-xcframework.sh": "builds the XCFramework and its Swift bindings",
     "bindings/typescript-wasm/scripts/build-wasm.ts": "runs `wasm-pack build`",
     "bindings/typescript-wasm/scripts/copy-wasm-asset.ts": "copies the built `.wasm`",

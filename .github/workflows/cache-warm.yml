@@ -462,17 +462,32 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-linux-android
+      # The group holds two target directories: the root workspace's, and
+      # tools/uniffi-bindgen's, where scripts/uniffi-bindgen.sh builds the tool.
       - id: cache
         uses: ./.github/actions/rust-cache
         with:
           shared-key: android-x86_64-testing
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            tools/uniffi-bindgen -> target
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
       # kotlin-android-instrumented.
       - name: Build the UniFFI cdylib for the emulator
         if: steps.cache.outputs.cache-hit != 'true'
         run: cargo build -p scp-ffi-uniffi --features testing,scp-platform/vendored-openssl --target x86_64-linux-android
+      # kotlin-android-instrumented's bindings step, word for word: it builds the tool
+      # into tools/uniffi-bindgen/target, and generating from the library just built is
+      # the only way to run that build through the script the reader runs.
+      - name: Build uniffi-bindgen and generate the Kotlin bindings
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal
 
   # The Gradle user home that kotlin-lint, kotlin-test, kotlin-android-instrumented and
   # bridge-parity-kotlin restore read-only. Each of those sets the same
