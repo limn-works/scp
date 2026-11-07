@@ -10,9 +10,10 @@
 # This is its own workspace, with its own Cargo.lock, so adding it changed neither the
 # root Cargo.toml nor the root Cargo.lock: both feed the key of every cargo cache group
 # (.github/actions/rust-cache). scripts/uniffi-bindgen.sh builds it with `--locked` and
-# first fails unless every package this Cargo.lock names appears at the same version in
-# the root Cargo.lock, so the tool reads metadata with the uniffi version that wrote it
-# and compiles only crate versions the root lock's `cargo deny` run already checks.
+# first fails unless every package this Cargo.lock names appears in the root Cargo.lock
+# with the same version, source and checksum, so the tool reads metadata with the uniffi
+# version that wrote it and compiles only crates the root lock's `cargo deny` run
+# already checks.
 [package]
 name = "uniffi-bindgen"
 version = "0.0.0"

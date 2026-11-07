@@ -455,6 +455,7 @@ from __future__ import annotations
 import argparse
 import copy
 import functools
+import hashlib
 import itertools
 import json
 import os
@@ -14275,8 +14276,27 @@ UNIFFI_BINDGEN_SCRIPT = REPO / "scripts" / "uniffi-bindgen.sh"
 UNIFFI_BINDGEN_LOCK = REPO / "tools" / "uniffi-bindgen" / "Cargo.lock"
 
 # A `cargo` stand-in for scripts/uniffi-bindgen.sh: it fails when FAKE_CARGO_FAIL is
-# set, and otherwise writes a tool under the `--target-dir` it was given that prints its
-# arguments and exits with FAKE_TOOL_EXIT.
+# set, and otherwise copies a fake tool under the `--target-dir` it was given. The tool
+# prints its arguments, writes `<out-dir>/uniffi/scp/scp.kt` (non-empty; empty when
+# FAKE_TOOL_OUTPUT is `empty`; not at all when it is `none`) and exits with
+# FAKE_TOOL_EXIT.
+FAKE_TOOL = r"""#!/bin/sh
+echo "tool ran: $*"
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--out-dir" ]; then out="$2"; fi
+  shift
+done
+if [ -n "$out" ] && [ "${FAKE_TOOL_OUTPUT:-full}" != none ]; then
+  mkdir -p "$out/uniffi/scp"
+  if [ "${FAKE_TOOL_OUTPUT:-full}" = empty ]; then
+    : > "$out/uniffi/scp/scp.kt"
+  else
+    echo "package uniffi.scp" > "$out/uniffi/scp/scp.kt"
+  fi
+fi
+exit ${FAKE_TOOL_EXIT:-0}
+"""
 FAKE_CARGO = """#!/bin/sh
 [ -n "${FAKE_CARGO_FAIL:-}" ] && exit 101
 target=""
@@ -14286,15 +14306,24 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$target" ] || exit 102
 mkdir -p "$target/debug"
-printf '#!/bin/sh\necho "tool ran: $*"\nexit ${FAKE_TOOL_EXIT:-0}\n' > "$target/debug/uniffi-bindgen"
+cp "$(dirname "$0")/fake-tool" "$target/debug/uniffi-bindgen"
 chmod +x "$target/debug/uniffi-bindgen"
 """
+GENERATE_ARGS = ["--library", "lib.so", "--language", "kotlin", "--out-dir", "out"]
+FAKE_OUTPUT_DIGEST = hashlib.sha256(b"package uniffi.scp\n").hexdigest()
 
 
 def run_bindgen_script(
-    tool_lock: str, root_lock: str, env_extra: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    """Run scripts/uniffi-bindgen.sh in a planted tree, with a planted `cargo`."""
+    tool_lock: str | None,
+    root_lock: str | None,
+    env_extra: dict[str, str] | None = None,
+    args: list[str] | None = None,
+    stale_output: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    """Run scripts/uniffi-bindgen.sh in a planted tree, with a planted `cargo`.
+
+    Returns the result and the text of `out/uniffi/scp/scp.kt` afterwards (None when the
+    file is absent). A lock passed as None is not planted."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "scripts").mkdir()
@@ -14302,61 +14331,117 @@ def run_bindgen_script(
         (root / "bin").mkdir()
         script = root / "scripts" / "uniffi-bindgen.sh"
         script.write_text(UNIFFI_BINDGEN_SCRIPT.read_text())
-        (root / "Cargo.lock").write_text(root_lock)
-        (root / "tools" / "uniffi-bindgen" / "Cargo.lock").write_text(tool_lock)
+        if root_lock is not None:
+            (root / "Cargo.lock").write_text(root_lock)
+        if tool_lock is not None:
+            (root / "tools" / "uniffi-bindgen" / "Cargo.lock").write_text(tool_lock)
+        output = root / "out" / "uniffi" / "scp" / "scp.kt"
+        if stale_output:
+            output.parent.mkdir(parents=True)
+            output.write_text("package uniffi.scp // an earlier run's output\n")
+        (root / "bin" / "fake-tool").write_text(FAKE_TOOL)
         cargo = root / "bin" / "cargo"
         cargo.write_text(FAKE_CARGO)
         cargo.chmod(0o755)
-        env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}")
+        env = {
+            key: value for key, value in os.environ.items() if key != "GITHUB_ACTIONS"
+        }
+        env["PATH"] = f"{root / 'bin'}:{os.environ['PATH']}"
         env.update(env_extra or {})
-        return subprocess.run(
-            ["bash", str(script), "generate", "--language", "kotlin"],
+        result = subprocess.run(
+            [
+                "bash",
+                str(script),
+                "generate",
+                *(GENERATE_ARGS if args is None else args),
+            ],
             capture_output=True,
             text=True,
             env=env,
+            cwd=root,
             timeout=60,
         )
+        return result, (output.read_text() if output.is_file() else None)
 
 
-def lock_text(*packages: tuple[str, str]) -> str:
-    return "version = 4\n\n" + "".join(
-        f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
-        f'source = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
-        for name, version in packages
-    )
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+
+
+def lock_text(*packages: tuple[str, ...]) -> str:
+    """A Cargo.lock naming each `(name, version[, source[, checksum]])` package. The
+    source defaults to crates.io and the checksum to one derived from name and version;
+    an empty checksum writes no checksum line, as cargo does for a git package."""
+    text = "version = 4\n\n"
+    for name, version, *rest in packages:
+        source = rest[0] if rest else CRATES_IO
+        checksum = rest[1] if len(rest) > 1 else f"{name}-{version}".encode().hex()
+        text += f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+        text += f'source = "{source}"\n'
+        if checksum:
+            text += f'checksum = "{checksum}"\n'
+        text += "\n"
+    return text
 
 
 def check_uniffi_bindgen_script() -> None:
     real_tool_lock = UNIFFI_BINDGEN_LOCK.read_text()
     real_root_lock = (REPO / "Cargo.lock").read_text()
-    result = run_bindgen_script(real_tool_lock, real_root_lock)
+    result, output = run_bindgen_script(real_tool_lock, real_root_lock)
     check(
         "uniffi-bindgen.sh: the committed tools/uniffi-bindgen/Cargo.lock passes the "
-        "lock check against the root Cargo.lock, and the tool gets the arguments",
+        "lock check against the root Cargo.lock, the tool gets the arguments, and the "
+        "script prints the SHA-256 of the scp.kt the tool wrote",
         result.returncode == 0
-        and "tool ran: generate --language kotlin" in result.stdout,
+        and "tool ran: generate --library lib.so --language kotlin --out-dir out"
+        in result.stdout
+        and output == "package uniffi.scp\n"
+        and f"out/uniffi/scp/scp.kt sha256 {FAKE_OUTPUT_DIGEST}" in result.stdout,
         f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr!r}",
     )
     root = lock_text(("uniffi", "0.29.5"), ("clap", "4.5.0"))
+    git = "git+https://github.com/planted/clap?rev=1#0123456789abcdef"
     cases = [
         (
             "a package at another version than the root lock's",
             lock_text(("uniffi", "0.29.6")),
             root,
-            {},
             "uniffi 0.29.6",
         ),
         (
             "a package the root lock does not name",
             lock_text(("uniffi", "0.29.5"), ("planted-crate", "1.0.0")),
             root,
-            {},
             "planted-crate 1.0.0",
         ),
-        ("a lock that names no package", "version = 4\n", root, {}, "names no package"),
+        (
+            "a package the root lock holds at the same version from crates.io, named "
+            "here from a git source",
+            lock_text(("uniffi", "0.29.5"), ("clap", "4.5.0", git, "")),
+            root,
+            f"clap 4.5.0 {git} -",
+        ),
+        (
+            "a package at the root lock's version and source with another checksum",
+            lock_text(("uniffi", "0.29.5"), ("clap", "4.5.0", CRATES_IO, "ff" * 32)),
+            root,
+            f"clap 4.5.0 {CRATES_IO} {'ff' * 32}",
+        ),
+        ("a lock that names no package", "version = 4\n", root, "names no package"),
+        (
+            "a missing tool lock",
+            None,
+            root,
+            "tools/uniffi-bindgen/Cargo.lock does not exist",
+        ),
+        (
+            "a missing root lock",
+            lock_text(("uniffi", "0.29.5")),
+            None,
+            "Cargo.lock does not exist",
+        ),
     ]
-    for label, tool_lock, root_lock, env_extra, needle in cases:
-        result = run_bindgen_script(tool_lock, root_lock, env_extra)
+    for label, tool_lock, root_lock, needle in cases:
+        result, _ = run_bindgen_script(tool_lock, root_lock)
         check(
             f"uniffi-bindgen.sh: {label} exits 1 naming it, before any build",
             result.returncode == 1
@@ -14365,16 +14450,72 @@ def check_uniffi_bindgen_script() -> None:
             f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr!r}",
         )
     matching = lock_text(("uniffi", "0.29.5"))
-    result = run_bindgen_script(matching, root, {"FAKE_CARGO_FAIL": "1"})
+    argument_cases = [
+        (
+            "a generate naming another language",
+            ["--library", "lib.so", "--language", "swift", "--out-dir", "out"],
+            "pass exactly --language kotlin",
+        ),
+        (
+            "a generate naming two languages",
+            ["--library", "lib.so", "-l", "kotlin", "-l", "swift", "--out-dir", "out"],
+            "pass exactly --language kotlin",
+        ),
+        (
+            "a generate naming no --out-dir",
+            ["--library", "lib.so", "--language=kotlin"],
+            "names no --out-dir",
+        ),
+    ]
+    for label, args, needle in argument_cases:
+        result, _ = run_bindgen_script(matching, root, args=args)
+        check(
+            f"uniffi-bindgen.sh: {label} exits 1 naming it, before any build",
+            result.returncode == 1
+            and needle in result.stderr
+            and "tool ran" not in result.stdout,
+            f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr!r}",
+        )
+    result, _ = run_bindgen_script(matching, root, {"FAKE_CARGO_FAIL": "1"})
     check(
-        "uniffi-bindgen.sh: a failed build exits nonzero and runs no tool",
-        result.returncode != 0 and "tool ran" not in result.stdout,
+        "uniffi-bindgen.sh: a failed build exits 1, as the header documents, and runs "
+        "no tool",
+        result.returncode == 1
+        and "cargo build of" in result.stderr
+        and "tool ran" not in result.stdout,
+        f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr!r}",
+    )
+    result, _ = run_bindgen_script(matching, root, {"FAKE_TOOL_EXIT": "3"})
+    check(
+        "uniffi-bindgen.sh: the tool's nonzero exit code is the script's",
+        result.returncode == 3 and "tool ran" in result.stdout,
         f"exit {result.returncode}, stdout {result.stdout!r}",
     )
-    result = run_bindgen_script(matching, root, {"FAKE_TOOL_EXIT": "3"})
+    output_cases = [
+        ("writes no scp.kt", {"FAKE_TOOL_OUTPUT": "none"}, False),
+        ("writes an empty scp.kt", {"FAKE_TOOL_OUTPUT": "empty"}, False),
+        (
+            "writes no scp.kt where an earlier run left a non-empty one",
+            {"FAKE_TOOL_OUTPUT": "none"},
+            True,
+        ),
+    ]
+    for label, env_extra, stale in output_cases:
+        result, _ = run_bindgen_script(matching, root, env_extra, stale_output=stale)
+        check(
+            f"uniffi-bindgen.sh: a tool that exits 0 and {label} fails the script with 1",
+            result.returncode == 1
+            and "tool ran" in result.stdout
+            and "wrote no" in result.stderr,
+            f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr!r}",
+        )
+    result, _ = run_bindgen_script(matching, root, {"GITHUB_ACTIONS": "true"})
     check(
-        "uniffi-bindgen.sh: the tool's exit code is the script's",
-        result.returncode == 3 and "tool ran" in result.stdout,
+        "uniffi-bindgen.sh: under GitHub Actions the digest is a `::notice` annotation, "
+        "which the annotations API serves without a token",
+        result.returncode == 0
+        and "::notice title=uniffi-bindgen output::out/uniffi/scp/scp.kt sha256 "
+        f"{FAKE_OUTPUT_DIGEST}" in result.stdout,
         f"exit {result.returncode}, stdout {result.stdout!r}",
     )
 

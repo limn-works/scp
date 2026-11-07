@@ -29,6 +29,11 @@
 #     --target` reading `target/<triple>/ci-bridge`, with a bare `cargo run` reading
 #     `target/debug`, with `--profile test` reading `target/debug` and `--profile bench`
 #     reading `target/release`, and it joins backslash-continued lines before reading a command.
+#     For `scripts/uniffi-bindgen.sh generate` it fails a `--library` under the debug
+#     directory when the job's `for` loop builds release libraries only, and a
+#     `--library` whose build runs in a later step. It passes a `--library` under a
+#     directory an earlier step's `for` loop builds, one under a `--target-dir`, and one
+#     an earlier line of the same step builds.
 #   * Check 3 (group coverage) fails a reader that compiles a feature the writer does
 #     not, a reader that compiles in check mode against a build-mode writer, a reader
 #     whose command names a shell variable its script never sets, a reader whose
@@ -105,6 +110,8 @@ FIXTURES=(
     "bad-push-runs-unknown-action"
     "bad-push-runs-companion-if"
     "bad-cache-writer-main-or-failure"
+    "bad-bindgen-script-wrong-profile"
+    "bad-bindgen-script-before-build"
 )
 EXPECTED_EXITS=(
     "0"
@@ -134,6 +141,8 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "0"
+    "1"
+    "1"
     "1"
     "1"
     "1"
@@ -181,6 +190,8 @@ EXPECTED_SUBSTRINGS=(
     "uses actions/download-artifact@v4 on a push"
     "job check-draft runs on a push as the companion of job changes"
     "does not name refs/heads/main"
+    "reads the \`--library\` target/x86_64-linux-android/debug/libscp_ffi_uniffi.so, and no earlier \`cargo build\` in this job writes its directory (they write: target/aarch64-linux-android/release/, target/x86_64-linux-android/release/)"
+    "reads the \`--library\` target/x86_64-linux-android/debug/libscp_ffi_uniffi.so, and no earlier \`cargo build\` in this job writes its directory (they write: nothing)"
 )
 
 passed=0
@@ -225,15 +236,15 @@ done
 
 # The good fixture reports every good shape it holds; a case that passed for the wrong
 # reason (a parser that saw no step at all) would print zero counts, so hold the
-# bindgen count too.
+# bindgen count too: six `cargo run` steps and three scripts/uniffi-bindgen.sh steps.
 set +e
 good_output="$("$PYTHON" "$CHECK" --workflows-dir "$FIXTURES_DIR/good-groups-and-bindgen" 2>&1)"
 set -e
-if [[ "$good_output" == *"OK: 6 uniffi-bindgen step(s)"* ]]; then
-    echo "PASS [good-groups-and-bindgen counts six bindgen steps]"
+if [[ "$good_output" == *"OK: 9 uniffi-bindgen step(s)"* ]]; then
+    echo "PASS [good-groups-and-bindgen counts nine bindgen steps]"
     passed=$((passed + 1))
 else
-    echo "FAIL [good-groups-and-bindgen counts six bindgen steps]: $good_output" >&2
+    echo "FAIL [good-groups-and-bindgen counts nine bindgen steps]: $good_output" >&2
     failed=$((failed + 1))
 fi
 # Check 3 compares four readers there: job doc in both groups and the two fuzz legs

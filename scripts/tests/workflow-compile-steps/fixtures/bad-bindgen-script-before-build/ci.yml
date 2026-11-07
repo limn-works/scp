@@ -1,0 +1,13 @@
+# The bindings step runs before the step that builds the library it reads.
+name: Bad
+on: pull_request
+jobs:
+  instrumented:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir out
+      - run: cargo build -p scp-ffi-uniffi --features testing --target x86_64-linux-android

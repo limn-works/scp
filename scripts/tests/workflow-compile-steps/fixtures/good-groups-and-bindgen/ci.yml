@@ -1,7 +1,10 @@
 # Three groups, one writer each, on main — the build-mode and check-mode jobs that
 # write one `target/debug` hold two of them, and a job whose commands span both modes
 # restores both groups, one step each; six uniffi-bindgen steps whose `cargo run`
-# flags name the directory the `--library` sits in.
+# flags name the directory the `--library` sits in; and three scripts/uniffi-bindgen.sh
+# steps whose `--library` sits in a directory an earlier `cargo build` of the job writes:
+# one per word of a `for` list, in a step of its own, under `--target-dir`, and on an
+# earlier line of the same step.
 name: Good
 # A schedule writes these groups, so check `push runs`, which governs only what a push
 # to main runs, leaves the jobs below alone; good-push-runs holds the push shape.
@@ -108,3 +111,26 @@ jobs:
           cargo run --profile bench -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
             --library target/release/libscp_ffi_uniffi.so \
             --language kotlin
+  kotlin-release-script:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for target in aarch64-linux-android x86_64-linux-android; do
+            cargo build --release --target "$target" -p scp-ffi-uniffi
+          done
+      - run: |
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/release/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir out
+  kotlin-script-same-step:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo build -p scp-ffi-uniffi --target-dir build/cargo --target x86_64-linux-android
+          bash scripts/uniffi-bindgen.sh generate \
+            --library build/cargo/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir out
+          cargo build -p scp-ffi-uniffi
+          scripts/uniffi-bindgen.sh generate --library=target/debug/libscp_ffi_uniffi.so --language kotlin --out-dir out

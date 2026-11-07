@@ -635,7 +635,9 @@ jobs:
       # bindings describe a library this AAR ships. scripts/uniffi-bindgen.sh builds the
       # tool from tools/uniffi-bindgen, which compiles the `uniffi` crate alone; the
       # `[[bin]]` in scp-ffi-uniffi this step ran before compiled that crate's whole graph
-      # a second time, for the host.
+      # a second time, for the host. The tool exits 0 and writes nothing for a library
+      # whose `.symtab` was stripped, so the script fails unless it wrote a non-empty
+      # `uniffi/scp/scp.kt` under the out-dir.
       - name: Generate Kotlin bindings
         run: |
           ./scripts/uniffi-bindgen.sh generate \

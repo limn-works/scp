@@ -1,0 +1,17 @@
+# The release Kotlin job of build-matrix.yml with its `--library` under the debug
+# directory: the loop builds release libraries only, so the path does not exist.
+name: Bad
+on: push
+jobs:
+  kotlin-aar:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for target in aarch64-linux-android x86_64-linux-android; do
+            cargo build --release --target "$target" -p scp-ffi-uniffi
+          done
+      - run: |
+          ./scripts/uniffi-bindgen.sh generate \
+            --library target/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir bindings/kotlin/src/main/kotlin

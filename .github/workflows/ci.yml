@@ -183,7 +183,9 @@ env:
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
 #   android-x86_64-testing
-#                     `target/x86_64-linux-android/debug` under `--features testing` —
+#                     `target/x86_64-linux-android/debug` under `--features testing`, and
+#                     `tools/uniffi-bindgen/target/debug`, the uniffi-bindgen tool
+#                     scripts/uniffi-bindgen.sh builds from its own workspace —
 #                     kotlin-android-instrumented, whose API 30 and API 33 legs restore
 #                     it.
 #
@@ -5051,12 +5053,16 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-linux-android
-      # One writer for the group: the API 33 leg on main. Both legs compile the same
-      # units, so the API 30 leg restores what the API 33 leg saved.
+      # The group's one writer is job android-x86_64-testing of cache-warm.yml, which
+      # names the same two workspaces: the root one, and tools/uniffi-bindgen, whose
+      # target directory holds the tool the bindings step below builds.
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: android-x86_64-testing
           save-if: false
+          workspaces: |
+            . -> target
+            tools/uniffi-bindgen -> target
       - uses: ./.github/actions/cargo-fetch
       - name: Build the UniFFI cdylib for the emulator
         run: |
@@ -5075,21 +5081,15 @@ jobs:
           fi
       # The same generator scripts/generate-uniffi-kotlin.sh runs for uniffi-cdylib-linux,
       # pointed at the library the step above built, so the bindings and the library the
-      # emulator loads come from one compile. `sha256sum` prints the file's digest for a
-      # comparison with the `scp.kt` that job uploads.
+      # emulator loads come from one compile. The script fails unless the tool wrote a
+      # non-empty `scp.kt`, and prints that file's SHA-256 as a `::notice` annotation, as
+      # it does in uniffi-cdylib-linux, so the two jobs' files compare byte for byte.
       - name: Generate the Kotlin bindings from the emulator's cdylib
         run: |
-          set -euo pipefail
           ./scripts/uniffi-bindgen.sh generate \
             --library target/x86_64-linux-android/debug/libscp_ffi_uniffi.so \
             --language kotlin \
             --out-dir bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal
-          bindings=bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          if [ ! -s "$bindings" ]; then
-            echo "::error::uniffi-bindgen wrote nothing at $bindings"
-            exit 1
-          fi
-          sha256sum "$bindings"
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: true
