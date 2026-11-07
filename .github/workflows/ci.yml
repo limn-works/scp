@@ -2638,7 +2638,11 @@ jobs:
           SCP_EXPECT_SHIPPED_ADDON=1 bun test tests/shipped-addon.test.ts \
             --test-name-pattern 'identityCreateWithCustody refuses with SCP-IDENT-1100 before any provider call'
       - name: No build script reruns when an unrelated file of its package changes
-        run: python3 scripts/check-build-script-rerun.py build -p scp-ffi-napi --features server --lib
+        run: |
+          python3 scripts/check-build-script-rerun.py build -p scp-ffi-napi --features server --lib
+          # scp-ffi-napi-test-stubs is a dev-dependency of scp-ffi-napi, so the
+          # `--lib` build above never runs its build script.
+          python3 scripts/check-build-script-rerun.py build -p scp-ffi-napi-test-stubs
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2714,37 +2718,65 @@ jobs:
       # line of `<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt`, the
       # file pyo3-build-config 0.24.2 writes. A pyo3 bump that moves the file or
       # renames the key would leave that step finding nothing, and stale library
-      # directories would come back silently. This reads the real output of the
-      # pinned version, after the build above, and fails when no file records the
+      # directories would come back silently. This step asks cargo which run of
+      # pyo3-build-config's build script the build above used: cargo reports each
+      # build script's `out_dir` in a `build-script-executed` message, for a fresh
+      # run too. A glob over target/ would also match a run that a restored cache
+      # entry left there, and rust-cache keeps that directory across a pyo3 bump,
+      # so the step reads only that `out_dir`. It fails unless the directory has
+      # the layout the purge globs and its file's first `lib_dir=` line is the
       # LIBDIR of the interpreter the build used.
       - name: pyo3-build-config wrote the lib_dir the cache purge step reads
         run: |
           set -euo pipefail
-          shopt -s nullglob
           libdir="$("${PYO3_PYTHON:-python3}" -I -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          for config in target/*/build/pyo3-build-config-*/out/pyo3-build-config.txt \
-            target/*/*/build/pyo3-build-config-*/out/pyo3-build-config.txt; do
-            recorded=""
+          # The build step's command, so cargo resolves the same units; each unit
+          # is fresh, so this compiles nothing.
+          messages="$(cargo build -p scp-ffi --features server --message-format=json)"
+          out_dir="$(python3 -I -c '
+          import json, sys
+          dirs = set()
+          for line in sys.stdin:
+              if not line.startswith("{"):
+                  continue
+              message = json.loads(line)
+              fragment = str(message.get("package_id", "")).rpartition("#")[2]
+              if message.get("reason") == "build-script-executed" and fragment.partition("@")[0] == "pyo3-build-config":
+                  dirs.add(message["out_dir"])
+          if len(dirs) != 1:
+              sys.exit(f"cargo reported {len(dirs)} pyo3-build-config build-script runs, expected 1: {sorted(dirs)}")
+          print(dirs.pop())
+          ' <<< "$messages")"
+          target="$(pwd -P)/target"
+          real_out="$(cd -- "$out_dir" && pwd -P)"
+          relative="${real_out#"$target"/}"
+          if [[ $relative == "$real_out" || ! $relative =~ ^([^/]+/)?[^/]+/build/pyo3-build-config-[0-9a-f]+/out$ ]]; then
+            echo "::error::the build used the pyo3-build-config run at $out_dir, which is not target/<profile>/build/pyo3-build-config-<hex>/out; the pyo3 purge step in .github/actions/rust-cache globs that layout"
+            exit 1
+          fi
+          recorded=""
+          if [[ -f $real_out/pyo3-build-config.txt ]]; then
             while IFS= read -r line || [[ -n $line ]]; do
               if [[ $line == lib_dir=* ]]; then
                 recorded="${line#lib_dir=}"
                 break
               fi
-            done < "$config"
-            if [[ $recorded == "$libdir" ]]; then
-              echo "$config records lib_dir $libdir"
-              exit 0
-            fi
-          done
-          echo "::error::no target/<profile>/build/pyo3-build-config-*/out/pyo3-build-config.txt records lib_dir=$libdir; the pyo3 purge step in .github/actions/rust-cache reads that file, so check where the pinned pyo3-build-config writes it"
-          exit 1
+            done < "$real_out/pyo3-build-config.txt"
+          fi
+          if [[ $recorded != "$libdir" ]]; then
+            echo "::error::$out_dir/pyo3-build-config.txt, the file the build used, records lib_dir '$recorded', not $libdir; the pyo3 purge step in .github/actions/rust-cache reads that key from that file, so check where the pinned pyo3-build-config writes it"
+            exit 1
+          fi
+          echo "$out_dir/pyo3-build-config.txt records lib_dir $libdir"
       - name: No build script reruns when an unrelated file of its package changes
         run: |
           # A build script that prints no rerun-if line is rerun, and its crate and
           # every dependent recompiled, whenever any file of its package changes.
           # The self-test proves the check catches such a script. scp-ffi has no
-          # build script, so the check runs over the workspace packages that do,
-          # in jobs rust-test-napi-production and rust-build-uniffi-production.
+          # build script, so the check runs over the three workspace packages that
+          # have one: scp-ffi-napi and scp-ffi-napi-test-stubs in job
+          # rust-test-napi-production, and scp-ffi-uniffi in job
+          # rust-build-uniffi-production.
           python3 scripts/check-build-script-rerun.py --self-test
       - name: Shipped pyo3 fail-closed assertions
         run: |
