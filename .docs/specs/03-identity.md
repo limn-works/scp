@@ -35,7 +35,7 @@ Custody migration moves the operational signing capability from one custody prov
 
 1. **Initiate on the target device.** Generate the new keypair in the target custody provider and record the key's algorithm and its custody type, both of which `09-security-model.md` §9.7.4.2's definitions fix. The custody type is a declaration the requesting device wrote, and every consumer reads it as `Software` until a platform proof verifies (`27-attestations.md` §27.4.4), so no step below reads it as a hardware rating.
 2. **Authorize on a device holding a threshold of the standing root.** Compose the `KeyState` carrying the complete key state and sign it with a root signature by the standing root set (`09-security-model.md` §9.7.4.2 R3 and R8).
-3. **Publish, re-sign, and reissue.** Publish the extended key-event log to every entry of the publication set, which is the identity's own `SCPNode` nodes together with the fallback set (§3.10.5). Re-sign the service record under the new key and republish it (§3.10.13): the rotation resets every reader's high-water mark for that record, and every copy the replaced key signed stops verifying the moment a reader adopts the `KeyState` of step 2. Issue MLS Update proposals in every active context (§9.7.3). Revoke every UCAN the replaced key signed and reissue under the new one.
+3. **Publish, re-sign, and reissue.** Publish the extended key-event log to every entry of the publication set, which is the identity's own `SCPNode` nodes together with the fallback set (§3.10.5). Re-sign the service record under the new key and republish it (§3.10.13): the rotation resets every reader's high-water mark for that record, and every copy the replaced key signed stops verifying the moment a reader adopts the `KeyState` of step 2. In every active context, submit a key-history request and an own-device request that replaces the leaf (`09-security-model.md` §9.7.3). Revoke every UCAN the replaced key signed and reissue under the new one.
 4. **Re-sign the attestation chain.** Every identity attestation the replaced key signed is re-signed under the new key and republished (§3.5), which the SDK does as one transaction with the steps above.
 5. **Destroy the replaced key material** after confirmed publication, which `09-security-model.md` §9.7.4.2 R10 defines as durable self-retention together with acceptance by at least one entry of the publication set. The controller waits on confirmed publication alone: whether the publish cycle reached a fallback-set entry, which `PublishOutcome.fallback_reached` reports (§3.10.10), gates no destruction. A controller that destroyed on a local signature alone would leave every party that never received the event resolving the replaced key as `Current`, and the identity could then sign nothing that party accepts.
 
@@ -573,6 +573,12 @@ All identity private state event types, organized by category:
 | `EnrollDevice` | `device_id: String, device_hpke_pubkey: [u8; 65], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
+
+**Context membership events (`09-security-model.md` §9.7.1, "What X's device completes"):**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `RecordContextMembership` | `context_id: ContextId, member: bool, timestamp: u64` | No (same context) | A device appends `member` true when it completes the identity's first join of the context, by creation, invitation or re-seat, and `member` false when the identity leaves the context or is removed from it. A device completes a Welcome without asking only for a context whose latest record says `member` true. Every other Welcome is an invitation, which the identity's human accepts or declines (`05-contexts.md` §5.12.2), and accepting appends `member` true |
 
 **Recovery contact events:**
 
