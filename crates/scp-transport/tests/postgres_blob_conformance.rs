@@ -26,7 +26,9 @@ async fn isolated_database_url() -> String {
         .await
         .expect("connect to the DATABASE_URL server");
     let name = format!("scp_conf_{:016x}", rand::random::<u64>());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    // `name` is `scp_conf_` and sixteen hex digits, and CREATE DATABASE takes no bind
+    // parameter for its name.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("create the test database");

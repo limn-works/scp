@@ -23,7 +23,10 @@
 //!   Before opening, each call asks the linked `SQLite`
 //!   `sqlite3_compileoption_used("ENABLE_MEMORY_MANAGEMENT")` and refuses
 //!   with [`PoolsError::PageCacheBulkPossible`] unless it returns 1. The bundled
-//!   `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines the option.
+//!   `SQLCipher` defines the option in every cargo build run inside this
+//!   repository: libsqlite3-sys 0.40.0 does not pass it, so
+//!   `.cargo/config.toml` sets `LIBSQLITE3_FLAGS` to
+//!   `-DSQLITE_ENABLE_MEMORY_MANAGEMENT`.
 //! - **Lookaside.** After opening, each call runs
 //!   `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)`. `SQLite`
 //!   returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` shows the

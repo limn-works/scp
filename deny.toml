@@ -28,6 +28,15 @@ allow = [
     "CDLA-Permissive-2.0",  # webpki-root-certs (root CA bundle)
     "AGPL-3.0-only",  # scp-node only
 ]
+# sqlcipher-src carries the SQLCipher amalgamation that libsqlite3-sys 0.40 compiles for
+# `bundled-sqlcipher`, and declares `MIT AND BSD-3-Clause AND blessing AND WTFPL`.
+# `blessing` is SQLite's public-domain dedication, which covers the SQLite code inside the
+# amalgamation. `WTFPL` is the second of libtomcrypt's two licenses (the first is a
+# public-domain dedication); libsqlite3-sys compiles libtomcrypt for no native target, and
+# the crate ships its sources anyway. Neither license is allowed for any other crate.
+exceptions = [
+    { allow = ["blessing", "WTFPL"], crate = "sqlcipher-src" },
+]
 
 # ── Advisories ──────────────────────────────────────────────────────────────
 [advisories]
