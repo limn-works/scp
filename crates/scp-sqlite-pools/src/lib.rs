@@ -144,7 +144,9 @@ impl fmt::Display for PoolsError {
             Self::PageCacheBulkPossible => f.write_str(
                 "SQLite's page-cache bulk block cannot be proven absent: the linked SQLite was \
                  compiled without SQLITE_ENABLE_MEMORY_MANAGEMENT, so freed pages could keep \
-                 decrypted plaintext unwiped",
+                 decrypted plaintext unwiped; rebuild with \
+                 LIBSQLITE3_FLAGS=\"-DSQLITE_ENABLE_MEMORY_MANAGEMENT\" in the cargo build \
+                 environment (libsqlite3-sys 0.40 and later no longer set the option)",
             ),
             Self::Open(e) => write!(f, "failed to open database: {e}"),
             Self::LookasideOn { code } => write!(
@@ -434,6 +436,21 @@ mod tests {
                 "answer {answer} must be refused"
             );
         }
+    }
+
+    /// The refusal names the missing compile option and the build setting that
+    /// supplies it.
+    #[test]
+    fn bulk_block_refusal_names_the_build_fix() {
+        let message = PoolsError::PageCacheBulkPossible.to_string();
+        assert!(
+            message.contains("compiled without SQLITE_ENABLE_MEMORY_MANAGEMENT"),
+            "{message}"
+        );
+        assert!(
+            message.contains("LIBSQLITE3_FLAGS=\"-DSQLITE_ENABLE_MEMORY_MANAGEMENT\""),
+            "{message}"
+        );
     }
 
     /// A `SQLite` without the option is refused before any connection opens.
