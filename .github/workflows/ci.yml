@@ -2753,7 +2753,7 @@ jobs:
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
           # `vendored-openssl` sets for non-Apple targets only, because
-          # libsqlite3-sys 0.30.1 checks `bundled-sqlcipher-vendored-openssl` before
+          # libsqlite3-sys 0.40.0 checks `bundled-sqlcipher-vendored-openssl` before
           # the Apple branch that selects CommonCrypto. For each wheel target this
           # resolves the wheel's feature list, requires the vendored feature on the
           # Linux and Windows targets, and on the Apple targets requires
