@@ -1,0 +1,265 @@
+//! Context lifecycle: free-function logic for create, join, leave,
+//! restore, export, import. Hoisted out of the deleted `manager/`
+//! directory in ADR-049 §15; the helpers in
+//! [`crate::helpers`] call into these primitives.
+
+use scp_runtime_core::context::shared::lifecycle::build_identity_assessment;
+use std::collections::HashMap;
+
+use scp_protocol::context::ContextError;
+
+use scp_did::DID;
+
+/// Maximum permitted future cooldown horizon, in seconds.
+///
+/// Cooldown timestamps in an imported or restored snapshot are clamped
+/// to `now + MAX_COOLDOWN_SECS`. A malicious snapshot that injects
+/// `cooldown_until[i] = u64::MAX` would otherwise permanently disable
+/// the targeted consequence rule. 30 days is well above any legitimate
+/// cooldown window — the longest spec-defined consequence cooldowns are
+/// measured in hours — so the clamp is non-disruptive in practice.
+pub const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Sanitizes an imported or restored `cooldown_until` map in place.
+///
+/// Drops every entry whose key (rule index) is out of bounds for the
+/// supplied `consequence_rules` vector — these would otherwise let an
+/// attacker inject cooldown state for nonexistent rules and influence
+/// future rule evaluation. Clamps every remaining timestamp to
+/// `now + MAX_COOLDOWN_SECS`. Both events emit a warning so anomalies
+/// are visible at runtime.
+///
+/// Part of the imported-snapshot validation policy applied to the runtime
+/// `ContextManager` import paths.
+pub fn sanitize_cooldown_until(
+    cooldown_until: &mut HashMap<usize, u64>,
+    consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+    now: u64,
+    source: &str,
+) {
+    let max_ts = now.saturating_add(MAX_COOLDOWN_SECS);
+    let rule_count = consequence_rules.len();
+    cooldown_until.retain(|&rule_index, ts| {
+        if rule_index >= rule_count {
+            tracing::warn!(
+                source = source,
+                rule_index,
+                rule_count,
+                "dropping cooldown_until entry: rule_index out of bounds"
+            );
+            return false;
+        }
+        if *ts > max_ts {
+            tracing::warn!(
+                source = source,
+                rule_index,
+                original_ts = *ts,
+                clamped_ts = max_ts,
+                "clamping cooldown_until entry to MAX_COOLDOWN_SECS horizon"
+            );
+            *ts = max_ts;
+        }
+        true
+    });
+}
+
+/// Validates a snapshot's live `consequence_rules` against its params'
+/// `consequence_config` and returns [`ContextError::ImportRejected`] on
+/// failure.
+///
+/// The live rule set is input beyond the params: governance replaces it after
+/// creation, so it lives on the snapshot, not in `ContextParams`, and
+/// [`validate_context_params_for_import`] does not read it. `import_context`
+/// and `restore_context` call this so the bridge translators surface the
+/// canonical `SCP-CTX-2092` code.
+pub fn validate_consequence_rules_for_import(
+    rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+    config: &scp_protocol::context::params::ConsequenceConfig,
+) -> Result<(), ContextError> {
+    for (idx, rule) in rules.iter().enumerate() {
+        rule.validate_against_config(config)
+            .map_err(|e| ContextError::ImportRejected {
+                reason: format!("consequence_rules[{idx}] invalid: {e}"),
+            })?;
+    }
+    Ok(())
+}
+
+/// Runs [`validate_params`](scp_runtime_core::context::params_validation::validate_params),
+/// the one validator of every check that reads only `ContextParams`, on
+/// imported or restored params with
+/// [`ParamsOrigin::Existing`](scp_runtime_core::context::params_validation::ParamsOrigin::Existing),
+/// and returns [`ContextError::ImportRejected`] on failure, so the bridge
+/// translators surface `SCP-CTX-2092` as they do for
+/// [`validate_consequence_rules_for_import`]. The template check does not
+/// run, because §5.10 promotion changes a context's params after creation.
+///
+/// # Errors
+///
+/// [`ContextError::ImportRejected`] naming the refused field when `params`
+/// fails any check `validate_params` runs, for example a `sybil_policy` that
+/// breaks a §9.3.1 validity rule.
+pub fn validate_context_params_for_import(
+    params: &scp_protocol::context::ContextParams,
+) -> Result<(), ContextError> {
+    scp_runtime_core::context::params_validation::validate_params(
+        params,
+        scp_runtime_core::context::params_validation::ParamsOrigin::Existing,
+    )
+    .map_err(|e| ContextError::ImportRejected {
+        reason: format!("context_params invalid: {e}"),
+    })
+}
+
+// ADR-049 Phase 2A finalization keystone — type unification (ADR-049 §15):
+// the legacy `evaluate_sybil_resistance(&PerContextState, ...)` /
+// `post_join_bookkeeping(&mut PerContextState, ...)` /
+// `enforce_join_economy(&mut PerContextState, ...)` wrappers were carried
+// alongside their field-disjoint counterparts only because the legacy
+// and actor struct types diverged. With the unified struct (single
+// `PerContextState`), each public entry point now takes the field
+// sub-borrows directly — callers build them from the unified struct at
+// the call site. The legacy `&PerContextState` wrappers are gone.
+
+/// Performs sybil resistance evaluation for a join candidate (#1530).
+///
+/// Reads the `sybil_policy` directly so callers may pass
+/// `state.handle.params().sybil_policy.as_ref()` from the unified
+/// [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1). When `None`, passes
+/// unconditionally. When `Some`, constructs an
+/// [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) from the member's available trust signals
+/// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::PermissionDenied`] if the sybil policy is
+/// configured and the assessment fails.
+pub fn evaluate_sybil_resistance(
+    sybil_policy: Option<&scp_protocol::trust::sybil::ContextSybilPolicy>,
+    governance: &scp_runtime_core::context::state::GovernanceState,
+    member_did: &DID,
+    now: u64,
+) -> Result<(), ContextError> {
+    let Some(policy) = sybil_policy else {
+        tracing::trace!(
+            member = %member_did,
+            "sybil resistance check: no policy configured, passing"
+        );
+        return Ok(());
+    };
+
+    let assessment = build_identity_assessment(member_did, governance, now);
+
+    scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
+        .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
+}
+
+/// Initializes the per-member participation record for a new member (#1530):
+/// computes a `ParticipationRecord` from the merged join event set and inserts it
+/// into `participation_cache`. Budget spend is NOT recorded here — that is
+/// `enforce_join_economy`'s responsibility (#1537). Takes the `&mut participation_cache` field and a
+/// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
+/// unified [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
+/// the cache via `governance_class_c_mut().participation_cache_mut()` and the
+/// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
+/// `state_mut()`) is needed.
+pub fn post_join_bookkeeping(
+    participation_cache: &mut std::collections::HashMap<
+        String,
+        scp_protocol::trust::participation::ParticipationRecord,
+    >,
+    receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+    context_id: &str,
+    member_did: &DID,
+    deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+) {
+    let now = deps.clock.now_secs();
+    let event_log = deps.event_log.as_ref();
+    let context_id_bytes = scp_runtime_core::context::state::context_id_to_bytes(context_id);
+    let merkle_root = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
+    // Participation-record path consumes only the merged event set;
+    // the consequence window anchor is not used here.
+    let (join_events, _convergent_now) = deps
+        .domains
+        .governance
+        .event_log_entries_for_consequences_after_side_effect(
+            receive_buffer,
+            context_id,
+            now,
+            event_log,
+        );
+    if !join_events.is_empty()
+        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            &join_events,
+            member_did.as_ref(),
+            context_id,
+            merkle_root,
+            now,
+            // attestation_count is a credential-layer, verifier-relative fact
+            // (§7.3.2); this lifecycle path gates only on participation_count and
+            // has no attestation-cache access, so it passes an empty accessible-
+            // attestation set (count 0) by design — NOT a stub.
+            &[],
+        )
+    {
+        participation_cache.insert(member_did.to_string(), record);
+    }
+}
+
+/// Enforces economic policy for context joins (#1537, #1593).
+///
+/// Checks auto-accept guard, then delegates to the unified
+/// `enforce_economy` which evaluates join cost, checks spending UCAN
+/// AND-composition (spec §19.5), and records spend against the joiner's
+/// budget. Takes a `&mut GovernanceState` and `member_count` directly so
+/// callers may pass disjoint sub-borrows of the unified
+/// [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState) (ADR-049 §Decision 1).
+///
+/// # Errors
+///
+/// Returns [`ContextError::PermissionDenied`] if the auto-accept guard
+/// rejects, or any error surfaced by `enforce_economy`.
+pub fn enforce_join_economy(
+    governance: &mut scp_runtime_core::context::state::GovernanceState,
+    member_count: usize,
+    joiner_did: &DID,
+    now: u64,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    context_id: &str,
+    deps: &scp_runtime_core::context::actor::deps::ActorDeps,
+) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
+        governance.economic_policy.as_ref(),
+    ) {
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-12030: paid context requires explicit acceptance".into(),
+        ));
+    }
+    let pricing_default =
+        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+    let pricing = governance
+        .message_pricing
+        .as_ref()
+        .unwrap_or(&pricing_default);
+    deps.domains.economy.enforce_economy(
+        scp_runtime_core::context::shared::economy::EnforceEconomyRequest {
+            economic_policy: governance.economic_policy.as_ref(),
+            budget_tracker: &mut governance.budget_tracker,
+            velocity_tracker: &governance.velocity_tracker,
+            member_count,
+            action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+            actor_did: joiner_did,
+            now,
+            spending_ucan,
+            action_label: "context:join",
+            context_id,
+            clock: &*deps.clock,
+            pricing,
+            nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
+            revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+            key_resolver: &deps.key_resolver,
+        },
+    )
+}

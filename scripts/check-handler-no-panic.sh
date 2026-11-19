@@ -16,13 +16,14 @@
 # This gate enforces the panic ban across the FULL set of code reachable
 # SYNCHRONOUSLY on the per-context actor task, in three concentric scopes:
 #
-#   1. The actor HANDLERS (`crates/scp-runtime/src/context/actor/handlers/`)
-#      and the dispatch HUB (`crates/scp-runtime/src/context/actor/mod.rs`):
+#   1. The actor HANDLERS (each domain crate's `crates/scp-runtime-<domain>/src/handler.rs`,
+#      ADR-070) and the dispatch HUB (`crates/scp-runtime-core/src/context/actor/mod.rs`):
 #      the FULL banned set below, including the `assert*!` family. A panic
 #      here unwinds the actor task directly.
 #
 #   2. The PER-CONTEXT dispatch layer — EVERY `.rs` file under
-#      `crates/scp-runtime/src/context/` RECURSIVELY (the `*_helpers.rs` /
+#      `crates/scp-runtime-core/src/context/` and under each domain crate's
+#      `crates/scp-runtime-<domain>/src/`, RECURSIVELY (the domain `helpers.rs` /
 #      `*_logic.rs` dispatch transitives, the `governance/`, `tools/`,
 #      `actor/`, `supervisor/`, `providers/` submodules, and the bare
 #      `ttl.rs` / `manager_methods.rs` / etc. leaves): the REACHABLE-panic
@@ -114,13 +115,32 @@ else
     C_RESET=""
 fi
 
-SCAN_DIR="crates/scp-runtime/src/context/actor/handlers"
+# ADR-070: each domain's handler is the `handler.rs` of its own crate. Every
+# entry must exist; a renamed or dropped handler fails the gate loudly.
+HANDLER_FILES=(
+    "crates/scp-runtime-messaging/src/handler.rs"
+    "crates/scp-runtime-lifecycle/src/handler.rs"
+    "crates/scp-runtime-governance/src/handler.rs"
+    "crates/scp-runtime-broadcast/src/handler.rs"
+    "crates/scp-runtime-economy/src/handler.rs"
+    "crates/scp-runtime-trust-recovery/src/handler.rs"
+    "crates/scp-runtime-standing/src/handler.rs"
+    "crates/scp-runtime-ttl-close/src/handler.rs"
+    "crates/scp-runtime-outlets/src/handler.rs"
+    "crates/scp-runtime-push/src/handler.rs"
+    "crates/scp-runtime-queries/src/handler.rs"
+    "crates/scp-runtime-saga/src/handler.rs"
+    "crates/scp-runtime-lifecycle-control/src/handler.rs"
+)
 
-if [[ ! -d "$SCAN_DIR" ]]; then
-    printf '%serror:%s scan dir %s does not exist\n' \
-        "$C_RED" "$C_RESET" "$SCAN_DIR" >&2
-    exit 2
-fi
+for handler in "${HANDLER_FILES[@]}"; do
+    if [[ ! -f "$handler" ]]; then
+        printf '%serror:%s handler file %s does not exist\n' \
+            "$C_RED" "$C_RESET" "$handler" >&2
+        exit 2
+    fi
+done
+SCAN_TARGETS="$(printf '%s\n' "${HANDLER_FILES[@]}")"
 
 # ---------------------------------------------------------------------------
 # Scan one file. Emits, per offending line:
@@ -357,7 +377,7 @@ scan_dispatch_hub() {
     ' "$file"
 }
 
-DISPATCH_HUB="crates/scp-runtime/src/context/actor/mod.rs"
+DISPATCH_HUB="crates/scp-runtime-core/src/context/actor/mod.rs"
 
 if [[ ! -f "$DISPATCH_HUB" ]]; then
     printf '%serror:%s dispatch hub %s does not exist\n' \
@@ -386,17 +406,39 @@ fi
 # `TestInducePanic` seam in `actor/mod.rs`, all excluded by the test/testing
 # brace-depth carve-out in `scan_helper_file`. Scanning the whole tree therefore
 # passes clean; no file needs a documented per-file exclusion.
-HELPER_DIR="crates/scp-runtime/src/context"
+#
+# ADR-070 moved each domain's helpers, logic and handler into its own crate, so
+# the layer is core's `context/` tree plus every domain crate's `src/` tree.
+HELPER_DIRS=(
+    "crates/scp-runtime-core/src/context"
+    "crates/scp-runtime-types/src/context"
+    "crates/scp-runtime-messaging/src"
+    "crates/scp-runtime-lifecycle/src"
+    "crates/scp-runtime-governance/src"
+    "crates/scp-runtime-broadcast/src"
+    "crates/scp-runtime-economy/src"
+    "crates/scp-runtime-trust-recovery/src"
+    "crates/scp-runtime-standing/src"
+    "crates/scp-runtime-ttl-close/src"
+    "crates/scp-runtime-outlets/src"
+    "crates/scp-runtime-push/src"
+    "crates/scp-runtime-queries/src"
+    "crates/scp-runtime-saga/src"
+    "crates/scp-runtime-lifecycle-control/src"
+)
 
-if [[ ! -d "$HELPER_DIR" ]]; then
-    printf '%serror:%s helper dir %s does not exist\n' \
-        "$C_RED" "$C_RESET" "$HELPER_DIR" >&2
-    exit 2
-fi
+for helper_dir in "${HELPER_DIRS[@]}"; do
+    if [[ ! -d "$helper_dir" ]]; then
+        printf '%serror:%s helper dir %s does not exist\n' \
+            "$C_RED" "$C_RESET" "$helper_dir" >&2
+        exit 2
+    fi
+done
+HELPER_TARGETS="$(printf '%s\n' "${HELPER_DIRS[@]}")"
 
 # ---------------------------------------------------------------------------
 # scan_helper_file — scan one per-context dispatch-layer file (ANY `.rs` under
-# `crates/scp-runtime/src/context/`, recursively) for the REACHABLE-panic family
+# a HELPER_DIRS entry, recursively) for the REACHABLE-panic family
 # only. ADR-049 §10: the per-context dispatch layer holds the `execute_*`
 # governance leaves, the per-context dispatch transitives, the Class-S mutators,
 # AND the synchronously-called submodule leaves (`governance/timeout.rs`,
@@ -478,6 +520,18 @@ scan_helper_file() {
             raw ~ /#\[cfg\([^]]*feature[[:space:]]*=[[:space:]]*"testing"/) {
             gated_pending = 1
         }
+        # A file-level inner attribute at depth 0 (`#![cfg(test)]`, the
+        # `all(test, ..)` / `any(test, ..)` forms, or `feature = "testing"`)
+        # compiles the WHOLE file only under test, as for an out-of-line test
+        # module declared `#[cfg(test)] mod x_tests;` in its parent. Exclude the
+        # rest of the file: a floor of -1 is never reached, so the region never
+        # closes. `not(test)` does not match, so production files stay scanned.
+        if (depth == 0 && \
+            (raw ~ /^#!\[cfg\((all\(|any\()?test[,) ]/ || \
+             raw ~ /^#!\[cfg\([^]]*feature[[:space:]]*=[[:space:]]*"testing"/)) {
+            in_gated = 1
+            gated_floor = -1
+        }
 
         line = raw
         if (!in_block) gsub(/"[^"]*"/, "", line)
@@ -534,29 +588,40 @@ scan_helper_file() {
 # panic) and assert the gate actually catches them.
 #
 # Args:
-#   $1 — handlers scan dir
+#   $1 — handler targets, one per line: a handler `.rs` file, or a directory
+#        whose top-level `*.rs` files are each a handler (the self-test fixtures)
 #   $2 — dispatch hub file
 #   $3 — verb for messages ("scan" for the real run, "self-test" otherwise)
-#   $4 — (optional) helper-layer dir scanned for the reachable-panic family.
-#        When empty (the self-test fixtures), the helper scan is skipped.
+#   $4 — (optional) helper-layer dirs, one per line, each scanned recursively
+#        for the reachable-panic family. When empty (the self-test fixtures),
+#        the helper scan is skipped.
 # ---------------------------------------------------------------------------
 run_scan() {
-    local scan_dir="$1"
+    local scan_targets="$1"
     local dispatch_hub="$2"
     local label="${3:-scan}"
-    local helper_dir="${4:-}"
+    local helper_targets="${4:-}"
 
-    local tmp_out
+    local tmp_out tmp_helper
     tmp_out=$(mktemp)
+    tmp_helper=$(mktemp)
 
-    printf '\n%shandler panic-ban %s:%s %s\n' \
-        "$C_DIM" "$label" "$C_RESET" "$scan_dir"
-
-    # Scan only top-level *.rs files in the handlers dir (the handler modules).
-    find "$scan_dir" -maxdepth 1 -type f -name '*.rs' -print0 \
-        | while IFS= read -r -d '' file; do
-            scan_file "$file"
-        done > "$tmp_out"
+    local target
+    : > "$tmp_out"
+    while IFS= read -r target; do
+        [[ -n "$target" ]] || continue
+        printf '\n%shandler panic-ban %s:%s %s\n' \
+            "$C_DIM" "$label" "$C_RESET" "$target"
+        if [[ -d "$target" ]]; then
+            # Scan only top-level *.rs files in a handlers dir.
+            find "$target" -maxdepth 1 -type f -name '*.rs' -print0 \
+                | while IFS= read -r -d '' file; do
+                    scan_file "$file"
+                done >> "$tmp_out"
+        else
+            scan_file "$target" >> "$tmp_out"
+        fi
+    done <<< "$scan_targets"
 
     # Scan the dispatch hub with the testing-seam exclusion.
     printf '%shandler panic-ban %s:%s %s\n' \
@@ -580,15 +645,20 @@ run_scan() {
     # family; they additionally get the FULL banned set via `scan_file` /
     # `scan_dispatch_hub` above — the overlap is harmless.)
     local helper_scanned=0 helper_min=0
-    if [[ -n "$helper_dir" ]]; then
-        printf '%sdispatch-layer panic-ban %s:%s %s/**/*.rs (recursive)\n' \
-            "$C_DIM" "$label" "$C_RESET" "$helper_dir"
-        find "$helper_dir" -type f -name '*.rs' -print0 \
-            | while IFS= read -r -d '' file; do
-                scan_helper_file "$file"
-            done >> "$tmp_out"
-        helper_scanned=$(awk -F'\t' -v D="$helper_dir" \
-            '$1=="SCANNED" && index($2, D)==1 {s+=$3} END{print s+0}' "$tmp_out")
+    if [[ -n "$helper_targets" ]]; then
+        while IFS= read -r target; do
+            [[ -n "$target" ]] || continue
+            printf '%sdispatch-layer panic-ban %s:%s %s/**/*.rs (recursive)\n' \
+                "$C_DIM" "$label" "$C_RESET" "$target"
+            find "$target" -type f -name '*.rs' -print0 \
+                | while IFS= read -r -d '' file; do
+                    scan_helper_file "$file"
+                done >> "$tmp_helper"
+        done <<< "$helper_targets"
+        # The floor applies to the UNION of every helper dir's scanned lines.
+        helper_scanned=$(awk -F'\t' \
+            '$1=="SCANNED" {s+=$3} END{print s+0}' "$tmp_helper")
+        cat "$tmp_helper" >> "$tmp_out"
         # The per-context tree is tens of thousands of production lines; a
         # near-zero count means the scanner wedged (and the gate would vacuously
         # pass). The real count is ~24k; this floor is well below that but far
@@ -626,7 +696,7 @@ run_scan() {
     # Helper-layer vacuity: if a helper dir was scanned, it must contribute a
     # non-trivial line count (the helper layer is thousands of lines). A wedged
     # helper scanner would otherwise let a reachable panic slip through.
-    if [[ -n "$helper_dir" && "$helper_scanned" -lt "$helper_min" ]]; then
+    if [[ -n "$helper_targets" && "$helper_scanned" -lt "$helper_min" ]]; then
         vacuous=1
     fi
 
@@ -670,7 +740,7 @@ run_scan() {
         printf 'diagnostic value. See ADR-049 §10.\n' >&2
     fi
 
-    rm -f "$tmp_out"
+    rm -f "$tmp_out" "$tmp_helper"
 
     if [[ "$hits" -ne 0 || "$multi" -ne 0 || "$vacuous" -ne 0 ]]; then
         return 1
@@ -963,6 +1033,55 @@ self_test_helpers() {
         rc=1
     fi
 
+    # (9): a file whose depth-0 inner attribute is `#![cfg(test)]` is test-only
+    # as a whole (an out-of-line test module), so its panic MUST be excluded.
+    {
+        printf '//! Out-of-line tests.\n'
+        printf '#![cfg(test)]\n'
+        printf 'fn t() {\n'
+        printf '    match v {\n'
+        printf '        other => panic!("expected X, got {other:?}"),\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fixt/h_tests.rs"
+    out=$(scan_helper_file "$fixt/h_tests.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic in a file whose\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'inner attribute is `#![cfg(test)]` (the whole file is test-only).\n' >&2
+        rc=1
+    fi
+
+    # (10): a depth-0 `#![cfg(not(test))]` file is PRODUCTION code, and a
+    # `#![cfg(test)]` text inside a nested item is not a file-level gate: both
+    # panics MUST be caught.
+    {
+        printf '#![cfg(not(test))]\n'
+        printf 'pub fn prod_only2() {\n'
+        printf '    panic!("production-only panic must be caught");\n'
+        printf '}\n'
+    } > "$fixt/i_helpers.rs"
+    {
+        printf 'pub mod inner {\n'
+        printf '#![cfg(test)]\n'
+        printf '}\n'
+        printf 'pub fn prod3() {\n'
+        printf '    todo!("production panic after a nested inner attribute");\n'
+        printf '}\n'
+    } > "$fixt/j_helpers.rs"
+    if ! grep -q $'^HIT\t.*panic' <<< "$(scan_helper_file "$fixt/i_helpers.rs")"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner did NOT catch a panic in a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#![cfg(not(test))]` file — `not(test)` was read as a test gate.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*todo' <<< "$(scan_helper_file "$fixt/j_helpers.rs")"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner did NOT catch a production panic after\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'a nested `#![cfg(test)]` — only a depth-0 inner attribute gates the file.\n' >&2
+        rc=1
+    fi
+
     rm -rf "$fixt"
     return "$rc"
 }
@@ -984,12 +1103,12 @@ if [[ -z "${NO_PANIC_GATE_SELFTEST:-}" ]]; then
         "$C_DIM" "$C_RESET"
 fi
 
-if run_scan "$SCAN_DIR" "$DISPATCH_HUB" "scan" "$HELPER_DIR"; then
+if run_scan "$SCAN_TARGETS" "$DISPATCH_HUB" "scan" "$HELPER_TARGETS"; then
     printf '%sPASSED%s: no banned panic-family macros in handler production code,\n' \
         "$C_GREEN" "$C_RESET"
     printf '%s        %s and no reachable panics anywhere in the per-context tree\n' \
         "$C_DIM" "$C_RESET"
-    printf '%s        %s (context/**/*.rs, scanned recursively).\n' \
+    printf '%s        %s (core context/**/*.rs and each domain src/**/*.rs, recursively).\n' \
         "$C_DIM" "$C_RESET"
     exit 0
 fi

@@ -1,0 +1,26 @@
+[package]
+name = "scp-runtime-push"
+version = "0.1.0-beta.2"
+description = "The push domain of the SCP runtime: push-notification registration commands"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Forwards `scp-runtime-core/testing`; the assembly crate's `testing` turns it on in
+# every domain crate. Only test builds enable it.
+testing = ["scp-runtime-core/testing"]
+
+[dependencies]
+scp-runtime-core = { workspace = true }
+scp-protocol = { workspace = true }
+
+[dev-dependencies]
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-did = { workspace = true }
+
+[lints]
+workspace = true

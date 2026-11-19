@@ -2933,7 +2933,7 @@ fn establish_xctx_streaming_saga_preconditions(
 #[allow(clippy::too_many_lines)] // one linear §6.2.4 non-blocking-open flow
 fn xctx_streaming_saga_open_returns_before_committed_non_blocking() {
     use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
-    use scp_core::context::supervisor::{SagaId, SagaState};
+    use scp_core::context::saga_journal::{SagaId, SagaState};
 
     Python::with_gil(|py| {
         let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =

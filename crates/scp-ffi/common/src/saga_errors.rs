@@ -155,7 +155,7 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scp_core::context::supervisor::SagaId;
+    use scp_core::context::saga_journal::SagaId;
 
     /// A rate-limited abort preserves `retry_after_ms = Some(ms)` STRUCTURALLY
     /// and formats the producer's numeric `code` as the canonical

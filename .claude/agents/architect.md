@@ -65,7 +65,7 @@ needs the artifact that governs it.
 ## Patterns & Conventions
 
 ### Crate Layout and Dependency Rules
-`.docs/architecture.md` names every crate and binding and gives the crate layout and the SDK strategy. `scp-protocol` holds pure synchronous types and compiles for wasm32, so it depends on no async runtime. `scripts/check-protocol-deps.sh` rejects an async-runtime dependency in `scp-protocol`, and `scripts/check-cross-layer.sh` rejects a new public function in `scp-protocol` or `scp-runtime` that has no FFI bridge export. Read both before you propose a new dependency edge or public function.
+`.docs/architecture.md` names every crate and binding and gives the crate layout and the SDK strategy. `scp-protocol` holds pure synchronous types and compiles for wasm32, so it depends on no async runtime. `scripts/check-protocol-deps.sh` rejects an async-runtime dependency in `scp-protocol`, and `scripts/check-cross-layer.sh` rejects a new public function in `scp-protocol` or any `scp-runtime*` crate that has no FFI bridge export. ADR-070 splits the runtime into `scp-runtime-types`, `scp-runtime-core`, 13 sibling domain crates that reach one another only through core's `DomainHandlers`, and the `scp-runtime` assembly crate. Read both before you propose a new dependency edge or public function.
 
 ### Construction and Naming
 Public construction entry points follow `.docs/standards/construction.md`, which enacts ADR-052, the unified construction pattern. Naming follows `.docs/standards/conventions.md` and the per-language standard.

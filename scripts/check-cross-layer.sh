@@ -49,7 +49,7 @@ NEW_PUB_FN_NAMES=()
 
 CORE_DIFF=$(git diff "$DIFF_RANGE" --unified=0 --diff-filter=ACMR -- \
     ':(glob)crates/scp-protocol/src/**/*.rs' \
-    ':(glob)crates/scp-runtime/src/**/*.rs' \
+    ':(glob)crates/scp-runtime*/src/**/*.rs' \
     2>/dev/null || true)
 
 if [[ -z "$CORE_DIFF" ]]; then

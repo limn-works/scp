@@ -27,9 +27,9 @@ use rand::RngCore;
 use scp_did::SigningKeyId;
 use scp_mls::credential::ScpCredential;
 use scp_platform::in_memory::InMemoryStorage;
-use scp_runtime::crypto::mls::backend::MlsBackend;
-use scp_runtime::crypto::mls::production_backend::ProductionMlsBackend;
-use scp_runtime::crypto::mls::storage_adapter::{
+use scp_runtime_types::crypto::mls::backend::MlsBackend;
+use scp_runtime_types::crypto::mls::production_backend::ProductionMlsBackend;
+use scp_runtime_types::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
 };
 
@@ -61,7 +61,7 @@ impl<A: OpenMlsStorageAdapter + Send + Sync> OpenMlsStorageAdapter for SlowAdapt
         &self,
         key: &str,
         value: &[u8],
-    ) -> Result<(), scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageError> {
+    ) -> Result<(), scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageError> {
         Self::jitter().await;
         self.inner.store(key, value).await
     }
@@ -69,7 +69,7 @@ impl<A: OpenMlsStorageAdapter + Send + Sync> OpenMlsStorageAdapter for SlowAdapt
     async fn retrieve(
         &self,
         key: &str,
-    ) -> Result<Option<Vec<u8>>, scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageError>
+    ) -> Result<Option<Vec<u8>>, scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageError>
     {
         Self::jitter().await;
         self.inner.retrieve(key).await
@@ -78,7 +78,7 @@ impl<A: OpenMlsStorageAdapter + Send + Sync> OpenMlsStorageAdapter for SlowAdapt
     async fn delete(
         &self,
         key: &str,
-    ) -> Result<(), scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageError> {
+    ) -> Result<(), scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageError> {
         Self::jitter().await;
         self.inner.delete(key).await
     }

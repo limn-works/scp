@@ -104,7 +104,7 @@ mod context_handle_cas_stress {
     use std::thread;
 
     use scp_protocol::context::{ContextParams, ContextState};
-    use scp_runtime::context::ContextHandle;
+    use scp_runtime_core::context::ContextHandle;
 
     /// States reachable from `Active` in exactly one FSM step. Crucially, none
     /// of them is reachable from any of the others (they are all terminal or

@@ -37,10 +37,10 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::params::{
     Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
 };
-use scp_runtime::context::ContextHandle;
-use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::ContextHandle;
+use scp_runtime_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime_core::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 const ALICE: &str = "did:dht:z6MkAlice";
 const BOB: &str = "did:dht:z6MkBob";
@@ -157,7 +157,7 @@ fn ceiling() -> Vec<Capability> {
 }
 
 fn manager_with_transport(transport: Arc<RecordingTransport>) -> std::sync::Arc<Supervisor> {
-    scp_runtime::context::test_supervisor(
+    scp_runtime::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             ALICE.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
@@ -235,7 +235,7 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
                 did: bob(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -245,7 +245,7 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
             &prop.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -267,9 +267,9 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
             &handle,
             &alice(),
             b"hello",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                sk_alice.clone(),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            ),
             None,
             None,
         )
@@ -315,7 +315,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
                 did: bob(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -325,7 +325,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &prop.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -337,9 +337,9 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                sk_alice.clone(),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            ),
             None,
             None,
         )
@@ -366,9 +366,9 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello-again",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                sk_alice.clone(),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            ),
             None,
             None,
         )
@@ -411,9 +411,9 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-nobody",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                sk_alice.clone(),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            ),
             None,
             None,
         )
@@ -450,7 +450,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
                 did: bob(),
                 role: "member".into(),
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -460,7 +460,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &prop.proposal_id,
             &bob(),
             true,
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -477,9 +477,9 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-bob",
-            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
-                sk_alice.clone(),
-            )),
+            MessageSigner::Active(
+                &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            ),
             None,
             None,
         )

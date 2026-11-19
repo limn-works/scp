@@ -511,7 +511,7 @@ impl crate::scp::PyScp {
             // Serialize via the single canonical helper shared by all bridges,
             // so the JSON contract (string currency, numeric amount, `ok` vs
             // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
-            // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
+            // UniFFI. See `scp_runtime_types::economy::receipt::verification_results_to_json`.
             Ok(scp_core::economy::verification_results_to_json(results))
         })?
     }

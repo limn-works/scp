@@ -4975,6 +4975,8 @@ dependencies = [
  "scp-mls",
  "scp-protocol",
  "scp-runtime",
+ "scp-runtime-core",
+ "scp-runtime-types",
  "serde_json",
 ]
 
@@ -5516,7 +5518,6 @@ dependencies = [
 name = "scp-runtime"
 version = "0.1.0-beta.2"
 dependencies = [
- "aes 0.8.4",
  "arc-swap",
  "async-trait",
  "base64",
@@ -5525,15 +5526,10 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "lru 0.18.2",
  "metrics",
  "metrics-util",
  "openmls",
  "openmls_basic_credential",
- "openmls_memory_storage",
- "openmls_rust_crypto",
- "openmls_traits",
- "proptest",
  "rand 0.8.8",
  "rmp-serde",
  "rmpv",
@@ -5548,6 +5544,93 @@ dependencies = [
  "scp-platform",
  "scp-protocol",
  "scp-relay-client",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "z-base-32",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-runtime-broadcast"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rmp-serde",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-platform",
+ "scp-protocol",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-core"
+version = "0.1.0-beta.2"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bs58",
+ "dashmap",
+ "ed25519-dalek 2.2.0",
+ "futures",
+ "hex",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_traits",
+ "proptest",
+ "rand 0.8.8",
+ "rmp-serde",
+ "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-platform",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-runtime-types",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5558,7 +5641,356 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "unicode-normalization",
+ "uuid",
+ "z-base-32",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-runtime-economy"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "scp-did",
+ "scp-protocol",
+ "scp-runtime-core",
+ "scp-runtime-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "scp-runtime-governance"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-platform",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-lifecycle"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "dashmap",
+ "ed25519-dalek 2.2.0",
+ "futures",
+ "hex",
+ "openmls",
+ "rmp-serde",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-platform",
+ "scp-protocol",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-lifecycle-control"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "scp-protocol",
+ "scp-runtime-core",
+ "tokio",
+]
+
+[[package]]
+name = "scp-runtime-messaging"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "ed25519-dalek 2.2.0",
+ "futures",
+ "hex",
+ "openmls",
+ "rmp-serde",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-platform",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-outlets"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "scp-clock",
+ "scp-did",
+ "scp-platform",
+ "scp-protocol",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-push"
+version = "0.1.0-beta.2"
+dependencies = [
+ "scp-did",
+ "scp-protocol",
+ "scp-runtime-core",
+]
+
+[[package]]
+name = "scp-runtime-queries"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek 2.2.0",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-platform",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "subtle",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-runtime-saga"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-platform",
+ "scp-protocol",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "scp-runtime-types",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "z-base-32",
+]
+
+[[package]]
+name = "scp-runtime-standing"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "scp-did",
+ "scp-protocol",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-ttl-close",
+ "tokio",
+]
+
+[[package]]
+name = "scp-runtime-trust-recovery"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "scp-did",
+ "scp-event-log",
+ "scp-protocol",
+ "scp-runtime-core",
+ "scp-runtime-types",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-ttl-close"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "hex",
+ "scp-clock",
+ "scp-did",
+ "scp-event-log",
+ "scp-platform",
+ "scp-protocol",
+ "scp-runtime-broadcast",
+ "scp-runtime-core",
+ "scp-runtime-economy",
+ "scp-runtime-governance",
+ "scp-runtime-lifecycle",
+ "scp-runtime-lifecycle-control",
+ "scp-runtime-messaging",
+ "scp-runtime-outlets",
+ "scp-runtime-push",
+ "scp-runtime-queries",
+ "scp-runtime-saga",
+ "scp-runtime-standing",
+ "scp-runtime-trust-recovery",
+ "scp-runtime-types",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scp-runtime-types"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "lru 0.18.2",
+ "metrics",
+ "metrics-util",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_traits",
+ "rand 0.8.8",
+ "rmp-serde",
+ "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-dht",
+ "scp-did",
+ "scp-event-log",
+ "scp-identity",
+ "scp-mls",
+ "scp-platform",
+ "scp-protocol",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
  "z-base-32",
  "zeroize",
@@ -5609,6 +6041,8 @@ dependencies = [
  "scp-protocol",
  "scp-relay-client",
  "scp-runtime",
+ "scp-runtime-core",
+ "scp-runtime-types",
  "scp-testing",
  "scp-transport",
  "serde",

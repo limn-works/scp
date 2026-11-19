@@ -17,8 +17,10 @@ CHECK="$REPO_ROOT/scripts/check-deleted-primitives.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/deleted-primitives.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# Every scope directory a ban entry names (the second `|` field).
-SCOPES=$(grep -E '^    "[^"]*\|[^|]+\|[^|]+\|' "$CHECK" | cut -d'|' -f2 | sort -u)
+# Every scope word a ban entry names (the second `|` field holds one or more
+# space-separated directory globs). A trailing `*` is dropped, so the fixture
+# root holds `crates/scp-runtime` for the `crates/scp-runtime*` glob.
+SCOPES=$(grep -E '^    "[^"]*\|[^|]+\|[^|]+\|' "$CHECK" | cut -d'|' -f2 | tr ' ' '\n' | sed 's/\*$//' | sort -u)
 
 new_root() {
     local root="$WORK/$1"
@@ -94,6 +96,23 @@ run_case "defaulted-storage-parameter" 1 "[:[[:space:]]*Storage[[:space:]]*=[[:s
 root=$(new_root defaulted-encrypted-storage)
 printf 'struct C<S: EncryptedStorage = X> {}\n' > "$root/crates/config.rs"
 run_case "defaulted-encrypted-storage-parameter" 1 "[:[[:space:]]*EncryptedStorage[[:space:]]*=[[:space:]]*[A-Za-z]] 1 match(es) in crates (*.rs)" "$root"
+
+# ADR-070: a runtime ban covers every crates/scp-runtime* crate, so a deleted
+# primitive reintroduced in a domain crate fails.
+root=$(new_root runtime-domain-crate)
+mkdir -p "$root/crates/scp-runtime-messaging/src"
+printf 'fn f(x: Mutex<PerContextState>) {}\n' > "$root/crates/scp-runtime-messaging/src/helpers.rs"
+run_case "runtime-ban-reaches-domain-crate" 1 "[Mutex<PerContextState>] 1 match(es) in crates/scp-runtime* (*.rs)" "$root"
+
+# Both crypto directories of the pending_joins row are scanned.
+root=$(new_root runtime-core-crypto)
+printf 'struct S { pending_joins: u8 }\n' > "$root/crates/scp-runtime-core/src/crypto/mls.rs"
+run_case "pending-joins-reaches-core-crypto" 1 "[pending_joins] 1 match(es)" "$root"
+
+# A scope word that matches no directory is a configuration error.
+root=$(new_root missing-scope)
+rm -rf "$root/crates/scp-runtime-core"
+run_case "missing-scope-dir-errors" 2 "scope dir does not exist: crates/scp-runtime-core/src/crypto" "$root"
 
 # A type alias that names a DID method is not a defaulted bound.
 root=$(new_root did-method-alias)

@@ -60,10 +60,9 @@ use scp_core::context::builder::{
 };
 use scp_core::context::governance::{GovernanceAction, KeyResolver, compute_proposal_id};
 use scp_core::context::persistence::ContextPersistence;
+use scp_core::context::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
 use scp_core::context::state::ContextSnapshot;
-use scp_core::context::supervisor::{
-    DurableProviders, ProtocolRepositorySagaJournal, SagaJournal, Supervisor,
-};
+use scp_core::context::supervisor::{DurableProviders, Supervisor};
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
@@ -900,6 +899,7 @@ fn restore_supervisor(
         Some(clock),
         DurableProviders::for_test(journal, mls_storage),
         scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
+        scp_core::context::domain_handlers(),
     )
 }
 

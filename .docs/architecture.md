@@ -261,15 +261,30 @@ scp/
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
 │   │
-│   ├── scp-runtime/           # Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049)
-│   │   ├── context/           # Supervisor, ContextActor, IdentityRegistry + IdentityActor, saga coordinator, persistence bridges
-│   │   ├── crypto/            # MLS wrapper (OpenMLS), UCAN minting, key protocol
-│   │   ├── identity/          # SCPID, custody migration, recovery
-│   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
-│   │   ├── event_log/         # Tiered storage, cold-tier provider
-│   │   └── ...                # envelope, discovery, economy async modules
+│   ├── scp-runtime-types/     # Runtime leaf modules no actor or Supervisor code reaches (ADR-070):
+│   │   ├── context/           #   config, policy, governance, saga journal, sequence reservations
+│   │   ├── crypto/            #   MlsBackend + OpenMLS backend and storage adapter, access keys,
+│   │   │                      #   sender keys + key protocol, UCAN minting
+│   │   ├── identity/          #   SCPID, blocking, custody migration
+│   │   └── ...                #   discovery, economy, provenance, metrics, well_known
 │   │
-│   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
+│   ├── scp-runtime-core/      # Async orchestration core (ADR-049, ADR-070)
+│   │   ├── context/           # Supervisor, ContextActor + dispatch_state, DomainHandlers (the 13
+│   │   │                      #   domain traits), ActorDeps, builder providers, shared helpers
+│   │   ├── crypto/            # MLS provider and node factory, wrapping
+│   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
+│   │   └── ...                # envelope, identity recovery, push, sync, trust
+│   │
+│   ├── scp-runtime-<domain>/  # One crate per actor domain (13): broadcast, economy, governance,
+│   │                          #   lifecycle, lifecycle-control, messaging, outlets, push, queries,
+│   │                          #   saga, standing, trust-recovery, ttl-close. Each holds handler.rs
+│   │                          #   (its ContextActor dispatch) and helpers.rs, implements its core
+│   │                          #   trait, and depends only on scp-runtime-types and scp-runtime-core
+│   │
+│   ├── scp-runtime/           # Assembly: domain_handlers() builds DomainHandlers from the 13
+│   │                          #   domain crates; holds the tests that build a Supervisor; re-exports nothing
+│   │
+│   ├── scp-core/              # Facade re-exporting scp-protocol + the runtime crates
 │   │
 │   ├── scp-identity/          # Native identity subsystem — key-event log, publication, lifecycle;
 │   │                          #   NodeNetwork, the one implementor of the sealed IdentityBackend;
@@ -598,7 +613,10 @@ State:
               ┌──────┴──────┐
               ▼              ▼
          scp-runtime    scp-protocol
+         (assembly)          │
               │              │
+              ├──► scp-runtime-<domain> ×13 ──► scp-runtime-core, scp-runtime-types
+              ├──► scp-runtime-core ──► scp-runtime-types
               ├──► scp-protocol
               ├──► scp-platform
               ├──► scp-identity
@@ -694,8 +712,13 @@ Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model
            │                          Layer 0 crates depend on no SCP crate but the ones named.
            │
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
-           │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
-           │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
+           │  scp-runtime-types       Runtime leaf modules: config, policy, MLS backend, keys, UCAN (ADR-070).
+           │  scp-runtime-core        Async orchestration core: Supervisor, ContextActor, the 13 domain
+           │                          traits in DomainHandlers (ADR-049, ADR-070). Depends on scp-runtime-types.
+           │  scp-runtime-<domain>    13 domain crates; each implements one core trait and depends only on
+           │                          scp-runtime-types and scp-runtime-core, never on a sibling.
+           │  scp-runtime             Assembly: builds DomainHandlers from the 13 domain crates.
+           │  scp-core                Facade re-exporting scp-protocol and the runtime crates.
            │  scp-identity            Native identity subsystem — key-event log composition,
            │                          resolution and publication over the SCP node network
            │                          (NodeNetwork); imports the identity model from scp-did.
@@ -736,11 +759,11 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
 | Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | None — sealed | Not replaceable by a caller: `NodeNetwork` is its one implementor, and each instance's Supervisor builds it (`03-identity.md` §3.10.10). The seam ADR-063 names stays inside `scp-identity`. |
-| MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
-| OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage_adapter.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
-| Context transport | `ContextTransportProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
-| Context event log | `ContextEventLogProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
-| Saga journal | `SagaJournal` | `scp-runtime/src/context/supervisor/` | Full | Nothing — durable append-only coordinator log for cross-context sagas. |
+| MLS primitives | `MlsBackend` | `scp-runtime-types/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
+| OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime-types/src/crypto/mls/storage_adapter.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
+| Context transport | `ContextTransportProvider` | `scp-runtime-core/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
+| Context event log | `ContextEventLogProvider` | `scp-runtime-core/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
+| Saga journal | `SagaJournal` | `scp-runtime-types/src/context/supervisor/saga_journal.rs` | Full | Nothing — durable append-only coordinator log for cross-context sagas. |
 | Cold-tier storage | `ColdTierProvider` | `scp-core/src/event_log/tiered_storage.rs` | Full | Nothing — relay-hosted cold storage, local archive, custom. |
 | Payment rail | `PaymentAdapter` | `scp-core/src/economy/adapter.rs` | Full | Nothing — x402, Lightning, SPL, Stripe, test ledger. |
 
@@ -780,14 +803,14 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 
 **`IdentityBackend`** (scp-identity) — `Send + Sync`, async, sealed. `03-identity.md` §3.10.10 declares the trait's methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
 
-**Identity ownership and crate edges.** Each SCP instance owns its identities. `CoreFields::new` takes the instance's encrypted storage and node client and builds the Supervisor before it returns. The Supervisor holds the instance's `IdentityRegistry`, its one `Arc<NodeNetwork>` and its one `RecordLock` (`03-identity.md` §3.10.10). Every identity operation is a `dispatch_identity_*` method, which the registry serves or which the identity's `IdentityActor` in `scp-runtime/src/context/supervisor/` serves (ADR-049, the actor-per-context concurrency model, Decision 17). The crate edges:
+**Identity ownership and crate edges.** Each SCP instance owns its identities. `CoreFields::new` takes the instance's encrypted storage and node client and builds the Supervisor before it returns. The Supervisor holds the instance's `IdentityRegistry`, its one `Arc<NodeNetwork>` and its one `RecordLock` (`03-identity.md` §3.10.10). Every identity operation is a `dispatch_identity_*` method, which the registry serves or which the identity's `IdentityActor` in `scp-runtime-core/src/context/supervisor/` serves (ADR-049, the actor-per-context concurrency model, Decision 17). The crate edges:
 - `NodeNetwork` and the sealed `IdentityBackend` live in `scp-identity`, which depends on `scp-kel`, `scp-platform` and the node client crate.
 - `scp-runtime` depends on `scp-identity`, an edge that already exists.
 - The `NodeId` newtype lives in `scp-did`, which depends on no SCP crate, and `NodeId`'s derivation lives in `scp-kel`.
 - `scp-protocol` gains only pure types: `NodeAddress`, the node record structs and their preimage builders. It gains no async dependency, so `scripts/check-protocol-deps.sh` holds.
 - The node's public-record store is built in `scp-node`, which already depends on `scp-identity`, so the store adds no crate edge.
 
-**`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
+**`MlsBackend`** (scp-runtime-types/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
 - Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`. `decrypt` merges a received Commit.
 - Methods take `&mut ScpMlsGroup` (or equivalent) as an explicit parameter; the trait owns no state.
 - **RFC 9420 conformance required.** The SCP ciphersuite (§9.5) is fixed; methods that accept ciphersuite arguments MUST reject any other.
@@ -802,23 +825,23 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - **Randomness.** Sealing is randomized per RFC 9180 (nonce managed internally). Wrapping-keypair generation MUST use a cryptographically secure random source (OsRng or equivalent); deterministic key generation is not permitted.
 - Used by sender-key distribution, access-key distribution, and invitation sealing.
 
-**`OpenMlsStorageAdapter`** (scp-runtime/crypto/mls/storage) — `Send + Sync`, async methods. **Internal to the OpenMLS-based `MlsBackend`; not intended as an independent replacement point.**
+**`OpenMlsStorageAdapter`** (scp-runtime-types/crypto/mls/storage_adapter) — `Send + Sync`, async methods. **Internal to the OpenMLS-based `MlsBackend`; not intended as an independent replacement point.**
 - Bridges OpenMLS's sync `StorageProvider` trait to SCP's async `Storage`.
 - Each read/write wraps `spawn_blocking` so the upstream sync trait does not pin async worker threads.
 - Per-actor `OpenMlsBackend` instances share the underlying adapter; OpenMLS namespaces keys by MLS `group_id`, preventing cross-actor collision.
 
-**`ContextTransportProvider`** (scp-runtime/context) — `Send + Sync`, async methods (except `is_connected`).
+**`ContextTransportProvider`** (scp-runtime-core/context) — `Send + Sync`, async methods (except `is_connected`).
 - `is_connected` returns a boolean — no side effects, no cancellation concerns.
 - `publish_context` and `delete_published` are scoped by context ID.
 - `send_message` delivers encrypted payloads through the transport layer.
 - **Cancellation.** `publish_context`, `delete_published`, and `send_message` are cancellation-aborts-cleanly: a cancelled call releases internal state, but the handler treats cancellation as a send failure and does not assume the remote observed or did not observe the call. Retry is the caller's responsibility.
 
-**`ContextEventLogProvider`** (scp-runtime/context) — `Send + Sync`, async methods.
+**`ContextEventLogProvider`** (scp-runtime-core/context) — `Send + Sync`, async methods.
 - `init_event_log` creates an empty Merkle event log for a context.
 - `append_event` appends a named event. **Cancel-safe:** persists first, commits to in-memory chain only after durable write succeeds. Returns `Err` on persist failure; in-memory chain never advances speculatively. A cancelled `append_event` either completes durably (in-memory advances) or leaves both persisted and in-memory unchanged — never one without the other.
 - `destroy_event_log` is for rollback — idempotent.
 
-**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. Full contract in §17.16.1 and §9.4.3 (commitment + bearer discipline).
+**`SagaJournal`** (scp-runtime-types/context/supervisor) — `Send + Sync`, async methods. Full contract in §17.16.1 and §9.4.3 (commitment + bearer discipline).
 - Construction — fail-closed if the backing storage cannot durably flush or cannot provide at-rest encryption for secret-bearing saga types (§9.4.3).
 - `append` — durable append per saga identifier; persisted format MUST make partial writes detectable on reload (e.g., length prefix plus checksum). Cancel-hostile; `load_unresolved` is the sole post-cancel recovery signal.
 - `load_unresolved` — latest entry per unresolved saga; skips or reconciles any torn-write entries detected on scan. Cancel-safe.

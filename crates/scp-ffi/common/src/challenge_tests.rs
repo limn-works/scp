@@ -145,6 +145,7 @@ fn supervisor(clock: &Arc<TestClock>) -> Arc<Supervisor> {
         None,
         Some(Arc::clone(clock) as Arc<dyn scp_clock::Clock>),
         mls_storage,
+        scp_core::context::domain_handlers(),
     )
 }
 

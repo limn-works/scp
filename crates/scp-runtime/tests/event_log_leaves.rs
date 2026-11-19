@@ -38,13 +38,13 @@ use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 use scp_protocol::context::params::{
     Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
 };
-use scp_runtime::context::actor::commands::{
+use scp_runtime_core::context::actor::commands::{
     BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload, UnsubscribeBroadcastPayload,
 };
-use scp_runtime::context::builder::ContextTransportProvider;
-use scp_runtime::context::providers::MerkleEventLogProvider;
-use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_runtime_core::context::builder::ContextTransportProvider;
+use scp_runtime_core::context::providers::MerkleEventLogProvider;
+use scp_runtime_core::context::supervisor::Supervisor;
+use scp_runtime_core::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock transport — replicates the pattern from governance_integration.rs.
@@ -129,7 +129,7 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // ---------------------------------------------------------------------------
 
 fn new_manager() -> Arc<Supervisor> {
-    scp_runtime::context::test_supervisor(
+    scp_runtime::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             Arc::new(scp_clock::SystemClock),
@@ -436,7 +436,7 @@ async fn governance_ban_emits_key_epoch_advance_per_author() {
                 did: bob(),
                 access: AccessScope::Both,
             },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("propose RevokeAccess");
@@ -536,7 +536,7 @@ async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            &scp_runtime_core::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("propose RotateContentKeys");

@@ -72,7 +72,7 @@ use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::outlets::error_codes::{
     CODE_ECONOMIC_FAULT, SLUG_ECONOMIC_BUDGET_EXCEEDED,
 };
-use scp_runtime::context::actor::commands::QueriesCommand;
+use scp_runtime_core::context::actor::commands::QueriesCommand;
 
 // ---------------------------------------------------------------------------
 // Host construction — a real `Supervisor` over a concrete `NodeMlsFactory`.
@@ -134,6 +134,7 @@ fn build_supervisor(creator_did: &str, key_resolver: KeyResolver) -> Arc<Supervi
         None,                                   // event_tx
         Some(Arc::new(scp_clock::SystemClock)), // clock (required by invoke_outlet_with_economy)
         test_mls_storage(),
+        scp_core::context::domain_handlers(),
     )
 }
 

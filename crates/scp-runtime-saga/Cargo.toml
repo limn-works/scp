@@ -1,0 +1,59 @@
+[package]
+name = "scp-runtime-saga"
+version = "0.1.0-beta.2"
+description = "The saga domain of the SCP runtime: the cross-context saga phases"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Forwards `scp-runtime-core/testing`; the assembly crate's `testing` turns it on in
+# every domain crate. Only test builds enable it.
+testing = ["scp-runtime-core/testing", "scp-runtime-types/testing"]
+
+[dependencies]
+scp-runtime-types = { workspace = true }
+scp-runtime-core = { workspace = true }
+tokio = { workspace = true }
+scp-clock = { workspace = true }
+scp-crypto = { workspace = true }
+scp-did = { workspace = true }
+scp-protocol = { workspace = true }
+scp-platform = { workspace = true }
+scp-event-log = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+z-base-32 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+scp-crypto = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+scp-platform = { workspace = true, features = ["testing", "encrypting"] }
+scp-event-log = { workspace = true, features = ["testing"] }
+# The 12 sibling domains: `test_support::test_domain_handlers` installs every domain in
+# this crate's test Supervisor, and the tests call the `testing_access` items of
+# `scp-runtime-outlets`. No `version`: `cargo publish` strips them, and no
+# domain crate has a non-dev dependency on a sibling (ADR-070 §3).
+scp-runtime-messaging = { path = "../scp-runtime-messaging", features = ["testing"] }
+scp-runtime-lifecycle = { path = "../scp-runtime-lifecycle", features = ["testing"] }
+scp-runtime-governance = { path = "../scp-runtime-governance", features = ["testing"] }
+scp-runtime-broadcast = { path = "../scp-runtime-broadcast", features = ["testing"] }
+scp-runtime-economy = { path = "../scp-runtime-economy", features = ["testing"] }
+scp-runtime-trust-recovery = { path = "../scp-runtime-trust-recovery", features = ["testing"] }
+scp-runtime-standing = { path = "../scp-runtime-standing", features = ["testing"] }
+scp-runtime-ttl-close = { path = "../scp-runtime-ttl-close", features = ["testing"] }
+scp-runtime-outlets = { path = "../scp-runtime-outlets", features = ["testing"] }
+scp-runtime-push = { path = "../scp-runtime-push", features = ["testing"] }
+scp-runtime-queries = { path = "../scp-runtime-queries", features = ["testing"] }
+scp-runtime-lifecycle-control = { path = "../scp-runtime-lifecycle-control", features = ["testing"] }
+
+[lints]
+workspace = true

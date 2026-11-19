@@ -25,7 +25,7 @@ actor model and [construction.md](../../.docs/standards/construction.md)
 context lifecycle -- membership, roles, governance, broadcast, TTL. It lives in
 the `CoreFields.supervisor` slot of `PyBridgeInstance` (not a process-global
 `OnceLock`), is built by `build_supervisor` in `runtime.rs` via
-`Supervisor::with_providers_and_journal(...)` (durable saga journal plus
+`Supervisor::with_providers_and_journal(..., scp_core::context::domain_handlers())` (durable saga journal plus
 production MLS / transport / event-log providers), and is reached through
 `runtime::supervisor()`. All `py_context_*` functions delegate here. This
 replaced the previously-shared `Arc<ContextManager>`, now deleted (ADR-049

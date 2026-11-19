@@ -1,0 +1,2033 @@
+//! Async signing operations for the sender key distribution protocol.
+//!
+//! This module contains the **async** operations that depend on
+//! [`KeyCustody`] for signing and key agreement. Pure synchronous
+//! verification, wire types, HPKE helpers, and constants live in
+//! [`scp_protocol::crypto::sender_keys::key_protocol_verify`] and are
+//! re-exported here for backward compatibility.
+//!
+//! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design
+//! and §5.14.8 for broadcast-mode blocking specifics.
+
+pub use scp_protocol::crypto::sender_keys::key_protocol_verify::*;
+
+use std::collections::HashSet;
+use std::hash::BuildHasher;
+
+use rand::RngCore;
+use rand::rngs::OsRng;
+use zeroize::Zeroizing;
+
+use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
+
+use scp_did::SigningKeyId;
+use scp_protocol::crypto::hpke::p256 as hpke_p256;
+use scp_protocol::crypto::sender_keys::{SenderKey, SenderKeyError, generate_sender_key};
+
+// ---------------------------------------------------------------------------
+// SenderKeyRequestResult — holds KeyHandle from scp-platform
+// ---------------------------------------------------------------------------
+
+/// Result of [`request_sender_key`], containing the serialized request
+/// message and the DHKEM(P-256) wrapping key handle for later HPKE decryption.
+#[derive(Debug)]
+pub struct SenderKeyRequestResult {
+    /// The serialized [`SenderKeyRequest`] message to send.
+    pub request_message: Vec<u8>,
+    /// The [`KeyType::HpkeP256`] key handle used for HPKE wrapping. The caller
+    /// retains this to decrypt the eventual [`SenderKeyResponse`].
+    pub wrapping_key_handle: KeyHandle,
+}
+
+// ---------------------------------------------------------------------------
+// Epoch advance — signing
+// ---------------------------------------------------------------------------
+
+/// Constructs a signed [`SenderKeyEpochAdvance`] and serializes it for
+/// transmission as an MLS application message.
+///
+/// The sender signs `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`
+/// with their signing key (Active or Agent, as specified by `signer_key_ref`).
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::Custody`] if custody signing fails, and
+/// [`SenderKeyError::SigningFailed`] if the signature is not 64 bytes.
+/// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
+pub async fn publish_sender_key_epoch_advance(
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    signer_key_ref: SigningKeyId,
+) -> Result<Vec<u8>, SenderKeyError> {
+    let hash = compute_epoch_advance_hash(context_id, sender_did, epoch, signer_key_ref)?;
+
+    let signature = key_custody
+        .sign(signing_key, &hash)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
+    let advance = SenderKeyEpochAdvance {
+        sender_did: sender_did.to_owned(),
+        epoch,
+        signer_key_ref,
+        signature: sig_bytes,
+    };
+
+    rmp_serde::to_vec_named(&advance)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Sender key request — signing
+// ---------------------------------------------------------------------------
+
+/// Constructs a signed [`SenderKeyRequest`] with a fresh ephemeral
+/// DHKEM(P-256) wrapping keypair and serializes it for transmission.
+///
+/// The requester signs the request with their Active Signing Key. The
+/// wrapping key handle is returned so the caller can later decrypt the
+/// [`SenderKeyResponse`] via [`open_sender_key_response`].
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::Custody`] if key generation, the public-key
+/// lookup or signing fails in custody.
+/// Returns [`SenderKeyError::MalformedWrappingPublicKey`] if custody returns a
+/// wrapping public key that is not a valid 65-byte uncompressed P-256 point.
+/// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
+pub async fn request_sender_key(
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+    requester_did: &str,
+    sender_did: &str,
+    epoch: u64,
+    clock: &dyn scp_clock::Clock,
+) -> Result<SenderKeyRequestResult, SenderKeyError> {
+    // Generate a fresh DHKEM(P-256) wrapping keypair inside custody.
+    let wrapping_key_handle = key_custody
+        .generate_keypair(KeyType::HpkeP256)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+
+    let wrapping_pubkey = key_custody
+        .public_key(&wrapping_key_handle)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+    // Validate before signing, so the request never commits to a malformed key.
+    let wrap_point = hpke_p256::P256Point::try_from(wrapping_pubkey.as_bytes())
+        .map_err(|e| SenderKeyError::MalformedWrappingPublicKey(e.to_string()))?;
+
+    // Generate cryptographic nonce and timestamp for replay protection.
+    let mut nonce = [0u8; REQUEST_NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce);
+    let timestamp = clock.now_secs();
+
+    // Sign the request (including nonce and timestamp).
+    let hash = compute_request_hash(
+        requester_did,
+        sender_did,
+        &wrap_point,
+        &nonce,
+        RequestHashInput {
+            epoch,
+            requested_at: timestamp,
+        },
+    )?;
+
+    let signature = key_custody
+        .sign(signing_key, &hash)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
+    let request = SenderKeyRequest {
+        requester_did: requester_did.to_owned(),
+        sender_did: sender_did.to_owned(),
+        epoch,
+        wrapping_pubkey: wrap_point,
+        nonce,
+        timestamp,
+        signature: sig_bytes,
+    };
+
+    let message = rmp_serde::to_vec_named(&request)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
+
+    Ok(SenderKeyRequestResult {
+        request_message: message,
+        wrapping_key_handle,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Handle sender key request (responder side) — async
+// ---------------------------------------------------------------------------
+
+/// Handles an incoming [`SenderKeyRequest`].
+///
+/// Verifies the signature, validates timestamp freshness, checks nonce
+/// replay, verifies membership and the block list, and HPKE-encrypts
+/// the sender key to the requester's wrapping public key.
+///
+/// Returns `None` if the requester is blocked (no response, the requester
+/// cannot obtain the key). Returns `Some(serialized_response)` otherwise.
+///
+/// # Replay Protection
+///
+/// Two layers of replay defense:
+///
+/// 1. **Timestamp freshness** — rejects requests with timestamps outside
+///    `REQUEST_FRESHNESS_SECS` (past or future), preventing replay of old
+///    requests and guarding against clock-skew manipulation.
+/// 2. **Nonce dedup** — rejects requests whose nonce has been seen within
+///    `NONCE_EXPIRY_SECS`, preventing replay of recently-valid requests.
+///    After processing, the nonce is recorded in the dedup cache.
+///
+/// # Sybil Resistance (BLACK-006, §9.16.6)
+///
+/// When `context_members` is `Some`, the requester's DID must be in the
+/// membership set or the request is rejected with
+/// [`SenderKeyError::NotContextMember`]. This is the primary mechanical
+/// defense against Sybil block bypass: a Sybil DID that has not been
+/// admitted to the context through normal admission controls cannot obtain
+/// sender keys, even though it is not on the block list.
+///
+/// In **Encrypted** contexts, MLS group membership already gates who can
+/// see application messages, so `context_members` is a defense-in-depth
+/// redundancy. In **Broadcast** contexts, where key requests travel as
+/// relay messages outside MLS, `context_members` is the primary gate.
+///
+/// Callers SHOULD always provide `context_members`. Passing `None` is
+/// permitted for backward compatibility but disables the membership check.
+///
+/// # HPKE Assembly
+///
+/// Seals via RFC 9180 HPKE Base mode (§9.16.2) through the shared
+/// `scp_protocol::crypto::hpke::p256` suite: a fresh ephemeral keypair performs
+/// DHKEM Encap to the requester's wrapping pubkey, `KeySchedule_base` derives
+/// the AEAD key/nonce, and a single seq-0 `Seal` produces the 48-byte
+/// ciphertext. The `ephemeral_pubkey` (HPKE `enc`) is returned in the
+/// response; there is no external nonce.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::StaleSenderKeyRequest`] if the request
+/// timestamp is outside the freshness window.
+/// Returns [`SenderKeyError::ReplayedRequest`] if the request nonce has
+/// already been seen within the dedup window.
+/// Returns [`SenderKeyError::NotContextMember`] if `context_members` is
+/// provided and the requester is not a member.
+/// Returns [`SenderKeyError::VerificationFailed`] if the request signature
+/// is invalid or malformed. Returns other variants for HPKE failures.
+#[allow(clippy::unused_async)] // API contract: callers expect async; may need await in future
+pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
+    request: &SenderKeyRequest,
+    requester_public_key: &[u8],
+    params: &HandleRequestParams<'_, S>,
+    nonce_dedup: &mut NonceDedup,
+) -> Result<Option<Vec<u8>>, SenderKeyError> {
+    // Verify the request signature.
+    let valid = verify_sender_key_request(request, requester_public_key)?;
+    if !valid {
+        return Err(SenderKeyError::VerificationFailed(
+            "sender key request signature verification failed".to_owned(),
+        ));
+    }
+
+    // Timestamp freshness: reject requests outside the freshness window.
+    validate_sender_key_request_freshness(request, params.now_secs)?;
+
+    // Nonce replay protection: reject requests with previously-seen nonces.
+    if nonce_dedup.is_replayed(&request.nonce, params.now_secs) {
+        return Err(SenderKeyError::ReplayedRequest);
+    }
+
+    // Membership gate (BLACK-006, §9.16.6): reject requests from DIDs
+    // that are not context members. This prevents Sybil identities —
+    // which bypass per-DID block lists by definition — from obtaining
+    // sender keys. The Sybil DID must first pass the context's admission
+    // controls (MLS membership, UCAN gating, earned capacity thresholds)
+    // before it can even request a key.
+    if let Some(members) = params.context_members
+        && !members.contains(&request.requester_did)
+    {
+        return Err(SenderKeyError::NotContextMember {
+            did: request.requester_did.clone(),
+        });
+    }
+
+    // Check block list: if requester is blocked, return None (no response).
+    if params.block_list.contains(&request.requester_did) {
+        return Ok(None);
+    }
+
+    // Serde fixed the wrapping key at 65 bytes; the seal validates the point
+    // (§9.5: `0x04` prefix, on the curve) and fails closed on anything else.
+    // HPKE seal: encrypt the sender key to the requester's wrapping key.
+    // Context binding (§9.16.2): info and AAD include context_id, sender_did, epoch.
+    let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
+        params.sender_key.as_bytes(),
+        &request.wrapping_pubkey,
+        params.context_id,
+        params.sender_did,
+        params.epoch,
+    )?;
+
+    // Convert to fixed-size array. The HPKE seal always returns exactly 48
+    // bytes (ciphertext 32 + AES-128-GCM tag 16) for a 32-byte plaintext;
+    // the AEAD nonce is internal per RFC 9180.
+    let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+        SenderKeyError::HpkeEncryptionFailed(format!(
+            "HPKE seal produced {} bytes, expected 48",
+            v.len()
+        ))
+    })?;
+
+    let response = SenderKeyResponse {
+        sender_did: params.sender_did.to_owned(),
+        epoch: params.epoch,
+        hpke_sealed_key: sealed,
+        ephemeral_pubkey: ephemeral_pub,
+        request_nonce: request.nonce,
+    };
+
+    let message = rmp_serde::to_vec_named(&response)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
+
+    // Record nonce only after successful processing to prevent the dedup
+    // cache from being poisoned by requests that fail for other reasons
+    // (e.g., the requester is blocked or not a member).
+    nonce_dedup.record(request.nonce, params.now_secs);
+
+    Ok(Some(message))
+}
+
+// ---------------------------------------------------------------------------
+// Open sender key response (requester side) — async custody variant
+// ---------------------------------------------------------------------------
+
+/// Checks that a [`SenderKeyResponse`] names `mls_sender`, the member the
+/// MLS layer authenticated as the message's sender.
+///
+/// The response's `sender_did` is bound into the HPKE `info` and `aad`, so an
+/// open under the wrong sender fails anyway; this check rejects it from the
+/// public field alone, before any custody call. Every receive path runs it
+/// first: [`open_sender_key_response`] and the runtime's
+/// `NodeMlsFactory::open_incoming_sender_key`.
+///
+/// # Errors
+///
+/// [`SenderKeyError::SenderMismatch`] if `response.sender_did` is not
+/// `mls_sender`.
+pub fn check_response_sender(
+    mls_sender: &str,
+    response: &SenderKeyResponse,
+) -> Result<(), SenderKeyError> {
+    if response.sender_did == mls_sender {
+        Ok(())
+    } else {
+        Err(SenderKeyError::SenderMismatch {
+            claimed: response.sender_did.clone(),
+            mls_sender: mls_sender.to_owned(),
+        })
+    }
+}
+
+/// Opens a [`SenderKeyResponse`] using the requester's wrapping key handle
+/// inside the [`KeyCustody`] boundary (RFC 9180 HPKE Base mode, §9.16.2).
+///
+/// The KEM Diffie-Hellman output is computed inside custody via
+/// `key_custody.dh_agree(wrapping_key_handle, enc)`, so the wrapping private
+/// key never leaves the boundary. The recipient public key `pkRm` is fetched
+/// via `key_custody.public_key(wrapping_key_handle)`. RFC 9180 DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD open
+/// then complete in software via
+/// [`scp_protocol::crypto::hpke::p256::custody::open_with_external_dh`].
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails (wrong
+/// key/`info`/`aad`, tampered `enc`/`ct`) or the recovered plaintext is not
+/// exactly 32 bytes. The response's `enc` was validated (§9.5) when it was
+/// decoded. Returns [`SenderKeyError::Custody`] if
+/// the DH agreement or public-key lookup fails in custody, and
+/// [`SenderKeyError::MalformedWrappingPublicKey`] if custody returns a
+/// wrapping public key that is not 65 bytes. Returns
+/// [`SenderKeyError::SenderMismatch`], before any custody call, if the
+/// response names a sender other than `mls_sender`.
+pub async fn open_sender_key_response(
+    key_custody: &impl KeyCustody,
+    wrapping_key_handle: &KeyHandle,
+    context_id: &str,
+    mls_sender: &str,
+    response: &SenderKeyResponse,
+) -> Result<SenderKey, SenderKeyError> {
+    // The public sender check runs before any custody call, so a response
+    // that cannot be accepted never costs a host round trip.
+    check_response_sender(mls_sender, response)?;
+
+    // Spec 09 §9.16.2 order: `enc` is validated (§9.5) before any key
+    // agreement. Decoding the `P256Point` validated it.
+    let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
+
+    // Compute the KEM DH output inside the custody boundary (same handle,
+    // same enc — the only sound inputs to open_with_external_dh).
+    let dh = key_custody
+        .dh_agree(wrapping_key_handle, enc.as_bytes())
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+    let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
+
+    // Fetch pkRm for the same handle, needed for kem_context = enc || pkRm.
+    let pk_rm = key_custody
+        .public_key(wrapping_key_handle)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+    let pk_rm_bytes: [u8; hpke_p256::PUBLIC_KEY_LEN] =
+        pk_rm.as_bytes().try_into().map_err(|_| {
+            SenderKeyError::MalformedWrappingPublicKey(format!(
+                "wrapping public key must be {} bytes, got {}",
+                hpke_p256::PUBLIC_KEY_LEN,
+                pk_rm.as_bytes().len()
+            ))
+        })?;
+
+    open_sender_key_response_with_dh(&dh_bytes, &pk_rm_bytes, context_id, response)
+}
+
+/// Opens a [`SenderKeyResponse`] with a KEM Diffie-Hellman output computed in custody.
+///
+/// `dh` is computed inside custody for the response's `enc`, and `pk_rm` is
+/// the recipient's wrapping public key (RFC 9180 HPKE Base mode, §9.16.2).
+/// The software half of [`open_sender_key_response`]: DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD
+/// open. The caller computes `dh` with the custody handle whose public key is
+/// `pk_rm`, for exactly `ValidatedEnc::from(response.ephemeral_pubkey)`.
+///
+/// # Errors
+///
+/// [`SenderKeyError::HpkeDecryptionFailed`] if the HPKE open fails (wrong
+/// key, `info` or `aad`, tampered `enc` or `ct`) or the recovered plaintext
+/// is not exactly 32 bytes.
+pub fn open_sender_key_response_with_dh(
+    dh: &Zeroizing<[u8; 32]>,
+    pk_rm: &[u8; hpke_p256::PUBLIC_KEY_LEN],
+    context_id: &str,
+    response: &SenderKeyResponse,
+) -> Result<SenderKey, SenderKeyError> {
+    let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
+
+    // Build context-bound info and AAD (§9.16.2) using response fields.
+    let info = build_hpke_info(context_id, &response.sender_did, response.epoch);
+    let aad = build_hpke_aad(context_id, &response.sender_did, response.epoch);
+
+    let plaintext = Zeroizing::new(
+        hpke_p256::custody::open_with_external_dh(
+            dh,
+            pk_rm,
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?,
+    );
+
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
+            SenderKeyError::HpkeDecryptionFailed(format!(
+                "decrypted key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })?);
+
+    Ok(SenderKey::from_bytes(*key_bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Block notification — signing
+// ---------------------------------------------------------------------------
+
+/// Constructs a signed [`BlockNotification`] and serializes it for
+/// transmission as an MLS application message.
+///
+/// Signature payload:
+/// `SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp_BE)`.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::Custody`] if custody signing fails, and
+/// [`SenderKeyError::SigningFailed`] if the signature is not 64 bytes.
+/// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
+#[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
+pub async fn send_block_notification(
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+    context_id: &str,
+    blocker_did: &str,
+    blocked_did: &str,
+    signing_key_id: SigningKeyId,
+    clock: &dyn scp_clock::Clock,
+) -> Result<Vec<u8>, SenderKeyError> {
+    let timestamp = clock.now_millis();
+
+    let hash = compute_block_notification_hash(
+        context_id,
+        blocker_did,
+        blocked_did,
+        signing_key_id,
+        timestamp,
+    )?;
+
+    let signature = key_custody
+        .sign(signing_key, &hash)
+        .await
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
+
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
+    let notification = BlockNotification {
+        notification_type: "block".to_owned(),
+        blocker: blocker_did.to_owned(),
+        blocked: blocked_did.to_owned(),
+        signing_key_id,
+        timestamp,
+        signature: sig_bytes,
+    };
+
+    rmp_serde::to_vec_named(&notification)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Rotate sender key for block — async
+// ---------------------------------------------------------------------------
+
+/// Generates a new sender key, increments the epoch, publishes a
+/// [`SenderKeyEpochAdvance`], and adds the blocked DID to the block list.
+///
+/// Non-blocked members observe the epoch advance, send a
+/// [`SenderKeyRequest`], and receive the new key via
+/// [`handle_sender_key_request`] which checks the block list. The blocked
+/// party can send a request but receives no response.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::EpochOverflow`] if the epoch counter is at
+/// `u64::MAX` and cannot be incremented.
+/// Returns [`SenderKeyError::Custody`] if custody signing of the epoch advance
+/// fails.
+/// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
+pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+    params: &RotateForBlockParams<'_>,
+    block_list: &mut HashSet<String, S>,
+) -> Result<RotateForBlockResult, SenderKeyError> {
+    // Generate new sender key.
+    let new_key = generate_sender_key();
+    let new_epoch = params
+        .current_epoch
+        .checked_add(1)
+        .ok_or(SenderKeyError::EpochOverflow)?;
+
+    // Add blocked DID to block list.
+    block_list.insert(params.blocked_did.to_owned());
+
+    // Publish epoch advance notification.
+    let epoch_advance_message = publish_sender_key_epoch_advance(
+        key_custody,
+        signing_key,
+        params.context_id,
+        params.sender_did,
+        new_epoch,
+        params.signer_key_ref,
+    )
+    .await?;
+
+    Ok(RotateForBlockResult {
+        new_key,
+        new_epoch,
+        epoch_advance_message,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Async Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::items_after_statements
+)]
+mod tests {
+    use std::collections::HashSet;
+
+    use scp_clock::Clock;
+    use scp_platform::testing::InMemoryKeyCustody;
+    use scp_platform::traits::{KeyCustody, KeyType};
+
+    use super::*;
+    use crate::crypto::key_loss_custody::{KeyLoss, KeyLossCustody};
+    use scp_protocol::crypto::hpke::p256::P256Point;
+    use scp_protocol::crypto::sender_keys::key_protocol_verify::{
+        BLOCK_NOTIFICATION_FRESHNESS_MS, REQUEST_FRESHNESS_SECS,
+    };
+
+    /// Creates a test custody and an Ed25519 signing key.
+    async fn setup() -> (InMemoryKeyCustody, KeyHandle) {
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        (custody, key)
+    }
+
+    /// Creates test fixtures for sender key request handling tests.
+    ///
+    /// Returns `(bob_custody, bob_signing_key, bob_public_key, sender_key)`.
+    async fn setup_request_test_fixtures() -> (
+        InMemoryKeyCustody,
+        KeyHandle,
+        scp_platform::traits::PublicKey,
+        SenderKey,
+    ) {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+        let sender_key = generate_sender_key();
+        (bob_custody, bob_signing_key, bob_pubkey, sender_key)
+    }
+
+    // -------------------------------------------------------------------
+    // SenderKeyEpochAdvance tests
+    // -------------------------------------------------------------------
+
+    /// A destroyed signing key fails the epoch advance with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn epoch_advance_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        let err = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .expect_err("an epoch advance under a destroyed key must fail");
+        assert!(
+            matches!(&err, SenderKeyError::Custody(failure) if failure.is_key_not_found()),
+            "expected SenderKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Custody key-not-found: one test per custody call. Each asserts the
+    // typed failure every bridge reports as `SCP-CRYPTO-4006`.
+    // -------------------------------------------------------------------
+
+    fn assert_key_not_found<T: std::fmt::Debug>(result: Result<T, SenderKeyError>, step: &str) {
+        let err = result.expect_err(step);
+        assert!(
+            matches!(&err, SenderKeyError::Custody(failure) if failure.is_key_not_found()),
+            "{step}: expected SenderKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    async fn request_with(
+        custody: &impl KeyCustody,
+        signing_key: &KeyHandle,
+    ) -> Result<SenderKeyRequestResult, SenderKeyError> {
+        request_sender_key(
+            custody,
+            signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &scp_clock::SystemClock,
+        )
+        .await
+    }
+
+    /// A response whose `enc` is a valid P-256 point, so `open` reaches
+    /// both custody calls. The sealed key is never opened by these tests.
+    fn response_with_valid_enc() -> SenderKeyResponse {
+        let secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
+        SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: [0u8; 48],
+            ephemeral_pubkey: P256Point::from(&secret.public_key()),
+            request_nonce: [0u8; REQUEST_NONCE_SIZE],
+        }
+    }
+
+    /// Re-encodes the named-map `MessagePack` form of `value` with `field`
+    /// replaced by the binary `bytes`, as a peer could put on the wire.
+    fn with_wire_field(value: &impl serde::Serialize, field: &str, bytes: &[u8]) -> Vec<u8> {
+        let encoded = rmp_serde::to_vec_named(value).unwrap();
+        let mut map = rmpv::decode::read_value(&mut encoded.as_slice()).unwrap();
+        let rmpv::Value::Map(entries) = &mut map else {
+            panic!("a named struct encodes as a map");
+        };
+        let entry = entries
+            .iter_mut()
+            .find(|(k, _)| k.as_str() == Some(field))
+            .unwrap();
+        entry.1 = rmpv::Value::Binary(bytes.to_vec());
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &map).unwrap();
+        out
+    }
+
+    /// §9.5: a wire key that is not a 65-byte uncompressed P-256 point fails
+    /// at decode, in the request's `wrapping_pubkey` and the response's
+    /// `ephemeral_pubkey` (`enc`), so no hash, seal or key agreement reads
+    /// it. The positive control re-encodes each field with valid point bytes
+    /// through the same path; a short key's error names its length.
+    #[test]
+    fn sender_key_wire_points_reject_invalid_encodings_at_decode() {
+        let valid = scp_crypto::p256::testing::valid_uncompressed_point(2);
+        let point = P256Point::try_from(valid).unwrap();
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: point,
+            nonce: [0u8; REQUEST_NONCE_SIZE],
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+        };
+        let response = response_with_valid_enc();
+
+        let decoded: SenderKeyRequest =
+            rmp_serde::from_slice(&with_wire_field(&request, "wrapping_pubkey", &valid)).unwrap();
+        assert_eq!(decoded.wrapping_pubkey, point);
+        let decoded: SenderKeyResponse =
+            rmp_serde::from_slice(&with_wire_field(&response, "ephemeral_pubkey", &valid)).unwrap();
+        assert_eq!(decoded.ephemeral_pubkey, point);
+
+        for (case, bad) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+            let request_err = rmp_serde::from_slice::<SenderKeyRequest>(&with_wire_field(
+                &request,
+                "wrapping_pubkey",
+                &bad,
+            ))
+            .unwrap_err()
+            .to_string();
+            let response_err = rmp_serde::from_slice::<SenderKeyResponse>(&with_wire_field(
+                &response,
+                "ephemeral_pubkey",
+                &bad,
+            ))
+            .unwrap_err()
+            .to_string();
+            for err in [&request_err, &response_err] {
+                assert!(err.contains("P-256 point"), "{case}: {err}");
+                if bad.len() == 32 {
+                    assert!(err.contains("got 32 bytes"), "{case}: {err}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_wrapping_key_generation_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::OnGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping key generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping public key read",
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_with_a_destroyed_signing_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "request signing",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sender_key_response_with_a_destroyed_wrapping_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        custody.destroy_key(&wrapping_key).await.unwrap();
+        assert_key_not_found(
+            open_sender_key_response(
+                &custody,
+                &wrapping_key,
+                "ctx-1",
+                "did:dht:alice",
+                &response_with_valid_enc(),
+            )
+            .await,
+            "DH agreement",
+        );
+    }
+
+    /// A response naming a sender other than the MLS sender is refused from
+    /// its public field, with no custody call; the same response under its
+    /// real sender reaches custody (positive control).
+    #[tokio::test]
+    async fn open_sender_key_response_refuses_a_wrong_sender_before_custody() {
+        let custody = crate::crypto::dh_counting_custody::DhCountingCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        let response = response_with_valid_enc();
+
+        let refused = open_sender_key_response(
+            &custody,
+            &wrapping_key,
+            "ctx-1",
+            "did:dht:mallory",
+            &response,
+        )
+        .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SenderKeyError::SenderMismatch { claimed, mls_sender })
+                    if claimed == "did:dht:alice" && mls_sender == "did:dht:mallory"
+            ),
+            "a wrong sender is SenderMismatch: {refused:?}"
+        );
+        assert_eq!(custody.dh_calls(), 0, "no dh_agree for a wrong sender");
+
+        // The sealed key is all zeros, so the open fails after the agree; the
+        // real sender passes the check and reaches custody.
+        let opened =
+            open_sender_key_response(&custody, &wrapping_key, "ctx-1", "did:dht:alice", &response)
+                .await;
+        assert!(
+            matches!(opened, Err(SenderKeyError::HpkeDecryptionFailed(_))),
+            "the real sender reaches the open: {opened:?}"
+        );
+        assert_eq!(custody.dh_calls(), 1, "the real sender reaches dh_agree");
+    }
+
+    #[tokio::test]
+    async fn open_sender_key_response_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterDhAgree);
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        assert_key_not_found(
+            open_sender_key_response(
+                &custody,
+                &wrapping_key,
+                "ctx-1",
+                "did:dht:alice",
+                &response_with_valid_enc(),
+            )
+            .await,
+            "wrapping public key read after DH agreement",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_block_notification_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        assert_key_not_found(
+            send_block_notification(
+                &custody,
+                &signing_key,
+                "ctx-1",
+                "did:dht:alice",
+                "did:dht:dave",
+                SigningKeyId::Active,
+                &scp_clock::SystemClock,
+            )
+            .await,
+            "block notification signing",
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        let mut block_list = HashSet::new();
+        assert_key_not_found(
+            rotate_sender_key_for_block(
+                &custody,
+                &signing_key,
+                &RotateForBlockParams {
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    current_epoch: 3,
+                    blocked_did: "did:dht:dave",
+                    signer_key_ref: SigningKeyId::Active,
+                },
+                &mut block_list,
+            )
+            .await,
+            "epoch advance signing during block rotation",
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_creation_and_signature_verification() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        assert_eq!(advance.sender_did, "did:dht:alice");
+        assert_eq!(advance.epoch, 5);
+        assert_eq!(advance.signer_key_ref, SigningKeyId::Active);
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(valid, "epoch advance signature should be valid");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_rejects_wrong_context() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+
+        // Verify with wrong context_id should fail.
+        let valid = verify_epoch_advance(&advance, "ctx-WRONG", pubkey.as_bytes()).unwrap();
+        assert!(!valid, "wrong context should invalidate signature");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_rejects_wrong_key() {
+        let (custody, signing_key) = setup().await;
+        let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        let valid = verify_epoch_advance(&advance, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
+        assert!(!valid, "wrong public key should invalidate signature");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_with_agent_signing_key() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            3,
+            SigningKeyId::Agent,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        assert_eq!(advance.signer_key_ref, SigningKeyId::Agent);
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(valid, "Agent signing key epoch advance should verify");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_rejects_tampered_signer_key_ref() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            3,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let mut advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        // Tamper: flip signer_key_ref from Active to Agent.
+        advance.signer_key_ref = SigningKeyId::Agent;
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(
+            !valid,
+            "tampering with signer_key_ref must invalidate signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_serde_defaults_signer_key_ref_to_active() {
+        // Simulate an old-format message without signer_key_ref by
+        // constructing a minimal struct that omits the field.
+        #[derive(serde::Serialize)]
+        struct LegacyAdvance {
+            sender_did: String,
+            epoch: u64,
+            #[serde(with = "serde_bytes")]
+            signature: Vec<u8>,
+        }
+
+        let (custody, signing_key) = setup().await;
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        let legacy = LegacyAdvance {
+            sender_did: advance.sender_did.clone(),
+            epoch: advance.epoch,
+            signature: advance.signature.to_vec(),
+        };
+        let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let deserialized: SenderKeyEpochAdvance = rmp_serde::from_slice(&legacy_bytes).unwrap();
+
+        assert_eq!(
+            deserialized.signer_key_ref,
+            SigningKeyId::Active,
+            "missing signer_key_ref should default to Active"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // SenderKeyRequest/Response roundtrip with HPKE
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn request_response_roundtrip_with_hpke() {
+        // Setup: Alice (sender/responder) and Bob (requester).
+        let alice_custody = InMemoryKeyCustody::new();
+        let _alice_signing_key = alice_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+        let sender_key_bytes = *sender_key.as_bytes();
+
+        // Bob creates a request for Alice's key.
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        // Alice handles the request (no membership gate — backward compat).
+        let block_list = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
+        let response_bytes = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response_bytes.is_some(),
+            "non-blocked requester should get a response"
+        );
+        let response: SenderKeyResponse = rmp_serde::from_slice(&response_bytes.unwrap()).unwrap();
+
+        assert_eq!(response.sender_did, "did:dht:alice");
+        assert_eq!(response.epoch, 1);
+        // DHKEM(P-256): `enc` is an uncompressed ephemeral point (its type
+        // fixes the 65 bytes), the sealed key 32 + 16 bytes.
+        assert_eq!(response.ephemeral_pubkey.as_bytes()[0], 0x04);
+        assert_eq!(response.hpke_sealed_key.len(), 48);
+
+        // Bob opens the response using his wrapping key.
+        let recovered_key = open_sender_key_response(
+            &bob_custody,
+            &request_result.wrapping_key_handle,
+            "ctx-1",
+            "did:dht:alice",
+            &response,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recovered_key.as_bytes(),
+            &sender_key_bytes,
+            "recovered sender key should match original"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_signature_verification() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let clock = scp_clock::SystemClock;
+        let result = request_sender_key(
+            &custody,
+            &signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            3,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
+
+        let valid = verify_sender_key_request(&request, pubkey.as_bytes()).unwrap();
+        assert!(valid, "request signature should be valid");
+    }
+
+    #[tokio::test]
+    async fn request_rejects_wrong_signer() {
+        let custody = InMemoryKeyCustody::new();
+        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
+
+        let clock = scp_clock::SystemClock;
+        let result = request_sender_key(
+            &custody,
+            &signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            3,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
+
+        let valid = verify_sender_key_request(&request, wrong_pubkey.as_bytes()).unwrap();
+        assert!(!valid, "wrong signer should invalidate request signature");
+    }
+
+    // -------------------------------------------------------------------
+    // Block list enforcement
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blocked_requester_gets_no_response() {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        // Bob creates a request.
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        // Alice has Bob on her block list.
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:bob".into());
+
+        let mut nonce_dedup = NonceDedup::new();
+        let response = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_none(),
+            "blocked requester should receive no response"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblocked_requester_gets_response() {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        // Block list has someone else, not Bob.
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".into());
+
+        let mut nonce_dedup = NonceDedup::new();
+        let response = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_some(),
+            "unblocked requester should receive a response"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Membership gate — Sybil defense (BLACK-006)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn non_member_rejected_when_context_members_provided() {
+        let sybil_custody = InMemoryKeyCustody::new();
+        let sybil_signing_key = sybil_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let sybil_pubkey = sybil_custody.public_key(&sybil_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        // Sybil identity creates a request.
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &sybil_custody,
+            &sybil_signing_key,
+            "did:dht:sybil",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+
+        // Context members do NOT include the Sybil identity.
+        let mut members = HashSet::new();
+        members.insert("did:dht:alice".to_owned());
+        members.insert("did:dht:bob".to_owned());
+
+        let mut nonce_dedup = NonceDedup::new();
+        let result = handle_sender_key_request(
+            &request,
+            sybil_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: Some(&members),
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::NotContextMember { .. })),
+            "non-member Sybil DID should be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_allowed_when_context_members_provided() {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+
+        // Context members include Bob.
+        let mut members = HashSet::new();
+        members.insert("did:dht:alice".to_owned());
+        members.insert("did:dht:bob".to_owned());
+
+        let mut nonce_dedup = NonceDedup::new();
+        let response = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: Some(&members),
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_some(),
+            "member should receive a response when context_members is provided"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // expand_block_list + Sybil (async E2E test)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn expanded_block_list_blocks_sybil_identity() {
+        // End-to-end: Dave is blocked. Dave's Sybil alias is linked.
+        // The expanded block list should block the Sybil alias too.
+        let sybil_custody = InMemoryKeyCustody::new();
+        let sybil_signing_key = sybil_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let sybil_pubkey = sybil_custody.public_key(&sybil_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        // Sybil identity requests the key.
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &sybil_custody,
+            &sybil_signing_key,
+            "did:dht:dave-alt",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        // Original block list only has Dave.
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".to_owned());
+
+        // Expand with identity links.
+        let expanded = expand_block_list(&block_list, |did| {
+            if did == "did:dht:dave" {
+                vec!["did:dht:dave-alt".to_owned()]
+            } else {
+                vec![]
+            }
+        });
+
+        let mut nonce_dedup = NonceDedup::new();
+        let response = handle_sender_key_request(
+            &request,
+            sybil_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &expanded,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_none(),
+            "Sybil alias should be blocked via expanded block list"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Block notification tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn block_notification_creation_and_verification() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let clock = scp_clock::SystemClock;
+        let message = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
+        assert_eq!(notification.notification_type, "block");
+        assert_eq!(notification.blocker, "did:dht:alice");
+        assert_eq!(notification.blocked, "did:dht:dave");
+        assert_eq!(notification.signing_key_id, SigningKeyId::Active);
+        assert!(notification.timestamp > 0);
+
+        let valid = verify_block_notification(&notification, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(valid, "block notification signature should be valid");
+    }
+
+    #[tokio::test]
+    async fn block_notification_rejects_wrong_context() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let clock = scp_clock::SystemClock;
+        let message = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
+        let valid =
+            verify_block_notification(&notification, "ctx-WRONG", pubkey.as_bytes()).unwrap();
+        assert!(!valid, "wrong context should invalidate block notification");
+    }
+
+    #[tokio::test]
+    async fn block_notification_rejects_wrong_key() {
+        let (custody, signing_key) = setup().await;
+        let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
+
+        let clock = scp_clock::SystemClock;
+        let message = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
+        let valid =
+            verify_block_notification(&notification, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
+        assert!(!valid, "wrong key should invalidate block notification");
+    }
+
+    // -------------------------------------------------------------------
+    // rotate_sender_key_for_block flow
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_increments_epoch_and_blocks() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let mut block_list = HashSet::new();
+        let current_epoch = 3;
+
+        let result = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
+            &mut block_list,
+        )
+        .await
+        .unwrap();
+
+        // Epoch should be incremented.
+        assert_eq!(result.new_epoch, 4);
+
+        // Block list should contain the blocked DID.
+        assert!(block_list.contains("did:dht:dave"));
+
+        // The epoch advance message should be valid.
+        let advance: SenderKeyEpochAdvance =
+            rmp_serde::from_slice(&result.epoch_advance_message).unwrap();
+        assert_eq!(advance.epoch, 4);
+        assert_eq!(advance.sender_did, "did:dht:alice");
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(valid, "epoch advance from rotate should be valid");
+
+        // New key should be 32 bytes.
+        assert_eq!(result.new_key.as_bytes().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_multiple_blocks_accumulate() {
+        let (custody, signing_key) = setup().await;
+
+        let mut block_list = HashSet::new();
+
+        let result1 = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: 0,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
+            &mut block_list,
+        )
+        .await
+        .unwrap();
+
+        let result2 = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: result1.new_epoch,
+                blocked_did: "did:dht:eve",
+                signer_key_ref: SigningKeyId::Active,
+            },
+            &mut block_list,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result2.new_epoch, 2);
+        assert!(block_list.contains("did:dht:dave"));
+        assert!(block_list.contains("did:dht:eve"));
+        assert_eq!(block_list.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // End-to-end: block then request (blocked party gets nothing)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blocked_party_cannot_obtain_key_after_rotation() {
+        let alice_custody = InMemoryKeyCustody::new();
+        let alice_signing_key = alice_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+
+        let dave_custody = InMemoryKeyCustody::new();
+        let dave_signing_key = dave_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let dave_pubkey = dave_custody.public_key(&dave_signing_key).await.unwrap();
+
+        let mut block_list = HashSet::new();
+
+        // Alice rotates her key, blocking Dave.
+        let rotate_result = rotate_sender_key_for_block(
+            &alice_custody,
+            &alice_signing_key,
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: 0,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
+            &mut block_list,
+        )
+        .await
+        .unwrap();
+
+        // Dave tries to request the new key.
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &dave_custody,
+            &dave_signing_key,
+            "did:dht:dave",
+            "did:dht:alice",
+            rotate_result.new_epoch,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        // Alice handles Dave's request with the updated block list.
+        let mut nonce_dedup = NonceDedup::new();
+        let response = handle_sender_key_request(
+            &request,
+            dave_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &rotate_result.new_key,
+                sender_did: "did:dht:alice",
+                epoch: rotate_result.new_epoch,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+                context_id: "ctx-1",
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_none(),
+            "blocked Dave should not receive Alice's new key"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Epoch overflow
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_epoch_overflow_returns_error() {
+        let (custody, signing_key) = setup().await;
+        let mut block_list = HashSet::new();
+
+        let result = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: u64::MAX,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
+            &mut block_list,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::EpochOverflow)),
+            "epoch at u64::MAX should return EpochOverflow, got {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // validate_block_notification_freshness (SCP-179) — async variants
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fresh_block_notification_passes_freshness_check() {
+        let (custody, signing_key) = setup().await;
+        let clock = scp_clock::SystemClock;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
+        let now_ms = clock.now_millis();
+        let result = validate_block_notification_freshness(&notification, now_ms);
+        assert!(
+            result.is_ok(),
+            "fresh notification should pass freshness check"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_block_notification_rejected() {
+        let (custody, signing_key) = setup().await;
+        let clock = scp_clock::SystemClock;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
+        // Simulate the notification being received far in the future.
+        let far_future_ms = notification.timestamp + BLOCK_NOTIFICATION_FRESHNESS_MS + 1_000;
+        let result = validate_block_notification_freshness(&notification, far_future_ms);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleBlockNotification)),
+            "stale notification should be rejected with StaleBlockNotification"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_timestamp_block_notification_rejected() {
+        let (custody, signing_key) = setup().await;
+        let clock = scp_clock::SystemClock;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+            SigningKeyId::Active,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let mut notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
+        // Set the notification timestamp far ahead of "now" so it exceeds the
+        // freshness window into the future.
+        let now_ms = notification.timestamp;
+        notification.timestamp = now_ms + BLOCK_NOTIFICATION_FRESHNESS_MS + 10_000;
+        let result = validate_block_notification_freshness(&notification, now_ms);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleBlockNotification)),
+            "future-timestamped notification should be rejected with StaleBlockNotification"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_key_response_echoes_request_nonce() {
+        let alice_custody = InMemoryKeyCustody::new();
+        let _alice_signing_key = alice_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+
+        let requester_custody = InMemoryKeyCustody::new();
+        let requester_signing_key = requester_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        // The requester's *public* key is used by the responder to verify the request signature.
+        let requester_pubkey = requester_custody
+            .public_key(&requester_signing_key)
+            .await
+            .unwrap();
+
+        let sender_key = generate_sender_key();
+        let block_list: HashSet<String> = HashSet::new();
+        let clock = scp_clock::SystemClock;
+
+        let result = request_sender_key(
+            &requester_custody,
+            &requester_signing_key,
+            "did:dht:requester",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
+        let original_nonce = request.nonce;
+
+        let mut nonce_dedup = NonceDedup::new();
+        let response_bytes = handle_sender_key_request(
+            &request,
+            requester_pubkey.as_bytes(), // verify requester's signature
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let response: SenderKeyResponse = rmp_serde::from_slice(&response_bytes).unwrap();
+        assert_eq!(
+            response.request_nonce, original_nonce,
+            "response must echo the request nonce"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // handle_request_rejects_stale_timestamp / replayed nonce
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_request_rejects_stale_timestamp() {
+        let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
+            setup_request_test_fixtures().await;
+
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
+        // Simulate receiving the request far in the future.
+        let stale_now = request.timestamp + REQUEST_FRESHNESS_SECS + 100;
+        let result = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: stale_now,
+            },
+            &mut nonce_dedup,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleSenderKeyRequest)),
+            "stale request should be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_replayed_nonce() {
+        let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
+            setup_request_test_fixtures().await;
+
+        let clock = scp_clock::SystemClock;
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
+
+        let params = HandleRequestParams {
+            sender_key: &sender_key,
+            context_id: "ctx-1",
+            sender_did: "did:dht:alice",
+            epoch: 1,
+            block_list: &block_list,
+            context_members: None,
+            now_secs: request.timestamp,
+        };
+
+        // First call succeeds.
+        let first =
+            handle_sender_key_request(&request, bob_pubkey.as_bytes(), &params, &mut nonce_dedup)
+                .await;
+        assert!(first.is_ok(), "first request should succeed");
+
+        // Second call with same nonce should be rejected as replay.
+        let second =
+            handle_sender_key_request(&request, bob_pubkey.as_bytes(), &params, &mut nonce_dedup)
+                .await;
+        assert!(
+            matches!(second, Err(SenderKeyError::ReplayedRequest)),
+            "replayed request should be rejected, got {second:?}"
+        );
+    }
+}

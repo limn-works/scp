@@ -1,0 +1,29 @@
+[package]
+name = "scp-runtime-lifecycle-control"
+version = "0.1.0-beta.2"
+description = "The lifecycle control domain of the SCP runtime: actor lifecycle control commands"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Turns on the `testing`-gated command variants of `scp-runtime-core` together with
+# this crate's match arms for them (ADR-070 plan §4, unification hazard). Only test
+# builds enable it.
+testing = ["scp-runtime-core/testing"]
+
+[dependencies]
+scp-runtime-core = { workspace = true }
+tokio = { workspace = true }
+scp-protocol = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-protocol = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
