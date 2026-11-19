@@ -13,9 +13,10 @@
 //! cache's free list when dropped, and nothing holding the marker is freed
 //! before the connection closes; a page allocated on its own is freed at once.
 //!
-//! The bundled `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines
-//! `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which makes every cache share one page
-//! group and allocate no bulk block, and `scp_sqlite_pools::open` refuses a
+//! `.cargo/config.toml` compiles the bundled `SQLCipher` with
+//! `SQLITE_ENABLE_MEMORY_MANAGEMENT` through `LIBSQLITE3_FLAGS`. That option
+//! makes every cache share one page group and allocate no bulk block, and
+//! `scp_sqlite_pools::open` refuses a
 //! `SQLite` without that option. This test checks that property on its own:
 //! it opens with `rusqlite::Connection::open`, bypassing the crate's check, so
 //! a build without the option fails here at the assertion. A test that

@@ -34,6 +34,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Every cargo command below runs from the repository root. Cargo reads
+# `.cargo/config.toml` by searching upward from its working directory, not from
+# `--manifest-path`, and that file's `[env]` table supplies
+# `LIBSQLITE3_FLAGS=-DSQLITE_ENABLE_MEMORY_MANAGEMENT`, which spec 17 §17.6 requires
+# of the bundled SQLCipher. A run started outside the checkout would otherwise build
+# without it. `scripts/tests/xcframework-cwd/run-tests.sh` holds this.
+cd "$REPO_ROOT"
+
 # Rust crate that produces the static library
 FFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 FFI_LIB_NAME="libscp_ffi_uniffi.a"

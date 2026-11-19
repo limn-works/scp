@@ -103,7 +103,7 @@ rusqlite = { workspace = true, optional = true }
 scp-sqlite-pools = { path = "../scp-sqlite-pools", version = "=0.1.0-beta.2", optional = true }
 redb = { workspace = true, optional = true }
 zeroize = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "postgres"], optional = true }
 # No `sigv4a`. That feature turns on `aws-runtime/sigv4a`, which signs requests addressed
 # to an S3 Multi-Region Access Point, and it is the only edge in this workspace that pulls
 # the superseded RustCrypto generation: p256 0.11, ecdsa 0.14, elliptic-curve 0.12,
