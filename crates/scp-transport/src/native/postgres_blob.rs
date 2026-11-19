@@ -238,8 +238,11 @@ impl BlobStorage for PostgresBlobStore {
 
         // $3 is the `stored_at` floor and $4 the cursor's `blob_id`, or NULL
         // for a cursor without one; a row at the floor passes only above it.
-        // $6 is the lifetime filter's code.
-        let rows = sqlx::query(&format!(
+        // $6 is the lifetime filter's code. The text interpolates only
+        // `lifetime_predicate("$6")`, whose one argument is this literal, so no
+        // runtime value reaches the SQL text and `AssertSqlSafe` asserts nothing
+        // a reader cannot check here; every value is a bind parameter.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT blob_id, recipient_hint, blob_ttl, admission, stored_at, blob \
              FROM blobs \
              WHERE routing_id = $1 AND (expires_at IS NULL OR expires_at > $2) \
@@ -249,7 +252,7 @@ impl BlobStorage for PostgresBlobStore {
              ORDER BY stored_at ASC, blob_id ASC \
              LIMIT $5",
             lifetime_predicate("$6")
-        ))
+        )))
         .bind(routing_id.as_slice())
         .bind(u64_to_i64(now))
         .bind(u64_to_i64(cursor.floor()))
@@ -431,7 +434,9 @@ mod tests {
             .await
             .expect("connect to the DATABASE_URL server");
         let name = format!("scp_test_{:016x}", rand::random::<u64>());
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        // `name` is `scp_test_` and sixteen hex digits, and CREATE DATABASE takes no
+        // bind parameter for its name.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&admin)
             .await
             .expect("create the test database");

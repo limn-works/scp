@@ -213,7 +213,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # PyO3's build script runs a Python interpreter to learn the ABI it compiles
-      # against, and crates/scp-ffi/build.rs asks `python3.12` for its LIBDIR.
+      # against.
       - uses: ./.github/actions/toolcache-setup
         with:
           tool: python
