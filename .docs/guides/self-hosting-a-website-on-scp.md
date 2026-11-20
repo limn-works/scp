@@ -143,7 +143,11 @@ not the internal relay port (see `fn build_no_domain_inner`, `crates/scp-node/sr
 - **Tier 2 — STUN** (RFC 8489, `crates/scp-transport/src/nat/mod.rs`): discovers
   the external `IP:port`, classifies NAT type, self-tests reachability, then
   publishes `ws://<external-ip>:<port>/scp/v1` into the DID document on the real
-  Mainline DHT.
+  Mainline DHT. **This path no longer matches spec 10 §10.12.3** (amended
+  2026-11-20): a Tier 2 node registers with a bridge, publishes no IP address,
+  and gives a peer a direct path by a signed hole punch followed by QUIC to a
+  pinned certificate. Stories SCP-381, SCP-382 and SCP-383 (the Tier 2 direct
+  path gate of `.docs/prds/reachability.json`) implement it.
 - **Tier 3 — bridge relay reverse-tunnel** (symmetric-NAT fallback): **not wired
   node-side**, and the bridge only forwards relay blob frames, never HTTP.
 
@@ -202,6 +206,7 @@ future work.
    port-mapping still requires building with `--features upnp` (§3.1).
 3. **STUN is discovery-only — no ICE agent, no hole-punching.** Tier 2 *assumes*
    the NAT keeps the hole open. True for **cone NAT**; false for **symmetric NAT**.
+   Spec 10 §10.12.3 now specifies the punch; the shipped code does not run it yet.
 4. ~~No NAT-PMP/UPnP lease renewal wired into the node path.~~ **Fixed:** the
    `--self-host` path now renews the NAT port-mapping lease at 50% of the
    gateway-reported TTL (spec §10.12.2) via a contained renewal task tied to the

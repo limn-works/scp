@@ -63,6 +63,17 @@
       "stories": [
         "SCP-343"
       ]
+    },
+    {
+      "id": "gate-reachability-6",
+      "name": "Tier 2 Direct Path",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-381",
+        "SCP-382",
+        "SCP-383"
+      ]
     }
   ],
   "stories": [
@@ -220,7 +231,7 @@
         "When .no_domain() is set, ACME TLS provisioning is skipped entirely",
         "When .no_domain() is set, .well-known/scp is NOT served",
         "When .no_domain() is set, NAT type is probed via STUN on build()",
-        "When .no_domain() is set, the service record carries a ws:// relay URL",
+        "Amended 2026-11-20: §10.12.8 step 6 publishes a ws:// node URL on Tier 1 only; Tiers 2 and 3 publish a bridged context node address, which SCP-383 implements. (was: When .no_domain() is set, the service record carries a ws:// relay URL)",
         "When .domain() is set and succeeds, wss:// is used (existing behavior, no regression)",
         "When .domain() is set and fails (DNS/ACME), automatic fallthrough to Tiers 1-3",
         "Unit test: .no_domain() build skips TLS and publishes ws:// URL",
@@ -548,9 +559,9 @@
       "description": "After obtaining an external address via UPnP (Tier 1, §10.12.2 step 4) or STUN (Tier 2, §10.12.3), the SDK must perform a reachability self-test before publishing the address in the service record. If the self-test fails, the mapping is considered unreliable and the SDK falls through to the next tier. Currently, the tier selection algorithm publishes the address without verification. This story adds the self-test probe.",
       "acceptanceCriteria": [
         "After Tier 1 UPnP mapping, a self-test probe verifies external reachability before publishing",
-        "After Tier 2 STUN hole punch, a self-test probe verifies external reachability before publishing",
+        "Withdrawn 2026-11-20: §10.12.3 **No reachability self-test for Tier 2** — a Tier 2 node publishes no address, so it runs no self-test; SCP-383 removes it. (was: After Tier 2 STUN hole punch, a self-test probe verifies external reachability before publishing)",
         "Self-test failure on Tier 1 triggers fallthrough to Tier 2 (§10.12.2 step 4)",
-        "Self-test failure on Tier 2 triggers fallthrough to Tier 3 (§10.12.3)",
+        "Withdrawn 2026-11-20: §10.12.3 **No reachability self-test for Tier 2** — a Tier 2 node publishes no address, so it runs no self-test; SCP-383 removes it. (was: Self-test failure on Tier 2 triggers fallthrough to Tier 3 (§10.12.3))",
         "Self-test uses a known relay as intermediary to probe the external address",
         "Unit test: self-test success proceeds with address publication",
         "Unit test: self-test failure triggers fallthrough to next tier"
@@ -1182,6 +1193,164 @@
       "details": {
         "crate": "scp-did",
         "withdrawn": "2026-11-02: the `wrappingKey` writer and reader criteria are withdrawn because `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only; tier 3 bridge fields live in `NodeAddress` (`09-security-model.md` §9.5.2), which SCP-365 builds."
+      }
+    },
+    {
+      "id": "SCP-381",
+      "title": "Encode, sign and verify HOLE_PUNCH_REQUEST and HOLE_PUNCH_RESPONSE, and answer requests on a Tier 2 node",
+      "gate": "gate-reachability-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/nat/punch.rs",
+        "crates/scp-transport/src/nat/mod.rs",
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Implements the two punch frames of `10-infrastructure-and-self-hosting.md` §10.12.3 **Punch frames** and the node's side of **The node's checks on a request**. Both frames are ADR-004 frames that travel only inside a bridge session as a `BRIDGE_DATA` payload (ADR-004 client-to-relay and relay-to-client tables). The response pins the node's QUIC TLS certificate under the node identity's designated service key, which `09-security-model.md` §9.13 makes the second self-signed-certificate exception. The peer's side, the probes and the QUIC connection are SCP-382; tier selection is SCP-383. File locations, function names and type names are indicators.",
+      "acceptanceCriteria": [
+        "`UdpAddress` encodes as a family byte (4 or 6), 4 or 16 address bytes, and a 2-byte big-endian port; a unit test round-trips one IPv4 and one IPv6 address, and the decoder refuses, one test case each: family byte 5, an IPv4 family with 19 bytes, an IPv6 family with 7 bytes, and port 0",
+        "The request preimage is `\"SCP-HOLE-PUNCH-REQUEST-V1:\" || requester || requester_address || target_routing_id || nonce || BE64(timestamp)` under the §9.5.1 construction, with `requester_address` length-prefixed and every other field fixed-length; a unit test pins the bytes and the SHA-256 for one fixed input",
+        "The response preimage is `\"SCP-HOLE-PUNCH-RESPONSE-V1:\" || responder || request_hash || responder_address || cert_spki_hash || BE64(timestamp)` under the same construction; a unit test pins the bytes and the SHA-256 for one fixed input",
+        "A Tier 2 node signs a response with the key its identity's key state designates for the service record, and `cert_spki_hash` equals the SHA-256 of the DER SubjectPublicKeyInfo of the certificate its QUIC endpoint presents; an in-process test reads both back from the node",
+        "The node answers `ERR` 4003 and sends no probe, one test each: `target_routing_id` differs from its registered identity routing ID; `timestamp` 61 seconds from its clock; a signature by a key the requester's key state does not list `Current` as `#active`; a second request with the same `request_hash` within 120 seconds",
+        "The node answers `ERR` 4012 to the fifth request within 60 seconds from one `source_tag`, and answers a request from a second `source_tag` in that window",
+        "The node checks a request in the §10.12.3 order: a test whose request fails both check 1 and check 3 observes no key-event-log resolution",
+        "A Tier 3 node (symmetric NAT) answers no `HOLE_PUNCH_REQUEST` with a `HOLE_PUNCH_RESPONSE`"
+      ],
+      "actionItems": [
+        "Add the two frames to the relay-client protocol codec",
+        "Add the preimage builders and the UdpAddress codec",
+        "Add the node handler for HOLE_PUNCH_REQUEST on a bridge session with the five checks in order",
+        "Add tests"
+      ],
+      "blockedBy": [
+        "SCP-340"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.13 Transport Security Requirements"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-382",
+      "title": "A peer punches to a Tier 2 node and moves from its bridge session to QUIC on a certificate the punch response pins",
+      "gate": "gate-reachability-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/nat/punch.rs",
+        "crates/scp-transport/src/nat/stun.rs",
+        "crates/scp-transport/src/quic/adapter.rs",
+        "crates/scp-transport/src/relay/bridge.rs"
+      ],
+      "description": "Implements `10-infrastructure-and-self-hosting.md` §10.12.3 **The node's QUIC socket** and **Punch**: one UDP socket per side carries STUN and QUIC, demultiplexed by first byte; the peer opens a bridge session first, sends a punch request only when `SHA-256(\"scp:did:\" || operator)` equals `bridge_target`, verifies the response, probes, opens QUIC to `responder_address` accepting only the certificate whose SubjectPublicKeyInfo hashes to `cert_spki_hash`, resubscribes on QUIC, and closes the bridge session. `09-security-model.md` §9.13 admits that certificate and no other self-signed one. Frames and node checks are SCP-381. File locations and type names are indicators.",
+      "acceptanceCriteria": [
+        "On one UDP socket, a datagram whose first byte is 0 to 3 reaches the STUN handler and every other datagram reaches the QUIC endpoint; a unit test feeds one of each",
+        "Neither QUIC endpoint sends the `grease_quic_bit` transport parameter; a test reads the transport parameters of a completed handshake",
+        "The peer sends no `HOLE_PUNCH_REQUEST` when `SHA-256(\"scp:did:\" || operator)` differs from `bridge_target`, and keeps the bridge session",
+        "The peer discards a response, keeps the bridge session and opens no QUIC connection, one test each: a `request_hash` of another request; a `timestamp` 61 seconds from its clock; a signature by a key other than the operator's designated service key",
+        "The node sends 3 STUN Binding Requests at 500 ms intervals to `requester_address` after it sends a response, and each side answers a Binding Request on its QUIC socket with a Binding Success Response",
+        "An in-process test with two loopback endpoints completes a punch and a QUIC handshake, after which the peer's subscriptions deliver on the QUIC connection with the ADR-004 `since` overlap and the bridge session is closed with code 0",
+        "The QUIC handshake fails when the node presents a certificate whose SubjectPublicKeyInfo hashes to anything but `cert_spki_hash`, and the peer then keeps the bridge session",
+        "The first QUIC connection after a punch sends no 0-RTT data",
+        "When no STUN packet arrives from `responder_address` within 1.5 seconds, the peer keeps the bridge session and opens no QUIC connection",
+        "When the direct QUIC connection closes, the peer opens a new bridge session",
+        "A browser build (`scp-client-wasm`) sends no `HOLE_PUNCH_REQUEST`"
+      ],
+      "actionItems": [
+        "Share one UDP socket between STUN and a quinn endpoint with first-byte demultiplexing",
+        "Add the pinned-SPKI certificate verifier for the QUIC client",
+        "Drive the punch from an open bridge session and migrate subscriptions",
+        "Add tests"
+      ],
+      "blockedBy": [
+        "SCP-381"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.13 Transport Security Requirements"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.14 QUIC Transport Binding"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-383",
+      "title": "Tier 2 registers with a bridge and publishes no IP address, and runs no reachability self-test",
+      "gate": "gate-reachability-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/nat/mod.rs"
+      ],
+      "description": "`10-infrastructure-and-self-hosting.md` §10.12.1 step 4, §10.12.3, §10.12.7 and §10.12.8 changed on 2026-11-20: a Tier 2 node registers with a bridge node as Tier 3 does, the context node address names that bridge, and no service-record entry carries the node's IP address. The shipped `ReachabilityTier::Stun` path publishes a `ws://` URL with the STUN-discovered address after a self-test, which SCP-235 and SCP-242 built against the earlier text. This story replaces that path. File locations and type names are indicators.",
+      "acceptanceCriteria": [
+        "On a non-symmetric NAT after Tier 1 fails, the node sends `BRIDGE_REGISTER` to a bridge node and opens its QUIC socket; a test asserts both",
+        "On Tier 2 the service record the node publishes carries no `SCPNode` entry whose URL holds the node's external address",
+        "On Tier 2 the node runs no reachability self-test; a test with a probe that would fail still selects Tier 2",
+        "On a symmetric NAT the node registers with a bridge and answers no punch request (Tier 3)",
+        "When the node cannot obtain a STUN-discovered address for its QUIC socket, it runs as Tier 3",
+        "A STUN keepalive that reports a changed address makes the node answer later punch requests with the new address"
+      ],
+      "actionItems": [
+        "Change select_tier so Tier 2 registers with a bridge and carries the QUIC socket",
+        "Remove the ws:// publication and the self-test from the Tier 2 path",
+        "Add tests"
+      ],
+      "blockedBy": [
+        "SCP-381"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.1 Reachability Tiers"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.7 Service-Record Node URL Encoding"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.8 ApplicationNode Integration"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-node"
       }
     }
   ]
