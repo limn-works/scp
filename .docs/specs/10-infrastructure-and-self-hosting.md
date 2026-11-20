@@ -598,7 +598,7 @@ The "run it on your MacBook" thesis is the keystone of "protocol requires no ope
 | Tier | Mechanism | NAT coverage | External infrastructure | Latency | Protocol changes |
 |------|-----------|-------------|------------------------|---------|-----------------|
 | 1 | UPnP/NAT-PMP port mapping | ~40% home routers | None | Direct | None |
-| 2 | STUN hole punching | ~85% cumulative (cone NATs) | Any SCP node as STUN server | Direct after punch | None (STUN is pre-connection) |
+| 2 | STUN hole punching, then QUIC on the punched UDP path | ~85% cumulative (cone NATs) | A willing SCP node as bridge, which also carries the punch exchange; any SCP node as STUN server | Bridge session until the punch succeeds, then direct | `HOLE_PUNCH_REQUEST` + `HOLE_PUNCH_RESPONSE` inside a bridge session; QUIC (§10.14) to a certificate the response pins |
 | 3 | Node bridging (TURN-like) | ~100% (symmetric NAT fallback) | A willing SCP node as bridge | +1 hop | BRIDGE_REGISTER + BRIDGE_DATA operations |
 | 4 | Domain-based (existing §18.6) | 100% | DNS + ACME CA | Direct | None |
 
@@ -607,11 +607,11 @@ The "run it on your MacBook" thesis is the keystone of "protocol requires no ope
 1. If a domain is configured (`.domain()`), attempt domain-based deployment first. Verify: DNS resolves to a reachable address, ACME challenge succeeds, `wss://` WebSocket upgrade completes. If all checks pass, Tier 4 is the active tier. If any check fails, log the failure reason and fall through to step 2.
 2. If no domain is configured (`.no_domain()`), or if domain-based deployment failed, probe NAT type via STUN binding request to a known node (§10.12.3).
 3. Attempt Tier 1 (UPnP/NAT-PMP). If a port mapping is obtained and external reachability is verified, Tier 1 is the active tier.
-4. If Tier 1 fails and NAT type is non-symmetric (full-cone, address-restricted, or port-restricted), attempt Tier 2 (STUN hole punching). If the external address is reachable, Tier 2 is the active tier.
-5. If Tier 2 fails or NAT type is symmetric, register with a bridge node (Tier 3). Tier 3 always succeeds if a bridge node is available.
+4. If Tier 1 fails and NAT type is non-symmetric (full-cone, address-restricted, or port-restricted), attempt Tier 2 (STUN hole punching). The node registers with a bridge node as Tier 3 does and also answers punch requests (§10.12.3). Tier 2 is the active tier once the bridge accepts the registration and the node holds a STUN-discovered address for its QUIC socket.
+5. If NAT type is symmetric, or the node cannot keep a STUN-discovered address for its QUIC socket, register with a bridge node (Tier 3) and answer no punch request. Tier 3 always succeeds if a bridge node is available.
 6. If no bridge node is available, the self-hosted node is unreachable from the internet. Log an error. The operator can still participate as an SCP identity using external nodes — they just cannot serve as a node for others.
 
-Selection is logged at INFO level but not exposed to the user as a choice. The SDK re-evaluates periodically (recommended: every 30 minutes) and on network change events (IP change, interface up/down). Tier changes are transparent — the service record is rewritten with the new node address at an incremented sequence, and peers re-resolve on connection failure.
+Selection is logged at INFO level but not exposed to the user as a choice. The SDK re-evaluates periodically (recommended: every 30 minutes) and on network change events (IP change, interface up/down). Tier changes are transparent. On Tiers 1 and 4 the node rewrites the service record with the new node address at an incremented sequence. On Tiers 2 and 3 the operator signs a new context node address at a higher sequence (`09-security-model.md` §9.5.2). Peers re-resolve on connection failure.
 
 ### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping
 
@@ -641,7 +641,9 @@ On node startup, the SDK attempts to open a port mapping on the local gateway us
 
 ### 10.12.3 Tier 2: STUN Hole Punching
 
-For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT, RFC 8489) can discover the node's external address and establish a reachable UDP socket through NAT hole punching.
+For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT, RFC 8489) discovers the external address of the node's UDP socket, and a hole punch opens that socket's NAT mapping to one peer at a time. A peer then reaches the node over QUIC (§10.14) on the punched UDP path. QUIC runs over UDP, so the path a UDP punch opens carries it. A WebSocket runs over TCP, and a UDP punch opens no TCP path, so no WebSocket crosses a punched hole.
+
+**A Tier 2 node is a Tier 3 node that also offers a direct path.** The node registers with a bridge node exactly as §10.12.4 **Bridge establishment** states, and the context's node address names that bridge in `bridge` (`09-security-model.md` §9.5.2). The node publishes no IP address: no service-record entry and no node address names its external address. A peer reaches the node first over a bridge session, and asks the node for a direct path over that session.
 
 **NAT type classification:** The SDK performs a STUN binding request to classify the NAT type:
 
@@ -652,60 +654,71 @@ For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT,
 | Port-restricted cone | ~35% | Yes | Only the specific host:port the internal endpoint has contacted |
 | Symmetric | ~15% | No | Different mapping per destination — external address unpredictable |
 
-**Procedure for non-symmetric NATs:**
+**The node's QUIC socket.** A Tier 2 node opens one UDP socket and runs four things on it: its STUN Binding Requests to a STUN server (RFC 8489), the 25-second keepalive below, the punch probes of **Punch** below, and a QUIC server endpoint (§10.14). The external `ip:port` the STUN server reports for that socket is the node's `responder_address`. The node re-probes on each network change event and whenever a keepalive's Binding Response reports a different address, and it answers every later punch request with the new address. The receiver of a datagram on the socket hands it to STUN when its first byte is 0 to 3, and to the QUIC endpoint otherwise (RFC 7983 §7, RFC 9443). A QUIC packet with the fixed bit set has a first byte of 64 or more, so the two never collide. Neither QUIC endpoint sends the `grease_quic_bit` transport parameter (RFC 9287), because a greased packet can have a first byte of 0 to 3.
 
-1. The SDK opens a UDP socket and performs a STUN Binding Request (RFC 8489) to a STUN server (see below). The response contains the external `ip:port` as seen by the STUN server.
-2. For full-cone NATs, this external address is immediately reachable by any host.
-3. For address-restricted and port-restricted NATs, the SDK must send an initial packet to a peer before the peer can send back. Connection coordination (step 5 below) handles this.
-4. The external address is published in the service record as the node's reachable address.
-5. **Connection coordination:** A peer resolving the self-hosted node's service record obtains the external address. For restricted NATs, the self-hosted node must initiate a packet exchange with each connecting peer. The coordination protocol below specifies how peers signal intent and exchange addresses.
-
-**STUN hole punching coordination protocol:**
-
-For address-restricted and port-restricted NATs, both the self-hosted node and the connecting peer must send packets to each other's external addresses to create NAT pinholes. This requires a coordination exchange through an intermediary node that both parties can reach:
+**Punch frames.** Two ADR-004 frames carry the punch exchange. Each travels inside a bridge session as the `payload` of a `BRIDGE_DATA`: the request from the peer to the node, the response from the node to the peer. The bridge carries both unchanged and parses neither (§10.12.4 **What the bridge reads**).
 
 ```
-HOLE_PUNCH_REQUEST (peer → intermediary node → self-hosted node) {
-  requester_did:     Identifier,       // the connecting peer
-  requester_address: SocketAddr,       // Peer's STUN-discovered external address
-  target_routing_id: [u8; 32],         // routing ID of the self-hosted node
-  nonce:             [u8; 16],         // Random nonce for replay prevention
-  timestamp:         u64,             // Unix timestamp (ms)
-  signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
+HOLE_PUNCH_REQUEST (peer → node, inside a bridge session) {
+  requester:         Identifier,   // The connecting peer's identifier
+  requester_address: UdpAddress,   // The peer's STUN-discovered external address for its own QUIC socket
+  target_routing_id: [u8; 32],     // The node address's bridge_target
+  nonce:             [u8; 16],     // Drawn fresh by the peer from a CSPRNG
+  timestamp:         u64,          // Unix time in milliseconds
+  signature:         [u8; 64],     // P-256, by the requester's #active, over the request preimage below
+}
+
+HOLE_PUNCH_RESPONSE (node → peer, inside the same session) {
+  request_hash:      [u8; 32],     // The request preimage digest below, of the request this answers
+  responder_address: UdpAddress,   // The node's STUN-discovered external address for its QUIC socket
+  cert_spki_hash:    [u8; 32],     // SHA-256 of the DER SubjectPublicKeyInfo of the node's QUIC TLS certificate
+  timestamp:         u64,          // Unix time in milliseconds
+  signature:         [u8; 64],     // P-256, by the node identity's designated service key, over the response preimage below
 }
 ```
 
-```
-HOLE_PUNCH_RESPONSE (self-hosted node → intermediary node → peer) {
-  responder_address: SocketAddr,       // Self-hosted node's STUN-discovered external address
-  requester_did:     Identifier,       // echo of the requester
-  nonce:             [u8; 16],         // Echo of request nonce
-  timestamp:         u64,
-  signature:         P256Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
-}
-```
+- **`UdpAddress`** encodes as one family byte, 4 or 6, then the address, 4 bytes for IPv4 and 16 bytes for IPv6, then the port as a 2-byte big-endian integer: 7 or 19 bytes. A reader refuses any other family byte, a length that does not match the family, and port 0.
+- **Request preimage.** `"SCP-HOLE-PUNCH-REQUEST-V1:" || requester || requester_address || target_routing_id || nonce || BE64(timestamp)`, under the `09-security-model.md` §9.5.1 construction: `requester` as the identifier's 32 raw digest bytes, `requester_address` as a variable-length field, and the other fields fixed-length. `request_hash` is the SHA-256 of these bytes. The requester signs `request_hash` with the key its key state lists `Current` in the `#active` role.
+- **Response preimage.** `"SCP-HOLE-PUNCH-RESPONSE-V1:" || responder || request_hash || responder_address || cert_spki_hash || BE64(timestamp)`, under the same construction: `responder` as the node identity's 32 raw digest bytes, `responder_address` as a variable-length field, and the other fields fixed-length. The node signs the SHA-256 of these bytes with the key its identity's key state designates for the service record, the key that signs the identity's service record (`03-identity.md` §3.10.13). The response names `responder` only inside the preimage, because the peer already knows that identifier (step 1 of **Punch**).
 
-**Protocol sequence:**
+**The node's checks on a request.** The node answers a `HOLE_PUNCH_REQUEST` only when every check passes, in this order:
 
-1. The peer discovers the self-hosted node's service record, which lists an intermediary node address (the node the self-hosted node maintains a persistent connection to).
-2. The peer performs a STUN binding request to discover its own external address.
-3. The peer sends `HOLE_PUNCH_REQUEST` to the intermediary node, which forwards it to the self-hosted node over the existing connection.
-4. The self-hosted node sends `HOLE_PUNCH_RESPONSE` back through the intermediary.
-5. Both parties simultaneously begin sending UDP keepalive packets to each other's external addresses (3 attempts at 500ms intervals). The first packet from each side creates the NAT pinhole; subsequent packets traverse the pinhole.
-6. Once bidirectional UDP connectivity is established (verified by receiving a keepalive response), the peer upgrades to a WebSocket connection over the punched hole.
-7. If no response is received after 3 attempts (1.5 seconds total), the punch has failed. The peer falls through to Tier 3 (node bridging).
+1. `target_routing_id` equals the identity routing ID the node registered at the bridge (§10.12.4.1). Otherwise it answers `ERR` `4003` INVALID_FIELD.
+2. `timestamp` is within 60 seconds of the node's clock. Otherwise it answers `ERR` `4003`.
+3. The signature verifies under the key the requester's key state lists `Current` in the `#active` role, which the node reads by replaying the requester's key-event log under `09-security-model.md` §9.7.4.2 R2, R3 and R8. Otherwise it answers `ERR` `4003`.
+4. The node has not answered a request with this `request_hash` in the last 120 seconds. Otherwise it answers `ERR` `4003`, so a replayed request makes the node send no further probes.
+5. The session's `source_tag` (§10.12.4 **Caps**) has sent at most 4 requests in the last 60 seconds, a local policy with that default. Otherwise it answers `ERR` `4012` LIMIT_EXCEEDED.
 
-**Security:** The intermediary node sees both external addresses but cannot inject itself into the connection — MLS handles all payload encryption. The signatures prevent address spoofing (an attacker cannot redirect a peer to a different address). The nonce prevents replay.
+The node then sends `HOLE_PUNCH_RESPONSE` on the session and starts its probes (**Punch**, step 5).
 
-**Keepalive:** NAT mappings expire if unused (typical timeout: 30-120 seconds). The SDK sends a 25-second UDP keepalive to maintain the mapping. The keepalive is a minimal STUN Binding Indication (no response expected) or a zero-length UDP packet, depending on the STUN server's capabilities.
+**Punch.** A peer that holds a context's node address with a `bridge`, and that can open its own UDP socket, takes these steps:
+
+1. The peer opens a bridge session to `bridge_target` (§10.12.4 **Sessions**) and uses it as its node connection at once. It reads the context operator's identifier from the `operator` field of the context's `ContextOperatorBinding` (`09-security-model.md` §9.5.2), and it sends no punch request unless `SHA-256("scp:did:" || operator)` equals `bridge_target`.
+2. The peer opens a UDP socket for its QUIC client and learns that socket's external address with a STUN Binding Request.
+3. The peer sends `HOLE_PUNCH_REQUEST` on the session.
+4. The peer accepts a `HOLE_PUNCH_RESPONSE` only when its `request_hash` equals the request the peer sent, its `timestamp` is within 60 seconds of the peer's clock, and its signature verifies under the key the operator's key state designates for the service record, which the peer reads by replaying the operator's key-event log under `09-security-model.md` §9.7.4.2 R2, R3 and R8. The signature's class is the attestation class of §9.7.1, with the role the service-key designation. The peer discards a response that fails a check and keeps the bridge session.
+5. Each side sends a STUN Binding Request (RFC 8489) from its QUIC socket to the other side's address: the node to `requester_address` when it sends the response, the peer to `responder_address` when it accepts the response. Each side sends 3 Binding Requests at 500 ms intervals and answers every Binding Request it receives with a Binding Success Response. A side's first outbound packet opens its own NAT's mapping toward the other side.
+6. When the peer's socket receives any STUN packet from `responder_address`, the peer opens a QUIC connection from that socket to `responder_address` as the client (§10.14.2), with no 0-RTT data on this first connection. The peer accepts the node's TLS 1.3 certificate only when the SHA-256 of its DER SubjectPublicKeyInfo equals `cert_spki_hash`. It checks no certificate chain and no name, because the response signature authenticates the key. The handshake fails on any other certificate, and the peer then closes the QUIC connection and keeps the bridge session.
+7. After the handshake completes, the peer opens on the QUIC connection every subscription it held on the bridge session, with the `since` overlap ADR-004 states for a reconnect, and then closes the bridge session with `BRIDGE_SESSION_CLOSE` code `0`.
+8. When the peer's socket receives no STUN packet from `responder_address` within 1.5 seconds of step 5, the punch failed. The peer keeps the bridge session, which is the Tier 3 path, and MAY request a punch again after a network change event.
+
+When a direct QUIC connection later closes, the peer opens a new bridge session and MAY punch again from step 2.
+
+**A peer without its own UDP socket stays on the bridge.** A browser peer can neither send a STUN request from a socket it chooses nor open a QUIC connection to an address it chose, so it sends no `HOLE_PUNCH_REQUEST` and reaches a Tier 2 node over the bridge session alone, as it reaches a Tier 3 node. A peer behind a symmetric NAT can send a request, but its NAT maps its QUIC socket to a different external address toward the node than toward the STUN server, so its punch fails at step 8 and the peer keeps the bridge session.
+
+**No reachability self-test for Tier 2.** The node publishes no address, so it has no address to test before publishing. A restricted-cone NAT drops an unsolicited test packet by design, so a self-test from another node would fail on a working Tier 2 path. The NAT classification above decides whether the node answers punch requests.
+
+**Security.** The bridge sees both external addresses, because the request and the response cross it. It can drop or delay either frame, which leaves the peer on the bridge session. It cannot change `responder_address` or `cert_spki_hash`, because the node identity's designated service key signs both. A bridge that sends the peer to an endpoint it controls therefore fails the QUIC handshake at step 6, because that endpoint cannot present a certificate whose key hashes to `cert_spki_hash`. MLS protects every blob on either path. The request signature means the node sends probes only to an address that a resolvable identity signed. It does not stop that identity from naming a third party's address. Step 5 bounds what one such request costs that third party to 3 STUN Binding Requests of 20 bytes each, and check 5 bounds the request rate per source prefix.
+
+**Keepalive:** NAT mappings expire if unused (typical timeout: 30-120 seconds). The node sends a STUN Binding Request from its QUIC socket to its STUN server every 25 seconds, which keeps the mapping open and reports the mapping's current external address. A direct QUIC connection keeps its own path open with QUIC PING frames (§10.14.2).
 
 **STUN service on SCP nodes:** Any SCP node MAY serve as a STUN endpoint. STUN is lightweight (stateless, single UDP socket, minimal CPU) and can coexist with the node's WebSocket endpoint. The node advertises STUN support in its `.well-known/scp` `node_config`.
 
-- Self-hosted nodes that have achieved public reachability (Tiers 1, 2, or 4) MAY also offer STUN service — a self-reinforcing network where every new reachable node makes the next NAT traversal easier.
+- Self-hosted nodes that accept unsolicited UDP from any host (Tier 1 with a UDP mapping, or Tier 4) MAY also offer STUN service, so each such node adds one STUN server for the next node's NAT probe.
 
-**Symmetric NAT:** If the STUN probe determines the NAT is symmetric (~15% of deployments), hole punching is not viable — the NAT assigns a different external mapping per destination, making the external address unpredictable. The SDK falls through to Tier 3.
+**Symmetric NAT:** If the STUN probe determines the NAT is symmetric (~15% of deployments), hole punching is not viable — the NAT assigns a different external mapping per destination, making the external address unpredictable. The node registers with a bridge as Tier 3 and answers no punch request.
 
-**Fallthrough:** If NAT is symmetric, or if the STUN-discovered address fails the reachability self-test, proceed to Tier 3.
+**Fallthrough:** If NAT is symmetric, or the node cannot hold a STUN-discovered address for its QUIC socket, the node runs as Tier 3. A punch that fails for one peer leaves that peer on its bridge session and changes no tier.
 
 ### 10.12.4 Tier 3: Node Bridging
 
@@ -810,7 +823,7 @@ The protocol uses two distinct routing ID derivation schemes for different purpo
 1. The self-hosted node behind symmetric NAT connects outbound to a bridge node (outbound connections are not blocked by NAT).
 2. The self-hosted node registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving control of its identifier with a P-256 signature.
 3. The bridge node accepts incoming connections from peers. A peer opens a session to the registered self-hosted node with `BRIDGE_SESSION_OPEN` and exchanges node frames with it over the existing outbound connection (**Sessions**).
-4. The tier 3 address travels in the context's node address (`09-security-model.md` §9.5.2), under the operator's signature: a `NodeAddress` whose `bridge` carries the bridge node's `NodeId` as `via`, the identity routing ID (§10.12.4.1) the self-hosted node registered in step 2 as `bridge_target`, and the `wrapping_key` of the §10.7.1 **Tier 3 envelope**. A peer dials the bridge node's own URL and opens a session to `bridge_target`. A service record's `SCPNode` entry carries a URL alone and never a tier 3 address (`18-addressability-and-deployment.md` §18.2.1).
+4. The tier 3 address travels in the context's node address (`09-security-model.md` §9.5.2), under the operator's signature: a `NodeAddress` whose `bridge` carries the bridge node's `NodeId` as `via`, the identity routing ID (§10.12.4.1) the self-hosted node registered in step 2 as `bridge_target`, and the `wrapping_key` of the §10.7.1 **Tier 3 envelope**. A peer dials the bridge node's own URL and opens a session to `bridge_target`. A service record's `SCPNode` entry carries a URL alone and never a tier 3 address (`18-addressability-and-deployment.md` §18.2.1). A Tier 2 node publishes the same `NodeAddress`, and a peer asks it for a direct path over the session (§10.12.3 **Punch**).
 5. When the self-hosted node disconnects, the bridge deregisters all its routing IDs and closes every session of its connection (**Connection loss**). A subsequent `BRIDGE_SESSION_OPEN` for those IDs returns `BRIDGE_TARGET_NOT_FOUND`.
 
 **Bridge properties:**
@@ -843,7 +856,8 @@ TLS is required for all domain-based node connections (§9.13). Self-hosted node
 | Node type | Where the resolver took the URL | Transport | TLS required |
 |-----------|---------------|-----------|-------------|
 | Domain-based | `.well-known/scp` or explicit URL | `wss://` | Yes (§9.13) |
-| Self-hosted, no domain | the source §9.13's criterion admits | `ws://` permitted | No |
+| Self-hosted, no domain, Tier 1 | the source §9.13's criterion admits | `ws://` permitted | No |
+| Self-hosted, no domain, Tier 2 direct path | `cert_spki_hash` of a `HOLE_PUNCH_RESPONSE` the peer verified (§10.12.3) | QUIC to an address literal | Yes: TLS 1.3 to the certificate whose key the response pins |
 | Self-hosted, with domain | Either | `wss://` | Yes |
 
 **Rationale.** TLS serves two purposes: confidentiality and server authentication.
@@ -860,22 +874,22 @@ Operators concerned about metadata exposure to network intermediaries can:
 
 - Add a domain and use `wss://` (Tier 4).
 - Route node traffic through a VPN or Tor.
-- Use a bridge node with `wss://` (Tier 3 always uses `wss://` because the bridge node has a domain).
+- Use a bridge node with `wss://` (Tiers 2 and 3 reach the node over the bridge node's `wss://` URL, because the bridge node has a domain, and a Tier 2 direct path runs QUIC with TLS 1.3).
 
 ### 10.12.7 Service-Record Node URL Encoding
 
-Tiers 1, 2 and 4 each produce a different node URL format for the service record's `SCPNode` entries (§18.2.1). Tier 3 produces no service-record URL, because its address is the `bridge` of the context's node address (§10.12.4):
+Tiers 1 and 4 each produce a different node URL format for the service record's `SCPNode` entries (§18.2.1). Tiers 2 and 3 produce no service-record URL, because their address is the `bridge` of the context's node address (§10.12.3, §10.12.4):
 
 | Tier | URL format | Example |
 |------|-----------|---------|
 | 1 (UPnP) | `ws://` with IP literal | `ws://203.0.113.42:8443/scp/v1` |
-| 2 (STUN) | `ws://` with IP literal | `ws://198.51.100.7:32891/scp/v1` |
+| 2 (STUN) | No service-record URL: the same `NodeAddress.bridge` as Tier 3. The node's external address reaches a peer only in a signed `HOLE_PUNCH_RESPONSE` (§10.12.3) | A peer dials `wss://bridge.example.com/scp/v1`, then QUIC to the address the response carries |
 | 3 (Bridge) | No service-record URL: `NodeAddress.bridge` carries `via`, `bridge_target` and `wrapping_key` (§10.12.4) | A peer dials the bridge node's own URL, `wss://bridge.example.com/scp/v1` |
 | 4 (Domain) | `wss://` with operator domain | `wss://node.example.com/scp/v1` |
 
-Every URL has a canonical form under the canonical node URL rule of `09-security-model.md` §9.18.2. A tier 3 address carries its routing target in `bridge_target`, never in a URL.
+Every URL has a canonical form under the canonical node URL rule of `09-security-model.md` §9.18.2. A tier 2 or tier 3 address carries its routing target in `bridge_target`, never in a URL.
 
-Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, no-domain tiers where TLS is not available (§10.12.6). A peer reaches a tier 3 node over the bridge node's `wss://` URL, because the bridge node itself has a domain and TLS. Tier 4 uses `wss://` with the operator's domain.
+Tier 1 uses `ws://` with a raw IP address, because a node with no domain has no WebPKI certificate (§10.12.6). A peer reaches a tier 2 or tier 3 node over the bridge node's `wss://` URL, because the bridge node itself has a domain and TLS. A tier 2 direct path runs QUIC with TLS 1.3 to the certificate the punch response pins (§10.12.3). Tier 4 uses `wss://` with the operator's domain.
 
 **Address change handling.** Residential IP addresses change (ISP DHCP lease renewal, router reboot). UPnP port mappings may be reassigned. STUN-discovered addresses shift when NAT mappings expire and reform. The `RepublishManager` handles address changes by:
 
@@ -892,7 +906,8 @@ Peers that fail to connect to a stale node address re-resolve the identity's ser
 ```rust
 impl ApplicationNodeBuilder {
     /// Zero-config NAT-traversed mode. No domain, no TLS, no .well-known/scp.
-    /// Probes NAT, attempts Tiers 1-3, publishes a ws:// node URL in the service record.
+    /// Probes NAT, attempts Tiers 1-3. Tier 1 publishes a ws:// node URL in the service record;
+    /// Tiers 2 and 3 register with a bridge and publish a bridged context node address.
     pub fn no_domain(mut self) -> Self;
 
     /// Override the STUN endpoint used for NAT type probing.
@@ -910,9 +925,9 @@ impl ApplicationNodeBuilder {
 1. Skip ACME TLS provisioning entirely.
 2. Probe NAT type via STUN binding request.
 3. Attempt Tier 1 (UPnP/NAT-PMP port mapping).
-4. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2 (STUN hole punching).
-5. If Tier 2 fails or NAT is symmetric, register with a bridge node (Tier 3).
-6. Publish the service record with a `ws://` node URL (Tiers 1-2) or a `wss://` bridge URL (Tier 3).
+4. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2: register with a bridge node, open the QUIC socket, and answer punch requests (§10.12.3).
+5. If NAT is symmetric, or the node cannot hold a STUN-discovered address for its QUIC socket, register with a bridge node (Tier 3).
+6. On Tier 1, publish the service record with a `ws://` node URL. On Tiers 2 and 3, the operator signs a context node address whose `bridge` names the bridge node (`09-security-model.md` §9.5.2).
 7. Do NOT serve `.well-known/scp` — there is no domain to serve it from. Discovery runs through the identity's service record on the SCP node network alone (`03-identity.md` §3.10.13).
 
 **Behavior when `.domain()` is set:**
@@ -933,13 +948,13 @@ The reachability tiers introduce attack surfaces beyond the standard node threat
 
 **UPnP mapping hijack.** A malicious device on the local network deletes or modifies the node's UPnP port mapping. Impact: availability only — the node becomes unreachable. MLS prevents any confidentiality or integrity impact. Mitigation: the SDK verifies the mapping periodically (at 50% TTL) and detects loss. On loss, the SDK re-attempts the mapping and, if that fails, falls through to Tier 2. A persistent attacker on the LAN can deny Tier 1 indefinitely, but cannot prevent fallthrough to other tiers.
 
-**STUN server manipulation.** A malicious or compromised STUN server reports an incorrect external address to the self-hosted node. Impact: availability — peers attempt to connect to the wrong address. Cannot affect confidentiality (MLS) or integrity (the designated operational key signs the service record, `03-identity.md` §3.10.13). Mitigation: the SDK validates the STUN-reported address by performing a reachability self-test (connecting to its own reported address via an intermediary). If the self-test fails, the STUN result is discarded. Additionally, the SDK SHOULD probe multiple STUN servers and compare results — divergence indicates manipulation.
+**STUN server manipulation.** A malicious or compromised STUN server reports an incorrect external address to the self-hosted node. Impact: availability — peers attempt to connect to the wrong address. Cannot affect confidentiality (MLS) or integrity (the designated operational key signs the service record, `03-identity.md` §3.10.13, and the punch response, §10.12.3). Mitigation on Tier 1: the SDK validates the reported address by performing a reachability self-test (connecting to its own reported address via an intermediary), and discards the result when the self-test fails. On Tier 2 a wrong address makes each peer's punch fail at step 8 of §10.12.3 **Punch**, which leaves that peer on its bridge session. Additionally, the SDK SHOULD probe multiple STUN servers and compare results — divergence indicates manipulation.
 
 **Bridge node as man-in-the-middle.** A bridge node has the same position as any SCP node — it sees routing IDs, blob sizes, and timing (§9.9.1). It CANNOT read MLS-encrypted content, forge messages, modify blobs, or inject members into contexts. It CAN perform suppression, delay, and replay — the same attacks any node can mount. The same mitigations apply: sequence gap detection and head binding (§9.9.2), the context chain proofs (§9.9.3), and resubmission of a refused submission (§9.9.4). Bridge nodes are substitutable — switching bridges requires only a new context node address, not a session renegotiation.
 
-**Network metadata exposure without TLS.** For Tiers 1 and 2, node traffic uses `ws://` (plaintext WebSocket). Network intermediaries (ISPs, network operators on the path) can observe the same metadata that the node operator sees (§9.9.1): connection timing, blob sizes, routing IDs. They cannot read MLS-encrypted blob content. This is the same metadata exposure as the node operator has — TLS merely prevents intermediaries other than the node from seeing it. Accepted tradeoff for zero-config deployment (§10.12.6).
+**Network metadata exposure without TLS.** On Tier 1, node traffic uses `ws://` (plaintext WebSocket). A Tier 2 direct path runs QUIC, whose TLS 1.3 hides this metadata from the path. Network intermediaries (ISPs, network operators on the path) can observe the same metadata that the node operator sees (§9.9.1): connection timing, blob sizes, routing IDs. They cannot read MLS-encrypted blob content. This is the same metadata exposure as the node operator has — TLS merely prevents intermediaries other than the node from seeing it. Accepted tradeoff for zero-config deployment (§10.12.6).
 
-**Residential IP exposure in the service record.** Tiers 1 and 2 publish the operator's residential IP address in the service record the node network stores. Anyone who resolves the identifier learns the operator's IP. This is inherent to self-hosting without a domain — the node must be reachable, and reachability requires a public address. Tier 3 (bridge) exposes only the bridge node's address, not the operator's. Privacy-conscious operators who do not want to expose their residential IP have three options:
+**Residential IP exposure.** Tier 1 publishes the operator's residential IP address in the service record the node network stores, so anyone who resolves the identifier learns the operator's IP. Tier 2 publishes no IP address. Its node sends its external address only in a `HOLE_PUNCH_RESPONSE`, which it sends only to an identity whose signed request it verified, at most 4 requests per source prefix per minute under the default (§10.12.3). Any identity can still sign a request, so a Tier 2 node hides its address from resolvers and not from a party that holds a key and a bridge session to it. Tier 3 (bridge) exposes only the bridge node's address, not the operator's. Privacy-conscious operators who do not want to expose their residential IP have three options:
 
 - Use a bridge node (Tier 3) even when not required by NAT type — the SDK could support a `force_bridge()` builder method for this.
 - Route traffic through a VPN, exposing the VPN's address instead.
@@ -953,13 +968,13 @@ The reachability tiers introduce attack surfaces beyond the standard node threat
 |-----------|-------|-------|-------|
 | NAT type detection (STUN probing) | Phase 2 | `scp-transport` | RFC 8489 binding requests |
 | UPnP/NAT-PMP port mapping | Phase 2 | `scp-transport` | `igd-next` crate for UPnP, `natpmp` crate for NAT-PMP/PCP |
-| STUN hole punching + keepalive | Phase 2 | `scp-transport` | `stun-rs` or `webrtc-rs/stun` |
+| STUN hole punching + keepalive, `HOLE_PUNCH_REQUEST`/`HOLE_PUNCH_RESPONSE`, QUIC on the punched path with a pinned certificate | Phase 3 | `scp-transport` | Needs node bridging, because the punch exchange travels inside a bridge session (§10.12.3) |
 | `.no_domain()` builder mode | Phase 2 | `scp-node` | `ApplicationNodeBuilder` extension |
 | `ws://` transport for service-record-discovered nodes | Phase 2 | `scp-transport` | Enforcement: reject `ws://` from any source but a verified service record (§18.2.1) |
 | Node bridging (BRIDGE_REGISTER + BRIDGE_DATA) | Phase 3 | `scp-transport` | Wire operations, P-256-authenticated registration, transparent forwarding |
 | STUN service on SCP nodes | Phase 3 | `scp-transport` | Coexists with WebSocket endpoint |
 
-Phase 2 delivers the zero-config floor: a self-hosted node behind most consumer NATs becomes reachable without any manual configuration. Phase 3 closes the remaining ~15% (symmetric NAT) with node bridging and adds STUN service to the node fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.
+Phase 2 delivers Tier 1 and NAT classification. Phase 3 delivers node bridging, which makes a self-hosted node behind any NAT reachable, and the Tier 2 direct path, which runs over a bridge session until a punch succeeds and adds STUN service to the node fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.
 
 ### 10.12.11 Self-Hosted Website Surface
 

@@ -707,6 +707,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | `BRIDGE_DATA` | `session_id: u64`, `payload: bin` | From a peer or a registered relay: one frame of this ADR, carried unchanged to the session's other end. None; the bridge closes the session with `4010` above `max_blob_size` plus 1,024 bytes and with `4035` beyond the sender's credit, and answers ERR `4033` for a session ID never opened on the connection |
 | `BRIDGE_SESSION_CREDIT` | `session_id: u64`, `bytes: u32` | Grants the bridge `bytes` more payload bytes on the session. None; ERR `4033` as for `BRIDGE_DATA` |
 | `BRIDGE_SESSION_CLOSE` | `session_id: u64`, `code: u16` | Closes the session, with `0` or an error code of this ADR; the bridge sends the other end `BRIDGE_SESSION_CLOSE` with the same code. None; ERR `4033` as for `BRIDGE_DATA` |
+| `HOLE_PUNCH_REQUEST` | `requester: bin32`, `requester_address: bin` (7 or 19 bytes), `target_routing_id: bin32`, `nonce: bin16`, `timestamp: u64`, `signature: bin64` | Sent by a peer only inside a bridge session, as a `BRIDGE_DATA` payload, to a Tier 2 node. `HOLE_PUNCH_RESPONSE`, or ERR `4003` or `4012` (§10.12.3, which states the encoding of `requester_address` and the node's checks) |
 
 **Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
 
@@ -723,6 +724,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | `BRIDGE_DATA` | `session_id: u64`, `payload: bin` | One frame of this ADR that the session's other end sent, unchanged. |
 | `BRIDGE_SESSION_CREDIT` | `session_id: u64`, `bytes: u32` | The bridge grants `bytes` more payload bytes on the session. |
 | `BRIDGE_SESSION_CLOSE` | `session_id: u64`, `code: u16` | The session closed: the code the other end sent, `0` on the peer's disconnect, `4032` when the registered relay's connection closed, or `4010` or `4035` when the bridge closed it (§10.12.4 **Closing**). |
+| `HOLE_PUNCH_RESPONSE` | `ref: string?`, `request_hash: bin32`, `responder_address: bin` (7 or 19 bytes), `cert_spki_hash: bin32`, `timestamp: u64`, `signature: bin64` | A Tier 2 node's answer to a `HOLE_PUNCH_REQUEST`, sent only inside the same bridge session. The peer verifies it and punches as §10.12.3 **Punch** states. |
 
 #### Error Codes
 
